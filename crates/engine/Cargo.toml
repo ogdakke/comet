@@ -10,6 +10,7 @@ zeron-proto.workspace = true
 zeron-doc.workspace = true
 zeron-sync.workspace = true
 zeron-harness.workspace = true
+zeron-studio.workspace = true
 zeron-rpc.workspace = true
 zeron-update.workspace = true
 loro.workspace = true

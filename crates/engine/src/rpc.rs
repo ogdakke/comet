@@ -57,7 +57,12 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use zeron_doc::{MessagePart, SessionCommandPayload};
-use zeron_proto::{ChatConfig, EngineInfo, HarnessId, ToolCall, WorkspaceScope};
+use zeron_proto::{
+    ArchiveStudioConversationRequest, ChatConfig, CreateStudioConversationRequest, EngineInfo,
+    HarnessId, ListStudioConversationsRequest, ListStudioConversationsResponse,
+    ListStudioProvidersResponse, ProviderValidationState, RenameStudioConversationRequest,
+    StudioProviderConnection, ToolCall, WorkspaceScope,
+};
 use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
 use crate::agent_accounts::AgentAccounts;
@@ -67,6 +72,7 @@ use crate::doc_host::DocHost;
 use crate::registry::HarnessRegistry;
 use crate::repos::{Repos, home_dir};
 use crate::sessions::SessionsEngine;
+use crate::studio::{StudioProviderRegistry, StudioStore};
 use crate::terminals::Terminals;
 use crate::uploads::Uploads;
 use crate::workspace_host::WorkspaceHost;
@@ -379,6 +385,8 @@ pub struct EngineRpc {
     diff_sync: CheckoutDiffSync,
     uploads: Uploads,
     agent_accounts: AgentAccounts,
+    studio: std::sync::Arc<StudioStore>,
+    studio_providers: std::sync::Arc<StudioProviderRegistry>,
     auth: Option<Auth>,
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<zeron_update::Updater>,
@@ -398,6 +406,8 @@ impl EngineRpc {
         diff_sync: CheckoutDiffSync,
         uploads: Uploads,
         agent_accounts: AgentAccounts,
+        studio: std::sync::Arc<StudioStore>,
+        studio_providers: std::sync::Arc<StudioProviderRegistry>,
         workspace_scope: WorkspaceScope,
     ) -> Self {
         let engine_info = EngineInfo {
@@ -414,6 +424,8 @@ impl EngineRpc {
             diff_sync,
             uploads,
             agent_accounts,
+            studio,
+            studio_providers,
             auth: None,
             links: None,
             updater: None,
@@ -1019,6 +1031,55 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&models)
+            }
+            methods::LIST_STUDIO_PROVIDERS => {
+                let providers = self
+                    .studio_providers
+                    .list()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
+                    .into_iter()
+                    .map(|provider| StudioProviderConnection {
+                        display_label: provider.id.as_str().to_owned(),
+                        provider_id: provider.id,
+                        configured: false,
+                        validation_state: ProviderValidationState::NotValidated,
+                        validated_at: None,
+                        validation_message: None,
+                    })
+                    .collect();
+                RpcReply::value(&ListStudioProvidersResponse { providers })
+            }
+            methods::LIST_STUDIO_CONVERSATIONS => {
+                let request: ListStudioConversationsRequest = parse_params(params)?;
+                let conversations = self
+                    .studio
+                    .list_conversations(request.include_archived)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&ListStudioConversationsResponse { conversations })
+            }
+            methods::CREATE_STUDIO_CONVERSATION => {
+                let request: CreateStudioConversationRequest = parse_params(params)?;
+                let conversation = self
+                    .studio
+                    .create_conversation(&request.title, request.forked_from_turn_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&conversation)
+            }
+            methods::RENAME_STUDIO_CONVERSATION => {
+                let request: RenameStudioConversationRequest = parse_params(params)?;
+                let conversation = self
+                    .studio
+                    .rename_conversation(request.conversation_id, &request.title)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&conversation)
+            }
+            methods::ARCHIVE_STUDIO_CONVERSATION => {
+                let request: ArchiveStudioConversationRequest = parse_params(params)?;
+                let conversation = self
+                    .studio
+                    .archive_conversation(request.conversation_id, request.archived)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&conversation)
             }
             methods::LIST_COMMANDS => {
                 // Same shape as ListModels: forces a lazy resolve, then the

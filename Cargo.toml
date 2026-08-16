@@ -5,6 +5,7 @@ members = [
     "crates/doc",
     "crates/sync",
     "crates/harness",
+    "crates/studio",
     "crates/engine",
     "crates/rpc",
     "crates/update",
@@ -24,6 +25,7 @@ zeron-proto = { path = "crates/proto" }
 zeron-doc = { path = "crates/doc" }
 zeron-sync = { path = "crates/sync" }
 zeron-harness = { path = "crates/harness" }
+zeron-studio = { path = "crates/studio" }
 zeron-engine = { path = "crates/engine" }
 zeron-rpc = { path = "crates/rpc" }
 zeron-update = { path = "crates/update" }

@@ -132,6 +132,26 @@ pub mod methods {
     /// Download + apply the newest release on the target device (symlink-managed
     /// installs; the service restart is scheduled after the reply flushes).
     pub const APPLY_UPDATE: &str = "ApplyUpdate";
+    // Studio is IPC-local in v1: generated media never crosses the device relay.
+    pub const LIST_STUDIO_PROVIDERS: &str = "ListStudioProviders";
+    pub const SET_STUDIO_PROVIDER_CREDENTIAL: &str = "SetStudioProviderCredential";
+    pub const REMOVE_STUDIO_PROVIDER_CREDENTIAL: &str = "RemoveStudioProviderCredential";
+    pub const VALIDATE_STUDIO_PROVIDER: &str = "ValidateStudioProvider";
+    pub const LIST_STUDIO_MODELS: &str = "ListStudioModels";
+    pub const LIST_STUDIO_CONVERSATIONS: &str = "ListStudioConversations";
+    pub const CREATE_STUDIO_CONVERSATION: &str = "CreateStudioConversation";
+    pub const RENAME_STUDIO_CONVERSATION: &str = "RenameStudioConversation";
+    pub const ARCHIVE_STUDIO_CONVERSATION: &str = "ArchiveStudioConversation";
+    pub const WATCH_STUDIO_CONVERSATION: &str = "WatchStudioConversation";
+    pub const IMPORT_STUDIO_ASSET: &str = "ImportStudioAsset";
+    pub const QUOTE_STUDIO_BATCH: &str = "QuoteStudioBatch";
+    pub const CREATE_STUDIO_TURN: &str = "CreateStudioTurn";
+    pub const CONFIRM_STUDIO_BATCH: &str = "ConfirmStudioBatch";
+    pub const CANCEL_STUDIO_RUN: &str = "CancelStudioRun";
+    pub const RETRY_STUDIO_RUN: &str = "RetryStudioRun";
+    pub const DELETE_STUDIO_ARTIFACT: &str = "DeleteStudioArtifact";
+    pub const WATCH_STUDIO_JOBS: &str = "WatchStudioJobs";
+    pub const READ_STUDIO_ARTIFACT_CHUNK: &str = "ReadStudioArtifactChunk";
 }
 
 #[derive(Debug, thiserror::Error)]

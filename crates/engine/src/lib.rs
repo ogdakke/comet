@@ -29,6 +29,7 @@ pub mod rpc;
 pub mod run_journal;
 pub mod sessions;
 pub mod spaces;
+pub mod studio;
 pub mod terminals;
 pub mod titles;
 pub mod uploads;
@@ -50,6 +51,10 @@ pub use rpc::EngineRpc;
 pub use run_journal::{JournalError, RunJournal};
 pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
 pub use spaces::SpacesSync;
+pub use studio::{
+    ArtifactStore, StudioProviderDescriptor, StudioProviderRegistry, StudioRegistryError,
+    StudioStore, StudioStoreError,
+};
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
 pub use uploads::{AttachmentChunk, Uploads};
@@ -69,6 +74,8 @@ pub enum EngineError {
     Store(#[from] zeron_sync::StoreError),
     #[error("harness: {0}")]
     Harness(#[from] zeron_harness::HarnessError),
+    #[error("studio: {0}")]
+    Studio(#[from] studio::StudioStoreError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("{0}")]
@@ -117,6 +124,8 @@ pub struct EngineCore {
     pub spaces_sync: SpacesSync,
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
+    pub studio: Arc<StudioStore>,
+    pub studio_providers: Arc<StudioProviderRegistry>,
     pub device_id: String,
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
@@ -256,6 +265,11 @@ impl EngineCore {
             )
         });
         let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));
+        let studio = Arc::new(StudioStore::open(
+            profile.store_root(),
+            studio::DEFAULT_MAX_ARTIFACT_BYTES,
+        )?);
+        let studio_providers = Arc::new(StudioProviderRegistry::new());
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
@@ -279,6 +293,8 @@ impl EngineCore {
             spaces_sync,
             uploads,
             agent_accounts,
+            studio,
+            studio_providers,
             device_id,
             local_import,
             workspace_scope: profile.scope(),
@@ -405,6 +421,8 @@ impl EngineCore {
             self.diff_sync.clone(),
             self.uploads.clone(),
             self.agent_accounts.clone(),
+            self.studio.clone(),
+            self.studio_providers.clone(),
             self.workspace_scope,
         )
         .with_auth(self.auth());

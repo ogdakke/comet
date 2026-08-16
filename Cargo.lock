@@ -9160,6 +9160,7 @@ dependencies = [
  "zeron-harness",
  "zeron-proto",
  "zeron-rpc",
+ "zeron-studio",
  "zeron-sync",
  "zeron-update",
 ]
@@ -9192,6 +9193,7 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid",
+ "zeron-studio",
 ]
 
 [[package]]
@@ -9211,6 +9213,19 @@ dependencies = [
  "zeron-doc",
  "zeron-proto",
  "zeron-sync",
+]
+
+[[package]]
+name = "zeron-studio"
+version = "0.2.3"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
