@@ -134,8 +134,15 @@ fn apply_lightbox_swipe_delta(
     }
 }
 
+/// How far a zoomed image may travel. `stage * zoom / 2` lets any edge
+/// reach the stage center — enough to clear the overlaid titlebar/filmstrip
+/// on a 9:16 that fills the stage height.
 fn lightbox_pan_range(stage: f32, zoom: f32) -> f32 {
-    stage.max(1.0) * (zoom - 1.0).max(0.0) / 2.0
+    if zoom <= 1.001 {
+        0.0
+    } else {
+        stage.max(1.0) * zoom / 2.0
+    }
 }
 
 fn snap_offset_at(from: f32, to: f32, elapsed: f32, duration: f32) -> f32 {
@@ -726,11 +733,12 @@ impl StudioPage {
                 .items_center()
                 .justify_center()
         } else {
+            // Do not combine inset_0 with left/top: that pins the far edges
+            // and shrinks the box when you pan down, so the top of a tall
+            // image is unreachable.
             div()
                 .absolute()
                 .inset_0()
-                .left(self.lightbox_pan.x)
-                .top(self.lightbox_pan.y)
                 .flex()
                 .items_center()
                 .justify_center()
@@ -756,6 +764,14 @@ impl StudioPage {
                     .h(px(self.lightbox_stage_height * zoom))
             } else {
                 picture.w(gpui::relative(zoom)).h(gpui::relative(zoom))
+            };
+            let picture = if page.is_none() && self.lightbox_zoom > 1.001 {
+                picture
+                    .relative()
+                    .left(self.lightbox_pan.x)
+                    .top(self.lightbox_pan.y)
+            } else {
+                picture
             };
             frame.child(picture).into_any_element()
         } else {
@@ -1244,10 +1260,9 @@ mod tests {
 
     #[test]
     fn lightbox_pan_limits_cover_the_zoomed_stage() {
-        assert!((lightbox_pan_range(900.0, 2.0) - 450.0).abs() < 0.01);
-        assert!(lightbox_pan_range(900.0, 2.0) > 420.0);
-        assert!((lightbox_pan_range(1400.0, 3.0) - 1400.0).abs() < 0.01);
         assert_eq!(lightbox_pan_range(900.0, 1.0), 0.0);
+        assert!((lightbox_pan_range(900.0, 2.0) - 900.0).abs() < 0.01);
+        assert!((lightbox_pan_range(1400.0, 3.0) - 2100.0).abs() < 0.01);
     }
 
     #[test]
