@@ -140,3 +140,23 @@ pub struct CreateStudioTurnRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_turn_id: Option<StudioTurnId>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadStudioArtifactChunkRequest {
+    pub artifact_id: zeron_studio::StudioArtifactId,
+    #[serde(default)]
+    pub offset: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudioArtifactChunk {
+    pub artifact_id: zeron_studio::StudioArtifactId,
+    pub file_name: String,
+    pub mime_type: String,
+    /// Base64 of this chunk's byte range.
+    pub data: String,
+    pub next_offset: u64,
+    pub done: bool,
+}

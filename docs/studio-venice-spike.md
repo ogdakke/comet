@@ -39,5 +39,7 @@ Use OS-player handoff for video in the first release. Generated MP4 artifacts wi
 Reveal, and Export actions; embedded GPUI playback remains a separate platform spike. This leaves no
 unknown playback dependency on the Phase 2 MVP path.
 
-The remaining Phase 0 rendering proof must be completed in the GPUI slice: resolve images by jailed
-artifact ID through the engine/RPC boundary, never by accepting a UI-provided filesystem path.
+The engine-side rendering proof is complete: `ReadStudioArtifactChunk` accepts an artifact ID and
+offset, resolves the file and MIME type inside the profile's artifact jail, and returns bounded
+base64 chunks without a filesystem path. The GPUI slice can decode those chunks using the existing
+attachment image-cache pattern.

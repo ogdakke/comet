@@ -3,20 +3,33 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Seek, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard, RwLock},
 };
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use rusqlite::Connection;
 use uuid::Uuid;
-use zeron_proto::StudioConversationSummary;
+use zeron_proto::{StudioArtifactChunk, StudioConversationSummary};
 use zeron_studio::{MediaProvider, ProviderId, StudioArtifactId, SubmissionCapabilities};
 use zeron_studio::{StudioConversationId, StudioTurnId};
 
 const DATABASE_FILE: &str = "studio.sqlite3";
 const SCHEMA_VERSION: i64 = 1;
 pub(crate) const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+const ARTIFACT_READ_CHUNK_BYTES: u64 = 192_000;
+const ARTIFACT_FORMATS: &[(&str, &str)] = &[
+    ("webp", "image/webp"),
+    ("png", "image/png"),
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("gif", "image/gif"),
+    ("mp4", "video/mp4"),
+    ("mov", "video/quicktime"),
+    ("webm", "video/webm"),
+];
 
 const SCHEMA_V1: &str = r#"
 BEGIN IMMEDIATE;
@@ -244,6 +257,8 @@ pub enum StudioStoreError {
     ArtifactExists,
     #[error("artifact is not a regular file")]
     InvalidArtifact,
+    #[error("studio artifact was not found")]
+    ArtifactNotFound,
     #[error("studio database schema {0} is newer than this application supports")]
     NewerSchema(i64),
     #[error("studio database lock is poisoned")]
@@ -533,22 +548,68 @@ impl ArtifactStore {
         Ok(())
     }
 
+    /// Read a bounded byte range using only the artifact's opaque ID.
+    ///
+    /// The extension and path are resolved inside the jail. Multiple files with the same artifact
+    /// ID are rejected as corrupt rather than selecting one nondeterministically.
+    pub fn read_chunk(
+        &self,
+        artifact_id: StudioArtifactId,
+        offset: u64,
+    ) -> Result<StudioArtifactChunk, StudioStoreError> {
+        let (path, extension, mime_type) = self.locate(artifact_id)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(StudioStoreError::InvalidArtifact);
+        }
+        let size = metadata.len();
+        let start = offset.min(size);
+        let next_offset = (start + ARTIFACT_READ_CHUNK_BYTES).min(size);
+        let mut bytes = vec![0; (next_offset - start) as usize];
+        let mut file = File::open(&path)?;
+        file.seek(std::io::SeekFrom::Start(start))?;
+        file.read_exact(&mut bytes)?;
+
+        Ok(StudioArtifactChunk {
+            artifact_id,
+            file_name: format!("{}.{}", artifact_id.0, extension),
+            mime_type: mime_type.to_owned(),
+            data: BASE64.encode(bytes),
+            next_offset,
+            done: next_offset >= size,
+        })
+    }
+
     fn path_for(
         &self,
         artifact_id: StudioArtifactId,
         extension: &str,
     ) -> Result<PathBuf, StudioStoreError> {
-        if extension.is_empty()
-            || extension.len() > 10
-            || !extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        let extension = extension.to_ascii_lowercase();
+        if !ARTIFACT_FORMATS
+            .iter()
+            .any(|(supported, _)| *supported == extension)
         {
             return Err(StudioStoreError::InvalidExtension);
         }
-        Ok(self.root.join(format!(
-            "{}.{}",
-            artifact_id.0,
-            extension.to_ascii_lowercase()
-        )))
+        Ok(self.root.join(format!("{}.{}", artifact_id.0, extension)))
+    }
+
+    fn locate(
+        &self,
+        artifact_id: StudioArtifactId,
+    ) -> Result<(PathBuf, &'static str, &'static str), StudioStoreError> {
+        let mut found = None;
+        for &(extension, mime_type) in ARTIFACT_FORMATS {
+            let path = self.root.join(format!("{}.{}", artifact_id.0, extension));
+            match fs::symlink_metadata(&path) {
+                Ok(_) if found.is_some() => return Err(StudioStoreError::InvalidArtifact),
+                Ok(_) => found = Some((path, extension, mime_type)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        found.ok_or(StudioStoreError::ArtifactNotFound)
     }
 }
 

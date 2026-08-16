@@ -60,8 +60,8 @@ use zeron_doc::{MessagePart, SessionCommandPayload};
 use zeron_proto::{
     ArchiveStudioConversationRequest, ChatConfig, CreateStudioConversationRequest, EngineInfo,
     HarnessId, ListStudioConversationsRequest, ListStudioConversationsResponse,
-    ListStudioProvidersResponse, ProviderValidationState, RenameStudioConversationRequest,
-    StudioProviderConnection, ToolCall, WorkspaceScope,
+    ListStudioProvidersResponse, ProviderValidationState, ReadStudioArtifactChunkRequest,
+    RenameStudioConversationRequest, StudioProviderConnection, ToolCall, WorkspaceScope,
 };
 use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
@@ -1080,6 +1080,15 @@ impl RpcService for EngineRpc {
                     .archive_conversation(request.conversation_id, request.archived)
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&conversation)
+            }
+            methods::READ_STUDIO_ARTIFACT_CHUNK => {
+                let request: ReadStudioArtifactChunkRequest = parse_params(params)?;
+                let chunk = self
+                    .studio
+                    .artifacts()
+                    .read_chunk(request.artifact_id, request.offset)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&chunk)
             }
             methods::LIST_COMMANDS => {
                 // Same shape as ListModels: forces a lazy resolve, then the

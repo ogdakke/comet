@@ -1,10 +1,14 @@
 use std::io::Read;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use tempfile::tempdir;
 use zeron_engine::{
     EngineCore, EngineProfile, HarnessId, StudioProviderRegistry, StudioStore, default_registry,
 };
-use zeron_proto::{ListStudioConversationsResponse, StudioConversationSummary};
+use zeron_proto::{
+    ListStudioConversationsResponse, StudioArtifactChunk, StudioConversationSummary,
+};
 use zeron_rpc::{memory_client, methods};
 use zeron_studio::{FakeMediaProvider, FakeSubmissionMode, ProviderId, StudioArtifactId};
 
@@ -91,6 +95,24 @@ fn artifact_store_rejects_traversal_and_oversized_data() {
             .publish(StudioArtifactId::new(), "png", b"12345")
             .is_err()
     );
+}
+
+#[test]
+fn artifact_chunk_reads_resolve_mime_and_path_from_id() {
+    let root = tempdir().unwrap();
+    let store = StudioStore::open(root.path(), 1024).unwrap();
+    let id = StudioArtifactId::new();
+    store
+        .artifacts()
+        .publish(id, "webp", b"studio image")
+        .unwrap();
+
+    let chunk = store.artifacts().read_chunk(id, 0).unwrap();
+    assert_eq!(chunk.artifact_id, id);
+    assert_eq!(chunk.mime_type, "image/webp");
+    assert_eq!(BASE64.decode(chunk.data).unwrap(), b"studio image");
+    assert!(chunk.done);
+    assert!(!chunk.file_name.contains('/'));
 }
 
 #[test]
@@ -225,6 +247,40 @@ async fn conversation_rpc_round_trips_and_archives_profile_history() {
     .unwrap();
     assert_eq!(all.conversations.len(), 1);
     assert!(all.conversations[0].archived);
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn artifact_rpc_reads_by_id_without_exposing_a_filesystem_path() {
+    let root = tempdir().unwrap();
+    let profile = EngineProfile::synced(root.path(), "org", "artifact-user");
+    let engine = EngineCore::assemble_with_profile(
+        profile,
+        std::sync::Arc::new(default_registry()),
+        HarnessId::Mock,
+        None,
+    )
+    .unwrap();
+    let id = StudioArtifactId::new();
+    engine
+        .studio
+        .artifacts()
+        .publish(id, "png", b"image")
+        .unwrap();
+    let client = memory_client(engine.rpc_service());
+
+    let value = client
+        .call(
+            methods::READ_STUDIO_ARTIFACT_CHUNK,
+            serde_json::json!({ "artifactId": id, "offset": 0 }),
+        )
+        .await
+        .unwrap();
+    assert!(value.get("path").is_none());
+    let chunk: StudioArtifactChunk = serde_json::from_value(value).unwrap();
+    assert_eq!(chunk.mime_type, "image/png");
+    assert_eq!(BASE64.decode(chunk.data).unwrap(), b"image");
 
     engine.shutdown().await;
 }
