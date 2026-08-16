@@ -70,6 +70,9 @@ pub struct StudioPage {
     pub(super) inspector_scroll: gpui::ScrollHandle,
     pub(super) images: StudioImages,
     pub(super) loading_images: HashSet<StudioArtifactId>,
+    /// In-flight image reads that must retain the original encoded frame.
+    /// A thumb read can be promoted when hover/open happens before it finishes.
+    pub(super) loading_full_images: HashSet<StudioArtifactId>,
     pub(super) image_failed: HashSet<StudioArtifactId>,
     pub(super) image_protect: HashSet<StudioArtifactId>,
     pub(super) gallery: Vec<StudioGalleryItem>,
@@ -171,6 +174,7 @@ impl StudioPage {
             inspector_scroll: gpui::ScrollHandle::new(),
             images: StudioImages::default(),
             loading_images: HashSet::new(),
+            loading_full_images: HashSet::new(),
             image_failed: HashSet::new(),
             image_protect: HashSet::new(),
             gallery: Vec::new(),
@@ -429,6 +433,7 @@ impl StudioPage {
     pub(super) fn forget_artifact(&mut self, artifact_id: StudioArtifactId) {
         self.images.remove(&artifact_id);
         self.loading_images.remove(&artifact_id);
+        self.loading_full_images.remove(&artifact_id);
         self.image_failed.remove(&artifact_id);
         self.image_tasks.remove(&artifact_id);
         self.gallery.retain(|item| item.id != artifact_id);

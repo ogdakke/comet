@@ -23,7 +23,14 @@ const GALLERY_PAD: f32 = 20.0;
 const GALLERY_GAP: f32 = 10.0;
 const GALLERY_MIN_TILE: f32 = 248.0;
 const GALLERY_CHECK: f32 = 20.0;
-const MAX_IN_FLIGHT_IMAGES: usize = 20;
+// Image decoding is CPU-heavy. A large fan-out makes scrolling contend with
+// the render thread even though the list itself is virtualized.
+const MAX_IN_FLIGHT_IMAGES: usize = 2;
+/// Outward cache fill gets one slot; the other remains available to the
+/// viewport runway, hover, and lightbox work.
+const MAX_BACKGROUND_IMAGES: usize = 1;
+/// Synchronous runway maintained on every scroll update. At five columns this
+/// is up to 40 previews on either side, while decode concurrency stays bounded.
 const PREFETCH_ROWS: usize = 8;
 
 pub(super) fn gallery_columns(width: f32) -> usize {
@@ -54,6 +61,22 @@ pub(super) fn select_index_range(count: usize, from: usize, to: usize) -> Range<
     let start = from.min(to).min(count.saturating_sub(1));
     let end = from.max(to).min(count.saturating_sub(1));
     if count == 0 { 0..0 } else { start..end + 1 }
+}
+
+fn gallery_prefetch_row_order(total_rows: usize, visible: Range<usize>) -> Vec<usize> {
+    let start = visible.start.min(total_rows);
+    let end = visible.end.min(total_rows).max(start);
+    let radius = start.max(total_rows.saturating_sub(end));
+    let mut rows = Vec::with_capacity(total_rows.saturating_sub(end - start));
+    for distance in 0..radius {
+        if let Some(below) = end.checked_add(distance).filter(|row| *row < total_rows) {
+            rows.push(below);
+        }
+        if let Some(above) = start.checked_sub(distance + 1) {
+            rows.push(above);
+        }
+    }
+    rows
 }
 
 pub(super) fn new_gallery_list(cx: &mut Context<StudioPage>) -> ListState {
@@ -248,6 +271,27 @@ impl StudioPage {
             .collect()
     }
 
+    fn gallery_ids_outward_from_visible(&self) -> Vec<StudioArtifactId> {
+        let columns = self.gallery_list_columns.max(1);
+        let total_rows = gallery_row_count(self.gallery.len(), columns);
+        let visible = if self.gallery_visible_rows.end > self.gallery_visible_rows.start {
+            self.gallery_visible_rows.clone()
+        } else {
+            0..1.min(total_rows)
+        };
+        gallery_prefetch_row_order(total_rows, visible)
+            .into_iter()
+            .flat_map(|row| {
+                let start = row * columns;
+                self.gallery
+                    .get(start..(start + columns).min(self.gallery.len()))
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|item| item.id)
+            })
+            .collect()
+    }
+
     pub(super) fn request_visible_gallery_images(&mut self, cx: &mut Context<Self>) {
         if let Some(selected) = self.selected_artifact {
             let fulls = super::artifact::lightbox_neighbor_ids(&self.lightbox_frames, selected);
@@ -260,6 +304,11 @@ impl StudioPage {
             self.image_protect = thumbs.iter().chain(fulls.iter()).copied().collect();
             self.image_protect
                 .extend(self.loading_images.iter().copied());
+            // Start each lightbox neighbor as a thumb request, then promote
+            // that same in-flight read to retain the original. This ensures
+            // every paging target has a fallback instead of letting full-only
+            // work starve the never-blank path.
+            self.request_images(fulls.clone(), false, cx);
             self.request_images(fulls, true, cx);
             self.request_images(thumbs, false, cx);
             return;
@@ -278,8 +327,18 @@ impl StudioPage {
         self.image_protect = visible.iter().chain(thumbs.iter()).copied().collect();
         self.image_protect
             .extend(self.loading_images.iter().copied());
-        self.request_images(visible, true, cx);
+        // A sharp, cover-capable preview is the stable grid resource. Loading
+        // originals for every visible tile turns scrolling into a decode and
+        // GPU-cache eviction loop; hover/open promotes only the likely target.
+        self.request_images(visible, false, cx);
         self.request_images(thumbs, false, cx);
+        // Continuously spend one otherwise-free slot filling outward. This is
+        // capacity-driven rather than scroll-idle-driven, so casual scrolling
+        // still warms the gallery while foreground work keeps priority.
+        if self.images.has_thumb_capacity() {
+            let outward = self.gallery_ids_outward_from_visible();
+            self.request_images_with_limit(outward, false, MAX_BACKGROUND_IMAGES, false, cx);
+        }
     }
 
     pub(super) fn request_images(
@@ -288,41 +347,56 @@ impl StudioPage {
         full: bool,
         cx: &mut Context<Self>,
     ) {
+        self.request_images_with_limit(ids, full, MAX_IN_FLIGHT_IMAGES, true, cx);
+    }
+
+    fn request_images_with_limit(
+        &mut self,
+        ids: Vec<StudioArtifactId>,
+        full: bool,
+        max_in_flight: usize,
+        protect_requests: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(engine) = self.engine(cx) else {
             return;
         };
-        self.images.touch(ids.iter().copied());
-        self.image_protect.extend(ids.iter().copied());
+        if protect_requests {
+            self.images.touch(ids.iter().copied());
+            self.image_protect.extend(ids.iter().copied());
+        }
         let mut inflight = self.loading_images.len();
         for id in ids {
-            if inflight >= MAX_IN_FLIGHT_IMAGES {
-                break;
-            }
             let ready = if full {
                 self.images.contains_full(&id)
             } else {
                 self.images.contains_thumb(&id)
             };
-            if ready || self.loading_images.contains(&id) || self.image_failed.contains(&id) {
+            if ready || self.image_failed.contains(&id) {
                 continue;
             }
+            if self.loading_images.contains(&id) {
+                if full {
+                    // Promote an already-running thumb read instead of
+                    // fetching the same original a second time.
+                    self.loading_full_images.insert(id);
+                }
+                continue;
+            }
+            if inflight >= max_in_flight {
+                break;
+            }
+            if full {
+                self.loading_full_images.insert(id);
+            }
+            let need_thumb = !self.images.contains_thumb(&id);
             self.loading_images.insert(id);
             inflight += 1;
             let engine = engine.clone();
             let task = cx.spawn(async move |this, cx| {
                 let loaded = read_artifact_bytes(&engine, id).await;
                 let keep_full = this
-                    .update(cx, |page, _| {
-                        full || page.gallery_ids_around_visible(0).contains(&id)
-                            || page.visible_feed_has_image(id)
-                            || page.selected_artifact.is_some_and(|selected| {
-                                super::artifact::lightbox_neighbor_ids(
-                                    &page.lightbox_frames,
-                                    selected,
-                                )
-                                .contains(&id)
-                            })
-                    })
+                    .update(cx, |page, _| page.loading_full_images.contains(&id))
                     .unwrap_or(full);
                 let decoded = match loaded {
                     Ok((_, mime, bytes)) => {
@@ -331,17 +405,21 @@ impl StudioPage {
                         let full_image = keep_full.then(|| {
                             std::sync::Arc::new(gpui::Image::from_bytes(format, bytes.clone()))
                         });
-                        let thumb = cx
-                            .background_executor()
-                            .spawn(async move { downsample_gallery_thumb(bytes) })
-                            .await
-                            .ok();
+                        let thumb = if need_thumb {
+                            cx.background_executor()
+                                .spawn(async move { downsample_gallery_thumb(bytes) })
+                                .await
+                                .ok()
+                        } else {
+                            None
+                        };
                         Ok((full_image, thumb))
                     }
                     Err(error) => Err(error),
                 };
                 this.update(cx, |page, cx| {
                     page.loading_images.remove(&id);
+                    page.loading_full_images.remove(&id);
                     match decoded {
                         Ok((full_image, thumb)) => {
                             if let Some(full_image) = full_image {
@@ -822,7 +900,7 @@ impl StudioPage {
             .into_any_element()
     }
 
-    fn prefetch_gallery_full(
+    pub(super) fn prefetch_gallery_full(
         &mut self,
         id: StudioArtifactId,
         window: &mut Window,
@@ -977,5 +1055,15 @@ mod tests {
         assert_eq!(select_index_range(10, 5, 2), 2..6);
         assert_eq!(select_index_range(10, 0, 0), 0..1);
         assert_eq!(select_index_range(0, 0, 0), 0..0);
+    }
+
+    #[test]
+    fn background_prefetch_walks_outward_on_both_sides() {
+        assert_eq!(
+            gallery_prefetch_row_order(10, 4..6),
+            vec![6, 3, 7, 2, 8, 1, 9, 0]
+        );
+        assert_eq!(gallery_prefetch_row_order(4, 0..1), vec![1, 2, 3]);
+        assert_eq!(gallery_prefetch_row_order(4, 3..4), vec![2, 1, 0]);
     }
 }

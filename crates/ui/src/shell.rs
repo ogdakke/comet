@@ -63,6 +63,10 @@ actions!(
     [ToggleSidebar, ToggleChanges, AddSpacePalette, NewSession]
 );
 
+/// Give boot/auth/session restoration the first turn, then construct the
+/// retained Studio page so its compressed preview cache can warm off-screen.
+const STUDIO_BOOT_WARM_DELAY: Duration = Duration::from_secs(2);
+
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout (feature-inventory §1.1)
 // ---------------------------------------------------------------------------
@@ -823,6 +827,7 @@ pub struct Shell {
     harnesses_page: Option<Entity<HarnessesPage>>,
     providers_page: Option<Entity<ProvidersPage>>,
     studio_page: Option<Entity<StudioPage>>,
+    studio_warm_task: Option<Task<()>>,
     studio_sub: Option<Subscription>,
     studio_observe: Option<Subscription>,
     shortcuts_sub: Option<Subscription>,
@@ -1076,6 +1081,7 @@ impl Shell {
             harnesses_page: None,
             providers_page: None,
             studio_page: None,
+            studio_warm_task: None,
             studio_sub: None,
             studio_observe: None,
             shortcuts_sub: None,
@@ -1146,6 +1152,20 @@ impl Shell {
     // ---- splash ----
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        if state.read(cx).engine().is_some()
+            && self.studio_page.is_none()
+            && self.studio_warm_task.is_none()
+        {
+            self.studio_warm_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(STUDIO_BOOT_WARM_DELAY).await;
+                this.update(cx, |shell, cx| {
+                    // Opening Studio during the grace period constructs this
+                    // same retained entity; `ensure` makes the warmup a no-op.
+                    shell.ensure_studio_page(cx);
+                })
+                .ok();
+            }));
+        }
         let next_sync_flow = {
             let state = state.read(cx);
             sync_flow_after_auth(self.sync_flow, state.workspace_scope, state.auth.as_ref())

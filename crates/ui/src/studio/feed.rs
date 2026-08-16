@@ -435,6 +435,11 @@ impl StudioPage {
                 return base
                     .relative()
                     .cursor_pointer()
+                    .on_hover(cx.listener(move |page, hovered: &bool, window, cx| {
+                        if *hovered {
+                            page.prefetch_gallery_full(id, window, cx);
+                        }
+                    }))
                     .on_click(cx.listener(move |page, _, window, cx| {
                         let frames = page
                             .conversation
@@ -650,11 +655,6 @@ impl StudioPage {
         self.feed_visible_rows = feed_visible_from_top(top, count, span);
     }
 
-    pub(super) fn visible_feed_has_image(&self, id: StudioArtifactId) -> bool {
-        self.feed_ids_around_visible(FEED_PREFETCH_TURNS)
-            .contains(&id)
-    }
-
     pub(super) fn request_visible_feed_images(&mut self, cx: &mut Context<Self>) {
         // Do not read ListState here. The wheel handler runs while the list
         // holds a mutable borrow — `item_count()` would panic.
@@ -668,7 +668,7 @@ impl StudioPage {
         self.image_protect = visible.iter().chain(thumbs.iter()).copied().collect();
         self.image_protect
             .extend(self.loading_images.iter().copied());
-        self.request_images(visible, true, cx);
+        self.request_images(visible, false, cx);
         self.request_images(thumbs, false, cx);
     }
 

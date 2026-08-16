@@ -28,6 +28,10 @@ pub(super) struct StudioImages {
 }
 
 impl StudioImages {
+    pub(super) fn has_thumb_capacity(&self) -> bool {
+        self.thumbs.len() < IMAGE_CACHE_MAX_THUMBS
+    }
+
     pub(super) fn get_full(&self, id: &StudioArtifactId) -> Option<Arc<Image>> {
         self.full.get(id).map(|entry| entry.image.clone())
     }

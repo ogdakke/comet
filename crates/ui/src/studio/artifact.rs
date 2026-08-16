@@ -440,17 +440,35 @@ pub(super) fn write_artifact_file(destination: PathBuf, bytes: Vec<u8>) -> Resul
     std::fs::write(destination, bytes).map_err(|error| error.to_string())
 }
 
-/// Longest edge kept for gallery / filmstrip tiles. 2× a ~248px cell so
-/// retina still looks sharp without pinning a 4K frame in the cache.
-const GALLERY_THUMB_EDGE: u32 = 512;
+/// Minimum short edge retained for a gallery preview. The old longest-edge
+/// thumbnail left only ~288 source pixels across the short edge of a common
+/// 16:9 image, then enlarged that crop into a ~250px Retina tile.
+const GALLERY_THUMB_SHORT_EDGE: u32 = 640;
+/// Bound panoramas and unusually tall images without changing their aspect.
+const GALLERY_THUMB_LONG_EDGE: u32 = 1920;
+
+fn gallery_thumb_dimensions(width: u32, height: u32) -> (u32, u32) {
+    let short = width.min(height);
+    let long = width.max(height);
+    if short <= GALLERY_THUMB_SHORT_EDGE && long <= GALLERY_THUMB_LONG_EDGE {
+        return (width, height);
+    }
+    let scale_for_short = GALLERY_THUMB_SHORT_EDGE as f64 / short.max(1) as f64;
+    let scale_for_long = GALLERY_THUMB_LONG_EDGE as f64 / long.max(1) as f64;
+    let scale = scale_for_short.min(scale_for_long).min(1.0);
+    (
+        (width as f64 * scale).round().max(1.0) as u32,
+        (height as f64 * scale).round().max(1.0) as u32,
+    )
+}
 
 pub(super) fn downsample_gallery_thumb(bytes: Vec<u8>) -> Result<Arc<Image>, String> {
     let image = image::load_from_memory(&bytes).map_err(|error| error.to_string())?;
-    let thumb = if image.width().max(image.height()) > GALLERY_THUMB_EDGE {
-        image.thumbnail(GALLERY_THUMB_EDGE, GALLERY_THUMB_EDGE)
-    } else {
-        image
-    };
+    // Preserve aspect because conversation tiles use Contain while gallery
+    // and filmstrip tiles use Cover. Sizing from the short edge gives cover
+    // crops a 2×+ pixel buffer without retaining the original frame.
+    let (width, height) = gallery_thumb_dimensions(image.width(), image.height());
+    let thumb = image.resize_exact(width, height, image::imageops::FilterType::Triangle);
     let mut encoded = std::io::Cursor::new(Vec::new());
     thumb
         .write_to(&mut encoded, image::ImageFormat::Jpeg)
@@ -1769,6 +1787,15 @@ mod tests {
         let thumb = downsample_gallery_thumb(raw).unwrap();
         assert!(thumb.bytes.len() < 1200 * 800);
         assert_eq!(thumb.format, ImageFormat::Jpeg);
+        let decoded = image::load_from_memory(&thumb.bytes).unwrap();
+        assert_eq!(decoded.width(), 960);
+        assert_eq!(decoded.height(), GALLERY_THUMB_SHORT_EDGE);
+    }
+
+    #[test]
+    fn gallery_thumbs_bound_extreme_aspect_ratios() {
+        assert_eq!(gallery_thumb_dimensions(4096, 1024), (1920, 480));
+        assert_eq!(gallery_thumb_dimensions(800, 600), (800, 600));
     }
 
     #[test]
