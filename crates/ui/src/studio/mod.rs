@@ -5,6 +5,7 @@
 //! - [`feed`] — tiles, turns, and the tick rail;
 //! - [`composer`] — model picker, per-model controls, and generate;
 //! - [`artifact`] — full-bleed image strip, filmstrip, and inspector;
+//! - [`image_menu`] — right-click / two-finger-tap actions on visible images;
 //! - [`providers`] — connect / validate / remove image accounts;
 //! - [`draft`] — per-model draft settings and control chrome;
 //! - [`defaults`] — sticky last-used models and settings.
@@ -16,6 +17,7 @@ mod defaults;
 mod draft;
 mod feed;
 mod gallery;
+mod image_menu;
 mod images;
 mod page;
 mod providers;
@@ -35,4 +37,9 @@ pub enum StudioEvent {
         artifact_id: StudioArtifactId,
     },
     CloseArtifact,
+    /// Navigate to a thread. `focus_artifact` scrolls that image into view.
+    ShowThread {
+        conversation_id: StudioConversationId,
+        focus_artifact: Option<StudioArtifactId>,
+    },
 }

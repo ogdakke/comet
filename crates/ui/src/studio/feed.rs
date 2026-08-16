@@ -138,6 +138,19 @@ pub(super) fn conversation_image_count(turns: &[StudioTurnView]) -> u32 {
         .count() as u32
 }
 
+pub(super) fn turn_index_for_artifact(
+    turns: &[StudioTurnView],
+    artifact_id: StudioArtifactId,
+) -> Option<usize> {
+    turns.iter().position(|turn| {
+        turn.runs.iter().any(|run| {
+            run.artifacts
+                .iter()
+                .any(|artifact| artifact.id == artifact_id)
+        })
+    })
+}
+
 /// Height-affecting identity of the feed. Remeasure only when this changes
 /// so progress ticks do not reset the virtualizer.
 #[derive(Clone, PartialEq)]
@@ -418,7 +431,7 @@ impl StudioPage {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let height = width * aspect.1 as f32 / aspect.0.max(1) as f32;
-        let base = div()
+        let mut base = div()
             .id(SharedString::from(format!(
                 "studio-tile-{turn_ix}-{run_ix}-{output_ix}"
             )))
@@ -432,6 +445,17 @@ impl StudioPage {
             } else {
                 0.045
             }));
+        if let Some(id) = artifact_id
+            && let Some(conversation_id) = self.selected_conversation
+        {
+            base = self.bind_image_menu(
+                base,
+                id,
+                conversation_id,
+                super::image_menu::ImageSurface::ThreadTile,
+                cx,
+            );
+        }
         if let Some(id) = artifact_id {
             let (image, full) = self.display_layers(id, window, cx);
             if let Some(image) = image {
@@ -1481,6 +1505,25 @@ mod tests {
             test_turn("second", now, vec![other]),
         ];
         assert_eq!(conversation_image_count(&turns), 3);
+    }
+
+    #[test]
+    fn turn_index_for_artifact_finds_the_owning_turn() {
+        let now = Utc::now();
+        let first = test_artifact(0);
+        let second = test_artifact(0);
+        let missing = test_artifact(0);
+        let mut early = test_run("Flux", 1);
+        early.artifacts = vec![first.clone()];
+        let mut later = test_run("Kling", 1);
+        later.artifacts = vec![second.clone()];
+        let turns = vec![
+            test_turn("first", now, vec![early]),
+            test_turn("second", now, vec![later]),
+        ];
+        assert_eq!(turn_index_for_artifact(&turns, first.id), Some(0));
+        assert_eq!(turn_index_for_artifact(&turns, second.id), Some(1));
+        assert_eq!(turn_index_for_artifact(&turns, missing.id), None);
     }
 
     #[test]

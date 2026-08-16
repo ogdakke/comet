@@ -27,8 +27,11 @@ use super::draft::{
     DraftRunConfig, apply_remembered_drafts, apply_remembered_selection, apply_turn_models,
     draft_aspect, select_first_model,
 };
-use super::feed::{FeedLayoutSig, conversation_image_count, new_feed_list};
+use super::feed::{
+    FeedLayoutSig, conversation_image_count, new_feed_list, turn_index_for_artifact,
+};
 use super::gallery::new_gallery_list;
+use super::image_menu::ImageMenu;
 use super::images::StudioImages;
 
 pub struct StudioPage {
@@ -66,6 +69,7 @@ pub struct StudioPage {
     pub(super) feed_layout_sig: Option<FeedLayoutSig>,
     pub(super) scroll_after_turn_count: Option<usize>,
     pub(super) scroll_after_extend: Option<zeron_studio::StudioTurnId>,
+    pub(super) scroll_to_artifact: Option<StudioArtifactId>,
     pub(super) scroll_task: Option<Task<()>>,
     pub(super) rail_hover: Option<usize>,
     pub(super) source_turn: Option<zeron_studio::StudioTurnId>,
@@ -89,6 +93,7 @@ pub struct StudioPage {
     pub(super) gallery_visible_rows: std::ops::Range<usize>,
     pub(super) gallery_selected: BTreeSet<StudioArtifactId>,
     pub(super) gallery_anchor: Option<StudioArtifactId>,
+    pub(super) image_menu: popover::Popup<ImageMenu>,
     pub(super) selected_artifact: Option<StudioArtifactId>,
     pub(super) lightbox_frames: Vec<super::artifact::ArtifactFrame>,
     pub(super) lightbox_zoom: f32,
@@ -178,6 +183,7 @@ impl StudioPage {
             feed_layout_sig: None,
             scroll_after_turn_count: None,
             scroll_after_extend: None,
+            scroll_to_artifact: None,
             scroll_task: None,
             rail_hover: None,
             source_turn: None,
@@ -197,6 +203,7 @@ impl StudioPage {
             gallery_visible_rows: 0..0,
             gallery_selected: BTreeSet::new(),
             gallery_anchor: None,
+            image_menu: popover::Popup::default(),
             selected_artifact: None,
             lightbox_frames: Vec::new(),
             lightbox_zoom: 1.0,
@@ -370,6 +377,7 @@ impl StudioPage {
         let Some(engine) = self.engine(cx) else {
             return;
         };
+        self.close_image_menu(cx);
         if self.selected_conversation != Some(id) {
             self.close_artifact(cx);
             self.composer_seeded_for = None;
@@ -382,6 +390,8 @@ impl StudioPage {
         self.scroll_after_turn_count = None;
         self.scroll_after_extend = None;
         self.scroll_task = None;
+        // Keep a pending reveal across the reload so Open thread can land
+        // on the image once the watch snapshot arrives.
         self.rail_hover = None;
         self.reset_feed_list();
         cx.emit(StudioEvent::SidebarChanged);
@@ -419,7 +429,9 @@ impl StudioPage {
                         page.conversation = Some(view);
                         page.seed_composer_from_conversation(cx);
                         page.sync_feed_list();
-                        if first_open || submitted_turn_arrived {
+                        if page.apply_scroll_to_artifact(cx) {
+                            page.scroll_after_turn_count = None;
+                        } else if first_open || submitted_turn_arrived {
                             page.scroll_after_turn_count = None;
                             page.feed_scroll_to_end();
                         } else if page
@@ -440,6 +452,31 @@ impl StudioPage {
             }
         }));
         cx.notify();
+    }
+
+    pub fn reveal_artifact_in_thread(
+        &mut self,
+        artifact_id: StudioArtifactId,
+        cx: &mut Context<Self>,
+    ) {
+        self.scroll_to_artifact = Some(artifact_id);
+        self.apply_scroll_to_artifact(cx);
+    }
+
+    fn apply_scroll_to_artifact(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(artifact_id) = self.scroll_to_artifact else {
+            return false;
+        };
+        let Some(view) = self.conversation.as_ref() else {
+            return false;
+        };
+        let turn_ix = turn_index_for_artifact(&view.turns, artifact_id);
+        self.scroll_to_artifact = None;
+        match turn_ix {
+            Some(turn_ix) => self.scroll_to_turn(turn_ix, cx),
+            None => self.feed_scroll_to_end(),
+        }
+        true
     }
 
     pub(super) fn forget_artifact(&mut self, artifact_id: StudioArtifactId) {
@@ -490,7 +527,10 @@ impl StudioPage {
                 }) {
                     Ok(conversation) => {
                         page.conversations.insert(0, conversation.clone());
-                        page.open_conversation(conversation.id, cx);
+                        cx.emit(StudioEvent::ShowThread {
+                            conversation_id: conversation.id,
+                            focus_artifact: None,
+                        });
                         cx.emit(StudioEvent::SidebarChanged);
                     }
                     Err(error) => page.error = Some(error.to_string().into()),
@@ -833,6 +873,10 @@ impl StudioPage {
                         page.conversations.insert(0, conversation.clone());
                         page.open_conversation(conversation.id, cx);
                         page.use_prompt(&snapshot, cx);
+                        cx.emit(StudioEvent::ShowThread {
+                            conversation_id: conversation.id,
+                            focus_artifact: None,
+                        });
                     }
                     Err(error) => page.error = Some(error.to_string().into()),
                 }
@@ -1072,6 +1116,11 @@ impl Render for StudioPage {
             .relative()
             .size_full()
             .track_focus(&self.focus)
+            .on_key_down(cx.listener(|page, event: &gpui::KeyDownEvent, _, cx| {
+                if page.dismiss_image_menu(event, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .child(body)
             .when_some(self.error.clone(), |el, error| {
                 el.child(
@@ -1086,6 +1135,9 @@ impl Render for StudioPage {
                         .py(px(6.0))
                         .child(error),
                 )
+            })
+            .when_some(self.render_image_menu(&theme, cx), |el, menu| {
+                el.child(menu)
             })
     }
 }

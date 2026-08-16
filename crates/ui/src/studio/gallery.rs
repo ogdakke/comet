@@ -95,6 +95,8 @@ pub(super) fn new_gallery_list(cx: &mut Context<StudioPage>) -> ListState {
 
 impl StudioPage {
     pub fn show_gallery(&mut self, cx: &mut Context<Self>) {
+        self.close_image_menu(cx);
+        self.scroll_to_artifact = None;
         self.close_artifact(cx);
         self.gallery_selected.clear();
         self.gallery_anchor = None;
@@ -721,7 +723,7 @@ impl StudioPage {
                                 .mt(px(4.0))
                                 .text_size(px(12.0))
                                 .text_color(theme.text_faint)
-                                .child("Open a study and generate to fill the gallery."),
+                                .child("Open a thread and generate to fill the gallery."),
                         ),
                 ))
                 .into_any_element()
@@ -742,6 +744,10 @@ impl StudioPage {
             .flex_col()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|page, event: &gpui::KeyDownEvent, _, cx| {
+                if page.dismiss_image_menu(event, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 let key = event.keystroke.key.as_str();
                 let chord = event.keystroke.modifiers.platform || event.keystroke.modifiers.control;
                 if key == "escape" {
@@ -966,31 +972,38 @@ impl StudioPage {
                         .text_color(theme.bg),
                 )
             });
-        let frame = div()
-            .id(SharedString::from(format!("studio-gallery-tile-{}", id.0)))
-            .relative()
-            .size(px(tile))
-            .flex_none()
-            .rounded(px(10.0))
-            .overflow_hidden()
-            .bg(crate::theme::ink(0.045))
-            .cursor_pointer()
-            .border_1()
-            .border_color(if selected {
-                theme.text.opacity(0.7)
-            } else {
-                gpui::hsla(0.0, 0.0, 0.0, 0.0)
-            })
-            .on_hover(cx.listener(move |page, hovered: &bool, window, cx| {
-                if *hovered {
-                    page.prefetch_gallery_full(id, window, cx);
-                }
-            }))
-            .on_click(
-                cx.listener(move |page, event: &gpui::ClickEvent, window, cx| {
-                    page.on_gallery_item_click(id, event, window, cx);
-                }),
-            );
+        let conversation_id = item.conversation_id;
+        let frame = self.bind_image_menu(
+            div()
+                .id(SharedString::from(format!("studio-gallery-tile-{}", id.0)))
+                .relative()
+                .size(px(tile))
+                .flex_none()
+                .rounded(px(10.0))
+                .overflow_hidden()
+                .bg(crate::theme::ink(0.045))
+                .cursor_pointer()
+                .border_1()
+                .border_color(if selected {
+                    theme.text.opacity(0.7)
+                } else {
+                    gpui::hsla(0.0, 0.0, 0.0, 0.0)
+                })
+                .on_hover(cx.listener(move |page, hovered: &bool, window, cx| {
+                    if *hovered {
+                        page.prefetch_gallery_full(id, window, cx);
+                    }
+                }))
+                .on_click(
+                    cx.listener(move |page, event: &gpui::ClickEvent, window, cx| {
+                        page.on_gallery_item_click(id, event, window, cx);
+                    }),
+                ),
+            id,
+            conversation_id,
+            super::image_menu::ImageSurface::GalleryTile,
+            cx,
+        );
         match image {
             Some(image) => frame
                 .child(cover_image(image).size_full().rounded(px(10.0)))

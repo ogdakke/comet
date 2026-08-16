@@ -83,7 +83,9 @@ pub struct ListStudioModelsResponse {
 
 /// Default title for a newly created studio conversation. The first prompt
 /// replaces this with a truncated copy of itself.
-pub const UNTITLED_STUDIO_TITLE: &str = "Untitled study";
+pub const UNTITLED_STUDIO_TITLE: &str = "Untitled thread";
+/// Pre-rename default. First-prompt retitle still matches these older rows.
+pub const LEGACY_UNTITLED_STUDIO_TITLE: &str = "Untitled study";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

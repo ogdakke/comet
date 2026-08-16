@@ -15,9 +15,9 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeron_proto::{
-    ListStudioModelsResponse, StudioArtifactChunk, StudioArtifactView, StudioConversationSummary,
-    StudioConversationView, StudioGalleryItem, StudioModelRunSpec, StudioRunState, StudioRunView,
-    StudioTurnView, UNTITLED_STUDIO_TITLE,
+    LEGACY_UNTITLED_STUDIO_TITLE, ListStudioModelsResponse, StudioArtifactChunk,
+    StudioArtifactView, StudioConversationSummary, StudioConversationView, StudioGalleryItem,
+    StudioModelRunSpec, StudioRunState, StudioRunView, StudioTurnView, UNTITLED_STUDIO_TITLE,
 };
 use zeron_studio::{
     GenerationRequest, MediaModel, MediaProvider, ProviderArtifact, ProviderId, Quote,
@@ -563,14 +563,15 @@ impl StudioStore {
         if let Some(title) = (position == 0).then(|| title_from_prompt(prompt)).flatten() {
             transaction.execute(
                 "UPDATE studio_conversations
-                 SET title = CASE WHEN title = ?4 THEN ?2 ELSE title END,
+                 SET title = CASE WHEN title IN (?4, ?5) THEN ?2 ELSE title END,
                      updated_at = ?3
                  WHERE id = ?1",
                 rusqlite::params![
                     conversation_id.0.to_string(),
                     title,
                     now,
-                    UNTITLED_STUDIO_TITLE
+                    UNTITLED_STUDIO_TITLE,
+                    LEGACY_UNTITLED_STUDIO_TITLE
                 ],
             )?;
         } else {

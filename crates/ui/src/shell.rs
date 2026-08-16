@@ -278,12 +278,37 @@ impl SessionPanels {
 pub enum NavEntry {
     /// A chat route; the id of the selected chat ("" = the new-chat canvas).
     Chat(String),
-    Studio,
+    /// Studio gallery (`conversation_id` is `None`) or a studio thread.
+    /// `focus_artifact` is set when the visit came from Open in thread so the
+    /// feed can scroll that image into view.
+    Studio {
+        conversation_id: Option<zeron_studio::StudioConversationId>,
+        focus_artifact: Option<zeron_studio::StudioArtifactId>,
+    },
     StudioArtifact {
         conversation_id: zeron_studio::StudioConversationId,
         artifact_id: zeron_studio::StudioArtifactId,
     },
     Settings(SettingsSection),
+}
+
+impl NavEntry {
+    fn studio_gallery() -> Self {
+        NavEntry::Studio {
+            conversation_id: None,
+            focus_artifact: None,
+        }
+    }
+
+    fn studio_thread(
+        conversation_id: zeron_studio::StudioConversationId,
+        focus_artifact: Option<zeron_studio::StudioArtifactId>,
+    ) -> Self {
+        NavEntry::Studio {
+            conversation_id: Some(conversation_id),
+            focus_artifact,
+        }
+    }
 }
 
 /// Browser-style navigation history for the titlebar back/forward buttons
@@ -1040,7 +1065,7 @@ impl Shell {
         };
         let nav = NavHistory::new(match route {
             Route::Chat => NavEntry::Chat(String::new()),
-            Route::Studio => NavEntry::Studio,
+            Route::Studio => NavEntry::studio_gallery(),
             Route::StudioArtifact {
                 conversation_id,
                 artifact_id,
@@ -1867,7 +1892,7 @@ impl Shell {
 
     fn open_studio(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Studio;
-        self.nav.push(NavEntry::Studio);
+        self.nav.push(self.studio_nav_entry(cx));
         if let Some(page) = self.studio_page.as_ref() {
             page.update(cx, |page, cx| page.load(cx));
         }
@@ -1884,18 +1909,62 @@ impl Shell {
         cx.notify();
     }
 
-    /// Leave the artifact viewer without a history back-step: sidebar chat
-    /// clicks should land on that conversation's feed, not keep the lightbox
-    /// route which `render_main` would re-apply on the next frame.
+    /// Leave the artifact viewer without touching history. Sidebar / Open
+    /// thread then push their destination on top so Back can return here.
+    /// Must change the route: `render_main` re-applies the lightbox while
+    /// `Route::StudioArtifact` is current.
     fn dismiss_studio_artifact(&mut self, cx: &mut Context<Self>) {
         if !matches!(self.route, Route::StudioArtifact { .. }) {
             return;
         }
         self.route = Route::Studio;
-        self.nav.replace(NavEntry::Studio);
         if let Some(page) = self.studio_page.as_ref() {
             page.update(cx, |page, cx| page.close_artifact(cx));
         }
+    }
+
+    fn studio_nav_entry(&self, cx: &App) -> NavEntry {
+        match self
+            .studio_page
+            .as_ref()
+            .and_then(|page| page.read(cx).selected_conversation())
+        {
+            Some(conversation_id) => NavEntry::studio_thread(conversation_id, None),
+            None => NavEntry::studio_gallery(),
+        }
+    }
+
+    fn show_studio_gallery(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_studio_artifact(cx);
+        if let Some(page) = self.studio_page.clone() {
+            page.update(cx, |page, cx| page.show_gallery(cx));
+        }
+        self.route = Route::Studio;
+        self.nav.push(NavEntry::studio_gallery());
+        cx.notify();
+    }
+
+    fn show_studio_thread(
+        &mut self,
+        conversation_id: zeron_studio::StudioConversationId,
+        focus_artifact: Option<zeron_studio::StudioArtifactId>,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_studio_artifact(cx);
+        if let Some(page) = self.studio_page.clone() {
+            page.update(cx, |page, cx| {
+                if page.selected_conversation() != Some(conversation_id) {
+                    page.open_conversation(conversation_id, cx);
+                }
+                if let Some(artifact_id) = focus_artifact {
+                    page.reveal_artifact_in_thread(artifact_id, cx);
+                }
+            });
+        }
+        self.route = Route::Studio;
+        self.nav
+            .push(NavEntry::studio_thread(conversation_id, focus_artifact));
+        cx.notify();
     }
 
     fn ensure_studio_page(&mut self, cx: &mut Context<Self>) -> Entity<StudioPage> {
@@ -1934,6 +2003,12 @@ impl Shell {
                     shell.navigate_back(cx);
                 }
             }
+            StudioEvent::ShowThread {
+                conversation_id,
+                focus_artifact,
+            } => {
+                shell.show_studio_thread(*conversation_id, *focus_artifact, cx);
+            }
         }));
         self.studio_observe = Some(cx.observe(&page, |_, _, cx| cx.notify()));
         self.studio_page = Some(page.clone());
@@ -1969,12 +2044,25 @@ impl Shell {
             NavEntry::Settings(section) => {
                 self.route = Route::Settings(section);
             }
-            NavEntry::Studio => {
+            NavEntry::Studio {
+                conversation_id,
+                focus_artifact,
+            } => {
                 self.route = Route::Studio;
-                if let Some(page) = self.studio_page.as_ref() {
+                if let Some(page) = self.studio_page.clone() {
                     page.update(cx, |page, cx| {
                         page.close_artifact(cx);
-                        page.load(cx);
+                        match conversation_id {
+                            Some(conversation_id) => {
+                                if page.selected_conversation() != Some(conversation_id) {
+                                    page.open_conversation(conversation_id, cx);
+                                }
+                                if let Some(artifact_id) = focus_artifact {
+                                    page.reveal_artifact_in_thread(artifact_id, cx);
+                                }
+                            }
+                            None => page.show_gallery(cx),
+                        }
                     });
                 }
             }
@@ -2223,7 +2311,7 @@ impl Shell {
             .as_ref()
             .and_then(|page| page.read(cx).conversation_title(conversation_id))
             .unwrap_or_default();
-        let input = cx.new(|cx| ComposerInput::new("Study title", cx));
+        let input = cx.new(|cx| ComposerInput::new("Thread title", cx));
         input.update(cx, |input, cx| input.set_text(current, cx));
         let events = cx.subscribe(&input, |this: &mut Shell, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
@@ -3553,7 +3641,6 @@ impl Shell {
             .into_iter()
             .map(|conversation| {
                 let is_selected = selected == Some(conversation.id);
-                let select_page = page.clone();
                 let select_id = conversation.id;
                 let archive_id = conversation.id;
                 let menu_id = conversation.id;
@@ -3587,8 +3674,7 @@ impl Shell {
                         })
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.dismiss_studio_artifact(cx);
-                        select_page.update(cx, |page, cx| page.open_conversation(select_id, cx));
+                        this.show_studio_thread(select_id, None, cx);
                     }))
                     .on_mouse_down(
                         MouseButton::Right,
@@ -3703,7 +3789,6 @@ impl Shell {
             .collect::<Vec<_>>();
 
         let new_page = page.clone();
-        let gallery_page = page.clone();
         let header = div()
             .flex_none()
             .flex()
@@ -3743,8 +3828,7 @@ impl Shell {
                         theme.text.opacity(0.8)
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.dismiss_studio_artifact(cx);
-                        gallery_page.update(cx, |page, cx| page.show_gallery(cx));
+                        this.show_studio_gallery(cx);
                     }))
                     .child(
                         icon(icons::WIDGET)
@@ -5048,7 +5132,7 @@ impl Shell {
                         cx.notify();
                     }
                 }))
-                .child(popover::dialog_title(&theme, "Rename study"))
+                .child(popover::dialog_title(&theme, "Rename thread"))
                 .child(
                     div()
                         .mt(px(12.0))
@@ -5090,7 +5174,7 @@ impl Shell {
                     .unwrap_or_else(|| zeron_proto::UNTITLED_STUDIO_TITLE.into()),
             );
             let card = popover::dialog_card(&theme)
-                .child(popover::dialog_title(&theme, "Delete study?"))
+                .child(popover::dialog_title(&theme, "Delete thread?"))
                 .child(div().mt(px(6.0)).child(popover::dialog_body(
                     &theme,
                     format!("\u{201C}{title}\u{201D} will be permanently deleted. This can\u{2019}t be undone."),
@@ -7843,5 +7927,46 @@ mod tests {
             Some(NavEntry::Settings(SettingsSection::Devices))
         );
         assert_eq!(nav.back(), Some(chat("a")));
+    }
+
+    #[test]
+    fn studio_gallery_and_thread_are_distinct_history_entries() {
+        let conversation = zeron_studio::StudioConversationId::new();
+        let artifact = zeron_studio::StudioArtifactId::new();
+        let mut nav = NavHistory::new(chat("agent"));
+        nav.push(NavEntry::studio_gallery());
+        nav.push(NavEntry::studio_thread(conversation, Some(artifact)));
+        assert_eq!(nav.len(), 3);
+        assert_eq!(
+            nav.back(),
+            Some(NavEntry::studio_gallery()),
+            "back from Open in thread lands on the gallery, not the agent chat"
+        );
+        assert_eq!(nav.back(), Some(chat("agent")));
+        assert_eq!(nav.forward(), Some(NavEntry::studio_gallery()));
+        assert_eq!(
+            nav.forward(),
+            Some(NavEntry::studio_thread(conversation, Some(artifact)))
+        );
+    }
+
+    #[test]
+    fn studio_artifact_then_thread_keeps_the_lightbox_behind() {
+        let conversation = zeron_studio::StudioConversationId::new();
+        let artifact = zeron_studio::StudioArtifactId::new();
+        let mut nav = NavHistory::new(NavEntry::studio_gallery());
+        nav.push(NavEntry::StudioArtifact {
+            conversation_id: conversation,
+            artifact_id: artifact,
+        });
+        nav.push(NavEntry::studio_thread(conversation, Some(artifact)));
+        assert_eq!(
+            nav.back(),
+            Some(NavEntry::StudioArtifact {
+                conversation_id: conversation,
+                artifact_id: artifact,
+            })
+        );
+        assert_eq!(nav.back(), Some(NavEntry::studio_gallery()));
     }
 }

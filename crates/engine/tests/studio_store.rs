@@ -343,6 +343,30 @@ fn first_turn_titles_an_untitled_conversation_from_the_prompt() {
 }
 
 #[test]
+fn first_turn_titles_a_legacy_untitled_conversation_from_the_prompt() {
+    let root = tempdir().unwrap();
+    let model = image_model("fake");
+    let store = StudioStore::open(root.path(), 1024).unwrap();
+    let conversation = store
+        .create_conversation(zeron_proto::LEGACY_UNTITLED_STUDIO_TITLE, None)
+        .unwrap();
+    store
+        .create_turn(
+            conversation.id,
+            "a red comet over the sea at dusk with extra words",
+            None,
+            &[prepared_run(
+                &model,
+                "a red comet over the sea at dusk with extra words",
+            )],
+            "device-a",
+        )
+        .unwrap();
+    let view = store.conversation_view(conversation.id).unwrap();
+    assert_eq!(view.conversation.title, "a red comet over the sea at");
+}
+
+#[test]
 fn extend_turn_appends_the_original_model_set_under_the_same_prompt() {
     let root = tempdir().unwrap();
     let flux = image_model("fake");

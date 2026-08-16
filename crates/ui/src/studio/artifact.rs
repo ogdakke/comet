@@ -597,6 +597,7 @@ impl StudioPage {
         frames: Vec<ArtifactFrame>,
         cx: &mut Context<Self>,
     ) {
+        self.close_image_menu(cx);
         self.lightbox_frames = frames;
         if let Some(index) = self.lightbox_frames.iter().position(|frame| frame.id == id) {
             self.select_artifact_index(index, cx);
@@ -752,6 +753,7 @@ impl StudioPage {
     }
 
     pub fn close_artifact(&mut self, cx: &mut Context<Self>) {
+        self.close_image_menu(cx);
         if self.selected_artifact.take().is_some() {
             self.lightbox_frames.clear();
             self.reset_lightbox_viewer();
@@ -1080,13 +1082,18 @@ impl StudioPage {
         page: Option<(f32, f32)>,
         theme: &Theme,
         window: &mut Window,
-        cx: &mut gpui::App,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let (base, overlay) = artifact_id
             .map(|id| self.display_layers(id, window, cx))
             .unwrap_or((None, None));
+        let slide_id = match artifact_id {
+            Some(id) => SharedString::from(format!("studio-artifact-slide-{}", id.0)),
+            None => SharedString::from("studio-artifact-slide-empty"),
+        };
         let frame = if let Some((left, width)) = page {
             div()
+                .id(slide_id)
                 .absolute()
                 .top_0()
                 .bottom_0()
@@ -1101,12 +1108,26 @@ impl StudioPage {
             // and shrinks the box when you pan down, so the top of a tall
             // image is unreachable.
             div()
+                .id(slide_id)
                 .absolute()
                 .inset_0()
                 .overflow_hidden()
                 .flex()
                 .items_center()
                 .justify_center()
+        };
+        let frame = if let Some(id) = artifact_id
+            && let Some(conversation_id) = self.artifact_menu_conversation(id)
+        {
+            self.bind_image_menu(
+                frame,
+                id,
+                conversation_id,
+                self.artifact_image_surface(),
+                cx,
+            )
+        } else {
+            frame
         };
         let zoom = if page.is_some() {
             1.0
@@ -1216,6 +1237,16 @@ impl StudioPage {
                     .on_click(cx.listener(move |page, _, _, cx| {
                         page.select_artifact_index(index, cx);
                     }));
+                let frame = match self.artifact_menu_conversation(artifact_id) {
+                    Some(conversation_id) => self.bind_image_menu(
+                        frame,
+                        artifact_id,
+                        conversation_id,
+                        super::image_menu::ImageSurface::Filmstrip,
+                        cx,
+                    ),
+                    None => frame,
+                };
                 match thumbnail {
                     Some(thumbnail) => frame
                         .child(cover_image(thumbnail).size_full().rounded(px(7.0)))
@@ -1565,6 +1596,10 @@ impl StudioPage {
                 .min_w_0()
                 .track_focus(&self.focus)
                 .on_key_down(cx.listener(|page, event: &gpui::KeyDownEvent, _, cx| {
+                    if page.dismiss_image_menu(event, cx) {
+                        cx.stop_propagation();
+                        return;
+                    }
                     match event.keystroke.key.as_str() {
                         "escape" => {
                             page.selected_artifact = None;
