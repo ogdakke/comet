@@ -58,6 +58,26 @@ fn operation_and_controls_do_not_depend_on_model_name() {
 }
 
 #[test]
+fn auto_aspect_ratio_keeps_the_catalog_usable_and_omits_a_default_override() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(IMAGE).unwrap();
+    fixture["data"][0]["model_spec"]["constraints"]["aspectRatios"] =
+        serde_json::json!(["auto", "1:1", "16:9"]);
+    fixture["data"][0]["model_spec"]["constraints"]["defaultAspectRatio"] =
+        serde_json::json!("auto");
+
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    let aspect = model
+        .controls
+        .iter()
+        .find(|control| control.id == ControlId::from("aspect_ratio"))
+        .unwrap();
+    assert_eq!(aspect.choices.len(), 2);
+    assert!(aspect.default.is_none());
+}
+
+#[test]
 fn manifest_version_ignores_fetch_time_but_tracks_constraints() {
     let first = normalize_model_catalog(IMAGE, fetched_at())
         .unwrap()

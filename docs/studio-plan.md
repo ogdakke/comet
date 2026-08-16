@@ -418,6 +418,10 @@ own milestone.
 
 ## Delivery phases
 
+Implementation status (2026-08-16): the provider-neutral, conversation-based image slice in Phase 1
+is complete. The image-rendering portion of Phase 0 is complete; its video playback spike stays with
+the video phase. Phases 2–4 have not been started or pulled into the current implementation.
+
 ### Phase 0 — two short spikes
 
 1. Capture real Venice model responses for representative image, text-to-video, and
@@ -438,9 +442,9 @@ unknown video playback dependency blocks the MVP.
 5. Build the conversation index, four-column feed, multi-model composer, per-model settings, and
    artifact inspector.
 6. Add exact-aspect skeleton allocation, a simple GPUI shimmer, and the decoded-image crossfade.
-7. Build the routed image lightbox with conversation-wide keyboard/gesture navigation, zoom/pan,
+7. Build the routed image lightbox with conversation-wide keyboard and pointer navigation, zoom/pan,
    filmstrip, inspector, and Download.
-8. Support use-prompt, generate-again, retry, fork-to-new-conversation, export/delete, and restart
+8. Support use-prompt, generate-again, retry, fork-to-new-conversation, download/delete, and restart
    persistence.
 
 Exit: a Venice text-to-image generation completes end to end, survives restart, and a second fake
@@ -490,13 +494,9 @@ completed MP4 locally.
   traversal, oversized input/output, and profile isolation.
 - RPC tests cover serialization compatibility, stream cancellation, reconnect snapshots, and the
   fact that secrets never appear in responses or logs.
-- UI reducer/render tests cover dynamic per-model controls, multi-model partial failures, stale
-  catalogs, quotes, all run states, conversation lineage, prompt reuse, stable four-column ordering,
-  responsive breakpoints, feed cache eviction, lightbox ordering/wrap-around, route restoration,
-  keyboard focus/shortcuts, zoom-at-pointer math, pan clamping, gesture arbitration, click-outside
-  dismissal, thumbnail virtualization, bounded full-image caching, exact placeholder aspect/ordering,
-  no-reflow state transitions, reduced-motion behavior, offscreen animation suspension, and shimmer
-  lifecycle cleanup.
+- UI tests stay pragmatic: test user-visible behavior at stable reducer/layout seams, such as
+  responsive breakpoints, ordering, navigation, retry decisions, and exact placeholder allocation.
+  Do not assert button copy, decorative colors, spacing, or other presentation details.
 - End-to-end smoke: configure fake provider, generate an image, restart, inspect/export/delete; queue
   fake video, restart mid-poll, complete exactly once.
 

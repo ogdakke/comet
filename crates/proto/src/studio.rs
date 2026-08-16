@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use zeron_studio::{
     ControlId, ControlValue, GenerationInput, MediaKind, MediaModel, MediaOperation, ModelId,
-    ProviderId, StudioConversationId, StudioTurnId,
+    ProviderId, StudioArtifactId, StudioBatchId, StudioConversationId, StudioRunId, StudioTurnId,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +139,91 @@ pub struct CreateStudioTurnRequest {
     pub runs: Vec<StudioModelRunSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_turn_id: Option<StudioTurnId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StudioRunState {
+    Draft,
+    Quoting,
+    AwaitingConfirmation,
+    Queued,
+    Running,
+    Downloading,
+    Succeeded,
+    Failed,
+    Cancelling,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudioArtifactView {
+    pub id: StudioArtifactId,
+    pub output_position: u32,
+    pub media_kind: MediaKind,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub duration_seconds: Option<f64>,
+    pub metadata: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudioRunView {
+    pub id: StudioRunId,
+    pub position: u32,
+    pub provider_id: ProviderId,
+    pub model: MediaModel,
+    pub controls: BTreeMap<ControlId, ControlValue>,
+    pub output_count: u32,
+    pub display_aspect_ratio: (u32, u32),
+    pub state: StudioRunState,
+    pub progress: Option<f32>,
+    pub error: Option<String>,
+    pub artifacts: Vec<StudioArtifactView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudioTurnView {
+    pub id: StudioTurnId,
+    pub position: u32,
+    pub prompt: String,
+    pub source_turn_id: Option<StudioTurnId>,
+    pub batch_id: StudioBatchId,
+    pub runs: Vec<StudioRunView>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudioConversationView {
+    pub conversation: StudioConversationSummary,
+    pub turns: Vec<StudioTurnView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchStudioConversationRequest {
+    pub conversation_id: StudioConversationId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteStudioArtifactRequest {
+    pub artifact_id: StudioArtifactId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryStudioRunRequest {
+    pub run_id: StudioRunId,
+    #[serde(default)]
+    pub retry_anyway: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

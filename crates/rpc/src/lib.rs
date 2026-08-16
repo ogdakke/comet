@@ -143,14 +143,9 @@ pub mod methods {
     pub const RENAME_STUDIO_CONVERSATION: &str = "RenameStudioConversation";
     pub const ARCHIVE_STUDIO_CONVERSATION: &str = "ArchiveStudioConversation";
     pub const WATCH_STUDIO_CONVERSATION: &str = "WatchStudioConversation";
-    pub const IMPORT_STUDIO_ASSET: &str = "ImportStudioAsset";
-    pub const QUOTE_STUDIO_BATCH: &str = "QuoteStudioBatch";
     pub const CREATE_STUDIO_TURN: &str = "CreateStudioTurn";
-    pub const CONFIRM_STUDIO_BATCH: &str = "ConfirmStudioBatch";
-    pub const CANCEL_STUDIO_RUN: &str = "CancelStudioRun";
     pub const RETRY_STUDIO_RUN: &str = "RetryStudioRun";
     pub const DELETE_STUDIO_ARTIFACT: &str = "DeleteStudioArtifact";
-    pub const WATCH_STUDIO_JOBS: &str = "WatchStudioJobs";
     pub const READ_STUDIO_ARTIFACT_CHUNK: &str = "ReadStudioArtifactChunk";
 }
 

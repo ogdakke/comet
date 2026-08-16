@@ -9,8 +9,10 @@ mod request;
 
 pub mod fake;
 pub mod venice;
+mod venice_provider;
 
 pub use fake::{FakeMediaProvider, FakeSubmissionMode};
 pub use model::*;
 pub use provider::*;
 pub use request::*;
+pub use venice_provider::VeniceMediaProvider;

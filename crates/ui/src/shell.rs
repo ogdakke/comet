@@ -48,6 +48,7 @@ use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
     format_time_ago, org_name_valid, parse_orgs, sort_memberships,
 };
+use crate::studio::{ProvidersPage, StudioEvent, StudioPage};
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript};
@@ -158,6 +159,7 @@ pub enum SettingsSection {
     Harnesses,
     /// Per-provider CLI accounts (login, usage) — labeled "Accounts".
     Agents,
+    Providers,
     Appearance,
     Notifications,
     Shortcuts,
@@ -165,10 +167,11 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 7] = [
+    pub const ALL: [SettingsSection; 8] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
+        SettingsSection::Providers,
         SettingsSection::Appearance,
         SettingsSection::Notifications,
         SettingsSection::Shortcuts,
@@ -182,6 +185,7 @@ impl SettingsSection {
             SettingsSection::Devices => "Devices",
             SettingsSection::Harnesses => "Agents",
             SettingsSection::Agents => "Accounts",
+            SettingsSection::Providers => "Providers",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Notifications => "Notifications",
             SettingsSection::Shortcuts => "Shortcuts",
@@ -194,6 +198,11 @@ impl SettingsSection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
     Chat,
+    Studio,
+    StudioArtifact {
+        conversation_id: zeron_studio::StudioConversationId,
+        artifact_id: zeron_studio::StudioArtifactId,
+    },
     Settings(SettingsSection),
 }
 
@@ -265,6 +274,11 @@ impl SessionPanels {
 pub enum NavEntry {
     /// A chat route; the id of the selected chat ("" = the new-chat canvas).
     Chat(String),
+    Studio,
+    StudioArtifact {
+        conversation_id: zeron_studio::StudioConversationId,
+        artifact_id: zeron_studio::StudioArtifactId,
+    },
     Settings(SettingsSection),
 }
 
@@ -799,6 +813,9 @@ pub struct Shell {
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
+    providers_page: Option<Entity<ProvidersPage>>,
+    studio_page: Option<Entity<StudioPage>>,
+    studio_sub: Option<Subscription>,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
@@ -975,6 +992,7 @@ impl Shell {
                 Route::Settings(SettingsSection::Devices)
             }
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
+            Some("settings/providers") => Route::Settings(SettingsSection::Providers),
             Some("settings/harnesses") => Route::Settings(SettingsSection::Harnesses),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
@@ -985,6 +1003,7 @@ impl Shell {
                 state.update(cx, |s, _| s.auto_selected = true);
                 Route::Chat
             }
+            Some("studio") => Route::Studio,
             _ => Route::Chat,
         };
         // More capture knobs of the same kind: `ZERON_OPEN_DIALOG=rename|delete`
@@ -1003,6 +1022,14 @@ impl Shell {
         };
         let nav = NavHistory::new(match route {
             Route::Chat => NavEntry::Chat(String::new()),
+            Route::Studio => NavEntry::Studio,
+            Route::StudioArtifact {
+                conversation_id,
+                artifact_id,
+            } => NavEntry::StudioArtifact {
+                conversation_id,
+                artifact_id,
+            },
             Route::Settings(section) => NavEntry::Settings(section),
         });
         Self {
@@ -1034,6 +1061,9 @@ impl Shell {
             shortcuts_page: None,
             accounts_page: None,
             harnesses_page: None,
+            providers_page: None,
+            studio_page: None,
+            studio_sub: None,
             shortcuts_sub: None,
             notifications_sub: None,
             chat_menu: popover::Popup::default(),
@@ -1790,6 +1820,17 @@ impl Shell {
         cx.notify();
     }
 
+    fn open_studio(&mut self, cx: &mut Context<Self>) {
+        self.route = Route::Studio;
+        self.nav.push(NavEntry::Studio);
+        if let Some(page) = self.studio_page.as_ref() {
+            page.update(cx, |page, cx| page.load(cx));
+        }
+        self.close_user_menu(cx);
+        self.close_chat_menu(cx);
+        cx.notify();
+    }
+
     // ---- back/forward (route history) ----
 
     fn navigate_back(&mut self, cx: &mut Context<Self>) {
@@ -1818,6 +1859,29 @@ impl Shell {
             }
             NavEntry::Settings(section) => {
                 self.route = Route::Settings(section);
+            }
+            NavEntry::Studio => {
+                self.route = Route::Studio;
+                if let Some(page) = self.studio_page.as_ref() {
+                    page.update(cx, |page, cx| {
+                        page.close_artifact(cx);
+                        page.load(cx);
+                    });
+                }
+            }
+            NavEntry::StudioArtifact {
+                conversation_id,
+                artifact_id,
+            } => {
+                self.route = Route::StudioArtifact {
+                    conversation_id,
+                    artifact_id,
+                };
+                if let Some(page) = self.studio_page.as_ref() {
+                    page.update(cx, |page, cx| {
+                        page.show_artifact(conversation_id, artifact_id, cx)
+                    });
+                }
             }
         }
         self.close_user_menu(cx);
@@ -1854,6 +1918,16 @@ impl Shell {
                     self.accounts_page = Some(cx.new(|cx| AccountsPage::new(state, cx)));
                 }
                 match &self.accounts_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Providers => {
+                if self.providers_page.is_none() {
+                    let state = self.state.clone();
+                    self.providers_page = Some(cx.new(|cx| ProvidersPage::new(state, cx)));
+                }
+                match &self.providers_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -2658,7 +2732,7 @@ impl Shell {
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         match self.route {
             Route::Chat => self.render_session_title_bar(cx),
-            Route::Settings(_) => {
+            Route::Studio | Route::StudioArtifact { .. } | Route::Settings(_) => {
                 let inner = div()
                     .size_full()
                     .flex()
@@ -2856,7 +2930,9 @@ impl Shell {
         let theme = Theme::of(cx).clone();
         let inner: AnyElement = match self.route {
             Route::Settings(section) => self.render_settings_nav(section, &theme, cx),
-            Route::Chat => self.render_chat_sidebar(&theme, cx),
+            Route::Chat | Route::Studio | Route::StudioArtifact { .. } => {
+                self.render_chat_sidebar(&theme, cx)
+            }
         };
         let target = self.sidebar_target();
         // Transparent — the sidebar sits directly on the frost shell; the main
@@ -2887,6 +2963,7 @@ impl Shell {
             SettingsSection::Devices => icons::MONITOR,
             SettingsSection::Harnesses => icons::WIDGET,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
+            SettingsSection::Providers => icons::KEY_MINIMALISTIC,
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Notifications => icons::BELL,
             SettingsSection::Shortcuts => icons::KEYBOARD,
@@ -3432,6 +3509,32 @@ impl Shell {
                     ),
                 )
                 .fade_overflow_y(&self.sidebar_scroll),
+            )
+            .child(
+                div().px(px(Theme::SPACE_SM)).pb(px(Theme::SPACE_SM)).child(
+                    div()
+                        .id("open-studio")
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .rounded(px(8.0))
+                        .px(px(Theme::SPACE_SM))
+                        .py(px(7.0))
+                        .cursor_pointer()
+                        .bg(if matches!(self.route, Route::Studio) {
+                            crate::theme::glass_selected_bg()
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .hover(|style| style.bg(theme.glass_hover()))
+                        .on_click(cx.listener(|this, _, _, cx| this.open_studio(cx)))
+                        .child(
+                            icon(icons::WIDGET)
+                                .size(px(15.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Studio")),
+                ),
             )
             // Update strip (above the user menu; below the lists).
             .when_some(self.render_update_strip(theme, cx), |el, strip| {
@@ -4412,6 +4515,53 @@ impl Shell {
                 .flex_col()
                 .child(div().flex_1().min_h_0().child(outlet))
                 .into_any_element();
+        }
+
+        if matches!(self.route, Route::Studio | Route::StudioArtifact { .. }) {
+            if self.studio_page.is_none() {
+                let state = self.state.clone();
+                let page = cx.new(|cx| StudioPage::new(state, cx));
+                self.studio_sub = Some(cx.subscribe(&page, |shell, _, event, cx| match event {
+                    StudioEvent::OpenProviders => {
+                        shell.open_settings(SettingsSection::Providers, cx);
+                    }
+                    StudioEvent::OpenArtifact {
+                        conversation_id,
+                        artifact_id,
+                    } => {
+                        shell.route = Route::StudioArtifact {
+                            conversation_id: *conversation_id,
+                            artifact_id: *artifact_id,
+                        };
+                        shell.nav.push(NavEntry::StudioArtifact {
+                            conversation_id: *conversation_id,
+                            artifact_id: *artifact_id,
+                        });
+                        cx.notify();
+                    }
+                    StudioEvent::CloseArtifact => {
+                        if matches!(shell.route, Route::StudioArtifact { .. }) {
+                            shell.navigate_back(cx);
+                        }
+                    }
+                }));
+                self.studio_page = Some(page);
+            }
+            if let Route::StudioArtifact {
+                conversation_id,
+                artifact_id,
+            } = self.route
+                && let Some(page) = self.studio_page.as_ref()
+            {
+                page.update(cx, |page, cx| {
+                    page.show_artifact(conversation_id, artifact_id, cx)
+                });
+            }
+            return self
+                .studio_page
+                .as_ref()
+                .map(|page| page.clone().into_any_element())
+                .unwrap_or_else(|| Empty.into_any_element());
         }
 
         let _ = (text, border);
@@ -6177,6 +6327,13 @@ impl Render for Shell {
             self.focus_sub = Some(cx.on_focus_lost(window, |this: &mut Shell, window, cx| {
                 match this.route {
                     Route::Chat => window.focus(&this.composer.focus_handle(cx), cx),
+                    Route::Studio | Route::StudioArtifact { .. } => {
+                        if let Some(page) = this.studio_page.as_ref() {
+                            window.focus(&page.focus_handle(cx), cx);
+                        } else {
+                            window.blur();
+                        }
+                    }
                     // No composer here — clear the stale handle so `focused()`
                     // reads None (the render hook below re-lands focus when the
                     // route returns to Chat; a lingering unmounted handle would

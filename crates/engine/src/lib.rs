@@ -30,6 +30,7 @@ pub mod run_journal;
 pub mod sessions;
 pub mod spaces;
 pub mod studio;
+pub mod studio_credentials;
 pub mod terminals;
 pub mod titles;
 pub mod uploads;
@@ -55,6 +56,9 @@ pub use studio::{
     ArtifactStore, StudioProviderDescriptor, StudioProviderRegistry, StudioRegistryError,
     StudioStore, StudioStoreError,
 };
+pub use studio_credentials::{
+    StudioCredentialError, StudioCredentials, StudioSecretBackend, SystemStudioSecretBackend,
+};
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
 pub use uploads::{AttachmentChunk, Uploads};
@@ -76,6 +80,8 @@ pub enum EngineError {
     Harness(#[from] zeron_harness::HarnessError),
     #[error("studio: {0}")]
     Studio(#[from] studio::StudioStoreError),
+    #[error("studio credentials: {0}")]
+    StudioCredentials(#[from] studio_credentials::StudioCredentialError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("{0}")]
@@ -126,6 +132,7 @@ pub struct EngineCore {
     pub agent_accounts: AgentAccounts,
     pub studio: Arc<StudioStore>,
     pub studio_providers: Arc<StudioProviderRegistry>,
+    pub studio_credentials: Arc<StudioCredentials>,
     pub device_id: String,
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
@@ -269,7 +276,21 @@ impl EngineCore {
             profile.store_root(),
             studio::DEFAULT_MAX_ARTIFACT_BYTES,
         )?);
+        let recovered_studio_runs = studio.recover_interrupted_image_runs()?;
+        if recovered_studio_runs > 0 {
+            tracing::warn!(
+                recovered_studio_runs,
+                "recovered interrupted studio image generations"
+            );
+        }
         let studio_providers = Arc::new(StudioProviderRegistry::new());
+        studio_providers
+            .register(Arc::new(
+                zeron_studio::VeniceMediaProvider::new()
+                    .map_err(|error| EngineError::Other(error.to_string()))?,
+            ))
+            .map_err(|error| EngineError::Other(error.to_string()))?;
+        let studio_credentials = Arc::new(StudioCredentials::open(profile.device_root())?);
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
@@ -295,6 +316,7 @@ impl EngineCore {
             agent_accounts,
             studio,
             studio_providers,
+            studio_credentials,
             device_id,
             local_import,
             workspace_scope: profile.scope(),
@@ -423,6 +445,7 @@ impl EngineCore {
             self.agent_accounts.clone(),
             self.studio.clone(),
             self.studio_providers.clone(),
+            self.studio_credentials.clone(),
             self.workspace_scope,
         )
         .with_auth(self.auth());

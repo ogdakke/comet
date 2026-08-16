@@ -1,16 +1,78 @@
-use std::io::Read;
+use std::{collections::BTreeMap, io::Read, sync::Mutex};
 
+use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use tempfile::tempdir;
+use zeron_engine::studio::PreparedStudioRun;
 use zeron_engine::{
-    EngineCore, EngineProfile, HarnessId, StudioProviderRegistry, StudioStore, default_registry,
+    EngineCore, EngineProfile, HarnessId, StudioCredentialError, StudioCredentials,
+    StudioProviderRegistry, StudioSecretBackend, StudioStore, default_registry,
 };
 use zeron_proto::{
-    ListStudioConversationsResponse, StudioArtifactChunk, StudioConversationSummary,
+    ListStudioConversationsResponse, ListStudioModelsResponse, ProviderValidationState,
+    StudioArtifactChunk, StudioConversationSummary, StudioConversationView,
+    StudioProviderConnection, StudioRunState,
 };
 use zeron_rpc::{memory_client, methods};
-use zeron_studio::{FakeMediaProvider, FakeSubmissionMode, ProviderId, StudioArtifactId};
+use zeron_studio::{
+    FakeMediaProvider, FakeSubmissionMode, GenerationRequest, MediaKind, MediaModel,
+    MediaOperation, ProviderArtifact, ProviderError, ProviderErrorKind, ProviderId, Secret,
+    StudioArtifactId,
+};
+
+#[derive(Default)]
+struct MemorySecrets(Mutex<BTreeMap<ProviderId, String>>);
+
+#[async_trait]
+impl StudioSecretBackend for MemorySecrets {
+    async fn set(
+        &self,
+        provider_id: &ProviderId,
+        secret: &Secret,
+    ) -> Result<(), StudioCredentialError> {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(provider_id.clone(), secret.expose().to_owned());
+        Ok(())
+    }
+
+    async fn get(&self, provider_id: &ProviderId) -> Result<Secret, StudioCredentialError> {
+        self.0
+            .lock()
+            .unwrap()
+            .get(provider_id)
+            .cloned()
+            .map(Secret::new)
+            .ok_or(StudioCredentialError::NotConfigured)
+    }
+
+    async fn remove(&self, provider_id: &ProviderId) -> Result<(), StudioCredentialError> {
+        self.0.lock().unwrap().remove(provider_id);
+        Ok(())
+    }
+}
+
+fn image_model(provider_id: &str) -> MediaModel {
+    MediaModel {
+        provider_id: provider_id.into(),
+        id: "image-model".into(),
+        display_name: "Image model".into(),
+        description: None,
+        operation: MediaOperation::TextToImage,
+        output_kind: MediaKind::Image,
+        output_mime_types: vec!["image/png".into()],
+        input_constraints: Vec::new(),
+        prompt_maximum_chars: Some(1_000),
+        negative_prompt_maximum_chars: None,
+        maximum_output_count: 4,
+        controls: Vec::new(),
+        pricing: None,
+        manifest_version: "fixture-v1".into(),
+        fetched_at: chrono::Utc::now(),
+    }
+}
 
 #[test]
 fn studio_catalog_is_profile_scoped_and_migrated() {
@@ -30,6 +92,53 @@ fn studio_catalog_is_profile_scoped_and_migrated() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(version, 1);
+}
+
+#[test]
+fn restart_turns_interrupted_image_submissions_into_explicit_retry_states() {
+    let root = tempdir().unwrap();
+    let model = image_model("fake");
+    let store = StudioStore::open(root.path(), 1024).unwrap();
+    let conversation = store.create_conversation("Recovery", None).unwrap();
+    let prepared = PreparedStudioRun {
+        model: model.clone(),
+        request: GenerationRequest {
+            provider_id: model.provider_id.clone(),
+            model_id: model.id.clone(),
+            operation: model.operation,
+            prompt: "still durable".into(),
+            negative_prompt: None,
+            output_count: 1,
+            controls: BTreeMap::new(),
+            inputs: Vec::new(),
+            manifest_version: model.manifest_version.clone(),
+            display_aspect_ratio: (1, 1),
+        },
+    };
+    let runs = store
+        .create_turn(
+            conversation.id,
+            "still durable",
+            None,
+            &[prepared],
+            "device-a",
+        )
+        .unwrap();
+    store.mark_submitting(&runs[0]).unwrap();
+    drop(store);
+
+    let reopened = StudioStore::open(root.path(), 1024).unwrap();
+    assert_eq!(reopened.recover_interrupted_image_runs().unwrap(), 1);
+    let view = reopened.conversation_view(conversation.id).unwrap();
+    assert_eq!(view.turns[0].runs[0].state, StudioRunState::Failed);
+    assert!(
+        view.turns[0].runs[0]
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("may have completed"))
+    );
+    assert!(reopened.prepare_retry(runs[0].run_id, false).is_err());
+    assert!(reopened.prepare_retry(runs[0].run_id, true).is_ok());
 }
 
 #[tokio::test]
@@ -283,4 +392,319 @@ async fn artifact_rpc_reads_by_id_without_exposing_a_filesystem_path() {
     assert_eq!(BASE64.decode(chunk.data).unwrap(), b"image");
 
     engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn credentials_persist_only_metadata_and_provider_rpcs_use_the_secret_backend() {
+    let root = tempdir().unwrap();
+    let profile = EngineProfile::synced(root.path(), "org", "credential-user");
+    let mut engine = EngineCore::assemble_with_profile(
+        profile.clone(),
+        std::sync::Arc::new(default_registry()),
+        HarnessId::Mock,
+        None,
+    )
+    .unwrap();
+    let backend = std::sync::Arc::new(MemorySecrets::default());
+    engine.studio_credentials =
+        std::sync::Arc::new(StudioCredentials::with_backend(root.path(), backend).unwrap());
+    engine
+        .studio_providers
+        .register(std::sync::Arc::new(
+            FakeMediaProvider::new(
+                "fake",
+                vec![image_model("fake")],
+                FakeSubmissionMode::Complete(Vec::new()),
+            )
+            .with_accepted_secret("super-secret-value"),
+        ))
+        .unwrap();
+    let client = memory_client(engine.rpc_service());
+
+    let configured: StudioProviderConnection = serde_json::from_value(
+        client
+            .call(
+                methods::SET_STUDIO_PROVIDER_CREDENTIAL,
+                serde_json::json!({
+                    "providerId": "fake",
+                    "displayLabel": "Fake images",
+                    "secret": "super-secret-value"
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(configured.configured);
+    assert_eq!(
+        configured.validation_state,
+        ProviderValidationState::NotValidated
+    );
+
+    let validated: StudioProviderConnection = serde_json::from_value(
+        client
+            .call(
+                methods::VALIDATE_STUDIO_PROVIDER,
+                serde_json::json!({ "providerId": "fake" }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(validated.validation_state, ProviderValidationState::Valid);
+
+    let models: ListStudioModelsResponse = serde_json::from_value(
+        client
+            .call(
+                methods::LIST_STUDIO_MODELS,
+                serde_json::json!({ "providerId": "fake", "mediaKind": "image" }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(models.models.len(), 1);
+
+    let metadata =
+        std::fs::read_to_string(root.path().join("provider-accounts/connections.json")).unwrap();
+    assert!(metadata.contains("Fake images"));
+    assert!(!metadata.contains("super-secret-value"));
+
+    client
+        .call(
+            methods::REMOVE_STUDIO_PROVIDER_CREDENTIAL,
+            serde_json::json!({ "providerId": "fake" }),
+        )
+        .await
+        .unwrap();
+    assert!(engine.studio_credentials.list().unwrap().is_empty());
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn multi_model_turn_persists_successful_siblings_and_failed_runs() {
+    let root = tempdir().unwrap();
+    let profile = EngineProfile::synced(root.path(), "org", "generation-user");
+    let mut engine = EngineCore::assemble_with_profile(
+        profile.clone(),
+        std::sync::Arc::new(default_registry()),
+        HarnessId::Mock,
+        None,
+    )
+    .unwrap();
+    engine.studio_credentials = std::sync::Arc::new(
+        StudioCredentials::with_backend(root.path(), std::sync::Arc::new(MemorySecrets::default()))
+            .unwrap(),
+    );
+    engine
+        .studio_providers
+        .register(std::sync::Arc::new(FakeMediaProvider::new(
+            "success",
+            vec![image_model("success")],
+            FakeSubmissionMode::Complete(vec![ProviderArtifact {
+                media_kind: MediaKind::Image,
+                mime_type: "image/png".into(),
+                bytes: b"\x89PNG\r\n\x1a\ngenerated image".to_vec(),
+                width: Some(64),
+                height: Some(64),
+                duration_seconds: None,
+                metadata: serde_json::json!({ "seed": 7 }),
+            }]),
+        )))
+        .unwrap();
+    engine
+        .studio_providers
+        .register(std::sync::Arc::new(FakeMediaProvider::new(
+            "failure",
+            vec![image_model("failure")],
+            FakeSubmissionMode::Fail(ProviderError::new(
+                ProviderErrorKind::InsufficientFunds,
+                "not enough credits",
+            )),
+        )))
+        .unwrap();
+    let client = memory_client(engine.rpc_service());
+    for provider in ["success", "failure"] {
+        client
+            .call(
+                methods::SET_STUDIO_PROVIDER_CREDENTIAL,
+                serde_json::json!({
+                    "providerId": provider,
+                    "displayLabel": provider,
+                    "secret": "valid"
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    let conversation: StudioConversationSummary = serde_json::from_value(
+        client
+            .call(
+                methods::CREATE_STUDIO_CONVERSATION,
+                serde_json::json!({ "title": "Parallel study" }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let run = |provider: &str| {
+        serde_json::json!({
+            "providerId": provider,
+            "modelId": "image-model",
+            "operation": "text_to_image",
+            "outputCount": 1,
+            "controls": {},
+            "inputs": [],
+            "manifestVersion": "fixture-v1",
+            "displayAspectRatio": [1, 1]
+        })
+    };
+    let mut updates = client
+        .subscribe(
+            methods::WATCH_STUDIO_CONVERSATION,
+            serde_json::json!({ "conversationId": conversation.id }),
+        )
+        .await
+        .unwrap();
+    let empty: StudioConversationView =
+        serde_json::from_value(updates.recv().await.unwrap()).unwrap();
+    assert!(empty.turns.is_empty());
+    let queued: StudioConversationView = serde_json::from_value(
+        client
+            .call(
+                methods::CREATE_STUDIO_TURN,
+                serde_json::json!({
+                    "conversationId": conversation.id,
+                    "prompt": "a comet above the sea",
+                    "runs": [run("success"), run("failure")]
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(queued.turns[0].runs[0].state, StudioRunState::Queued);
+    assert_eq!(queued.turns[0].runs[1].state, StudioRunState::Queued);
+
+    let view = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let view: StudioConversationView =
+                serde_json::from_value(updates.recv().await.unwrap()).unwrap();
+            if view.turns[0].runs.iter().all(|run| {
+                matches!(
+                    run.state,
+                    StudioRunState::Succeeded | StudioRunState::Failed
+                )
+            }) {
+                break view;
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(view.turns.len(), 1);
+    assert_eq!(view.turns[0].runs.len(), 2);
+    assert_eq!(view.turns[0].runs[0].state, StudioRunState::Succeeded);
+    assert_eq!(view.turns[0].runs[0].artifacts.len(), 1);
+    assert_eq!(view.turns[0].runs[1].state, StudioRunState::Failed);
+    assert_eq!(
+        view.turns[0].runs[1].error.as_deref(),
+        Some("not enough credits")
+    );
+
+    let failed_run = view.turns[0].runs[1].id;
+    let retrying: StudioConversationView = serde_json::from_value(
+        client
+            .call(
+                methods::RETRY_STUDIO_RUN,
+                serde_json::json!({ "runId": failed_run }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(retrying.turns[0].runs[1].state, StudioRunState::Queued);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let update: StudioConversationView =
+                serde_json::from_value(updates.recv().await.unwrap()).unwrap();
+            if update.turns[0].runs[1].state == StudioRunState::Failed {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let attempt_count: i64 = engine
+        .studio
+        .connection()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM studio_attempts WHERE run_id = ?1",
+            [failed_run.0.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempt_count, 2);
+
+    let artifact = view.turns[0].runs[0].artifacts[0].id;
+    let chunk: StudioArtifactChunk = serde_json::from_value(
+        client
+            .call(
+                methods::READ_STUDIO_ARTIFACT_CHUNK,
+                serde_json::json!({ "artifactId": artifact }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        BASE64.decode(chunk.data).unwrap(),
+        b"\x89PNG\r\n\x1a\ngenerated image"
+    );
+    engine.shutdown().await;
+    drop(updates);
+    drop(client);
+    drop(engine);
+
+    let reopened = EngineCore::assemble_with_profile(
+        profile,
+        std::sync::Arc::new(default_registry()),
+        HarnessId::Mock,
+        None,
+    )
+    .unwrap();
+    let reopened_client = memory_client(reopened.rpc_service());
+    let mut reopened_updates = reopened_client
+        .subscribe(
+            methods::WATCH_STUDIO_CONVERSATION,
+            serde_json::json!({ "conversationId": conversation.id }),
+        )
+        .await
+        .unwrap();
+    let persisted: StudioConversationView =
+        serde_json::from_value(reopened_updates.recv().await.unwrap()).unwrap();
+    assert_eq!(persisted.turns[0].runs[0].state, StudioRunState::Succeeded);
+    assert_eq!(persisted.turns[0].runs[0].artifacts[0].id, artifact);
+    reopened_client
+        .call(
+            methods::DELETE_STUDIO_ARTIFACT,
+            serde_json::json!({ "artifactId": artifact }),
+        )
+        .await
+        .unwrap();
+    let deleted: StudioConversationView =
+        serde_json::from_value(reopened_updates.recv().await.unwrap()).unwrap();
+    assert!(deleted.turns[0].runs[0].artifacts.is_empty());
+    assert!(
+        reopened_client
+            .call(
+                methods::READ_STUDIO_ARTIFACT_CHUNK,
+                serde_json::json!({ "artifactId": artifact }),
+            )
+            .await
+            .is_err()
+    );
+    reopened.shutdown().await;
 }

@@ -11,10 +11,17 @@ use std::{
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
-use zeron_proto::{StudioArtifactChunk, StudioConversationSummary};
-use zeron_studio::{MediaProvider, ProviderId, StudioArtifactId, SubmissionCapabilities};
-use zeron_studio::{StudioConversationId, StudioTurnId};
+use zeron_proto::{
+    ListStudioModelsResponse, StudioArtifactChunk, StudioArtifactView, StudioConversationSummary,
+    StudioConversationView, StudioRunState, StudioRunView, StudioTurnView,
+};
+use zeron_studio::{
+    GenerationRequest, MediaModel, MediaProvider, ProviderArtifact, ProviderId, StudioArtifactId,
+    StudioAttemptId, StudioBatchId, StudioConversationId, StudioRunId, StudioTurnId,
+    SubmissionCapabilities,
+};
 
 const DATABASE_FILE: &str = "studio.sqlite3";
 const SCHEMA_VERSION: i64 = 1;
@@ -267,6 +274,22 @@ pub enum StudioStoreError {
     InvalidValue(String),
     #[error("studio conversation was not found")]
     ConversationNotFound,
+    #[error("studio run was not found")]
+    RunNotFound,
+}
+
+#[derive(Clone)]
+pub struct PreparedStudioRun {
+    pub model: MediaModel,
+    pub request: GenerationRequest,
+}
+
+#[derive(Clone, Debug)]
+pub struct StoredStudioRun {
+    pub run_id: StudioRunId,
+    pub attempt_id: StudioAttemptId,
+    pub idempotency_key: String,
+    pub request: GenerationRequest,
 }
 
 /// SQLite catalog rooted under one active profile.
@@ -274,6 +297,7 @@ pub struct StudioStore {
     database_path: PathBuf,
     connection: Mutex<Connection>,
     artifacts: ArtifactStore,
+    changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl StudioStore {
@@ -295,10 +319,12 @@ impl StudioStore {
             connection.execute_batch(SCHEMA_V1)?;
         }
 
+        let (changes, _) = tokio::sync::watch::channel(0);
         Ok(Self {
             database_path,
             connection: Mutex::new(connection),
             artifacts: ArtifactStore::open(&studio_root, maximum_artifact_bytes)?,
+            changes,
         })
     }
 
@@ -314,6 +340,70 @@ impl StudioStore {
         self.connection
             .lock()
             .map_err(|_| StudioStoreError::LockPoisoned)
+    }
+
+    /// Resolve image attempts interrupted by a process restart. A prepared attempt is known not to
+    /// have sent network bytes and becomes an ordinary retryable failure. Once submission began,
+    /// the provider may have charged for work, so preserve the ambiguity and require Retry anyway.
+    pub fn recover_interrupted_image_runs(&self) -> Result<usize, StudioStoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let rows = {
+            let mut statement = transaction.prepare(
+                "SELECT a.id, a.run_id, a.state
+                 FROM studio_attempts a
+                 JOIN studio_runs r ON r.id = a.run_id
+                 WHERE a.state IN ('prepared', 'submitting', 'queued', 'running')
+                   AND r.state IN ('queued', 'running', 'downloading')",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (attempt_id, run_id, old_state) in &rows {
+            let (attempt_state, message) = if old_state == "prepared" {
+                ("failed", "generation was interrupted before submission")
+            } else {
+                (
+                    "submission_unknown",
+                    "generation was interrupted during submission; provider work may have completed",
+                )
+            };
+            let error = serde_json::json!({ "message": message }).to_string();
+            transaction.execute(
+                "UPDATE studio_attempts SET state = ?2, error_json = ?3, completed_at = CASE WHEN ?2 = 'failed' THEN ?4 ELSE NULL END WHERE id = ?1",
+                rusqlite::params![attempt_id, attempt_state, error, now],
+            )?;
+            transaction.execute(
+                "UPDATE studio_runs SET state = 'failed', error_json = ?2, updated_at = ?3 WHERE id = ?1",
+                rusqlite::params![run_id, error, now],
+            )?;
+            transaction.execute(
+                "INSERT INTO studio_run_events (run_id, attempt_id, state, detail_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![run_id, attempt_id, attempt_state, error, now],
+            )?;
+        }
+        transaction.commit()?;
+        if !rows.is_empty() {
+            self.notify_change();
+        }
+        Ok(rows.len())
+    }
+
+    pub fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    fn notify_change(&self) {
+        self.changes
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
     pub fn create_conversation(
@@ -333,6 +423,7 @@ impl StudioStore {
                 forked_from_turn_id.map(|id| id.0.to_string())
             ],
         )?;
+        self.notify_change();
         self.conversation(id)
     }
 
@@ -370,6 +461,7 @@ impl StudioStore {
         if changed == 0 {
             return Err(StudioStoreError::ConversationNotFound);
         }
+        self.notify_change();
         self.conversation(id)
     }
 
@@ -386,7 +478,523 @@ impl StudioStore {
         if changed == 0 {
             return Err(StudioStoreError::ConversationNotFound);
         }
+        self.notify_change();
         self.conversation(id)
+    }
+
+    pub fn create_turn(
+        &self,
+        conversation_id: StudioConversationId,
+        prompt: &str,
+        source_turn_id: Option<StudioTurnId>,
+        runs: &[PreparedStudioRun],
+        owner_device_id: &str,
+    ) -> Result<Vec<StoredStudioRun>, StudioStoreError> {
+        let prompt = prompt.trim();
+        if prompt.is_empty() || prompt.chars().count() > 32_000 {
+            return Err(StudioStoreError::InvalidValue(
+                "prompt must contain 1 to 32000 characters".into(),
+            ));
+        }
+        if runs.is_empty() || runs.len() > 16 {
+            return Err(StudioStoreError::InvalidValue(
+                "a turn must contain 1 to 16 model runs".into(),
+            ));
+        }
+        if runs.iter().any(|run| !run.request.inputs.is_empty()) {
+            return Err(StudioStoreError::InvalidValue(
+                "studio inputs are not available in the image slice".into(),
+            ));
+        }
+
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM studio_conversations WHERE id = ?1 AND archived_at IS NULL)",
+            [conversation_id.0.to_string()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StudioStoreError::ConversationNotFound);
+        }
+        let position: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM studio_turns WHERE conversation_id = ?1",
+            [conversation_id.0.to_string()],
+            |row| row.get(0),
+        )?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let turn_id = StudioTurnId::new();
+        let batch_id = StudioBatchId::new();
+        transaction.execute(
+            "INSERT INTO studio_turns (id, conversation_id, position, prompt, source_turn_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![turn_id.0.to_string(), conversation_id.0.to_string(), position, prompt, source_turn_id.map(|id| id.0.to_string()), now],
+        )?;
+        transaction.execute(
+            "INSERT INTO studio_batches (id, turn_id, state, created_at, updated_at) VALUES (?1, ?2, 'queued', ?3, ?3)",
+            rusqlite::params![batch_id.0.to_string(), turn_id.0.to_string(), now],
+        )?;
+
+        let mut stored = Vec::with_capacity(runs.len());
+        for (position, prepared) in runs.iter().enumerate() {
+            let run_id = StudioRunId::new();
+            let attempt_id = StudioAttemptId::new();
+            let idempotency_key = Uuid::new_v4().to_string();
+            let model_json = serde_json::to_string(&prepared.model)
+                .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
+            let settings_json = serde_json::to_string(&prepared.request.controls)
+                .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
+            let request_json = serde_json::to_string(&prepared.request)
+                .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
+            let request_hash = format!("{:x}", Sha256::digest(request_json.as_bytes()));
+            transaction.execute(
+                "INSERT INTO studio_runs (id, batch_id, position, provider_id, model_id, operation, model_manifest_json, settings_json, owner_device_id, state, output_count, display_aspect_width, display_aspect_height, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'queued', ?10, ?11, ?12, ?13, ?13)",
+                rusqlite::params![run_id.0.to_string(), batch_id.0.to_string(), position as i64, prepared.request.provider_id.as_str(), prepared.request.model_id.as_str(), operation_name(prepared.request.operation), model_json, settings_json, owner_device_id, prepared.request.output_count, prepared.request.display_aspect_ratio.0, prepared.request.display_aspect_ratio.1, now],
+            )?;
+            transaction.execute(
+                "INSERT INTO studio_attempts (id, run_id, attempt_number, idempotency_key, request_json, request_wire_hash, state, provider_connection_id, created_at) VALUES (?1, ?2, 1, ?3, ?4, ?5, 'prepared', ?6, ?7)",
+                rusqlite::params![attempt_id.0.to_string(), run_id.0.to_string(), idempotency_key, request_json, request_hash, prepared.request.provider_id.as_str(), now],
+            )?;
+            transaction.execute(
+                "INSERT INTO studio_run_events (run_id, attempt_id, state, created_at) VALUES (?1, ?2, 'prepared', ?3)",
+                rusqlite::params![run_id.0.to_string(), attempt_id.0.to_string(), now],
+            )?;
+            stored.push(StoredStudioRun {
+                run_id,
+                attempt_id,
+                idempotency_key,
+                request: prepared.request.clone(),
+            });
+        }
+        transaction.execute(
+            "UPDATE studio_conversations SET updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![conversation_id.0.to_string(), now],
+        )?;
+        transaction.commit()?;
+        self.notify_change();
+        Ok(stored)
+    }
+
+    pub fn cache_models(
+        &self,
+        provider_id: &ProviderId,
+        models: &[MediaModel],
+        ttl: std::time::Duration,
+    ) -> Result<ListStudioModelsResponse, StudioStoreError> {
+        let fetched_at = chrono::Utc::now();
+        let expires_at = fetched_at
+            + chrono::Duration::from_std(ttl)
+                .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
+        let catalog = serde_json::to_string(models)
+            .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
+        self.connection()?.execute(
+            "INSERT INTO studio_model_catalogs (provider_id, catalog_json, fetched_at, expires_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(provider_id) DO UPDATE SET catalog_json = excluded.catalog_json, fetched_at = excluded.fetched_at, expires_at = excluded.expires_at",
+            rusqlite::params![provider_id.as_str(), catalog, fetched_at.timestamp_millis(), expires_at.timestamp_millis()],
+        )?;
+        Ok(ListStudioModelsResponse {
+            models: models.to_vec(),
+            fetched_at,
+            stale: false,
+        })
+    }
+
+    pub fn cached_models(
+        &self,
+        provider_id: &ProviderId,
+    ) -> Result<Option<ListStudioModelsResponse>, StudioStoreError> {
+        let connection = self.connection()?;
+        let result = connection.query_row(
+            "SELECT catalog_json, fetched_at, expires_at FROM studio_model_catalogs WHERE provider_id = ?1",
+            [provider_id.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+        );
+        let (catalog, fetched_at, expires_at) = match result {
+            Ok(result) => result,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Some(ListStudioModelsResponse {
+            models: serde_json::from_str(&catalog)
+                .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?,
+            fetched_at: timestamp(fetched_at)?,
+            stale: chrono::Utc::now().timestamp_millis() >= expires_at,
+        }))
+    }
+
+    pub fn delete_artifact(&self, artifact_id: StudioArtifactId) -> Result<(), StudioStoreError> {
+        let connection = self.connection()?;
+        let mime_type = connection
+            .query_row(
+                "SELECT mime_type FROM studio_artifacts WHERE id = ?1 AND deleted_at IS NULL",
+                [artifact_id.0.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StudioStoreError::ArtifactNotFound,
+                other => other.into(),
+            })?;
+        let extension = extension_for_mime(&mime_type).ok_or(StudioStoreError::InvalidExtension)?;
+        let now = chrono::Utc::now().timestamp_millis();
+        connection.execute(
+            "UPDATE studio_artifacts SET deleted_at = ?2 WHERE id = ?1",
+            rusqlite::params![artifact_id.0.to_string(), now],
+        )?;
+        drop(connection);
+        if let Err(error) = self.artifacts.delete(artifact_id, extension) {
+            let _ = self.connection()?.execute(
+                "UPDATE studio_artifacts SET deleted_at = NULL WHERE id = ?1",
+                [artifact_id.0.to_string()],
+            );
+            return Err(error);
+        }
+        self.notify_change();
+        Ok(())
+    }
+
+    pub fn prepare_retry(
+        &self,
+        run_id: StudioRunId,
+        retry_anyway: bool,
+    ) -> Result<(StoredStudioRun, StudioConversationId), StudioStoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let row = transaction
+            .query_row(
+                "SELECT a.id, a.request_json, a.state, r.provider_id, t.conversation_id
+             FROM studio_runs r
+             JOIN studio_batches b ON b.id = r.batch_id
+             JOIN studio_turns t ON t.id = b.turn_id
+             JOIN studio_attempts a ON a.run_id = r.id
+             WHERE r.id = ?1 ORDER BY a.attempt_number DESC LIMIT 1",
+                [run_id.0.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StudioStoreError::RunNotFound,
+                other => other.into(),
+            })?;
+        if row.2 == "submission_unknown" && !retry_anyway {
+            return Err(StudioStoreError::InvalidValue(
+                "retrying this uncertain submission may duplicate provider work; explicit confirmation is required".into(),
+            ));
+        }
+        if !matches!(
+            row.2.as_str(),
+            "failed" | "cancelled" | "submission_unknown"
+        ) {
+            return Err(StudioStoreError::InvalidValue(
+                "only terminal failed or uncertain runs can be retried".into(),
+            ));
+        }
+        let request: GenerationRequest = serde_json::from_str(&row.1)
+            .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
+        let attempt_number: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM studio_attempts WHERE run_id = ?1",
+            [run_id.0.to_string()],
+            |row| row.get(0),
+        )?;
+        let attempt_id = StudioAttemptId::new();
+        let idempotency_key = Uuid::new_v4().to_string();
+        let request_hash = format!("{:x}", Sha256::digest(row.1.as_bytes()));
+        let now = chrono::Utc::now().timestamp_millis();
+        if row.2 == "submission_unknown" {
+            transaction.execute(
+                "UPDATE studio_attempts SET state = 'failed', completed_at = ?2 WHERE id = ?1",
+                rusqlite::params![row.0, now],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO studio_attempts (id, run_id, attempt_number, idempotency_key, request_json, request_wire_hash, state, provider_connection_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'prepared', ?7, ?8)",
+            rusqlite::params![attempt_id.0.to_string(), run_id.0.to_string(), attempt_number, idempotency_key, row.1, request_hash, row.3, now],
+        )?;
+        transaction.execute(
+            "UPDATE studio_runs SET state = 'queued', progress = NULL, error_json = NULL, updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![run_id.0.to_string(), now],
+        )?;
+        transaction.execute(
+            "INSERT INTO studio_run_events (run_id, attempt_id, state, created_at) VALUES (?1, ?2, 'prepared', ?3)",
+            rusqlite::params![run_id.0.to_string(), attempt_id.0.to_string(), now],
+        )?;
+        transaction.commit()?;
+        self.notify_change();
+        Ok((
+            StoredStudioRun {
+                run_id,
+                attempt_id,
+                idempotency_key,
+                request,
+            },
+            StudioConversationId(parse_uuid(&row.4)?),
+        ))
+    }
+
+    pub fn mark_submitting(&self, run: &StoredStudioRun) -> Result<(), StudioStoreError> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let changed = self.connection()?.execute(
+            "UPDATE studio_attempts SET state = 'submitting', submitted_at = ?3 WHERE id = ?1 AND run_id = ?2 AND state = 'prepared'",
+            rusqlite::params![run.attempt_id.0.to_string(), run.run_id.0.to_string(), now],
+        )?;
+        if changed != 1 {
+            return Err(StudioStoreError::RunNotFound);
+        }
+        self.set_run_state(run.run_id, run.attempt_id, "running", None)
+    }
+
+    pub fn complete_run(
+        &self,
+        run: &StoredStudioRun,
+        artifacts: &[ProviderArtifact],
+    ) -> Result<(), StudioStoreError> {
+        if artifacts.len() != run.request.output_count as usize {
+            return self.fail_run(
+                run,
+                &format!(
+                    "provider returned {} artifacts; {} were requested",
+                    artifacts.len(),
+                    run.request.output_count
+                ),
+                false,
+            );
+        }
+        let mut published = Vec::with_capacity(artifacts.len());
+        for artifact in artifacts {
+            if !artifact_bytes_match_mime(&artifact.mime_type, &artifact.bytes) {
+                return self.fail_run(
+                    run,
+                    &format!(
+                        "provider artifact bytes do not match declared MIME {}",
+                        artifact.mime_type
+                    ),
+                    false,
+                );
+            }
+            let id = StudioArtifactId::new();
+            let extension = extension_for_mime(&artifact.mime_type).ok_or_else(|| {
+                StudioStoreError::InvalidValue(format!(
+                    "unsupported provider artifact MIME {}",
+                    artifact.mime_type
+                ))
+            })?;
+            match self.artifacts.publish(id, extension, &artifact.bytes) {
+                Ok(path) => published.push((id, path, extension, artifact)),
+                Err(error) => {
+                    for (id, _, extension, _) in &published {
+                        let _ = self.artifacts.delete(*id, extension);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        let result = (|| {
+            let mut connection = self.connection()?;
+            let transaction = connection.transaction()?;
+            let now = chrono::Utc::now().timestamp_millis();
+            for (position, (id, path, _, artifact)) in published.iter().enumerate() {
+                let relative_path = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or(StudioStoreError::InvalidArtifact)?;
+                let hash = format!("{:x}", Sha256::digest(&artifact.bytes));
+                transaction.execute(
+                    "INSERT INTO studio_artifacts (id, run_id, attempt_id, output_position, media_kind, relative_path, mime_type, size_bytes, content_hash, width, height, duration_seconds, metadata_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    rusqlite::params![id.0.to_string(), run.run_id.0.to_string(), run.attempt_id.0.to_string(), position as i64, media_kind_name(artifact.media_kind), relative_path, artifact.mime_type, artifact.bytes.len() as i64, hash, artifact.width, artifact.height, artifact.duration_seconds, artifact.metadata.to_string(), now],
+                )?;
+            }
+            transaction.execute(
+                "UPDATE studio_attempts SET state = 'succeeded', completed_at = ?2 WHERE id = ?1",
+                rusqlite::params![run.attempt_id.0.to_string(), now],
+            )?;
+            transaction.execute(
+                "UPDATE studio_runs SET state = 'succeeded', progress = 1.0, updated_at = ?2 WHERE id = ?1",
+                rusqlite::params![run.run_id.0.to_string(), now],
+            )?;
+            transaction.execute(
+                "INSERT INTO studio_run_events (run_id, attempt_id, state, created_at) VALUES (?1, ?2, 'succeeded', ?3)",
+                rusqlite::params![run.run_id.0.to_string(), run.attempt_id.0.to_string(), now],
+            )?;
+            recompute_batch(&transaction, run.run_id, now)?;
+            transaction.commit()?;
+            Ok::<(), StudioStoreError>(())
+        })();
+        if result.is_err() {
+            for (id, _, extension, _) in &published {
+                let _ = self.artifacts.delete(*id, extension);
+            }
+        }
+        if result.is_ok() {
+            self.notify_change();
+        }
+        result
+    }
+
+    pub fn fail_run(
+        &self,
+        run: &StoredStudioRun,
+        message: &str,
+        submission_unknown: bool,
+    ) -> Result<(), StudioStoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let attempt_state = if submission_unknown {
+            "submission_unknown"
+        } else {
+            "failed"
+        };
+        let error = serde_json::json!({ "message": message }).to_string();
+        transaction.execute(
+            "UPDATE studio_attempts SET state = ?2, error_json = ?3, completed_at = CASE WHEN ?2 = 'failed' THEN ?4 ELSE NULL END WHERE id = ?1",
+            rusqlite::params![run.attempt_id.0.to_string(), attempt_state, error, now],
+        )?;
+        transaction.execute(
+            "UPDATE studio_runs SET state = 'failed', error_json = ?2, updated_at = ?3 WHERE id = ?1",
+            rusqlite::params![run.run_id.0.to_string(), error, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO studio_run_events (run_id, attempt_id, state, detail_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![run.run_id.0.to_string(), run.attempt_id.0.to_string(), attempt_state, error, now],
+        )?;
+        recompute_batch(&transaction, run.run_id, now)?;
+        transaction.commit()?;
+        self.notify_change();
+        Ok(())
+    }
+
+    fn set_run_state(
+        &self,
+        run_id: StudioRunId,
+        attempt_id: StudioAttemptId,
+        state: &str,
+        progress: Option<f32>,
+    ) -> Result<(), StudioStoreError> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE studio_runs SET state = ?2, progress = ?3, updated_at = ?4 WHERE id = ?1",
+            rusqlite::params![run_id.0.to_string(), state, progress, now],
+        )?;
+        connection.execute(
+            "INSERT INTO studio_run_events (run_id, attempt_id, state, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![run_id.0.to_string(), attempt_id.0.to_string(), state, now],
+        )?;
+        self.notify_change();
+        Ok(())
+    }
+
+    pub fn conversation_view(
+        &self,
+        id: StudioConversationId,
+    ) -> Result<StudioConversationView, StudioStoreError> {
+        let summary = self.conversation(id)?;
+        let connection = self.connection()?;
+        let mut turns_statement = connection.prepare(
+            "SELECT t.id, t.position, t.prompt, t.source_turn_id, b.id, t.created_at FROM studio_turns t JOIN studio_batches b ON b.turn_id = t.id WHERE t.conversation_id = ?1 ORDER BY t.position",
+        )?;
+        let turn_rows = turns_statement
+            .query_map([id.0.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut turns = Vec::with_capacity(turn_rows.len());
+        for (turn_id, position, prompt, source_id, batch_id, created_at) in turn_rows {
+            let mut runs_statement = connection.prepare(
+                "SELECT id, position, provider_id, model_manifest_json, settings_json, output_count, display_aspect_width, display_aspect_height, state, progress, error_json FROM studio_runs WHERE batch_id = ?1 ORDER BY position",
+            )?;
+            let run_rows = runs_statement
+                .query_map([batch_id.clone()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, u32>(5)?,
+                        row.get::<_, u32>(6)?,
+                        row.get::<_, u32>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, Option<f32>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut run_views = Vec::with_capacity(run_rows.len());
+            for (
+                run_id,
+                run_position,
+                provider_id,
+                model_json,
+                settings_json,
+                output_count,
+                aspect_width,
+                aspect_height,
+                state,
+                progress,
+                error_json,
+            ) in run_rows
+            {
+                let mut artifacts_statement = connection.prepare(
+                    "SELECT id, output_position, media_kind, mime_type, size_bytes, width, height, duration_seconds, metadata_json, created_at FROM studio_artifacts WHERE run_id = ?1 AND deleted_at IS NULL ORDER BY output_position",
+                )?;
+                let artifacts = artifacts_statement
+                    .query_map([run_id.clone()], artifact_from_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let model: MediaModel = serde_json::from_str(&model_json)
+                    .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
+                let controls = serde_json::from_str(&settings_json)
+                    .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
+                let error = error_json
+                    .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                    .and_then(|value| {
+                        value
+                            .get("message")
+                            .and_then(|message| message.as_str())
+                            .map(str::to_owned)
+                    });
+                run_views.push(StudioRunView {
+                    id: StudioRunId(parse_uuid(&run_id)?),
+                    position: run_position,
+                    provider_id: ProviderId::new(provider_id),
+                    model,
+                    controls,
+                    output_count,
+                    display_aspect_ratio: (aspect_width, aspect_height),
+                    state: parse_run_state(&state)?,
+                    progress,
+                    error,
+                    artifacts,
+                });
+            }
+            turns.push(StudioTurnView {
+                id: StudioTurnId(parse_uuid(&turn_id)?),
+                position,
+                prompt,
+                source_turn_id: source_id
+                    .map(|value| parse_uuid(&value).map(StudioTurnId))
+                    .transpose()?,
+                batch_id: StudioBatchId(parse_uuid(&batch_id)?),
+                runs: run_views,
+                created_at: timestamp(created_at)?,
+            });
+        }
+        Ok(StudioConversationView {
+            conversation: summary,
+            turns,
+        })
     }
 
     fn conversation(
@@ -408,6 +1016,111 @@ impl StudioStore {
                 other => other.into(),
             })
     }
+}
+
+fn recompute_batch(
+    connection: &Connection,
+    run_id: StudioRunId,
+    now: i64,
+) -> Result<(), rusqlite::Error> {
+    connection.execute(
+        "UPDATE studio_batches SET state = CASE WHEN EXISTS(SELECT 1 FROM studio_runs r WHERE r.batch_id = studio_batches.id AND r.state NOT IN ('succeeded','failed','cancelled')) THEN 'running' WHEN EXISTS(SELECT 1 FROM studio_runs r WHERE r.batch_id = studio_batches.id AND r.state = 'succeeded') THEN 'succeeded' ELSE 'failed' END, updated_at = ?2 WHERE id = (SELECT batch_id FROM studio_runs WHERE id = ?1)",
+        rusqlite::params![run_id.0.to_string(), now],
+    )?;
+    Ok(())
+}
+
+fn operation_name(operation: zeron_studio::MediaOperation) -> &'static str {
+    match operation {
+        zeron_studio::MediaOperation::TextToImage => "text_to_image",
+        zeron_studio::MediaOperation::ImageToImage => "image_to_image",
+        zeron_studio::MediaOperation::ImageEdit => "image_edit",
+        zeron_studio::MediaOperation::Upscale => "upscale",
+        zeron_studio::MediaOperation::TextToVideo => "text_to_video",
+        zeron_studio::MediaOperation::ImageToVideo => "image_to_video",
+        zeron_studio::MediaOperation::ReferenceToVideo => "reference_to_video",
+        zeron_studio::MediaOperation::VideoToVideo => "video_to_video",
+    }
+}
+
+fn media_kind_name(kind: zeron_studio::MediaKind) -> &'static str {
+    match kind {
+        zeron_studio::MediaKind::Image => "image",
+        zeron_studio::MediaKind::Video => "video",
+    }
+}
+
+fn extension_for_mime(mime: &str) -> Option<&'static str> {
+    ARTIFACT_FORMATS
+        .iter()
+        .find_map(|(extension, supported)| (*supported == mime).then_some(*extension))
+}
+
+fn artifact_bytes_match_mime(mime: &str, bytes: &[u8]) -> bool {
+    match mime {
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/webp" => bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+        "video/mp4" => bytes.len() >= 12 && &bytes[4..8] == b"ftyp",
+        _ => false,
+    }
+}
+
+fn parse_uuid(value: &str) -> Result<Uuid, StudioStoreError> {
+    Uuid::parse_str(value).map_err(|error| StudioStoreError::InvalidValue(error.to_string()))
+}
+
+fn timestamp(value: i64) -> Result<chrono::DateTime<chrono::Utc>, StudioStoreError> {
+    chrono::DateTime::from_timestamp_millis(value).ok_or_else(|| {
+        StudioStoreError::InvalidValue("timestamp is outside the supported range".into())
+    })
+}
+
+fn parse_run_state(value: &str) -> Result<StudioRunState, StudioStoreError> {
+    match value {
+        "draft" => Ok(StudioRunState::Draft),
+        "quoting" => Ok(StudioRunState::Quoting),
+        "awaiting_confirmation" => Ok(StudioRunState::AwaitingConfirmation),
+        "queued" => Ok(StudioRunState::Queued),
+        "running" => Ok(StudioRunState::Running),
+        "downloading" => Ok(StudioRunState::Downloading),
+        "succeeded" => Ok(StudioRunState::Succeeded),
+        "failed" => Ok(StudioRunState::Failed),
+        "cancelling" => Ok(StudioRunState::Cancelling),
+        "cancelled" => Ok(StudioRunState::Cancelled),
+        _ => Err(StudioStoreError::InvalidValue(format!(
+            "unknown run state {value}"
+        ))),
+    }
+}
+
+fn artifact_from_row(row: &rusqlite::Row<'_>) -> Result<StudioArtifactView, rusqlite::Error> {
+    use rusqlite::types::Type;
+    let id: String = row.get(0)?;
+    let media_kind: String = row.get(2)?;
+    let metadata: String = row.get(8)?;
+    let created_at: i64 = row.get(9)?;
+    Ok(StudioArtifactView {
+        id: StudioArtifactId(Uuid::parse_str(&id).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
+        })?),
+        output_position: row.get(1)?,
+        media_kind: match media_kind.as_str() {
+            "image" => zeron_studio::MediaKind::Image,
+            "video" => zeron_studio::MediaKind::Video,
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        },
+        mime_type: row.get(3)?,
+        size_bytes: row.get(4)?,
+        width: row.get(5)?,
+        height: row.get(6)?,
+        duration_seconds: row.get(7)?,
+        metadata: serde_json::from_str(&metadata).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(8, Type::Text, Box::new(error))
+        })?,
+        created_at: chrono::DateTime::from_timestamp_millis(created_at)
+            .ok_or(rusqlite::Error::InvalidQuery)?,
+    })
 }
 
 fn validate_title(title: &str) -> Result<&str, StudioStoreError> {

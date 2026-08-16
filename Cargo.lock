@@ -9220,7 +9220,10 @@ name = "zeron-studio"
 version = "0.2.3"
 dependencies = [
  "async-trait",
+ "base64",
  "chrono",
+ "futures",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
@@ -9314,6 +9317,7 @@ dependencies = [
  "zeron-harness",
  "zeron-proto",
  "zeron-rpc",
+ "zeron-studio",
  "zeron-syntax",
  "zeron-update",
 ]

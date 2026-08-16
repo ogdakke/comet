@@ -299,6 +299,9 @@ fn aspect_ratio_control(
 ) -> Result<ModelControl, VeniceCatalogError> {
     let choices = values
         .iter()
+        // Venice uses `auto` to mean "omit aspect_ratio and let the model decide". It is not a
+        // geometric ratio and must not poison the rest of an otherwise valid live catalog.
+        .filter(|value| value.as_str() != "auto")
         .map(|value| {
             let (width, height) =
                 value
@@ -326,6 +329,7 @@ fn aspect_ratio_control(
         })
         .collect::<Result<Vec<_>, VeniceCatalogError>>()?;
     let default = default
+        .filter(|value| *value != "auto")
         .and_then(|value| choices.iter().find(|choice| choice.label == value))
         .map(|choice| choice.value.clone());
     Ok(ModelControl {
