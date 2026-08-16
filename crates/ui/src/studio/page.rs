@@ -282,12 +282,13 @@ impl StudioPage {
                 };
                 if this
                     .update(cx, |page, cx| {
+                        let first_open = page.conversation.is_none();
                         let submitted_turn_arrived = page
                             .scroll_after_turn_count
                             .is_some_and(|before| view.turns.len() > before);
                         page.conversation = Some(view);
                         page.seed_composer_from_conversation(cx);
-                        if submitted_turn_arrived {
+                        if first_open || submitted_turn_arrived {
                             page.scroll_after_turn_count = None;
                             page.feed_scroll.scroll_to_bottom();
                         }
