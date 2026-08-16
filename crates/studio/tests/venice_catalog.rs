@@ -26,6 +26,14 @@ fn real_catalog_fixtures_render_as_provider_neutral_controls() {
     assert_control(&image, "quality", ControlKind::Enum, 3);
     assert_control(&image, "steps", ControlKind::Integer, 0);
     assert_control(&image, "format", ControlKind::Enum, 3);
+    assert_eq!(
+        image.output_mime_types,
+        vec![
+            "image/webp".to_owned(),
+            "image/png".to_owned(),
+            "image/jpeg".to_owned()
+        ]
+    );
     assert_control(&image, "safe_mode", ControlKind::Boolean, 0);
     let safe_mode = image
         .controls
@@ -142,6 +150,57 @@ fn one_unusable_model_does_not_fail_the_catalog() {
         normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at()).unwrap();
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].id.as_str(), "gpt-image-2");
+}
+
+#[test]
+fn grok_imagine_hides_format_because_it_ignores_the_parameter() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(IMAGE).unwrap();
+    fixture["data"][0]["id"] = "grok-imagine-image-2-0".into();
+
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert!(
+        model
+            .controls
+            .iter()
+            .all(|control| control.id.as_str() != "format")
+    );
+    assert_eq!(
+        model.output_mime_types,
+        vec![
+            "image/webp".to_owned(),
+            "image/png".to_owned(),
+            "image/jpeg".to_owned()
+        ]
+    );
+}
+
+#[test]
+fn format_is_exposed_only_when_the_model_advertises_it() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(IMAGE).unwrap();
+    fixture["data"][0]["model_spec"]["constraints"]["formats"] = serde_json::json!(["jpeg", "png"]);
+    fixture["data"][0]["model_spec"]["constraints"]["defaultFormat"] = serde_json::json!("jpeg");
+
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_control(&model, "format", ControlKind::Enum, 2);
+    let format = model
+        .controls
+        .iter()
+        .find(|control| control.id == ControlId::from("format"))
+        .unwrap();
+    assert_eq!(
+        format.default,
+        Some(ControlValue::Enum {
+            value: "jpeg".into()
+        })
+    );
+    assert_eq!(
+        model.output_mime_types,
+        vec!["image/jpeg".to_owned(), "image/png".to_owned()]
+    );
 }
 
 #[test]

@@ -981,6 +981,22 @@ impl StudioStore {
         ))
     }
 
+    fn run_model(&self, run_id: StudioRunId) -> Result<MediaModel, StudioStoreError> {
+        let json: String = self
+            .connection()?
+            .query_row(
+                "SELECT model_manifest_json FROM studio_runs WHERE id = ?1",
+                [run_id.0.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StudioStoreError::RunNotFound,
+                other => other.into(),
+            })?;
+        serde_json::from_str(&json)
+            .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))
+    }
+
     pub fn mark_submitting(&self, run: &StoredStudioRun) -> Result<(), StudioStoreError> {
         let now = chrono::Utc::now().timestamp_millis();
         let changed = self.connection()?.execute(
@@ -1009,29 +1025,26 @@ impl StudioStore {
                 false,
             );
         }
+        let model = self.run_model(run.run_id)?;
         let mut published = Vec::with_capacity(artifacts.len());
         for artifact in artifacts {
-            if !artifact_bytes_match_mime(&artifact.mime_type, &artifact.bytes) {
+            let Some(mime_type) = model.accepted_output_mime(&artifact.bytes) else {
                 return self.fail_run(
                     run,
-                    &format!(
-                        "provider artifact bytes do not match declared MIME {}",
-                        artifact.mime_type
-                    ),
+                    "provider artifact is not a supported format for this model",
                     false,
                 );
-            }
+            };
             let id = StudioArtifactId::new();
-            let extension = extension_for_mime(&artifact.mime_type).ok_or_else(|| {
+            let extension = extension_for_mime(&mime_type).ok_or_else(|| {
                 StudioStoreError::InvalidValue(format!(
-                    "unsupported provider artifact MIME {}",
-                    artifact.mime_type
+                    "unsupported provider artifact MIME {mime_type}"
                 ))
             })?;
             match self.artifacts.publish(id, extension, &artifact.bytes) {
-                Ok(path) => published.push((id, path, extension, artifact)),
+                Ok(path) => published.push((id, path, extension, artifact, mime_type)),
                 Err(error) => {
-                    for (id, _, extension, _) in &published {
+                    for (id, _, extension, _, _) in &published {
                         let _ = self.artifacts.delete(*id, extension);
                     }
                     return Err(error);
@@ -1043,7 +1056,7 @@ impl StudioStore {
             let mut connection = self.connection()?;
             let transaction = connection.transaction()?;
             let now = chrono::Utc::now().timestamp_millis();
-            for (position, (id, path, _, artifact)) in published.iter().enumerate() {
+            for (position, (id, path, _, artifact, mime_type)) in published.iter().enumerate() {
                 let relative_path = path
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -1051,7 +1064,7 @@ impl StudioStore {
                 let hash = format!("{:x}", Sha256::digest(&artifact.bytes));
                 transaction.execute(
                     "INSERT INTO studio_artifacts (id, run_id, attempt_id, output_position, media_kind, relative_path, mime_type, size_bytes, content_hash, width, height, duration_seconds, metadata_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-                    rusqlite::params![id.0.to_string(), run.run_id.0.to_string(), run.attempt_id.0.to_string(), position as i64, media_kind_name(artifact.media_kind), relative_path, artifact.mime_type, artifact.bytes.len() as i64, hash, artifact.width, artifact.height, artifact.duration_seconds, artifact.metadata.to_string(), now],
+                    rusqlite::params![id.0.to_string(), run.run_id.0.to_string(), run.attempt_id.0.to_string(), position as i64, media_kind_name(artifact.media_kind), relative_path, mime_type, artifact.bytes.len() as i64, hash, artifact.width, artifact.height, artifact.duration_seconds, artifact.metadata.to_string(), now],
                 )?;
             }
             transaction.execute(
@@ -1071,7 +1084,7 @@ impl StudioStore {
             Ok::<(), StudioStoreError>(())
         })();
         if result.is_err() {
-            for (id, _, extension, _) in &published {
+            for (id, _, extension, _, _) in &published {
                 let _ = self.artifacts.delete(*id, extension);
             }
         }
@@ -1361,16 +1374,6 @@ fn extension_for_mime(mime: &str) -> Option<&'static str> {
     ARTIFACT_FORMATS
         .iter()
         .find_map(|(extension, supported)| (*supported == mime).then_some(*extension))
-}
-
-fn artifact_bytes_match_mime(mime: &str, bytes: &[u8]) -> bool {
-    match mime {
-        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
-        "image/webp" => bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
-        "video/mp4" => bytes.len() >= 12 && &bytes[4..8] == b"ftyp",
-        _ => false,
-    }
 }
 
 fn parse_uuid(value: &str) -> Result<Uuid, StudioStoreError> {

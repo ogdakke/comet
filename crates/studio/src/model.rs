@@ -324,6 +324,11 @@ pub struct MediaModel {
 }
 
 impl MediaModel {
+    /// Identify persistable output from bytes, but only if this model advertises that MIME.
+    pub fn accepted_output_mime(&self, bytes: &[u8]) -> Option<String> {
+        crate::accepted_output_mime(bytes, &self.output_mime_types)
+    }
+
     pub fn validate_controls(
         &self,
         values: &BTreeMap<ControlId, ControlValue>,

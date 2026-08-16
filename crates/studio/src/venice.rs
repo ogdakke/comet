@@ -14,6 +14,10 @@ use crate::{
 };
 
 pub const VENICE_PROVIDER_ID: &str = "venice";
+const DEFAULT_IMAGE_OUTPUT_MIMES: &[&str] = &["image/webp", "image/png", "image/jpeg"];
+/// Venice `POST /image/generate` documents these `format` values. Used when a
+/// model honors that field and the catalog does not list a narrower set.
+const ENDPOINT_IMAGE_FORMATS: &[&str] = &["webp", "png", "jpeg"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum VeniceCatalogError {
@@ -78,6 +82,9 @@ struct ImageConstraints {
     #[serde(default)]
     qualities: Vec<String>,
     default_quality: Option<String>,
+    #[serde(default)]
+    formats: Vec<String>,
+    default_format: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -196,13 +203,28 @@ fn normalize_image(
         choices: Vec::new(),
         visible_when: Vec::new(),
     });
-    controls.push(choice_control(
-        "format",
-        "Format",
-        ControlKind::Enum,
-        &["webp".to_owned(), "png".to_owned(), "jpeg".to_owned()],
-        Some("webp"),
-    ));
+    let formats = image_format_choices(&model.id, &constraints);
+    if !formats.is_empty() {
+        let default = constraints
+            .default_format
+            .as_deref()
+            .and_then(normalize_image_format)
+            .filter(|value| formats.iter().any(|choice| choice == value))
+            .or_else(|| {
+                formats
+                    .iter()
+                    .find(|value| value.as_str() == "webp")
+                    .cloned()
+            })
+            .or_else(|| formats.first().cloned());
+        controls.push(choice_control(
+            "format",
+            "Format",
+            ControlKind::Enum,
+            &formats,
+            default.as_deref(),
+        ));
+    }
     // Endpoint-level: Venice defaults this to true and returns a blurred placeholder
     // for anything it classifies as adult content. Expose it so the chosen value is
     // persisted on the job, and default it off so generations receive the original.
@@ -232,11 +254,7 @@ fn normalize_image(
         description: model.model_spec.description,
         operation: MediaOperation::TextToImage,
         output_kind: MediaKind::Image,
-        output_mime_types: vec![
-            "image/webp".to_owned(),
-            "image/png".to_owned(),
-            "image/jpeg".to_owned(),
-        ],
+        output_mime_types: image_output_mime_types(&formats),
         input_constraints: Vec::new(),
         prompt_maximum_chars: Some(constraints.prompt_character_limit),
         negative_prompt_maximum_chars: Some(constraints.prompt_character_limit),
@@ -454,6 +472,70 @@ fn duration_control(model_id: &str, values: &[String]) -> Result<ModelControl, V
         choices,
         visible_when: Vec::new(),
     })
+}
+
+fn normalize_image_format(value: &str) -> Option<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "webp" => Some("webp".into()),
+        "png" => Some("png".into()),
+        "jpeg" | "jpg" => Some("jpeg".into()),
+        _ => None,
+    }
+}
+
+fn image_format_mime(format: &str) -> Option<&'static str> {
+    match format {
+        "webp" => Some("image/webp"),
+        "png" => Some("image/png"),
+        "jpeg" => Some("image/jpeg"),
+        _ => None,
+    }
+}
+
+fn advertised_image_formats(values: &[String]) -> Vec<String> {
+    let mut formats = Vec::new();
+    for value in values {
+        let Some(format) = normalize_image_format(value) else {
+            continue;
+        };
+        if !formats.contains(&format) {
+            formats.push(format);
+        }
+    }
+    formats
+}
+
+/// Grok Imagine through Venice ignores `format` and returns JPEG. Seedream and
+/// the other generate models honor the documented endpoint values.
+fn honors_endpoint_image_format(model_id: &str) -> bool {
+    !model_id.starts_with("grok-imagine")
+}
+
+fn image_format_choices(model_id: &str, constraints: &ImageConstraints) -> Vec<String> {
+    let advertised = advertised_image_formats(&constraints.formats);
+    if !advertised.is_empty() {
+        return advertised;
+    }
+    if honors_endpoint_image_format(model_id) {
+        return ENDPOINT_IMAGE_FORMATS
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect();
+    }
+    Vec::new()
+}
+
+fn image_output_mime_types(formats: &[String]) -> Vec<String> {
+    if formats.is_empty() {
+        return DEFAULT_IMAGE_OUTPUT_MIMES
+            .iter()
+            .map(|mime| (*mime).to_owned())
+            .collect();
+    }
+    formats
+        .iter()
+        .filter_map(|format| image_format_mime(format).map(str::to_owned))
+        .collect()
 }
 
 fn choice_control(

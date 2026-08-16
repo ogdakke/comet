@@ -228,6 +228,77 @@ fn create_turn_persists_catalog_cost() {
     assert!((quote.amount - 0.10).abs() < f64::EPSILON);
 }
 
+#[test]
+fn complete_run_persists_sniffed_supported_mime() {
+    let root = tempdir().unwrap();
+    let mut model = image_model("fake");
+    model.output_mime_types = vec!["image/webp".into(), "image/png".into(), "image/jpeg".into()];
+    let store = StudioStore::open(root.path(), 1024).unwrap();
+    let conversation = store.create_conversation("mime", None).unwrap();
+    let stored = store
+        .create_turn(
+            conversation.id,
+            "a comet",
+            None,
+            &[prepared_run(&model, "a comet")],
+            "device-a",
+        )
+        .unwrap();
+    store
+        .complete_run(
+            &stored[0],
+            &[ProviderArtifact {
+                media_kind: MediaKind::Image,
+                mime_type: "image/webp".into(),
+                bytes: vec![0xff, 0xd8, 0xff, 0xdb, 1, 2, 3],
+                width: Some(8),
+                height: Some(8),
+                duration_seconds: None,
+                metadata: serde_json::json!({}),
+            }],
+        )
+        .unwrap();
+    let view = store.conversation_view(conversation.id).unwrap();
+    assert_eq!(view.turns[0].runs[0].state, StudioRunState::Succeeded);
+    assert_eq!(view.turns[0].runs[0].artifacts[0].mime_type, "image/jpeg");
+}
+
+#[test]
+fn complete_run_rejects_bytes_outside_the_model_formats() {
+    let root = tempdir().unwrap();
+    let store = StudioStore::open(root.path(), 1024).unwrap();
+    let conversation = store.create_conversation("mime", None).unwrap();
+    let stored = store
+        .create_turn(
+            conversation.id,
+            "a comet",
+            None,
+            &[prepared_run(&image_model("fake"), "a comet")],
+            "device-a",
+        )
+        .unwrap();
+    store
+        .complete_run(
+            &stored[0],
+            &[ProviderArtifact {
+                media_kind: MediaKind::Image,
+                mime_type: "image/png".into(),
+                bytes: vec![0xff, 0xd8, 0xff, 0xdb, 1, 2, 3],
+                width: Some(8),
+                height: Some(8),
+                duration_seconds: None,
+                metadata: serde_json::json!({}),
+            }],
+        )
+        .unwrap();
+    let view = store.conversation_view(conversation.id).unwrap();
+    assert_eq!(view.turns[0].runs[0].state, StudioRunState::Failed);
+    assert_eq!(
+        view.turns[0].runs[0].error.as_deref(),
+        Some("provider artifact is not a supported format for this model")
+    );
+}
+
 fn prepared_run(model: &MediaModel, prompt: &str) -> PreparedStudioRun {
     PreparedStudioRun {
         model: model.clone(),

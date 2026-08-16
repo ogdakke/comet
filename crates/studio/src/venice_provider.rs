@@ -164,7 +164,6 @@ impl MediaProvider for VeniceMediaProvider {
         let moderation = ModerationFlags::from_headers(response.headers());
         let response = require_success(response).await?;
         let bytes = read_limited(response, MAX_IMAGE_RESPONSE_BYTES).await?;
-        let mime_type = requested_mime(request)?;
 
         let artifacts = if binary {
             if !content_type.starts_with("image/") {
@@ -173,15 +172,7 @@ impl MediaProvider for VeniceMediaProvider {
                     format!("Venice returned {content_type} for a binary image request"),
                 ));
             }
-            vec![ProviderArtifact {
-                media_kind: MediaKind::Image,
-                mime_type: content_type,
-                bytes,
-                width: None,
-                height: None,
-                duration_seconds: None,
-                metadata: moderation.metadata(None),
-            }]
+            vec![image_artifact(bytes, moderation.metadata(None))?]
         } else {
             if content_type != "application/json" {
                 return Err(ProviderError::new(
@@ -213,15 +204,7 @@ impl MediaProvider for VeniceMediaProvider {
                                 error.to_string(),
                             )
                         })?;
-                    Ok(ProviderArtifact {
-                        media_kind: MediaKind::Image,
-                        mime_type: mime_type.clone(),
-                        bytes,
-                        width: None,
-                        height: None,
-                        duration_seconds: None,
-                        metadata: moderation.metadata(Some(response.id.as_str())),
-                    })
+                    image_artifact(bytes, moderation.metadata(Some(response.id.as_str())))
                 })
                 .collect::<ProviderResult<Vec<_>>>()?
         };
@@ -355,26 +338,25 @@ fn image_payload(request: &GenerationRequest, binary: bool) -> ProviderResult<se
     Ok(payload.into())
 }
 
-fn requested_mime(request: &GenerationRequest) -> ProviderResult<String> {
-    let format = match request.controls.get(&crate::ControlId::from("format")) {
-        Some(ControlValue::Enum { value }) => value.as_str(),
-        None => "webp",
-        _ => {
-            return Err(ProviderError::new(
-                ProviderErrorKind::InvalidRequest,
-                "invalid format control",
-            ));
-        }
-    };
-    match format {
-        "webp" => Ok("image/webp".into()),
-        "png" => Ok("image/png".into()),
-        "jpeg" => Ok("image/jpeg".into()),
-        _ => Err(ProviderError::new(
-            ProviderErrorKind::InvalidRequest,
-            "unsupported image format",
-        )),
-    }
+const PERSISTABLE_IMAGE_MIMES: &[&str] = &["image/webp", "image/png", "image/jpeg"];
+
+fn image_artifact(bytes: Vec<u8>, metadata: serde_json::Value) -> ProviderResult<ProviderArtifact> {
+    let mime_type =
+        crate::accepted_output_mime(&bytes, PERSISTABLE_IMAGE_MIMES).ok_or_else(|| {
+            ProviderError::new(
+                ProviderErrorKind::MalformedResponse,
+                "Venice image bytes are not a supported format",
+            )
+        })?;
+    Ok(ProviderArtifact {
+        media_kind: MediaKind::Image,
+        mime_type,
+        bytes,
+        width: None,
+        height: None,
+        duration_seconds: None,
+        metadata,
+    })
 }
 
 #[derive(Deserialize)]
@@ -652,6 +634,25 @@ mod tests {
         assert_eq!(
             video_quote_payload(&request).unwrap_err().kind,
             ProviderErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn image_bytes_are_labeled_from_magic_not_requested_format() {
+        let jpeg = vec![0xff, 0xd8, 0xff, 0xdb, 1, 2, 3];
+        let artifact = image_artifact(jpeg.clone(), serde_json::Value::Null).unwrap();
+        assert_eq!(artifact.mime_type, "image/jpeg");
+        assert_eq!(artifact.bytes, jpeg);
+
+        let png = b"\x89PNG\r\n\x1a\nrest".to_vec();
+        let artifact = image_artifact(png, serde_json::Value::Null).unwrap();
+        assert_eq!(artifact.mime_type, "image/png");
+
+        assert_eq!(
+            image_artifact(b"not-an-image".to_vec(), serde_json::Value::Null)
+                .unwrap_err()
+                .kind,
+            ProviderErrorKind::MalformedResponse
         );
     }
 
