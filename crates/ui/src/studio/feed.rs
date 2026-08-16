@@ -45,7 +45,7 @@ const FEED_OVERDRAW_PX: f32 = 1600.0;
 /// Turns above and below the visible range that prefetch thumbs.
 const FEED_PREFETCH_TURNS: usize = 2;
 /// Horizontal inset matching the previous overflow-scroll padding.
-const FEED_PAD_X: f32 = 24.0;
+pub(super) const FEED_PAD_X: f32 = 24.0;
 /// Collapsed prompt bubble: three rows of chat-bubble type, then Show more.
 const PROMPT_COLLAPSED_LINES: usize = 3;
 const PROMPT_LINE_HEIGHT: f32 = 22.0;
@@ -149,6 +149,74 @@ pub(super) fn turn_index_for_artifact(
                 .any(|artifact| artifact.id == artifact_id)
         })
     })
+}
+
+/// Hold the Open-in-thread ring at full strength, then fade it out.
+pub(super) const ARTIFACT_FOCUS_HOLD: Duration = Duration::from_millis(2600);
+pub(super) const ARTIFACT_FOCUS_FADE: Duration = Duration::from_millis(400);
+
+pub(super) fn artifact_focus_alpha(elapsed: Duration) -> Option<f32> {
+    let total = ARTIFACT_FOCUS_HOLD + ARTIFACT_FOCUS_FADE;
+    if elapsed >= total {
+        None
+    } else if elapsed <= ARTIFACT_FOCUS_HOLD {
+        Some(1.0)
+    } else {
+        let t = (elapsed - ARTIFACT_FOCUS_HOLD).as_secs_f32()
+            / ARTIFACT_FOCUS_FADE.as_secs_f32().max(0.001);
+        Some((1.0 - t).clamp(0.0, 1.0))
+    }
+}
+
+pub(super) struct ArtifactFeedTarget {
+    pub turn_ix: usize,
+    pub offset: f32,
+}
+
+/// Turn row and y-offset of `artifact_id` inside that turn, so the feed can
+/// land on the tile instead of the prompt.
+pub(super) fn artifact_feed_target(
+    turns: &[StudioTurnView],
+    artifact_id: StudioArtifactId,
+    content_width: f32,
+    tile_width: f32,
+    gap: f32,
+    columns: usize,
+) -> Option<ArtifactFeedTarget> {
+    let turn_ix = turn_index_for_artifact(turns, artifact_id)?;
+    let turn = &turns[turn_ix];
+    let columns = columns.max(1);
+    let header = estimated_turn_header(turn, content_width);
+    let mut slot = 0usize;
+    for run in &turn.runs {
+        for (_, id) in feed_output_slots(run) {
+            if id == Some(artifact_id) {
+                let (aw, ah) = run.display_aspect_ratio;
+                let tile_h = tile_width * ah as f32 / aw.max(1) as f32;
+                let row = slot / columns;
+                return Some(ArtifactFeedTarget {
+                    turn_ix,
+                    offset: header + row as f32 * (tile_h + gap),
+                });
+            }
+            slot += 1;
+        }
+    }
+    Some(ArtifactFeedTarget {
+        turn_ix,
+        offset: header,
+    })
+}
+
+fn estimated_turn_header(turn: &StudioTurnView, content_width: f32) -> f32 {
+    let bubble_width = content_width
+        .min(1600.0)
+        .min(crate::transcript::MAX_CONTENT_WIDTH * 0.8);
+    let inner = (bubble_width - PROMPT_BUBBLE_PAD_X * 2.0).max(1.0);
+    let lines = prompt_visual_lines_at(&turn.prompt, inner, PROMPT_AVG_CHAR_ADVANCE)
+        .clamp(1, PROMPT_COLLAPSED_LINES);
+    let prompt_h = 20.0 + lines as f32 * PROMPT_LINE_HEIGHT;
+    prompt_h + 8.0 + 24.0 + 12.0
 }
 
 /// Height-affecting identity of the feed. Remeasure only when this changes
@@ -488,6 +556,9 @@ impl StudioPage {
                                 )
                             }),
                     ))
+                    .when_some(self.artifact_focus_ring(id, theme), |tile, ring| {
+                        tile.child(ring)
+                    })
                     .into_any_element();
             }
         }
@@ -521,7 +592,28 @@ impl StudioPage {
             .when(state == StudioRunState::Failed, |tile| {
                 tile.child("Generation failed")
             })
+            .when_some(
+                artifact_id.and_then(|id| self.artifact_focus_ring(id, theme)),
+                |tile, ring| tile.child(ring),
+            )
             .into_any_element()
+    }
+
+    fn artifact_focus_ring(
+        &self,
+        artifact_id: StudioArtifactId,
+        theme: &Theme,
+    ) -> Option<AnyElement> {
+        let alpha = self.artifact_focus_alpha(artifact_id)?;
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .rounded(px(10.0))
+                .border_2()
+                .border_color(theme.text.opacity(0.88 * alpha))
+                .into_any_element(),
+        )
     }
 
     pub(super) fn feed_turns(&self) -> &[StudioTurnView] {
@@ -703,10 +795,20 @@ impl StudioPage {
     /// 500ms ease-in-out timeline as the chat MessageRail. Item-space while
     /// the target is unmeasured; pixel-exact once `bounds_for_item` lands.
     pub(super) fn scroll_to_turn(&mut self, turn_ix: usize, cx: &mut Context<Self>) {
+        self.scroll_to_turn_offset(turn_ix, 0.0, cx);
+    }
+
+    pub(super) fn scroll_to_turn_offset(
+        &mut self,
+        turn_ix: usize,
+        offset: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let offset = offset.max(0.0);
         if motion::reduced_motion(cx) {
             self.feed_list.scroll_to(ListOffset {
                 item_ix: turn_ix,
-                offset_in_item: px(0.0),
+                offset_in_item: px(offset),
             });
             cx.notify();
             return;
@@ -729,7 +831,7 @@ impl StudioPage {
                     if raw >= 1.0 {
                         list.scroll_to(ListOffset {
                             item_ix: turn_ix,
-                            offset_in_item: px(0.0),
+                            offset_in_item: px(offset),
                         });
                         cx.notify();
                         return true;
@@ -789,7 +891,8 @@ impl StudioPage {
                     }
                     match list.bounds_for_item(turn_ix) {
                         Some(bounds) => {
-                            let delta = f32::from(bounds.top() - list.viewport_bounds().top());
+                            let delta = f32::from(bounds.top()) + offset
+                                - f32::from(list.viewport_bounds().top());
                             list.scroll_by(px(frac * delta));
                         }
                         None => {
@@ -813,7 +916,7 @@ impl StudioPage {
             this.update(cx, |page, cx| {
                 page.feed_list.scroll_to(ListOffset {
                     item_ix: turn_ix,
-                    offset_in_item: px(0.0),
+                    offset_in_item: px(offset),
                 });
                 cx.notify();
             })
@@ -1524,6 +1627,43 @@ mod tests {
         assert_eq!(turn_index_for_artifact(&turns, first.id), Some(0));
         assert_eq!(turn_index_for_artifact(&turns, second.id), Some(1));
         assert_eq!(turn_index_for_artifact(&turns, missing.id), None);
+    }
+
+    #[test]
+    fn artifact_feed_target_lands_on_the_tile_row() {
+        let now = Utc::now();
+        let first = test_artifact(0);
+        let second = test_artifact(0);
+        let mut early = test_run("Flux", 1);
+        early.artifacts = vec![first.clone()];
+        early.display_aspect_ratio = (1, 1);
+        let mut later = test_run("Flux", 1);
+        later.artifacts = vec![second.clone()];
+        later.display_aspect_ratio = (1, 1);
+        let turns = vec![test_turn("short", now, vec![early, later])];
+        let first_target = artifact_feed_target(&turns, first.id, 800.0, 200.0, 16.0, 1).unwrap();
+        let second_target = artifact_feed_target(&turns, second.id, 800.0, 200.0, 16.0, 1).unwrap();
+        assert_eq!(first_target.turn_ix, 0);
+        assert_eq!(second_target.turn_ix, 0);
+        assert!(
+            second_target.offset > first_target.offset,
+            "second tile should sit on the next row, got {} then {}",
+            first_target.offset,
+            second_target.offset
+        );
+        assert!((second_target.offset - first_target.offset - 216.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn artifact_focus_ring_holds_then_fades() {
+        assert_eq!(artifact_focus_alpha(Duration::ZERO), Some(1.0));
+        assert_eq!(artifact_focus_alpha(ARTIFACT_FOCUS_HOLD), Some(1.0));
+        let mid = artifact_focus_alpha(ARTIFACT_FOCUS_HOLD + ARTIFACT_FOCUS_FADE / 2).unwrap();
+        assert!(mid > 0.0 && mid < 1.0, "mid fade was {mid}");
+        assert_eq!(
+            artifact_focus_alpha(ARTIFACT_FOCUS_HOLD + ARTIFACT_FOCUS_FADE),
+            None
+        );
     }
 
     #[test]

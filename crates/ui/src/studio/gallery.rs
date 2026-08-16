@@ -97,6 +97,7 @@ impl StudioPage {
     pub fn show_gallery(&mut self, cx: &mut Context<Self>) {
         self.close_image_menu(cx);
         self.scroll_to_artifact = None;
+        self.focused_artifact = None;
         self.close_artifact(cx);
         self.gallery_selected.clear();
         self.gallery_anchor = None;

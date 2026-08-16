@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui::{
     Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Point, Render, SharedString,
@@ -28,7 +28,8 @@ use super::draft::{
     draft_aspect, select_first_model,
 };
 use super::feed::{
-    FeedLayoutSig, conversation_image_count, new_feed_list, turn_index_for_artifact,
+    ARTIFACT_FOCUS_FADE, ARTIFACT_FOCUS_HOLD, FeedLayoutSig, artifact_feed_target,
+    artifact_focus_alpha, conversation_image_count, new_feed_list,
 };
 use super::gallery::new_gallery_list;
 use super::image_menu::ImageMenu;
@@ -70,6 +71,8 @@ pub struct StudioPage {
     pub(super) scroll_after_turn_count: Option<usize>,
     pub(super) scroll_after_extend: Option<zeron_studio::StudioTurnId>,
     pub(super) scroll_to_artifact: Option<StudioArtifactId>,
+    pub(super) focused_artifact: Option<(StudioArtifactId, Instant)>,
+    pub(super) focus_task: Option<Task<()>>,
     pub(super) scroll_task: Option<Task<()>>,
     pub(super) rail_hover: Option<usize>,
     pub(super) source_turn: Option<zeron_studio::StudioTurnId>,
@@ -184,6 +187,8 @@ impl StudioPage {
             scroll_after_turn_count: None,
             scroll_after_extend: None,
             scroll_to_artifact: None,
+            focused_artifact: None,
+            focus_task: None,
             scroll_task: None,
             rail_hover: None,
             source_turn: None,
@@ -379,6 +384,7 @@ impl StudioPage {
         };
         self.close_image_menu(cx);
         if self.selected_conversation != Some(id) {
+            self.focused_artifact = None;
             self.close_artifact(cx);
             self.composer_seeded_for = None;
             self.expanded_prompts.clear();
@@ -470,13 +476,86 @@ impl StudioPage {
         let Some(view) = self.conversation.as_ref() else {
             return false;
         };
-        let turn_ix = turn_index_for_artifact(&view.turns, artifact_id);
+        let (content_width, tile_width, gap, columns) = self.feed_target_metrics();
+        let target = artifact_feed_target(
+            &view.turns,
+            artifact_id,
+            content_width,
+            tile_width,
+            gap,
+            columns,
+        );
         self.scroll_to_artifact = None;
-        match turn_ix {
-            Some(turn_ix) => self.scroll_to_turn(turn_ix, cx),
+        match target {
+            Some(target) => {
+                self.focus_artifact_tile(artifact_id, cx);
+                self.scroll_to_turn_offset(target.turn_ix, target.offset, cx);
+            }
             None => self.feed_scroll_to_end(),
         }
         true
+    }
+
+    fn feed_target_metrics(&self) -> (f32, f32, f32, usize) {
+        let width = if self.feed_width > 1.0 {
+            self.feed_width
+        } else if self.gallery_width > 1.0 {
+            self.gallery_width
+        } else {
+            960.0
+        };
+        let rail_gutter = if self.rail_should_show(width) {
+            super::feed::STUDIO_RAIL_GUTTER
+        } else {
+            0.0
+        };
+        let available = (width - super::feed::FEED_PAD_X * 2.0 - rail_gutter).clamp(240.0, 1600.0);
+        let columns = super::feed::grid_columns_sticky(available, self.feed_columns);
+        let gap = if available < 520.0 { 12.0 } else { 16.0 };
+        let tile = (available - gap * (columns.saturating_sub(1) as f32)) / columns.max(1) as f32;
+        (available, tile, gap, columns)
+    }
+
+    fn focus_artifact_tile(&mut self, artifact_id: StudioArtifactId, cx: &mut Context<Self>) {
+        self.focused_artifact = Some((artifact_id, Instant::now()));
+        let reduced = crate::motion::reduced_motion(cx);
+        self.focus_task = Some(cx.spawn(async move |this, cx| {
+            let hold = if reduced {
+                ARTIFACT_FOCUS_HOLD + ARTIFACT_FOCUS_FADE
+            } else {
+                ARTIFACT_FOCUS_HOLD
+            };
+            cx.background_executor().timer(hold).await;
+            if !reduced {
+                let fade_started = Instant::now();
+                while fade_started.elapsed() < ARTIFACT_FOCUS_FADE {
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        return;
+                    }
+                    cx.background_executor()
+                        .timer(Duration::from_millis(16))
+                        .await;
+                }
+            }
+            this.update(cx, |page, cx| {
+                if page
+                    .focused_artifact
+                    .is_some_and(|(id, _)| id == artifact_id)
+                {
+                    page.focused_artifact = None;
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    pub(super) fn artifact_focus_alpha(&self, artifact_id: StudioArtifactId) -> Option<f32> {
+        let (id, since) = self.focused_artifact?;
+        if id != artifact_id {
+            return None;
+        }
+        artifact_focus_alpha(since.elapsed())
     }
 
     pub(super) fn forget_artifact(&mut self, artifact_id: StudioArtifactId) {
