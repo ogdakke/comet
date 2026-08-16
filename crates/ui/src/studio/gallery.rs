@@ -740,6 +740,8 @@ impl StudioPage {
                     .id("studio-gallery-clear-selection")
                     .h(px(26.0))
                     .px(px(8.0))
+                    .flex()
+                    .items_center()
                     .rounded(px(7.0))
                     .cursor_pointer()
                     .hover(|style| style.bg(crate::theme::wash(0.10)))
