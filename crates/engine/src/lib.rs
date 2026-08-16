@@ -552,9 +552,11 @@ pub(crate) async fn refresh_configured_studio_catalogs(
         };
         match provider.list_models(&secret).await {
             Ok(models) => {
-                if let Err(error) =
-                    studio.cache_models(&connection.provider_id, &models, studio::STUDIO_CATALOG_TTL)
-                {
+                if let Err(error) = studio.cache_models(
+                    &connection.provider_id,
+                    &models,
+                    studio::STUDIO_CATALOG_TTL,
+                ) {
                     tracing::warn!(
                         provider = %connection.provider_id.as_str(),
                         error = %error,

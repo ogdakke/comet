@@ -129,10 +129,7 @@ fn cached_catalog_with_placeholder_pricing_is_stale() {
         )
         .unwrap();
     let cached = store.cached_models(&"fake".into()).unwrap().unwrap();
-    assert!(
-        cached.stale,
-        "pre-cost catalog snapshots must be refetched"
-    );
+    assert!(cached.stale, "pre-cost catalog snapshots must be refetched");
 
     store
         .cache_models(
