@@ -481,7 +481,8 @@ impl EngineRpc {
 
     /// Shared catalog for the picker and submit. Fresh cache is the source of
     /// truth so the form and the validator see the same schema. Live fetch only
-    /// happens when the cache is missing, expired, or a caller asked to refresh.
+    /// happens when the cache is missing, expired, or a caller asked to refresh
+    /// (the runtime does that once at boot).
     async fn studio_catalog(
         &self,
         provider_id: &zeron_studio::ProviderId,

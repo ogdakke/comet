@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use chrono::{TimeZone, Utc};
 use zeron_studio::{
-    ControlId, ControlKind, ControlValue, MediaOperation, PricingUnit, QuoteSource,
+    ControlId, ControlKind, ControlValue, MediaOperation, ModelFeature, PricingUnit, QuoteSource,
     venice::normalize_model_catalog,
 };
 
@@ -36,6 +36,7 @@ fn real_catalog_fixtures_render_as_provider_neutral_controls() {
         safe_mode.default,
         Some(zeron_studio::ControlValue::Boolean { value: false })
     );
+    assert_eq!(image.features, vec![ModelFeature::Anon]);
 
     let text_video = normalize_model_catalog(TEXT_TO_VIDEO, fetched_at())
         .unwrap()
@@ -44,6 +45,10 @@ fn real_catalog_fixtures_render_as_provider_neutral_controls() {
     assert!(text_video.input_constraints.is_empty());
     assert_control(&text_video, "duration", ControlKind::Duration, 9);
     assert_control(&text_video, "audio", ControlKind::Boolean, 0);
+    assert_eq!(
+        text_video.features,
+        vec![ModelFeature::Uncensored, ModelFeature::Anon]
+    );
 
     let image_video = normalize_model_catalog(IMAGE_TO_VIDEO, fetched_at())
         .unwrap()
@@ -177,6 +182,18 @@ fn manifest_version_ignores_display_copy_but_tracks_constraints() {
         .unwrap()
         .remove(0);
     assert_eq!(first.manifest_version, renamed.manifest_version);
+
+    let mut retagged: serde_json::Value = serde_json::from_slice(IMAGE).unwrap();
+    retagged["data"][0]["model_spec"]["privacy"] = "private".into();
+    retagged["data"][0]["model_spec"]["uncensored"] = true.into();
+    let retagged = normalize_model_catalog(&serde_json::to_vec(&retagged).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        retagged.features,
+        vec![ModelFeature::Uncensored, ModelFeature::Private]
+    );
+    assert_eq!(first.manifest_version, retagged.manifest_version);
 
     let mut changed: serde_json::Value = serde_json::from_slice(IMAGE).unwrap();
     changed["data"][0]["model_spec"]["constraints"]["steps"]["max"] = 51.into();

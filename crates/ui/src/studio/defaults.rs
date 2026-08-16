@@ -21,6 +21,8 @@ const FILE_NAME: &str = "studio-defaults.json";
 pub(super) struct StudioDefaults {
     pub(super) selected_model_ids: Vec<ModelId>,
     pub(super) drafts: BTreeMap<ModelId, RememberedDraft>,
+    /// Starred models in the picker, in starring order.
+    pub(super) favorites: Vec<ModelId>,
 }
 
 impl StudioDefaults {
@@ -54,6 +56,7 @@ impl StudioDefaults {
     pub(super) fn capture(
         selected: &BTreeSet<ModelId>,
         drafts: &HashMap<ModelId, DraftRunConfig>,
+        favorites: &[ModelId],
     ) -> Self {
         Self {
             selected_model_ids: selected.iter().cloned().collect(),
@@ -69,6 +72,22 @@ impl StudioDefaults {
                     )
                 })
                 .collect(),
+            favorites: favorites.to_vec(),
+        }
+    }
+
+    pub(super) fn is_favorite(&self, model: &ModelId) -> bool {
+        self.favorites.iter().any(|id| id == model)
+    }
+
+    /// Star/unstar a model; returns whether it is starred AFTER the toggle.
+    pub(super) fn toggle_favorite(&mut self, model: &ModelId) -> bool {
+        if let Some(at) = self.favorites.iter().position(|id| id == model) {
+            self.favorites.remove(at);
+            false
+        } else {
+            self.favorites.push(model.clone());
+            true
         }
     }
 }
@@ -98,13 +117,28 @@ mod tests {
                 )]),
             },
         );
-        let defaults = StudioDefaults::capture(&selected, &drafts);
+        let defaults = StudioDefaults::capture(&selected, &drafts, &[ModelId::new("flux")]);
         defaults.save(dir.path()).unwrap();
         assert_eq!(StudioDefaults::load(dir.path()), defaults);
         assert_eq!(
             defaults.selected_model_ids,
             vec![ModelId::new("flux"), ModelId::new("kling")]
         );
+        assert_eq!(defaults.favorites, vec![ModelId::new("flux")]);
+    }
+
+    #[test]
+    fn favorites_toggle_and_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut defaults = StudioDefaults::default();
+        assert!(defaults.toggle_favorite(&ModelId::new("flux")));
+        assert!(defaults.toggle_favorite(&ModelId::new("kling")));
+        assert!(defaults.is_favorite(&ModelId::new("flux")));
+        defaults.save(dir.path()).unwrap();
+        assert_eq!(StudioDefaults::load(dir.path()), defaults);
+        assert!(!defaults.toggle_favorite(&ModelId::new("flux")));
+        assert!(!defaults.is_favorite(&ModelId::new("flux")));
+        assert!(defaults.is_favorite(&ModelId::new("kling")));
     }
 
     #[test]
@@ -113,5 +147,13 @@ mod tests {
         assert_eq!(StudioDefaults::load(dir.path()), StudioDefaults::default());
         std::fs::write(StudioDefaults::path(dir.path()), "{nope").unwrap();
         assert_eq!(StudioDefaults::load(dir.path()), StudioDefaults::default());
+        std::fs::write(
+            StudioDefaults::path(dir.path()),
+            r#"{"selectedModelIds":["flux"],"drafts":{}}"#,
+        )
+        .unwrap();
+        let loaded = StudioDefaults::load(dir.path());
+        assert_eq!(loaded.selected_model_ids, vec![ModelId::new("flux")]);
+        assert!(loaded.favorites.is_empty());
     }
 }

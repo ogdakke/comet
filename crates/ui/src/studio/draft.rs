@@ -240,6 +240,7 @@ mod tests {
             maximum_output_count: 8,
             controls,
             pricing: None,
+            features: Vec::new(),
             manifest_version: "test".into(),
             fetched_at: Utc::now(),
         }

@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     ControlChoice, ControlId, ControlKind, ControlValue, InputConstraint, InputRole, MediaKind,
-    MediaModel, MediaOperation, MimeConstraint, ModelControl, ModelId, PricingEntry,
+    MediaModel, MediaOperation, MimeConstraint, ModelControl, ModelFeature, ModelId, PricingEntry,
     PricingMetadata, PricingUnit, ProviderId,
 };
 
@@ -54,6 +54,14 @@ struct ModelSpec {
     pricing: Option<serde_json::Value>,
     #[serde(default, rename = "supportsOptimizePromptThinking")]
     supports_optimize_prompt_thinking: bool,
+    #[serde(default)]
+    privacy: Option<String>,
+    #[serde(default)]
+    uncensored: bool,
+    #[serde(default)]
+    traits: Vec<String>,
+    #[serde(default)]
+    model_sets: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -130,6 +138,7 @@ fn normalize_image(
     model: CatalogModel,
     fetched_at: DateTime<Utc>,
 ) -> Result<MediaModel, VeniceCatalogError> {
+    let features = model_features(&model.model_spec);
     let constraints: ImageConstraints = serde_json::from_value(model.model_spec.constraints)?;
     let mut controls = Vec::new();
 
@@ -234,6 +243,7 @@ fn normalize_image(
         maximum_output_count: 4,
         controls,
         pricing: pricing_metadata(model.model_spec.pricing.as_ref()),
+        features,
         manifest_version: String::new(),
         fetched_at,
     })
@@ -243,6 +253,7 @@ fn normalize_video(
     model: CatalogModel,
     fetched_at: DateTime<Utc>,
 ) -> Result<MediaModel, VeniceCatalogError> {
+    let features = model_features(&model.model_spec);
     let constraints: VideoConstraints = serde_json::from_value(model.model_spec.constraints)?;
     let (operation, input_constraints) = match constraints.model_type.as_str() {
         "text-to-video" => (MediaOperation::TextToVideo, Vec::new()),
@@ -317,9 +328,41 @@ fn normalize_video(
         maximum_output_count: 1,
         controls,
         pricing: pricing_metadata(model.model_spec.pricing.as_ref()),
+        features,
         manifest_version: String::new(),
         fetched_at,
     })
+}
+
+fn model_features(spec: &ModelSpec) -> Vec<ModelFeature> {
+    let mut features = Vec::new();
+    let uncensored = spec.uncensored
+        || spec
+            .traits
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case("uncensored"))
+        || spec
+            .model_sets
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case("uncensored"));
+    if uncensored {
+        features.push(ModelFeature::Uncensored);
+    }
+    match spec
+        .privacy
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("anonymized" | "anonymised" | "anonymous" | "anon") => {
+            features.push(ModelFeature::Anon);
+        }
+        Some("private") => {
+            features.push(ModelFeature::Private);
+        }
+        _ => {}
+    }
+    features
 }
 
 fn parse_aspect_ratio(value: &str) -> Option<ControlValue> {
@@ -550,6 +593,7 @@ fn finish_manifest(mut model: MediaModel) -> Result<MediaModel, VeniceCatalogErr
         object.remove("display_name");
         object.remove("description");
         object.remove("pricing");
+        object.remove("features");
     }
     let bytes = serde_json::to_vec(&submit_relevant)?;
     let digest = Sha256::digest(bytes);

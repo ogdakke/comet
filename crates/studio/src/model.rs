@@ -277,6 +277,27 @@ impl PricingMetadata {
     }
 }
 
+/// Provider-advertised capability shown as a picker badge and filter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelFeature {
+    Uncensored,
+    Anon,
+    Private,
+}
+
+impl ModelFeature {
+    pub const ALL: [Self; 3] = [Self::Uncensored, Self::Anon, Self::Private];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Uncensored => "Uncensored",
+            Self::Anon => "Anon",
+            Self::Private => "Private",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MediaModel {
     pub provider_id: ProviderId,
@@ -292,6 +313,9 @@ pub struct MediaModel {
     pub maximum_output_count: u32,
     pub controls: Vec<ModelControl>,
     pub pricing: Option<PricingMetadata>,
+    /// Display-only badges. Excluded from [`Self::manifest_version`].
+    #[serde(default)]
+    pub features: Vec<ModelFeature>,
     /// Changes whenever submit-relevant constraints or controls change.
     /// Display copy and pricing are excluded so a catalog refresh does not
     /// invalidate an otherwise identical form.

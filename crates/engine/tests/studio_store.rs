@@ -69,6 +69,7 @@ fn image_model(provider_id: &str) -> MediaModel {
         maximum_output_count: 4,
         controls: Vec::new(),
         pricing: None,
+        features: Vec::new(),
         manifest_version: "fixture-v1".into(),
         fetched_at: chrono::Utc::now(),
     }

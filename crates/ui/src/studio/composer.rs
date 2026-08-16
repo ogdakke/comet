@@ -1,15 +1,56 @@
 //! Studio composer card: model picker, per-model controls, and submit.
 
+use std::collections::BTreeSet;
+
 use gpui::{
     AnyElement, Context, Focusable as _, KeyDownEvent, Point, SharedString, Window, div,
     prelude::*, px,
 };
+use zeron_studio::{MediaModel, ModelFeature, ModelId};
 
 use crate::popover;
 use crate::theme::Theme;
 
 use super::draft::{DraftRunConfig, boolean_control_chip, control_value_label, draft_aspect};
 use super::page::StudioPage;
+
+/// Catalog rows visible in the Studio model picker after favorites, feature
+/// filters, and search. Starred models stay floated to the top.
+fn visible_model_indices(
+    models: &[MediaModel],
+    query: &str,
+    favorites_only: bool,
+    favorites: &[ModelId],
+    filters: &BTreeSet<ModelFeature>,
+) -> Vec<usize> {
+    let is_favorite = |id: &ModelId| favorites.iter().any(|favorite| favorite == id);
+    let candidates = models
+        .iter()
+        .enumerate()
+        .filter(|(_, model)| {
+            if favorites_only && !is_favorite(&model.id) {
+                return false;
+            }
+            filters
+                .iter()
+                .all(|feature| model.features.contains(feature))
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let labels = candidates
+        .iter()
+        .map(|&index| models[index].display_name.as_str())
+        .collect::<Vec<_>>();
+    let mut ranked = popover::filter_indices(query, &labels);
+    ranked.sort_by_key(|&visible| {
+        let model_index = candidates[visible];
+        (!is_favorite(&models[model_index].id), visible)
+    });
+    ranked
+        .into_iter()
+        .map(|visible| candidates[visible])
+        .collect()
+}
 
 impl StudioPage {
     pub(super) fn close_model_picker(&mut self, cx: &mut Context<Self>) {
@@ -34,6 +75,8 @@ impl StudioPage {
             }
         });
         self.model_picker_active = None;
+        self.model_picker_favorites = false;
+        self.model_picker_filters.clear();
         self.model_picker_scroll.set_offset(Point::default());
         let search_focus = self.model_search.read(cx).focus_handle(cx);
         window.focus(&search_focus, cx);
@@ -41,13 +84,45 @@ impl StudioPage {
     }
 
     pub(super) fn filtered_model_indices(&self, cx: &gpui::App) -> Vec<usize> {
-        let query = self.model_search.read(cx).text();
-        let labels = self
-            .models
-            .iter()
-            .map(|model| model.display_name.as_str())
-            .collect::<Vec<_>>();
-        popover::filter_indices(query, &labels)
+        visible_model_indices(
+            &self.models,
+            self.model_search.read(cx).text(),
+            self.model_picker_favorites,
+            &self.remembered.favorites,
+            &self.model_picker_filters,
+        )
+    }
+
+    pub(super) fn toggle_model_favorite(&mut self, id: &ModelId, cx: &mut Context<Self>) {
+        self.remembered.toggle_favorite(id);
+        if let Some(dir) = self.state.read(cx).data_dir.clone()
+            && let Err(err) = self.remembered.save(&dir)
+        {
+            tracing::warn!(error = %err, "studio-defaults save failed");
+        }
+        let visible = self.filtered_model_indices(cx).len();
+        self.model_picker_active = self.model_picker_active.filter(|&active| active < visible);
+        cx.notify();
+    }
+
+    pub(super) fn show_favorite_models(&mut self, cx: &mut Context<Self>) {
+        self.model_picker_favorites = !self.model_picker_favorites;
+        self.model_picker_active = None;
+        self.model_picker_scroll.set_offset(Point::default());
+        cx.notify();
+    }
+
+    pub(super) fn toggle_model_feature_filter(
+        &mut self,
+        feature: ModelFeature,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.model_picker_filters.remove(&feature) {
+            self.model_picker_filters.insert(feature);
+        }
+        self.model_picker_active = None;
+        self.model_picker_scroll.set_offset(Point::default());
+        cx.notify();
     }
 
     pub(super) fn activate_model_picker_row(&mut self, cx: &mut Context<Self>) {
@@ -502,6 +577,8 @@ impl StudioPage {
             .collect::<Vec<_>>();
 
         let visible_model_indices = self.filtered_model_indices(cx);
+        let favorites_view = self.model_picker_favorites;
+        let searching = !self.model_search.read(cx).text().trim().is_empty();
         let picker_rows = visible_model_indices
             .iter()
             .map(|model_index| self.models[*model_index].clone())
@@ -509,12 +586,15 @@ impl StudioPage {
             .map(|(visible_index, model)| {
                 let selected = self.selected_models.contains(&model.id);
                 let active = self.model_picker_active == Some(visible_index);
+                let starred = self.remembered.is_favorite(&model.id);
                 let id = model.id.clone();
+                let star_id = model.id.clone();
+                let features = model.features.clone();
                 let mut row = div()
                     .id(SharedString::from(format!("studio-model-{}", id.as_str())))
-                    .h(px(40.0))
                     .flex_none()
                     .px(px(8.0))
+                    .py(px(6.0))
                     .flex()
                     .items_center()
                     .gap(px(8.0))
@@ -533,22 +613,69 @@ impl StudioPage {
                         page.persist_composer_defaults(cx);
                         cx.notify();
                     }))
-                    .child(
-                        div()
+                    .child({
+                        let mut copy = div()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
-                            .text_size(px(12.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .child(SharedString::from(model.display_name)),
-                    )
-                    .when(selected, |row| {
-                        row.child(
-                            crate::icons::icon(crate::icons::CHECK)
-                                .size(px(12.0))
-                                .text_color(theme.text_muted),
-                        )
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.0))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .truncate()
+                                    .text_size(px(12.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .child(SharedString::from(model.display_name)),
+                            );
+                        if !features.is_empty() {
+                            let mut badges = div().flex().items_center().gap(px(4.0));
+                            for feature in features {
+                                badges = badges.child(feature_badge(theme, feature));
+                            }
+                            copy = copy.child(badges);
+                        }
+                        copy
                     });
+                if selected {
+                    row = row.child(
+                        crate::icons::icon(crate::icons::CHECK)
+                            .size(px(12.0))
+                            .text_color(theme.text_muted),
+                    );
+                }
+                row = row.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "studio-model-star-{}",
+                            star_id.as_str()
+                        )))
+                        .flex_none()
+                        .size(px(22.0))
+                        .rounded(px(6.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(crate::theme::ink(0.08)))
+                        .on_click(cx.listener(move |page, _, _, cx| {
+                            cx.stop_propagation();
+                            page.toggle_model_favorite(&star_id, cx);
+                        }))
+                        .child(
+                            crate::icons::icon(if starred {
+                                crate::icons::STAR_BOLD
+                            } else {
+                                crate::icons::STAR
+                            })
+                            .size(px(13.0))
+                            .text_color(if starred {
+                                theme.warning
+                            } else {
+                                theme.text_muted.opacity(0.45)
+                            }),
+                        ),
+                );
                 if selected {
                     row = row
                         .bg(crate::theme::card_selected_bg())
@@ -564,6 +691,11 @@ impl StudioPage {
 
         let picker = self.model_picker.get().map(|_| {
             let empty = picker_rows.is_empty();
+            let empty_copy = if empty && favorites_view && !searching {
+                "No starred models yet — hit a row's star"
+            } else {
+                "No models found"
+            };
             let search_row = div()
                 .flex_none()
                 .h(px(46.0))
@@ -586,39 +718,123 @@ impl StudioPage {
                         .text_size(px(13.0))
                         .child(self.model_search.clone()),
                 );
+            let mut rail = div()
+                .w(px(112.0))
+                .flex_none()
+                .p(px(4.0))
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .child(
+                    filter_rail_row(
+                        "studio-model-rail-favorites",
+                        favorites_view,
+                        theme,
+                        |row| {
+                            row.child(
+                                crate::icons::icon(crate::icons::STAR_BOLD)
+                                    .size(px(13.0))
+                                    .text_color(if favorites_view {
+                                        theme.text
+                                    } else {
+                                        theme.text_muted.opacity(0.75)
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(if favorites_view {
+                                        theme.text
+                                    } else {
+                                        theme.text_muted
+                                    })
+                                    .child("Favorites"),
+                            )
+                        },
+                    )
+                    .on_click(cx.listener(|page, _, _, cx| page.show_favorite_models(cx))),
+                );
+            rail = rail.child(
+                div()
+                    .h(px(1.0))
+                    .mx(px(-4.0))
+                    .my(px(1.0))
+                    .bg(crate::theme::hairline(0.08)),
+            );
+            for feature in ModelFeature::ALL {
+                let selected = self.model_picker_filters.contains(&feature);
+                rail = rail.child(
+                    filter_rail_row(
+                        SharedString::from(format!("studio-model-rail-{}", feature.label())),
+                        selected,
+                        theme,
+                        |row| {
+                            row.child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(if selected {
+                                        theme.text
+                                    } else {
+                                        theme.text_muted
+                                    })
+                                    .child(feature.label()),
+                            )
+                        },
+                    )
+                    .on_click(cx.listener(move |page, _, _, cx| {
+                        page.toggle_model_feature_filter(feature, cx)
+                    })),
+                );
+            }
+            let list = div()
+                .id("studio-model-list")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .track_scroll(&self.model_picker_scroll)
+                .p(px(6.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .when(empty, |list| {
+                    list.child(
+                        div()
+                            .h(px(72.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .child(empty_copy),
+                    )
+                })
+                .children(picker_rows);
+            let pane = div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .bg(crate::theme::ink(0.02))
+                .border_l_1()
+                .border_color(crate::theme::hairline(0.07))
+                .child(search_row)
+                .child(list);
             let card = popover::popover_card_flush(theme)
                 .id("studio-model-picker")
-                .w(px(320.0))
+                .w(px(428.0))
+                .h(px(346.0))
                 .track_focus(&self.model_picker_focus)
                 .on_mouse_down_out(cx.listener(|page, _, _, cx| page.close_model_picker(cx)))
                 .on_key_down(cx.listener(|page, event: &KeyDownEvent, window, cx| {
                     page.on_model_picker_key_down(event, window, cx)
                 }))
-                .child(search_row)
-                .child(
-                    div()
-                        .id("studio-model-list")
-                        .max_h(px(300.0))
-                        .overflow_y_scroll()
-                        .track_scroll(&self.model_picker_scroll)
-                        .p(px(6.0))
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.0))
-                        .when(empty, |list| {
-                            list.child(
-                                div()
-                                    .h(px(72.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_size(px(12.0))
-                                    .text_color(theme.text_muted)
-                                    .child("No models found"),
-                            )
-                        })
-                        .children(picker_rows),
-                )
+                .flex()
+                .flex_row()
+                .items_stretch()
+                .child(rail)
+                .child(pane)
                 .into_any_element();
             popover::anchored_menu_above(
                 "studio-model-menu",
@@ -768,5 +984,148 @@ impl StudioPage {
             .justify_center()
             .child(crate::frost::frosted(26.0, 16.0, composer))
             .into_any_element()
+    }
+}
+
+fn feature_badge(theme: &Theme, feature: ModelFeature) -> gpui::Div {
+    div()
+        .flex_none()
+        .px(px(5.0))
+        .py(px(1.0))
+        .rounded(px(4.0))
+        .bg(crate::theme::wash(0.08))
+        .text_size(px(10.0))
+        .text_color(theme.text_muted)
+        .child(SharedString::from(feature.label()))
+}
+
+fn filter_rail_row(
+    id: impl Into<SharedString>,
+    selected: bool,
+    theme: &Theme,
+    decorate: impl FnOnce(gpui::Stateful<gpui::Div>) -> gpui::Stateful<gpui::Div>,
+) -> gpui::Stateful<gpui::Div> {
+    let mut row = div()
+        .id(id.into())
+        .relative()
+        .h(px(36.0))
+        .px(px(8.0))
+        .rounded(px(8.0))
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .cursor_pointer();
+    if selected {
+        row = row.bg(crate::theme::ink(0.06));
+    } else {
+        row = row.hover(|style| style.bg(crate::theme::ink(0.06)));
+    }
+    decorate(row).when(selected, |row| row.child(filter_rail_indicator(theme)))
+}
+
+fn filter_rail_indicator(theme: &Theme) -> gpui::Div {
+    let tint = match theme.appearance {
+        crate::theme::Appearance::Dark => crate::theme::oklch(0.702, 0.183, 293.541),
+        crate::theme::Appearance::Light => crate::theme::oklch(0.541, 0.281, 293.009),
+    };
+    div()
+        .absolute()
+        .right(px(-4.0))
+        .top(px(8.0))
+        .w(px(3.0))
+        .h(px(20.0))
+        .rounded_tl(px(3.0))
+        .rounded_bl(px(3.0))
+        .bg(tint)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn model(id: &str, name: &str, features: &[ModelFeature]) -> MediaModel {
+        MediaModel {
+            provider_id: "venice".into(),
+            id: id.into(),
+            display_name: name.into(),
+            description: None,
+            operation: zeron_studio::MediaOperation::TextToImage,
+            output_kind: zeron_studio::MediaKind::Image,
+            output_mime_types: vec!["image/png".into()],
+            input_constraints: Vec::new(),
+            prompt_maximum_chars: None,
+            negative_prompt_maximum_chars: None,
+            maximum_output_count: 1,
+            controls: Vec::new(),
+            pricing: None,
+            features: features.to_vec(),
+            manifest_version: "test".into(),
+            fetched_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn missing_features_deserialize_as_empty() {
+        let json = serde_json::json!({
+            "provider_id": "venice",
+            "id": "legacy",
+            "display_name": "Legacy",
+            "operation": "text_to_image",
+            "output_kind": "image",
+            "output_mime_types": ["image/png"],
+            "input_constraints": [],
+            "maximum_output_count": 1,
+            "controls": [],
+            "manifest_version": "old",
+            "fetched_at": "2026-01-01T00:00:00Z"
+        });
+        let model: MediaModel = serde_json::from_value(json).unwrap();
+        assert!(model.features.is_empty());
+    }
+
+    #[test]
+    fn picker_filters_and_favorites() {
+        let models = [
+            model(
+                "flux",
+                "Flux",
+                &[ModelFeature::Uncensored, ModelFeature::Private],
+            ),
+            model("gpt", "GPT Image", &[ModelFeature::Anon]),
+            model(
+                "seed",
+                "Seedream",
+                &[ModelFeature::Uncensored, ModelFeature::Anon],
+            ),
+        ];
+        let favorites = [ModelId::new("gpt")];
+
+        assert_eq!(
+            visible_model_indices(&models, "", false, &favorites, &BTreeSet::new()),
+            vec![1, 0, 2]
+        );
+        assert_eq!(
+            visible_model_indices(&models, "", true, &favorites, &BTreeSet::new()),
+            vec![1]
+        );
+
+        let uncensored = BTreeSet::from([ModelFeature::Uncensored]);
+        assert_eq!(
+            visible_model_indices(&models, "", false, &favorites, &uncensored),
+            vec![0, 2]
+        );
+
+        let uncensored_anon = BTreeSet::from([ModelFeature::Uncensored, ModelFeature::Anon]);
+        assert_eq!(
+            visible_model_indices(&models, "", false, &favorites, &uncensored_anon),
+            vec![2]
+        );
+
+        assert_eq!(
+            visible_model_indices(&models, "gpt", false, &favorites, &BTreeSet::new()),
+            vec![1]
+        );
+        assert!(visible_model_indices(&models, "gpt", false, &favorites, &uncensored).is_empty());
     }
 }

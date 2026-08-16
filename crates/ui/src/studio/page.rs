@@ -50,12 +50,16 @@ pub struct StudioPage {
     pub(super) model_picker_active: Option<usize>,
     pub(super) model_picker_scroll: gpui::ScrollHandle,
     pub(super) model_picker_focus: FocusHandle,
+    pub(super) model_picker_favorites: bool,
+    pub(super) model_picker_filters: BTreeSet<zeron_studio::ModelFeature>,
     pub(super) feed_scroll: gpui::ScrollHandle,
     pub(super) artifact_filmstrip_scroll: gpui::ScrollHandle,
     pub(super) scroll_after_turn_count: Option<usize>,
     pub(super) scroll_task: Option<Task<()>>,
     pub(super) rail_hover: Option<usize>,
     pub(super) source_turn: Option<zeron_studio::StudioTurnId>,
+    /// Turns whose prompt bubble is fully expanded past the 3-line clamp.
+    pub(super) expanded_prompts: HashSet<zeron_studio::StudioTurnId>,
     pub(super) images: HashMap<StudioArtifactId, Arc<Image>>,
     pub(super) loading_images: HashSet<StudioArtifactId>,
     pub(super) selected_artifact: Option<StudioArtifactId>,
@@ -130,12 +134,15 @@ impl StudioPage {
             model_picker_active: None,
             model_picker_scroll: gpui::ScrollHandle::new(),
             model_picker_focus: cx.focus_handle(),
+            model_picker_favorites: false,
+            model_picker_filters: BTreeSet::new(),
             feed_scroll: gpui::ScrollHandle::new(),
             artifact_filmstrip_scroll: gpui::ScrollHandle::new(),
             scroll_after_turn_count: None,
             scroll_task: None,
             rail_hover: None,
             source_turn: None,
+            expanded_prompts: HashSet::new(),
             images: HashMap::new(),
             loading_images: HashSet::new(),
             selected_artifact: None,
@@ -296,6 +303,7 @@ impl StudioPage {
         if self.selected_conversation != Some(id) {
             self.close_artifact(cx);
             self.composer_seeded_for = None;
+            self.expanded_prompts.clear();
         }
         self.selected_conversation = Some(id);
         self.conversation = None;
@@ -566,7 +574,11 @@ impl StudioPage {
 
     pub(super) fn persist_composer_defaults(&mut self, cx: &mut Context<Self>) {
         if let Some(dir) = self.state.read(cx).data_dir.clone() {
-            self.remembered = StudioDefaults::capture(&self.selected_models, &self.draft_runs);
+            self.remembered = StudioDefaults::capture(
+                &self.selected_models,
+                &self.draft_runs,
+                &self.remembered.favorites,
+            );
             if let Err(err) = self.remembered.save(&dir) {
                 tracing::warn!(error = %err, "studio-defaults save failed");
             }
@@ -636,6 +648,17 @@ impl StudioPage {
             })
             .ok();
         }));
+    }
+
+    pub(super) fn toggle_prompt_expanded(
+        &mut self,
+        turn_id: zeron_studio::StudioTurnId,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.expanded_prompts.remove(&turn_id) {
+            self.expanded_prompts.insert(turn_id);
+        }
+        cx.notify();
     }
 
     pub(super) fn use_prompt(&mut self, turn: &StudioTurnView, cx: &mut Context<Self>) {
@@ -920,30 +943,38 @@ impl Render for StudioPage {
                 24.0
             };
             let rail = self.render_studio_rail(window, &theme, cx);
+            // Top fade into the glass titlebar — same primitive as the chat
+            // transcript. Lightbox is a different branch and stays unfaded.
+            let feed = crate::edge_fade::edge_faded(
+                Theme::TRANSCRIPT_FADE_BAND,
+                true,
+                false,
+                div()
+                    .id("studio-feed-scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.feed_scroll)
+                    .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
+                    .when(has_turns, |feed| {
+                        feed.pt(px(Theme::TITLEBAR_HEIGHT + Theme::TRANSCRIPT_FADE_BAND))
+                            .pl(px(left_pad))
+                            .pr(px(24.0))
+                            .pb(px(STUDIO_COMPOSER_CLEARANCE))
+                            .flex()
+                            .flex_col()
+                            .gap(px(28.0))
+                    })
+                    .children(self.render_feed(window, &theme, show_rail, cx)),
+            )
+            .inset_top(Theme::TITLEBAR_HEIGHT)
+            .band_top(Theme::TRANSCRIPT_FADE_BAND);
             div()
                 .relative()
                 .flex_1()
                 .min_w_0()
                 .h_full()
                 .overflow_hidden()
-                .child(
-                    div()
-                        .id("studio-feed-scroll")
-                        .size_full()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.feed_scroll)
-                        .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
-                        .when(has_turns, |feed| {
-                            feed.pt(px(22.0))
-                                .pl(px(left_pad))
-                                .pr(px(24.0))
-                                .pb(px(STUDIO_COMPOSER_CLEARANCE))
-                                .flex()
-                                .flex_col()
-                                .gap(px(28.0))
-                        })
-                        .children(self.render_feed(window, &theme, show_rail, cx)),
-                )
+                .child(feed)
                 .child(rail)
                 .child(self.render_composer(&theme, cx))
                 .into_any_element()

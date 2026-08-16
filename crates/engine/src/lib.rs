@@ -332,6 +332,17 @@ impl EngineCore {
         self.workspace_scope
     }
 
+    /// Fetch each configured Studio provider's catalog in the background.
+    /// Does not block boot; a failed refresh leaves the on-disk cache in place.
+    fn prefetch_studio_catalogs(&self) {
+        let studio = self.studio.clone();
+        let providers = self.studio_providers.clone();
+        let credentials = self.studio_credentials.clone();
+        tokio::spawn(async move {
+            refresh_configured_studio_catalogs(&studio, &providers, &credentials).await;
+        });
+    }
+
     /// Attach the auth service (before building the RPC service / relays).
     pub fn set_auth(&self, auth: Auth) {
         *self
@@ -507,6 +518,64 @@ impl EngineCore {
         // Break the sessions ⇄ doc-host retain cycle so the replaced graph can
         // actually be freed once the last handle drops.
         self.sessions.clear_doc_host();
+    }
+}
+
+/// Live-fetch every configured Studio provider and replace the on-disk catalog.
+/// Used at process start so picker badges are not stuck on a pre-TTL snapshot.
+pub(crate) async fn refresh_configured_studio_catalogs(
+    studio: &studio::StudioStore,
+    providers: &studio::StudioProviderRegistry,
+    credentials: &StudioCredentials,
+) {
+    let connections = match credentials.list() {
+        Ok(connections) => connections,
+        Err(error) => {
+            tracing::warn!(error = %error, "studio catalog boot refresh skipped");
+            return;
+        }
+    };
+    for connection in connections {
+        let Ok(Some(provider)) = providers.get(&connection.provider_id) else {
+            continue;
+        };
+        let secret = match credentials.secret(&connection.provider_id).await {
+            Ok(secret) => secret,
+            Err(error) => {
+                tracing::warn!(
+                    provider = %connection.provider_id.as_str(),
+                    error = %error,
+                    "studio catalog boot refresh skipped"
+                );
+                continue;
+            }
+        };
+        match provider.list_models(&secret).await {
+            Ok(models) => {
+                if let Err(error) =
+                    studio.cache_models(&connection.provider_id, &models, studio::STUDIO_CATALOG_TTL)
+                {
+                    tracing::warn!(
+                        provider = %connection.provider_id.as_str(),
+                        error = %error,
+                        "studio catalog boot refresh failed"
+                    );
+                } else {
+                    tracing::info!(
+                        provider = %connection.provider_id.as_str(),
+                        models = models.len(),
+                        "refreshed studio catalog at boot"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    provider = %connection.provider_id.as_str(),
+                    error = %error,
+                    "studio catalog boot refresh failed"
+                );
+            }
+        }
     }
 }
 
@@ -782,6 +851,10 @@ impl Engine {
         // whose CLI is present but whose adapter isn't yet), so a first chat
         // never waits on — or dies inside — an npm run.
         zeron_harness::acp::prewarm_managed_adapters();
+        // Studio catalogs are cached for 6h so submit and the picker share a
+        // schema. Refresh once at process start so a new badge/filter field
+        // is not stuck behind that TTL.
+        core.prefetch_studio_catalogs();
 
         let host_relay = edge.as_ref().map(|edge| {
             let links = zeron_rpc::LinkCache::new(zeron_rpc::LinkCacheConfig::new(

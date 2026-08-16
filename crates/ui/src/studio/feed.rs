@@ -7,12 +7,13 @@ use gpui::{AnyElement, Context, ObjectFit, Point, SharedString, Window, div, img
 use zeron_proto::{StudioRunState, StudioRunView, StudioTurnView};
 use zeron_studio::StudioArtifactId;
 
+use crate::icons;
 use crate::motion;
 use crate::popover;
 use crate::rail;
 use crate::state::format_time_ago;
 use crate::theme::Theme;
-use crate::transcript::format_timestamp;
+use crate::transcript::{self, format_timestamp};
 
 use super::StudioEvent;
 use super::page::StudioPage;
@@ -24,6 +25,12 @@ pub(super) const STUDIO_COMPOSER_CLEARANCE: f32 = 256.0;
 /// Extra left inset so the tick rail (16px + 20px hover bar) does not cover
 /// the prompt header. Matches the chat transcript's wide-gutter band.
 pub(super) const STUDIO_RAIL_GUTTER: f32 = 28.0;
+/// Collapsed prompt bubble: three rows of chat-bubble type, then Show more.
+const PROMPT_COLLAPSED_LINES: usize = 3;
+const PROMPT_LINE_HEIGHT: f32 = 22.0;
+const PROMPT_BUBBLE_PAD_X: f32 = 16.0;
+/// Approximate Geist 14px Latin advance — wrap estimates without a layout pass.
+const PROMPT_AVG_CHAR_ADVANCE: f32 = 7.4;
 
 /// One feed-rail tick: a Studio turn's prompt, the models that ran it, and
 /// when it was sent.
@@ -97,6 +104,49 @@ pub fn grid_columns(content_width: f32) -> usize {
     } else {
         4
     }
+}
+
+/// Visual rows a prompt would occupy at `inner_width` (bubble minus padding).
+/// Newlines always take a row, including blank ones.
+fn prompt_visual_lines(prompt: &str, inner_width: f32) -> usize {
+    let cols = (inner_width / PROMPT_AVG_CHAR_ADVANCE).floor().max(1.0) as usize;
+    prompt
+        .split('\n')
+        .map(|line| {
+            let chars = line.chars().count();
+            if chars == 0 { 1 } else { chars.div_ceil(cols) }
+        })
+        .sum()
+}
+
+fn prompt_exceeds_collapsed_lines(prompt: &str, inner_width: f32) -> bool {
+    prompt_visual_lines(prompt, inner_width) > PROMPT_COLLAPSED_LINES
+}
+
+/// Quiet text action under a prompt bubble (`Use prompt`, `Show more`).
+fn turn_action(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    let id = id.into();
+    let fade = id.to_string();
+    div()
+        .id(id)
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .cursor_pointer()
+        .text_size(px(11.0))
+        .line_height(px(16.0))
+        .text_color(motion::hover_blend(
+            &fade,
+            theme.text_muted.opacity(0.7),
+            theme.text,
+        ))
+        .on_hover(motion::hover_listener(SharedString::from(fade)))
+        .child(label.into())
 }
 
 /// Tiles to paint for a run. In-flight and failed runs keep a slot for every
@@ -362,7 +412,9 @@ impl StudioPage {
         turns
             .iter()
             .enumerate()
-            .map(|(turn_ix, turn)| self.render_turn(turn_ix, turn, tile_width, gap, theme, cx))
+            .map(|(turn_ix, turn)| {
+                self.render_turn(turn_ix, turn, tile_width, gap, available, theme, cx)
+            })
             .collect()
     }
 
@@ -372,12 +424,21 @@ impl StudioPage {
         turn: &StudioTurnView,
         tile_width: f32,
         gap: f32,
+        content_width: f32,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let turn_for_prompt = turn.clone();
         let turn_for_again = turn.clone();
         let turn_for_fork = turn.clone();
+        let turn_id = turn.id;
+        let expanded = self.expanded_prompts.contains(&turn.id);
+        let bubble_width = content_width
+            .min(1600.0)
+            .min(transcript::MAX_CONTENT_WIDTH * 0.8);
+        let inner_width = (bubble_width - PROMPT_BUBBLE_PAD_X * 2.0).max(1.0);
+        let clampable = prompt_exceeds_collapsed_lines(&turn.prompt, inner_width);
+        let collapsed = clampable && !expanded;
         let mut grid = div().w_full().flex().flex_row().flex_wrap().gap(px(gap));
         for (run_ix, run) in turn.runs.iter().enumerate() {
             for (output_ix, artifact) in feed_output_slots(run) {
@@ -407,6 +468,32 @@ impl StudioPage {
                 )
             })
             .collect::<Vec<_>>();
+        let show_more = clampable.then(|| {
+            let more = !expanded;
+            let fade = format!("studio-toggle-prompt-{}", turn_id.0);
+            let chevron = if more {
+                icons::ALT_ARROW_DOWN
+            } else {
+                icons::ARROW_UP
+            };
+            turn_action(
+                fade.clone(),
+                if more { "Show more" } else { "Show less" },
+                theme,
+            )
+            .child(
+                icons::icon(chevron)
+                    .size(px(11.0))
+                    .text_color(motion::hover_blend(
+                        &fade,
+                        theme.text_muted.opacity(0.7),
+                        theme.text,
+                    )),
+            )
+            .on_click(cx.listener(move |page, _, _, cx| {
+                page.toggle_prompt_expanded(turn_id, cx);
+            }))
+        });
         div()
             .id(SharedString::from(format!("studio-turn-{turn_ix}")))
             .w_full()
@@ -414,85 +501,119 @@ impl StudioPage {
             .mx_auto()
             .flex()
             .flex_col()
-            .gap(px(10.0))
+            .gap(px(12.0))
             .child(
                 div()
+                    .w_full()
                     .flex()
-                    .items_center()
+                    .flex_col()
                     .gap(px(8.0))
                     .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(13.0))
-                            .text_color(theme.text_muted)
-                            .child(SharedString::from(turn.prompt.clone())),
-                    )
-                    .when_some(
-                        super::cost::turn_quote(&turn)
-                            .as_ref()
-                            .map(super::cost::format_quote),
-                        |row, cost| {
-                            row.child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(11.0))
-                                    .text_color(theme.text_muted)
-                                    .child(SharedString::from(cost)),
-                            )
-                        },
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("studio-use-prompt-{turn_ix}")))
-                            .cursor_pointer()
-                            .text_size(px(11.0))
-                            .text_color(theme.text_muted)
-                            .on_click(cx.listener(move |page, _, _, cx| {
-                                page.use_prompt(&turn_for_prompt, cx)
-                            }))
-                            .child("Use prompt"),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!(
-                                "studio-generate-again-{turn_ix}"
-                            )))
-                            .cursor_pointer()
-                            .text_size(px(11.0))
-                            .text_color(theme.text_muted)
-                            .on_click(cx.listener(move |page, _, _, cx| {
-                                page.generate_again(&turn_for_again, cx)
-                            }))
-                            .child("Generate again"),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("studio-fork-{turn_ix}")))
-                            .cursor_pointer()
-                            .text_size(px(11.0))
-                            .text_color(theme.text_muted)
-                            .on_click(
-                                cx.listener(move |page, _, _, cx| {
-                                    page.fork_from(&turn_for_fork, cx)
+                        // Agent-chat user bubble. Short prompts keep text as a
+                        // direct child so the plate hugs. Long prompts take an
+                        // explicit width and stack Show more inside — without
+                        // that width a flex column collapses to the button.
+                        div().w_full().flex().justify_end().child(
+                            div()
+                                .min_w_0()
+                                .max_w(px(transcript::MAX_CONTENT_WIDTH * 0.8))
+                                .when(clampable, |el| {
+                                    el.w(px(bubble_width)).flex().flex_col().gap(px(6.0))
+                                })
+                                .bg(crate::theme::user_bubble_bg())
+                                .rounded(px(Theme::BUBBLE_RADIUS))
+                                .px(px(PROMPT_BUBBLE_PAD_X))
+                                .py(px(10.0))
+                                .text_size(px(14.0))
+                                .line_height(px(PROMPT_LINE_HEIGHT))
+                                .text_color(theme.text)
+                                .when(!clampable, |el| {
+                                    el.child(SharedString::from(turn.prompt.clone()))
+                                })
+                                .when(clampable, |el| {
+                                    el.child(
+                                        div()
+                                            .w_full()
+                                            .when(collapsed, |box_| {
+                                                box_.max_h(px(PROMPT_LINE_HEIGHT
+                                                    * PROMPT_COLLAPSED_LINES as f32))
+                                                    .overflow_hidden()
+                                            })
+                                            .child(SharedString::from(turn.prompt.clone())),
+                                    )
+                                    .children(show_more)
                                 }),
-                            )
-                            .child("Fork"),
+                        ),
                     )
-                    .children(retry_runs.into_iter().map(|(run_id, retry_anyway)| {
+                    .child(
                         div()
-                            .id(SharedString::from(format!("studio-retry-{}", run_id.0)))
-                            .cursor_pointer()
-                            .text_size(px(11.0))
-                            .text_color(theme.danger)
-                            .on_click(cx.listener(move |page, _, _, cx| {
-                                page.retry(run_id, retry_anyway, cx)
-                            }))
-                            .child(if retry_anyway {
-                                "Retry anyway"
-                            } else {
-                                "Retry"
-                            })
-                    })),
+                            .w_full()
+                            .flex()
+                            .flex_wrap()
+                            .justify_end()
+                            .items_center()
+                            .gap(px(10.0))
+                            .when_some(
+                                super::cost::turn_quote(turn)
+                                    .as_ref()
+                                    .map(super::cost::format_quote),
+                                |row, cost| {
+                                    row.child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(px(11.0))
+                                            .text_color(theme.text_muted.opacity(0.7))
+                                            .child(SharedString::from(cost)),
+                                    )
+                                },
+                            )
+                            .child(
+                                turn_action(
+                                    format!("studio-use-prompt-{turn_ix}"),
+                                    "Use prompt",
+                                    theme,
+                                )
+                                .on_click(cx.listener(
+                                    move |page, _, _, cx| page.use_prompt(&turn_for_prompt, cx),
+                                )),
+                            )
+                            .child(
+                                turn_action(
+                                    format!("studio-generate-again-{turn_ix}"),
+                                    "Generate again",
+                                    theme,
+                                )
+                                .on_click(cx.listener(
+                                    move |page, _, _, cx| page.generate_again(&turn_for_again, cx),
+                                )),
+                            )
+                            .child(
+                                turn_action(format!("studio-fork-{turn_ix}"), "Fork", theme)
+                                    .on_click(cx.listener(move |page, _, _, cx| {
+                                        page.fork_from(&turn_for_fork, cx)
+                                    })),
+                            )
+                            .children(retry_runs.into_iter().map(|(run_id, retry_anyway)| {
+                                let fade = format!("studio-retry-{}", run_id.0);
+                                turn_action(
+                                    fade.clone(),
+                                    if retry_anyway {
+                                        "Retry anyway"
+                                    } else {
+                                        "Retry"
+                                    },
+                                    theme,
+                                )
+                                .text_color(motion::hover_blend(
+                                    &fade,
+                                    theme.danger.opacity(0.85),
+                                    theme.danger,
+                                ))
+                                .on_click(cx.listener(
+                                    move |page, _, _, cx| page.retry(run_id, retry_anyway, cx),
+                                ))
+                            })),
+                    ),
             )
             .child(grid)
             .into_any_element()
@@ -661,6 +782,7 @@ mod tests {
             maximum_output_count: 8,
             controls: Vec::new(),
             pricing: None,
+            features: Vec::new(),
             manifest_version: "test".into(),
             fetched_at: Utc::now(),
         }
@@ -735,6 +857,30 @@ mod tests {
         );
         assert_eq!(ticks[1].models, vec![("Flux".into(), 1)]);
         assert!(studio_rail_ticks(&[]).is_empty());
+    }
+
+    #[test]
+    fn prompt_clamp_counts_blank_and_wrapped_lines() {
+        // 80px inner ≈ 10 chars/line at the 7.4px advance.
+        let inner = 80.0;
+        assert_eq!(prompt_visual_lines("short", inner), 1);
+        assert!(!prompt_exceeds_collapsed_lines("short", inner));
+        assert!(!prompt_exceeds_collapsed_lines("one\ntwo\nthree", inner));
+        assert!(prompt_exceeds_collapsed_lines(
+            "one\ntwo\nthree\nfour",
+            inner
+        ));
+        assert!(prompt_exceeds_collapsed_lines("one\n\nthree\nfour", inner));
+        assert!(prompt_exceeds_collapsed_lines(
+            "this line is definitely longer than ten glyphs",
+            inner
+        ));
+        assert_eq!(prompt_visual_lines("abcdefghijabcdefghij", inner), 2);
+        assert_eq!(prompt_visual_lines("a\n\nb", inner), 3);
+        // A short studio prompt at the chat-bubble inner width stays one row.
+        let chat_inner = transcript::MAX_CONTENT_WIDTH * 0.8 - PROMPT_BUBBLE_PAD_X * 2.0;
+        assert!(!prompt_exceeds_collapsed_lines("cute dog", chat_inner));
+        assert_eq!(prompt_visual_lines("cute dog", chat_inner), 1);
     }
 
     #[test]

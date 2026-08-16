@@ -33,6 +33,7 @@ fn model() -> MediaModel {
             visible_when: Vec::new(),
         }],
         pricing: None,
+        features: Vec::new(),
         manifest_version: "fixture-v1".to_owned(),
         fetched_at: Utc::now(),
     }
