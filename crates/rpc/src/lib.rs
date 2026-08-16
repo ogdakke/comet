@@ -145,6 +145,7 @@ pub mod methods {
     pub const ARCHIVE_STUDIO_CONVERSATION: &str = "ArchiveStudioConversation";
     pub const WATCH_STUDIO_CONVERSATION: &str = "WatchStudioConversation";
     pub const CREATE_STUDIO_TURN: &str = "CreateStudioTurn";
+    pub const QUOTE_STUDIO_BATCH: &str = "QuoteStudioBatch";
     pub const RETRY_STUDIO_RUN: &str = "RetryStudioRun";
     pub const DELETE_STUDIO_ARTIFACT: &str = "DeleteStudioArtifact";
     pub const READ_STUDIO_ARTIFACT_CHUNK: &str = "ReadStudioArtifactChunk";

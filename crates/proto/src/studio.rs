@@ -6,7 +6,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use zeron_studio::{
     ControlId, ControlValue, GenerationInput, MediaKind, MediaModel, MediaOperation, ModelId,
-    ProviderId, StudioArtifactId, StudioBatchId, StudioConversationId, StudioRunId, StudioTurnId,
+    ProviderId, Quote, StudioArtifactId, StudioBatchId, StudioConversationId, StudioRunId,
+    StudioTurnId,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +153,30 @@ pub struct CreateStudioTurnRequest {
     pub source_turn_id: Option<StudioTurnId>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuoteStudioBatchRequest {
+    pub prompt: String,
+    pub runs: Vec<StudioModelRunSpec>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuoteStudioRunView {
+    pub provider_id: ProviderId,
+    pub model_id: ModelId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<Quote>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuoteStudioBatchResponse {
+    pub runs: Vec<QuoteStudioRunView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<Quote>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StudioRunState {
@@ -195,6 +220,8 @@ pub struct StudioRunView {
     pub state: StudioRunState,
     pub progress: Option<f32>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<Quote>,
     pub artifacts: Vec<StudioArtifactView>,
 }
 

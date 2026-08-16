@@ -17,8 +17,8 @@ use zeron_proto::{
 use zeron_rpc::{memory_client, methods};
 use zeron_studio::{
     ControlKind, ControlValue, FakeMediaProvider, FakeSubmissionMode, GenerationRequest, MediaKind,
-    MediaModel, MediaOperation, ModelControl, ProviderArtifact, ProviderError, ProviderErrorKind,
-    ProviderId, Secret, StudioArtifactId,
+    MediaModel, MediaOperation, ModelControl, PricingMetadata, PricingUnit, ProviderArtifact,
+    ProviderError, ProviderErrorKind, ProviderId, Quote, QuoteSource, Secret, StudioArtifactId,
 };
 
 #[derive(Default)]
@@ -74,6 +74,19 @@ fn image_model(provider_id: &str) -> MediaModel {
     }
 }
 
+fn priced_image_model(provider_id: &str, amount: f64) -> MediaModel {
+    let mut model = image_model(provider_id);
+    model.pricing = Some(PricingMetadata {
+        currency: "USD".into(),
+        unit: PricingUnit::PerOutput,
+        unit_label: String::new(),
+        amount: Some(amount),
+        entries: Vec::new(),
+        detail: None,
+    });
+    model
+}
+
 #[test]
 fn studio_catalog_is_profile_scoped_and_migrated() {
     let root = tempdir().unwrap();
@@ -102,6 +115,7 @@ fn restart_turns_interrupted_image_submissions_into_explicit_retry_states() {
     let conversation = store.create_conversation("Recovery", None).unwrap();
     let prepared = PreparedStudioRun {
         model: model.clone(),
+        quote: None,
         request: GenerationRequest {
             provider_id: model.provider_id.clone(),
             model_id: model.id.clone(),
@@ -139,6 +153,44 @@ fn restart_turns_interrupted_image_submissions_into_explicit_retry_states() {
     );
     assert!(reopened.prepare_retry(runs[0].run_id, false).is_err());
     assert!(reopened.prepare_retry(runs[0].run_id, true).is_ok());
+}
+
+#[test]
+fn create_turn_persists_catalog_cost() {
+    let root = tempdir().unwrap();
+    let model = priced_image_model("fake", 0.05);
+    let store = StudioStore::open(root.path(), 1024).unwrap();
+    let conversation = store.create_conversation("Costs", None).unwrap();
+    let prepared = PreparedStudioRun {
+        model: model.clone(),
+        quote: None,
+        request: GenerationRequest {
+            provider_id: model.provider_id.clone(),
+            model_id: model.id.clone(),
+            operation: model.operation,
+            prompt: "priced comet".into(),
+            negative_prompt: None,
+            output_count: 2,
+            controls: BTreeMap::new(),
+            inputs: Vec::new(),
+            manifest_version: model.manifest_version.clone(),
+            display_aspect_ratio: (1, 1),
+        },
+    };
+    store
+        .create_turn(
+            conversation.id,
+            "priced comet",
+            None,
+            &[prepared],
+            "device-a",
+        )
+        .unwrap();
+    let view = store.conversation_view(conversation.id).unwrap();
+    let quote = view.turns[0].runs[0].quote.clone().expect("catalog quote");
+    assert_eq!(quote.source, QuoteSource::Catalog);
+    assert_eq!(quote.currency, "USD");
+    assert!((quote.amount - 0.10).abs() < f64::EPSILON);
 }
 
 #[tokio::test]
@@ -895,6 +947,48 @@ async fn submit_uses_the_cached_catalog_instead_of_refetching() {
 }
 
 #[tokio::test]
+async fn quote_studio_batch_prefers_live_provider_quote() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(
+        FakeMediaProvider::new(
+            "fake",
+            vec![priced_image_model("fake", 0.05)],
+            FakeSubmissionMode::Complete(Vec::new()),
+        )
+        .with_quote(Quote::provider("USD", 0.99)),
+    );
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+    let quoted: zeron_proto::QuoteStudioBatchResponse = serde_json::from_value(
+        client
+            .call(
+                methods::QUOTE_STUDIO_BATCH,
+                serde_json::json!({
+                    "prompt": "a comet",
+                    "runs": [{
+                        "providerId": "fake",
+                        "modelId": "image-model",
+                        "operation": "text_to_image",
+                        "outputCount": 2,
+                        "controls": {},
+                        "inputs": [],
+                        "manifestVersion": "fixture-v1",
+                        "displayAspectRatio": [1, 1]
+                    }]
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let quote = quoted.runs[0].quote.clone().expect("live quote");
+    assert_eq!(quote.source, QuoteSource::Provider);
+    assert!((quote.amount - 0.99).abs() < f64::EPSILON);
+    let total = quoted.total.expect("batch total");
+    assert!((total.amount - 0.99).abs() < f64::EPSILON);
+    engine.shutdown().await;
+}
+
+#[tokio::test]
 async fn submit_silently_rebinds_a_compatible_request_to_the_current_catalog() {
     let root = tempdir().unwrap();
     let current = image_model_with_seed("fake", "current-v2", 10.0);
@@ -950,6 +1044,60 @@ async fn submit_silently_rebinds_a_compatible_request_to_the_current_catalog() {
         .unwrap();
     let request: serde_json::Value = serde_json::from_str(&request_json).unwrap();
     assert_eq!(request["manifest_version"], "current-v2");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn submit_drops_unknown_controls_replayed_from_a_previous_job() {
+    let root = tempdir().unwrap();
+    let current = image_model_with_seed("fake", "current-v2", 10.0);
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![current.clone()],
+        FakeSubmissionMode::Complete(Vec::new()),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+    engine
+        .studio
+        .cache_models(
+            &"fake".into(),
+            &[current],
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+
+    let conversation = create_conversation(&client).await;
+    let view: StudioConversationView = serde_json::from_value(
+        client
+            .call(
+                methods::CREATE_STUDIO_TURN,
+                serde_json::json!({
+                    "conversationId": conversation.id,
+                    "prompt": "a comet",
+                    "runs": [{
+                        "providerId": "fake",
+                        "modelId": "image-model",
+                        "operation": "text_to_image",
+                        "outputCount": 1,
+                        "controls": {
+                            "seed": { "type": "integer", "value": 4 },
+                            "safe_mode": { "type": "boolean", "value": false }
+                        },
+                        "inputs": [],
+                        "manifestVersion": "old-picker-version",
+                        "displayAspectRatio": [1, 1]
+                    }]
+                }),
+            )
+            .await
+            .expect("reused safe_mode must not fail bind against a catalog that lacks it"),
+    )
+    .unwrap();
+    assert!(
+        !view.turns[0].runs[0]
+            .controls
+            .contains_key(&zeron_studio::ControlId::from("safe_mode"))
+    );
     engine.shutdown().await;
 }
 

@@ -62,8 +62,9 @@ use zeron_proto::{
     CreateStudioTurnRequest, DeleteStudioArtifactRequest, EngineInfo, HarnessId,
     ListStudioConversationsRequest, ListStudioConversationsResponse, ListStudioModelsRequest,
     ListStudioModelsResponse, ListStudioProvidersResponse, ProviderValidationState,
+    QuoteStudioBatchRequest, QuoteStudioBatchResponse, QuoteStudioRunView,
     ReadStudioArtifactChunkRequest, RenameStudioConversationRequest, RetryStudioRunRequest,
-    SetStudioProviderCredentialRequest, SetStudioProviderPreferencesRequest,
+    SetStudioProviderCredentialRequest, SetStudioProviderPreferencesRequest, StudioModelRunSpec,
     StudioProviderConnection, StudioProviderRequest, ToolCall, WatchStudioConversationRequest,
     WorkspaceScope,
 };
@@ -518,6 +519,93 @@ impl EngineRpc {
                 })
                 .ok_or_else(|| RpcError::Failed(error.to_string())),
         }
+    }
+
+    async fn prepare_studio_runs(
+        &self,
+        prompt: &str,
+        specs: Vec<StudioModelRunSpec>,
+        submit: bool,
+    ) -> Result<Vec<PreparedStudioRun>, RpcError> {
+        let mut catalogs =
+            std::collections::BTreeMap::<zeron_studio::ProviderId, ListStudioModelsResponse>::new();
+        let mut prepared = Vec::with_capacity(specs.len());
+        for spec in specs {
+            if submit && !matches!(spec.operation, zeron_studio::MediaOperation::TextToImage) {
+                return Err(RpcError::Failed(
+                    "only text-to-image runs are available in the current Studio slice".into(),
+                ));
+            }
+            let catalog = match catalogs.get(&spec.provider_id) {
+                Some(catalog) => catalog.clone(),
+                None => {
+                    let catalog = self.studio_catalog(&spec.provider_id, false).await?;
+                    catalogs.insert(spec.provider_id.clone(), catalog.clone());
+                    catalog
+                }
+            };
+            let mut model = catalog
+                .models
+                .iter()
+                .find(|model| model.id == spec.model_id)
+                .cloned();
+            if model.is_none() {
+                let catalog = self.studio_catalog(&spec.provider_id, true).await?;
+                catalogs.insert(spec.provider_id.clone(), catalog.clone());
+                model = catalog
+                    .models
+                    .into_iter()
+                    .find(|model| model.id == spec.model_id);
+            }
+            let model =
+                model.ok_or_else(|| RpcError::Failed("studio model is unavailable".into()))?;
+            let mut generation = zeron_studio::GenerationRequest {
+                provider_id: spec.provider_id,
+                model_id: spec.model_id,
+                operation: spec.operation,
+                prompt: prompt.to_owned(),
+                negative_prompt: None,
+                output_count: spec.output_count,
+                controls: spec.controls,
+                inputs: spec.inputs,
+                manifest_version: spec.manifest_version,
+                display_aspect_ratio: spec.display_aspect_ratio,
+            };
+            generation.drop_unknown_controls(&model);
+            generation
+                .bind_to(&model)
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+            if submit
+                && let Some(safe_mode) =
+                    venice_safe_mode_to_persist(&generation, &model, &self.studio_credentials)?
+            {
+                generation.controls.insert(
+                    zeron_studio::ControlId::from("safe_mode"),
+                    zeron_studio::ControlValue::Boolean { value: safe_mode },
+                );
+            }
+            let quote = self.resolve_studio_quote(&generation, &model).await;
+            prepared.push(PreparedStudioRun {
+                model,
+                request: generation,
+                quote,
+            });
+        }
+        Ok(prepared)
+    }
+
+    async fn resolve_studio_quote(
+        &self,
+        request: &zeron_studio::GenerationRequest,
+        model: &zeron_studio::MediaModel,
+    ) -> Option<zeron_studio::Quote> {
+        if let Ok(Some(provider)) = self.studio_providers.get(&request.provider_id)
+            && let Ok(secret) = self.studio_credentials.secret(&request.provider_id).await
+            && let Ok(Some(quote)) = provider.quote(&secret, request).await
+        {
+            return Some(quote);
+        }
+        model.estimate_cost(&request.controls, request.output_count)
     }
 
     fn local_importer(&self) -> Result<&crate::local_import::LocalImporter, RpcError> {
@@ -1248,76 +1336,31 @@ impl RpcService for EngineRpc {
                 );
                 Ok(RpcReply::Stream(stream.boxed()))
             }
+            methods::QUOTE_STUDIO_BATCH => {
+                let request: QuoteStudioBatchRequest = parse_params(params)?;
+                let prepared = self
+                    .prepare_studio_runs(&request.prompt, request.runs, false)
+                    .await?;
+                let runs = prepared
+                    .into_iter()
+                    .map(|run| QuoteStudioRunView {
+                        provider_id: run.request.provider_id,
+                        model_id: run.request.model_id,
+                        quote: run.quote,
+                    })
+                    .collect::<Vec<_>>();
+                let total = runs
+                    .iter()
+                    .map(|run| run.quote.clone())
+                    .collect::<Option<Vec<_>>>()
+                    .and_then(|quotes| zeron_studio::Quote::total(quotes));
+                RpcReply::value(&QuoteStudioBatchResponse { runs, total })
+            }
             methods::CREATE_STUDIO_TURN => {
                 let request: CreateStudioTurnRequest = parse_params(params)?;
-                let mut catalogs = std::collections::BTreeMap::<
-                    zeron_studio::ProviderId,
-                    ListStudioModelsResponse,
-                >::new();
-                let mut prepared = Vec::with_capacity(request.runs.len());
-                for spec in request.runs {
-                    if !matches!(spec.operation, zeron_studio::MediaOperation::TextToImage) {
-                        return Err(RpcError::Failed(
-                            "only text-to-image runs are available in the current Studio slice"
-                                .into(),
-                        ));
-                    }
-                    let catalog = match catalogs.get(&spec.provider_id) {
-                        Some(catalog) => catalog.clone(),
-                        None => {
-                            let catalog = self.studio_catalog(&spec.provider_id, false).await?;
-                            catalogs.insert(spec.provider_id.clone(), catalog.clone());
-                            catalog
-                        }
-                    };
-                    let mut model = catalog
-                        .models
-                        .iter()
-                        .find(|model| model.id == spec.model_id)
-                        .cloned();
-                    if model.is_none() {
-                        let catalog = self.studio_catalog(&spec.provider_id, true).await?;
-                        catalogs.insert(spec.provider_id.clone(), catalog.clone());
-                        model = catalog
-                            .models
-                            .into_iter()
-                            .find(|model| model.id == spec.model_id);
-                    }
-                    let model = model
-                        .ok_or_else(|| RpcError::Failed("studio model is unavailable".into()))?;
-                    let mut generation = zeron_studio::GenerationRequest {
-                        provider_id: spec.provider_id,
-                        model_id: spec.model_id,
-                        operation: spec.operation,
-                        prompt: request.prompt.clone(),
-                        negative_prompt: None,
-                        output_count: spec.output_count,
-                        controls: spec.controls,
-                        inputs: spec.inputs,
-                        manifest_version: spec.manifest_version,
-                        display_aspect_ratio: spec.display_aspect_ratio,
-                    };
-                    generation
-                        .bind_to(&model)
-                        .map_err(|error| RpcError::Failed(error.to_string()))?;
-                    if generation.provider_id.as_str() == zeron_studio::venice::VENICE_PROVIDER_ID
-                        && let Some(connection) = self
-                            .studio_credentials
-                            .connection(&generation.provider_id)
-                            .map_err(|error| RpcError::Failed(error.to_string()))?
-                    {
-                        generation.controls.insert(
-                            zeron_studio::ControlId::from("safe_mode"),
-                            zeron_studio::ControlValue::Boolean {
-                                value: connection.safe_mode,
-                            },
-                        );
-                    }
-                    prepared.push(PreparedStudioRun {
-                        model,
-                        request: generation,
-                    });
-                }
+                let prepared = self
+                    .prepare_studio_runs(&request.prompt, request.runs, true)
+                    .await?;
                 let stored = self
                     .studio
                     .create_turn(
@@ -2084,6 +2127,43 @@ fn studio_provider_label(provider_id: &zeron_studio::ProviderId) -> String {
     }
 }
 
+fn venice_safe_mode_to_persist(
+    request: &zeron_studio::GenerationRequest,
+    model: &zeron_studio::MediaModel,
+    credentials: &StudioCredentials,
+) -> Result<Option<bool>, RpcError> {
+    if request.provider_id.as_str() != zeron_studio::venice::VENICE_PROVIDER_ID
+        || !model
+            .controls
+            .iter()
+            .any(|control| control.id.as_str() == "safe_mode")
+    {
+        return Ok(None);
+    }
+    Ok(credentials
+        .connection(&request.provider_id)
+        .map_err(|error| RpcError::Failed(error.to_string()))?
+        .map(|connection| connection.safe_mode))
+}
+
+fn apply_venice_safe_mode_for_submit(
+    credentials: &StudioCredentials,
+    mut request: zeron_studio::GenerationRequest,
+) -> zeron_studio::GenerationRequest {
+    if request.provider_id.as_str() != zeron_studio::venice::VENICE_PROVIDER_ID {
+        return request;
+    }
+    if let Ok(Some(connection)) = credentials.connection(&request.provider_id) {
+        request.controls.insert(
+            zeron_studio::ControlId::from("safe_mode"),
+            zeron_studio::ControlValue::Boolean {
+                value: connection.safe_mode,
+            },
+        );
+    }
+    request
+}
+
 async fn execute_studio_run(
     store: std::sync::Arc<StudioStore>,
     providers: std::sync::Arc<StudioProviderRegistry>,
@@ -2116,7 +2196,8 @@ async fn execute_studio_run(
         idempotency_key: run.idempotency_key.clone(),
         inputs: Vec::new(),
     };
-    match provider.submit(&secret, &run.request, &context).await {
+    let request = apply_venice_safe_mode_for_submit(&credentials, run.request.clone());
+    match provider.submit(&secret, &request, &context).await {
         Ok(zeron_studio::Submission::Completed { artifacts }) => {
             if let Err(error) = store.complete_run(&run, &artifacts) {
                 let message = error.to_string();

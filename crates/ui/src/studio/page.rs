@@ -10,7 +10,8 @@ use gpui::{
 };
 use zeron_proto::{
     ListStudioConversationsResponse, ListStudioModelsResponse, ListStudioProvidersResponse,
-    StudioConversationSummary, StudioConversationView, StudioProviderConnection, StudioTurnView,
+    QuoteStudioBatchResponse, StudioConversationSummary, StudioConversationView,
+    StudioProviderConnection, StudioTurnView,
 };
 use zeron_rpc::methods;
 use zeron_studio::{StudioArtifactId, StudioConversationId};
@@ -37,6 +38,9 @@ pub struct StudioPage {
     pub(super) selected_models: BTreeSet<zeron_studio::ModelId>,
     pub(super) draft_runs: HashMap<zeron_studio::ModelId, DraftRunConfig>,
     pub(super) remembered: StudioDefaults,
+    pub(super) live_quotes: HashMap<zeron_studio::ModelId, zeron_studio::Quote>,
+    pub(super) quote_generation: u64,
+    pub(super) quote_task: Option<Task<()>>,
     pub(super) composer_seeded_for: Option<StudioConversationId>,
     pub(super) selected_conversation: Option<StudioConversationId>,
     pub(super) conversation: Option<StudioConversationView>,
@@ -114,6 +118,9 @@ impl StudioPage {
             selected_models: BTreeSet::new(),
             draft_runs: HashMap::new(),
             remembered,
+            live_quotes: HashMap::new(),
+            quote_generation: 0,
+            quote_task: None,
             composer_seeded_for: None,
             selected_conversation: None,
             conversation: None,
@@ -211,6 +218,7 @@ impl StudioPage {
                             .unwrap_or_default();
                         page.apply_models(models.models);
                         page.apply_remembered_or_default_models();
+                        page.persist_composer_defaults(cx);
                         if page.selected_conversation.is_none()
                             && let Some(conversation) = page.conversations.first()
                         {
@@ -507,14 +515,78 @@ impl StudioPage {
         self.persist_composer_defaults(cx);
     }
 
-    pub(super) fn persist_composer_defaults(&mut self, cx: &Context<Self>) {
-        let Some(dir) = self.state.read(cx).data_dir.clone() else {
+    pub(super) fn persist_composer_defaults(&mut self, cx: &mut Context<Self>) {
+        if let Some(dir) = self.state.read(cx).data_dir.clone() {
+            self.remembered = StudioDefaults::capture(&self.selected_models, &self.draft_runs);
+            if let Err(err) = self.remembered.save(&dir) {
+                tracing::warn!(error = %err, "studio-defaults save failed");
+            }
+        }
+        self.refresh_draft_quotes(cx);
+    }
+
+    pub(super) fn refresh_draft_quotes(&mut self, cx: &mut Context<Self>) {
+        self.live_quotes
+            .retain(|id, _| self.selected_models.contains(id));
+        if !super::cost::needs_live_quote(&self.models, &self.selected_models, &self.draft_runs) {
+            self.quote_task = None;
+            return;
+        }
+        let Some(engine) = self.engine(cx) else {
             return;
         };
-        self.remembered = StudioDefaults::capture(&self.selected_models, &self.draft_runs);
-        if let Err(err) = self.remembered.save(&dir) {
-            tracing::warn!(error = %err, "studio-defaults save failed");
+        let prompt = self.prompt.read(cx).text().to_owned();
+        let runs = self
+            .models
+            .iter()
+            .filter(|model| self.selected_models.contains(&model.id))
+            .map(|model| {
+                let draft = self
+                    .draft_runs
+                    .get(&model.id)
+                    .cloned()
+                    .unwrap_or_else(|| DraftRunConfig::from_model(model));
+                serde_json::json!({
+                    "providerId": model.provider_id, "modelId": model.id,
+                    "operation": model.operation, "outputCount": draft.output_count, "controls": draft.controls,
+                    "inputs": [], "manifestVersion": model.manifest_version,
+                    "displayAspectRatio": draft_aspect(model, &draft),
+                })
+            })
+            .collect::<Vec<_>>();
+        if runs.is_empty() {
+            return;
         }
+        self.quote_generation = self.quote_generation.saturating_add(1);
+        let generation = self.quote_generation;
+        self.quote_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(250))
+                .await;
+            let result = engine
+                .client()
+                .call(
+                    methods::QUOTE_STUDIO_BATCH,
+                    serde_json::json!({ "prompt": prompt, "runs": runs }),
+                )
+                .await;
+            this.update(cx, |page, cx| {
+                if page.quote_generation != generation {
+                    return;
+                }
+                if let Ok(value) = result
+                    && let Ok(response) = serde_json::from_value::<QuoteStudioBatchResponse>(value)
+                {
+                    page.live_quotes = response
+                        .runs
+                        .into_iter()
+                        .filter_map(|run| run.quote.map(|quote| (run.model_id, quote)))
+                        .collect();
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     pub(super) fn use_prompt(&mut self, turn: &StudioTurnView, cx: &mut Context<Self>) {

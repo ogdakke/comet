@@ -9,7 +9,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     ControlChoice, ControlId, ControlKind, ControlValue, InputConstraint, InputRole, MediaKind,
-    MediaModel, MediaOperation, MimeConstraint, ModelControl, ModelId, PricingMetadata, ProviderId,
+    MediaModel, MediaOperation, MimeConstraint, ModelControl, ModelId, PricingEntry,
+    PricingMetadata, PricingUnit, ProviderId,
 };
 
 pub const VENICE_PROVIDER_ID: &str = "venice";
@@ -321,41 +322,44 @@ fn normalize_video(
     })
 }
 
-fn parse_aspect_ratio(value: &str) -> Option<(u32, u32)> {
+fn parse_aspect_ratio(value: &str) -> Option<ControlValue> {
     let value = value.trim();
-    // Venice uses `auto` to mean "omit aspect_ratio and let the model decide".
     if value.eq_ignore_ascii_case("auto") {
-        return None;
+        return Some(ControlValue::AspectRatioAuto);
     }
     let (width, height) = value.split_once(':')?;
     let width = width.parse().ok()?;
     let height = height.parse().ok()?;
-    (width > 0 && height > 0).then_some((width, height))
+    (width > 0 && height > 0).then_some(ControlValue::AspectRatio { width, height })
+}
+
+fn aspect_ratio_label(value: &str, parsed: &ControlValue) -> String {
+    match parsed {
+        ControlValue::AspectRatioAuto => "Auto".to_owned(),
+        _ => value.to_owned(),
+    }
 }
 
 fn aspect_ratio_control(values: &[String], default: Option<&str>) -> Option<ModelControl> {
     let choices = values
         .iter()
         .filter_map(|value| {
-            let (width, height) = parse_aspect_ratio(value)?;
+            let parsed = parse_aspect_ratio(value)?;
             Some(ControlChoice {
-                value: ControlValue::AspectRatio { width, height },
-                label: value.clone(),
+                label: aspect_ratio_label(value, &parsed),
+                value: parsed,
             })
         })
         .collect::<Vec<_>>();
     if choices.is_empty() {
         return None;
     }
-    let default = default
-        .and_then(parse_aspect_ratio)
-        .and_then(|parsed| {
-            choices.iter().find(|choice| match choice.value {
-                ControlValue::AspectRatio { width, height } => (width, height) == parsed,
-                _ => false,
-            })
-        })
-        .map(|choice| choice.value.clone());
+    let default = default.and_then(parse_aspect_ratio).and_then(|parsed| {
+        choices
+            .iter()
+            .find(|choice| choice.value == parsed)
+            .map(|choice| choice.value.clone())
+    });
     Some(ModelControl {
         id: ControlId::from("aspect_ratio"),
         label: "Aspect ratio".to_owned(),
@@ -460,15 +464,80 @@ fn input_constraint(role: &'static str, mime_types: &[&str]) -> InputConstraint 
 }
 
 fn pricing_metadata(pricing: Option<&serde_json::Value>) -> Option<PricingMetadata> {
-    pricing.map(|_| PricingMetadata {
+    let pricing = pricing?;
+    let mut entries = Vec::new();
+    if let Some(quality) = pricing.get("quality").and_then(|value| value.as_object()) {
+        for (resolution, levels) in quality {
+            let Some(levels) = levels.as_object() else {
+                continue;
+            };
+            for (quality, price) in levels {
+                if let Some(amount) = usd_amount(price) {
+                    entries.push(PricingEntry {
+                        when: [
+                            (
+                                ControlId::from("resolution"),
+                                ControlValue::Resolution {
+                                    value: resolution.clone(),
+                                },
+                            ),
+                            (
+                                ControlId::from("quality"),
+                                ControlValue::Enum {
+                                    value: quality.clone(),
+                                },
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                        amount,
+                    });
+                }
+            }
+        }
+    }
+    if let Some(resolutions) = pricing
+        .get("resolutions")
+        .and_then(|value| value.as_object())
+    {
+        for (resolution, price) in resolutions {
+            if let Some(amount) = usd_amount(price) {
+                entries.push(PricingEntry {
+                    when: [(
+                        ControlId::from("resolution"),
+                        ControlValue::Resolution {
+                            value: resolution.clone(),
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                    amount,
+                });
+            }
+        }
+    }
+    let amount = pricing
+        .get("generation")
+        .and_then(usd_amount)
+        .or_else(|| usd_amount(pricing));
+    if entries.is_empty() && amount.is_none() {
+        return None;
+    }
+    Some(PricingMetadata {
         currency: "USD".to_owned(),
-        unit_label: "provider-defined generation".to_owned(),
-        amount: None,
-        detail: Some(
-            "Price varies with the selected model controls; request a quote when supported"
-                .to_owned(),
-        ),
+        unit: PricingUnit::PerOutput,
+        unit_label: String::new(),
+        amount: if entries.is_empty() { amount } else { None },
+        entries,
+        detail: None,
     })
+}
+
+fn usd_amount(value: &serde_json::Value) -> Option<f64> {
+    value
+        .get("usd")
+        .and_then(|value| value.as_f64())
+        .filter(|amount| amount.is_finite() && *amount >= 0.0)
 }
 
 /// Hash the schema a request must satisfy. Display copy, pricing, and fetch

@@ -1,9 +1,9 @@
 use zeron_proto::{
-    ListStudioProvidersResponse, ProviderValidationState, ReadStudioArtifactChunkRequest,
-    SetStudioProviderCredentialRequest, SetStudioProviderPreferencesRequest,
-    StudioProviderConnection,
+    ListStudioProvidersResponse, ProviderValidationState, QuoteStudioBatchResponse,
+    QuoteStudioRunView, ReadStudioArtifactChunkRequest, SetStudioProviderCredentialRequest,
+    SetStudioProviderPreferencesRequest, StudioProviderConnection,
 };
-use zeron_studio::StudioArtifactId;
+use zeron_studio::{Quote, StudioArtifactId};
 
 #[test]
 fn provider_responses_have_no_secret_field() {
@@ -58,4 +58,24 @@ fn artifact_reads_are_authorized_by_id_not_path() {
         Some(42)
     );
     assert!(value.get("path").is_none());
+}
+
+#[test]
+fn quote_batch_uses_camel_case_wire_shape() {
+    let response = QuoteStudioBatchResponse {
+        runs: vec![QuoteStudioRunView {
+            provider_id: "venice".into(),
+            model_id: "gpt-image-2".into(),
+            quote: Some(Quote::catalog("USD", 0.26)),
+        }],
+        total: Some(Quote::catalog("USD", 0.26)),
+    };
+    let json = serde_json::to_value(response).unwrap();
+    assert_eq!(json["runs"][0]["providerId"], "venice");
+    assert_eq!(json["runs"][0]["modelId"], "gpt-image-2");
+    assert_eq!(json["runs"][0]["quote"]["amount"], 0.26);
+    assert_eq!(json["runs"][0]["quote"]["source"], "catalog");
+    assert_eq!(json["total"]["currency"], "USD");
+    assert!(json["runs"][0]["quote"].get("expires_at").is_none());
+    assert!(json["runs"][0]["quote"].get("expiresAt").is_some());
 }

@@ -1,5 +1,10 @@
+use std::collections::BTreeMap;
+
 use chrono::{TimeZone, Utc};
-use zeron_studio::{ControlId, ControlKind, MediaOperation, venice::normalize_model_catalog};
+use zeron_studio::{
+    ControlId, ControlKind, ControlValue, MediaOperation, PricingUnit, QuoteSource,
+    venice::normalize_model_catalog,
+};
 
 const IMAGE: &[u8] = include_bytes!("fixtures/venice/image-model.json");
 const TEXT_TO_VIDEO: &[u8] = include_bytes!("fixtures/venice/text-to-video-model.json");
@@ -68,7 +73,7 @@ fn operation_and_controls_do_not_depend_on_model_name() {
 }
 
 #[test]
-fn auto_aspect_ratio_keeps_the_catalog_usable_and_omits_a_default_override() {
+fn auto_aspect_ratio_is_a_first_class_choice() {
     let mut fixture: serde_json::Value = serde_json::from_slice(IMAGE).unwrap();
     fixture["data"][0]["model_spec"]["constraints"]["aspectRatios"] =
         serde_json::json!(["auto", "1:1", "16:9"]);
@@ -83,8 +88,40 @@ fn auto_aspect_ratio_keeps_the_catalog_usable_and_omits_a_default_override() {
         .iter()
         .find(|control| control.id == ControlId::from("aspect_ratio"))
         .unwrap();
-    assert_eq!(aspect.choices.len(), 2);
-    assert!(aspect.default.is_none());
+    assert_eq!(aspect.choices.len(), 3);
+    assert_eq!(
+        aspect.choices[0].value,
+        zeron_studio::ControlValue::AspectRatioAuto
+    );
+    assert_eq!(aspect.choices[0].label, "Auto");
+    assert_eq!(
+        aspect.default,
+        Some(zeron_studio::ControlValue::AspectRatioAuto)
+    );
+}
+
+#[test]
+fn auto_only_aspect_ratio_keeps_the_model() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(IMAGE).unwrap();
+    fixture["data"][0]["id"] = "flux-2-max".into();
+    fixture["data"][0]["model_spec"]["constraints"]["aspectRatios"] = serde_json::json!(["auto"]);
+    fixture["data"][0]["model_spec"]["constraints"]["defaultAspectRatio"] =
+        serde_json::json!("auto");
+
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(model.id.as_str(), "flux-2-max");
+    let aspect = model
+        .controls
+        .iter()
+        .find(|control| control.id == ControlId::from("aspect_ratio"))
+        .unwrap();
+    assert_eq!(aspect.choices.len(), 1);
+    assert_eq!(
+        aspect.default,
+        Some(zeron_studio::ControlValue::AspectRatioAuto)
+    );
 }
 
 #[test]
@@ -92,22 +129,14 @@ fn one_unusable_model_does_not_fail_the_catalog() {
     let mut fixture: serde_json::Value = serde_json::from_slice(IMAGE).unwrap();
     let good = fixture["data"][0].clone();
     let mut broken = good.clone();
-    broken["id"] = "flux-2-max".into();
-    broken["model_spec"]["constraints"]["aspectRatios"] = serde_json::json!(["auto"]);
-    broken["model_spec"]["constraints"]["defaultAspectRatio"] = serde_json::json!("auto");
+    broken["id"] = "broken-model".into();
+    broken["model_spec"]["constraints"]["steps"] = serde_json::json!("nope");
     fixture["data"] = serde_json::json!([broken, good]);
 
     let models =
         normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at()).unwrap();
-    assert_eq!(models.len(), 2);
-    assert_eq!(models[0].id.as_str(), "flux-2-max");
-    assert!(
-        models[0]
-            .controls
-            .iter()
-            .all(|control| control.id.as_str() != "aspect_ratio")
-    );
-    assert_eq!(models[1].id.as_str(), "gpt-image-2");
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].id.as_str(), "gpt-image-2");
 }
 
 #[test]
@@ -155,6 +184,164 @@ fn manifest_version_ignores_display_copy_but_tracks_constraints() {
         .unwrap()
         .remove(0);
     assert_ne!(first.manifest_version, changed.manifest_version);
+}
+
+#[test]
+fn catalog_quality_matrix_estimates_the_selected_tier() {
+    let model = normalize_model_catalog(IMAGE, fetched_at())
+        .unwrap()
+        .remove(0);
+    let pricing = model.pricing.as_ref().expect("fixture advertises pricing");
+    assert_eq!(pricing.currency, "USD");
+    assert_eq!(pricing.unit, PricingUnit::PerOutput);
+    assert!(pricing.amount.is_none());
+    assert!(
+        pricing
+            .entries
+            .iter()
+            .any(|entry| entry.when.len() == 2 && (entry.amount - 0.26).abs() < f64::EPSILON)
+    );
+
+    let high = model
+        .estimate_cost(
+            &BTreeMap::from([
+                (
+                    ControlId::from("resolution"),
+                    ControlValue::Resolution { value: "1K".into() },
+                ),
+                (
+                    ControlId::from("quality"),
+                    ControlValue::Enum {
+                        value: "high".into(),
+                    },
+                ),
+            ]),
+            1,
+        )
+        .unwrap();
+    assert_eq!(high.source, QuoteSource::Catalog);
+    assert_eq!(high.currency, "USD");
+    assert!((high.amount - 0.26).abs() < f64::EPSILON);
+
+    let low = model
+        .estimate_cost(
+            &BTreeMap::from([
+                (
+                    ControlId::from("resolution"),
+                    ControlValue::Resolution { value: "1K".into() },
+                ),
+                (
+                    ControlId::from("quality"),
+                    ControlValue::Enum {
+                        value: "low".into(),
+                    },
+                ),
+            ]),
+            1,
+        )
+        .unwrap();
+    assert!((low.amount - 0.02).abs() < f64::EPSILON);
+
+    let two = model
+        .estimate_cost(
+            &BTreeMap::from([
+                (
+                    ControlId::from("resolution"),
+                    ControlValue::Resolution { value: "1K".into() },
+                ),
+                (
+                    ControlId::from("quality"),
+                    ControlValue::Enum {
+                        value: "high".into(),
+                    },
+                ),
+            ]),
+            2,
+        )
+        .unwrap();
+    assert!((two.amount - 0.52).abs() < f64::EPSILON);
+}
+
+#[test]
+fn catalog_defaults_supply_quality_when_the_draft_omits_it() {
+    let model = normalize_model_catalog(IMAGE, fetched_at())
+        .unwrap()
+        .remove(0);
+    let quote = model
+        .estimate_cost(
+            &BTreeMap::from([(
+                ControlId::from("resolution"),
+                ControlValue::Resolution { value: "1K".into() },
+            )]),
+            1,
+        )
+        .unwrap();
+    assert!((quote.amount - 0.26).abs() < f64::EPSILON);
+}
+
+#[test]
+fn resolution_schedule_is_used_when_quality_is_absent() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(IMAGE).unwrap();
+    fixture["data"][0]["model_spec"]["pricing"]
+        .as_object_mut()
+        .unwrap()
+        .remove("quality");
+    fixture["data"][0]["model_spec"]["constraints"]
+        .as_object_mut()
+        .unwrap()
+        .remove("qualities");
+    fixture["data"][0]["model_spec"]["constraints"]
+        .as_object_mut()
+        .unwrap()
+        .remove("defaultQuality");
+
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert!(
+        model
+            .controls
+            .iter()
+            .all(|control| control.id.as_str() != "quality")
+    );
+    let quote = model
+        .estimate_cost(
+            &BTreeMap::from([(
+                ControlId::from("resolution"),
+                ControlValue::Resolution { value: "2K".into() },
+            )]),
+            1,
+        )
+        .unwrap();
+    assert!((quote.amount - 0.51).abs() < f64::EPSILON);
+}
+
+#[test]
+fn flat_generation_price_is_normalized() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(IMAGE).unwrap();
+    fixture["data"][0]["model_spec"]["pricing"] = serde_json::json!({
+        "generation": { "usd": 0.01, "diem": 0.01 }
+    });
+
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    let quote = model.estimate_cost(&BTreeMap::new(), 3).unwrap();
+    assert!((quote.amount - 0.03).abs() < f64::EPSILON);
+}
+
+#[test]
+fn missing_pricing_yields_no_estimate() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(TEXT_TO_VIDEO).unwrap();
+    fixture["data"][0]["model_spec"]
+        .as_object_mut()
+        .unwrap()
+        .remove("pricing");
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert!(model.pricing.is_none());
+    assert!(model.estimate_cost(&BTreeMap::new(), 1).is_none());
 }
 
 fn assert_control(

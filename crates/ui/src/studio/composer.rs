@@ -5,8 +5,6 @@ use gpui::{
     prelude::*, px,
 };
 
-use crate::composer::ComposerInput;
-use crate::icons;
 use crate::popover;
 use crate::theme::Theme;
 
@@ -300,6 +298,7 @@ impl StudioPage {
                     .is_some_and(|value| {
                         matches!(value, zeron_studio::ControlValue::Boolean { value: true })
                     });
+                let run_quote = super::cost::run_quote(&model, &draft, &self.live_quotes);
                 let aspect_model_id = model.id.clone();
                 let resolution_model_id = model.id.clone();
                 let reasoning_model_id = model.id.clone();
@@ -333,6 +332,17 @@ impl StudioPage {
                                     .font_weight(gpui::FontWeight::MEDIUM)
                                     .child(SharedString::from(model.display_name.clone())),
                             )
+                            .when_some(run_quote.as_ref(), |row, quote| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(10.5))
+                                        .text_color(theme.text_muted)
+                                        .child(SharedString::from(super::cost::format_quote(
+                                            quote,
+                                        ))),
+                                )
+                            })
                             .child(
                                 div()
                                     .id(SharedString::from(format!(
@@ -617,6 +627,12 @@ impl StudioPage {
             )
         });
 
+        let batch_quote = super::cost::selected_batch_quote(
+            &self.models,
+            &self.selected_models,
+            &self.draft_runs,
+            &self.live_quotes,
+        );
         let blocked = self.busy
             || self.selected_models.is_empty()
             || self.prompt.read(cx).text().trim().is_empty();
@@ -710,6 +726,14 @@ impl StudioPage {
                         )
                     })
                     .child(div().flex_1())
+                    .when_some(batch_quote.as_ref(), |row, quote| {
+                        row.child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(super::cost::format_quote(quote))),
+                        )
+                    })
                     .child(
                         div()
                             .id("studio-generate")

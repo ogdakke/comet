@@ -78,6 +78,7 @@ pub enum ControlValue {
     Boolean { value: bool },
     Dimensions { width: u32, height: u32 },
     AspectRatio { width: u32, height: u32 },
+    AspectRatioAuto,
     Resolution { value: String },
     DurationSeconds { value: f64 },
 }
@@ -90,9 +91,18 @@ impl ControlValue {
             Self::Number { .. } => ControlKind::Number,
             Self::Boolean { .. } => ControlKind::Boolean,
             Self::Dimensions { .. } => ControlKind::Dimensions,
-            Self::AspectRatio { .. } => ControlKind::AspectRatio,
+            Self::AspectRatio { .. } | Self::AspectRatioAuto => ControlKind::AspectRatio,
             Self::Resolution { .. } => ControlKind::Resolution,
             Self::DurationSeconds { .. } => ControlKind::Duration,
+        }
+    }
+
+    pub fn aspect_ratio_dimensions(&self) -> Option<(u32, u32)> {
+        match self {
+            Self::AspectRatio { width, height } | Self::Dimensions { width, height } => {
+                Some((*width, *height))
+            }
+            _ => None,
         }
     }
 }
@@ -214,12 +224,51 @@ pub enum ControlValidationError {
     UnknownControl { control_id: ControlId },
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PricingUnit {
+    #[default]
+    PerOutput,
+    PerRequest,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PricingEntry {
+    pub when: BTreeMap<ControlId, ControlValue>,
+    pub amount: f64,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PricingMetadata {
     pub currency: String,
+    #[serde(default)]
+    pub unit: PricingUnit,
+    /// Retained so older catalog snapshots still deserialize.
+    #[serde(default)]
     pub unit_label: String,
     pub amount: Option<f64>,
+    #[serde(default)]
+    pub entries: Vec<PricingEntry>,
     pub detail: Option<String>,
+}
+
+impl PricingMetadata {
+    fn resolve_unit_amount(&self, controls: &BTreeMap<ControlId, ControlValue>) -> Option<f64> {
+        let mut best: Option<(usize, f64)> = None;
+        for entry in &self.entries {
+            if entry
+                .when
+                .iter()
+                .all(|(id, value)| controls.get(id) == Some(value))
+            {
+                let specificity = entry.when.len();
+                if best.is_none_or(|(current, _)| specificity > current) {
+                    best = Some((specificity, entry.amount));
+                }
+            }
+        }
+        best.map(|(_, amount)| amount).or(self.amount)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -260,5 +309,38 @@ impl MediaModel {
             control.validate(value)?;
         }
         Ok(())
+    }
+
+    pub fn estimate_cost(
+        &self,
+        controls: &BTreeMap<ControlId, ControlValue>,
+        output_count: u32,
+    ) -> Option<crate::Quote> {
+        let pricing = self.pricing.as_ref()?;
+        let mut effective = BTreeMap::new();
+        for control in &self.controls {
+            if let Some(value) = controls
+                .get(&control.id)
+                .cloned()
+                .or_else(|| control.default.clone())
+            {
+                effective.insert(control.id.clone(), value);
+            }
+        }
+        let amount = pricing.resolve_unit_amount(&effective)?;
+        if !amount.is_finite() || amount < 0.0 {
+            return None;
+        }
+        let amount = match pricing.unit {
+            PricingUnit::PerOutput => amount * f64::from(output_count.max(1)),
+            PricingUnit::PerRequest => amount,
+        };
+        Some(crate::Quote {
+            currency: pricing.currency.clone(),
+            amount,
+            detail: pricing.detail.clone(),
+            expires_at: None,
+            source: crate::QuoteSource::Catalog,
+        })
     }
 }

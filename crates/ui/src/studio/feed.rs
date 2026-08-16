@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
 use gpui::{AnyElement, Context, ObjectFit, Point, SharedString, Window, div, img, prelude::*, px};
-use zeron_proto::{StudioRunState, StudioTurnView};
+use zeron_proto::{StudioRunState, StudioRunView, StudioTurnView};
 use zeron_studio::StudioArtifactId;
 
 use crate::motion;
@@ -33,6 +33,7 @@ struct StudioRailTick {
     prompt: String,
     models: Vec<(String, u32)>,
     created_at: DateTime<Utc>,
+    cost: Option<String>,
 }
 
 fn studio_rail_ticks(turns: &[StudioTurnView]) -> Vec<StudioRailTick> {
@@ -48,6 +49,9 @@ fn studio_rail_ticks(turns: &[StudioTurnView]) -> Vec<StudioRailTick> {
                 .map(|run| (run.model.display_name.clone(), run.output_count))
                 .collect(),
             created_at: turn.created_at,
+            cost: super::cost::turn_quote(turn)
+                .as_ref()
+                .map(super::cost::format_quote),
         })
         .collect()
 }
@@ -92,6 +96,29 @@ pub fn grid_columns(content_width: f32) -> usize {
         3
     } else {
         4
+    }
+}
+
+/// Tiles to paint for a run. In-flight and failed runs keep a slot for every
+/// requested output; a succeeded run only shows artifacts that still exist so
+/// a delete cannot leave a "Loading image" hole.
+fn feed_output_slots(run: &StudioRunView) -> Vec<(usize, Option<StudioArtifactId>)> {
+    if run.state == StudioRunState::Succeeded {
+        run.artifacts
+            .iter()
+            .map(|artifact| (artifact.output_position as usize, Some(artifact.id)))
+            .collect()
+    } else {
+        (0..run.output_count as usize)
+            .map(|output_ix| {
+                let artifact = run
+                    .artifacts
+                    .iter()
+                    .find(|artifact| artifact.output_position as usize == output_ix)
+                    .map(|artifact| artifact.id);
+                (output_ix, artifact)
+            })
+            .collect()
     }
 }
 
@@ -353,12 +380,7 @@ impl StudioPage {
         let turn_for_fork = turn.clone();
         let mut grid = div().w_full().flex().flex_row().flex_wrap().gap(px(gap));
         for (run_ix, run) in turn.runs.iter().enumerate() {
-            for output_ix in 0..run.output_count as usize {
-                let artifact = run
-                    .artifacts
-                    .iter()
-                    .find(|artifact| artifact.output_position as usize == output_ix)
-                    .map(|artifact| artifact.id);
+            for (output_ix, artifact) in feed_output_slots(run) {
                 grid = grid.child(self.render_tile(
                     turn_ix,
                     run_ix,
@@ -404,6 +426,20 @@ impl StudioPage {
                             .text_size(px(13.0))
                             .text_color(theme.text_muted)
                             .child(SharedString::from(turn.prompt.clone())),
+                    )
+                    .when_some(
+                        super::cost::turn_quote(&turn)
+                            .as_ref()
+                            .map(super::cost::format_quote),
+                        |row, cost| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text_muted)
+                                    .child(SharedString::from(cost)),
+                            )
+                        },
                     )
                     .child(
                         div()
@@ -534,6 +570,14 @@ impl StudioPage {
                                     .child(SharedString::from(models)),
                             )
                         })
+                        .when_some(tick.cost.clone(), |el, cost| {
+                            el.child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text_muted)
+                                    .child(SharedString::from(cost)),
+                            )
+                        })
                         .child(
                             div()
                                 .text_size(px(10.0))
@@ -622,6 +666,21 @@ mod tests {
         }
     }
 
+    fn test_artifact(output_position: u32) -> zeron_proto::StudioArtifactView {
+        zeron_proto::StudioArtifactView {
+            id: zeron_studio::StudioArtifactId::new(),
+            output_position,
+            media_kind: zeron_studio::MediaKind::Image,
+            mime_type: "image/png".into(),
+            size_bytes: 1,
+            width: Some(1),
+            height: Some(1),
+            duration_seconds: None,
+            metadata: serde_json::Value::Null,
+            created_at: Utc::now(),
+        }
+    }
+
     fn test_run(display_name: &str, output_count: u32) -> zeron_proto::StudioRunView {
         zeron_proto::StudioRunView {
             id: zeron_studio::StudioRunId::new(),
@@ -634,6 +693,7 @@ mod tests {
             state: StudioRunState::Succeeded,
             progress: None,
             error: None,
+            quote: None,
             artifacts: Vec::new(),
         }
     }
@@ -692,6 +752,29 @@ mod tests {
             format_studio_models(&[("Flux".into(), 4), ("Kling".into(), 2)]),
             "Flux · 4, Kling · 2"
         );
+    }
+
+    #[test]
+    fn succeeded_runs_omit_deleted_output_slots() {
+        let mut run = test_run("Flux", 2);
+        let kept = test_artifact(1);
+        let kept_id = kept.id;
+        run.artifacts = vec![kept];
+        assert_eq!(feed_output_slots(&run), vec![(1, Some(kept_id))]);
+
+        run.artifacts.clear();
+        assert!(feed_output_slots(&run).is_empty());
+    }
+
+    #[test]
+    fn in_flight_and_failed_runs_keep_empty_slots() {
+        let mut run = test_run("Flux", 2);
+        run.state = StudioRunState::Running;
+        assert_eq!(feed_output_slots(&run), vec![(0, None), (1, None)]);
+
+        run.state = StudioRunState::Failed;
+        run.output_count = 1;
+        assert_eq!(feed_output_slots(&run), vec![(0, None)]);
     }
 
     #[test]

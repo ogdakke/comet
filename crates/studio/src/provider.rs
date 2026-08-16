@@ -41,12 +41,69 @@ pub struct ProviderAccount {
     pub label: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuoteSource {
+    #[default]
+    Catalog,
+    Provider,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Quote {
     pub currency: String,
     pub amount: f64,
     pub detail: Option<String>,
     pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub source: QuoteSource,
+}
+
+impl Quote {
+    pub fn catalog(currency: impl Into<String>, amount: f64) -> Self {
+        Self {
+            currency: currency.into(),
+            amount,
+            detail: None,
+            expires_at: None,
+            source: QuoteSource::Catalog,
+        }
+    }
+
+    pub fn provider(currency: impl Into<String>, amount: f64) -> Self {
+        Self {
+            currency: currency.into(),
+            amount,
+            detail: None,
+            expires_at: None,
+            source: QuoteSource::Provider,
+        }
+    }
+
+    /// Sum quotes that share a currency. Mixed currencies yield `None`.
+    pub fn total(quotes: impl IntoIterator<Item = Self>) -> Option<Self> {
+        let mut quotes = quotes.into_iter();
+        let first = quotes.next()?;
+        let mut amount = first.amount;
+        let mut source = first.source;
+        for quote in quotes {
+            if quote.currency != first.currency {
+                return None;
+            }
+            amount += quote.amount;
+            if quote.source == QuoteSource::Provider {
+                source = QuoteSource::Provider;
+            }
+        }
+        Some(Self {
+            currency: first.currency,
+            amount,
+            detail: None,
+            expires_at: None,
+            source,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -7,10 +7,10 @@ use reqwest::{Client, Response, StatusCode};
 use serde::Deserialize;
 
 use crate::{
-    CancelResult, ControlValue, GenerationRequest, MediaKind, MediaProvider, PollResult,
-    ProviderAccount, ProviderAccountId, ProviderArtifact, ProviderError, ProviderErrorKind,
-    ProviderId, ProviderResult, Quote, RemoteAttempt, RemoteJob, Secret, Submission,
-    SubmissionCapabilities, SubmitContext,
+    CancelResult, ControlValue, GenerationRequest, MediaKind, MediaOperation, MediaProvider,
+    PollResult, ProviderAccount, ProviderAccountId, ProviderArtifact, ProviderError,
+    ProviderErrorKind, ProviderId, ProviderResult, Quote, RemoteAttempt, RemoteJob, Secret,
+    Submission, SubmissionCapabilities, SubmitContext,
     venice::{VENICE_PROVIDER_ID, normalize_model_catalog},
 };
 
@@ -98,10 +98,37 @@ impl MediaProvider for VeniceMediaProvider {
 
     async fn quote(
         &self,
-        _secret: &Secret,
-        _request: &GenerationRequest,
+        secret: &Secret,
+        request: &GenerationRequest,
     ) -> ProviderResult<Option<Quote>> {
-        Ok(None)
+        if !matches!(
+            request.operation,
+            MediaOperation::TextToVideo
+                | MediaOperation::ImageToVideo
+                | MediaOperation::ReferenceToVideo
+                | MediaOperation::VideoToVideo
+        ) {
+            return Ok(None);
+        }
+        let payload = video_quote_payload(request)?;
+        let response = self
+            .authenticated(reqwest::Method::POST, "/video/quote", secret)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(network_error)?;
+        let response = require_success(response).await?;
+        let bytes = read_limited(response, MAX_ERROR_BYTES).await?;
+        let quoted: VideoQuoteResponse = serde_json::from_slice(&bytes).map_err(|error| {
+            ProviderError::new(ProviderErrorKind::MalformedResponse, error.to_string())
+        })?;
+        if !quoted.quote.is_finite() || quoted.quote < 0.0 {
+            return Err(ProviderError::new(
+                ProviderErrorKind::MalformedResponse,
+                "Venice returned a non-finite video quote",
+            ));
+        }
+        Ok(Some(Quote::provider("USD", quoted.quote)))
     }
 
     async fn submit(
@@ -225,6 +252,50 @@ impl MediaProvider for VeniceMediaProvider {
     }
 }
 
+fn video_quote_payload(request: &GenerationRequest) -> ProviderResult<serde_json::Value> {
+    let mut payload = serde_json::Map::from_iter([(
+        "model".into(),
+        serde_json::Value::String(request.model_id.as_str().into()),
+    )]);
+    for (id, value) in &request.controls {
+        match (id.as_str(), value) {
+            ("duration", ControlValue::DurationSeconds { value }) => {
+                let duration = if value.fract() == 0.0 {
+                    format!("{}s", *value as i64)
+                } else {
+                    format!("{value}s")
+                };
+                payload.insert("duration".into(), duration.into());
+            }
+            ("resolution", ControlValue::Resolution { value }) => {
+                payload.insert("resolution".into(), value.clone().into());
+            }
+            ("aspect_ratio", ControlValue::AspectRatio { width, height }) => {
+                payload.insert("aspect_ratio".into(), format!("{width}:{height}").into());
+            }
+            ("aspect_ratio", ControlValue::AspectRatioAuto) => {
+                payload.insert("aspect_ratio".into(), "auto".into());
+            }
+            ("audio", ControlValue::Boolean { value }) => {
+                payload.insert("audio".into(), (*value).into());
+            }
+            _ => {}
+        }
+    }
+    if !payload.contains_key("duration") {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "video quote requires a duration",
+        ));
+    }
+    Ok(payload.into())
+}
+
+#[derive(Deserialize)]
+struct VideoQuoteResponse {
+    quote: f64,
+}
+
 fn image_payload(request: &GenerationRequest, binary: bool) -> ProviderResult<serde_json::Value> {
     let mut payload = serde_json::Map::from_iter([
         (
@@ -255,6 +326,7 @@ fn image_payload(request: &GenerationRequest, binary: bool) -> ProviderResult<se
             ("aspect_ratio", ControlValue::AspectRatio { width, height }) => {
                 format!("{width}:{height}").into()
             }
+            ("aspect_ratio", ControlValue::AspectRatioAuto) => "auto".into(),
             ("reasoning", ControlValue::Boolean { value }) => {
                 payload.insert(
                     "disable_prompt_optimization_thinking".into(),
@@ -486,6 +558,16 @@ mod tests {
     }
 
     #[test]
+    fn auto_aspect_ratio_is_forwarded() {
+        let mut request = request();
+        request
+            .controls
+            .insert("aspect_ratio".into(), ControlValue::AspectRatioAuto);
+        let value = image_payload(&request, true).unwrap();
+        assert_eq!(value["aspect_ratio"], "auto");
+    }
+
+    #[test]
     fn moderation_headers_are_recorded_on_artifacts() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("x-venice-is-blurred", "true".parse().unwrap());
@@ -517,5 +599,97 @@ mod tests {
     fn test_constructor_keeps_provider_calls_redirectable() {
         let provider = VeniceMediaProvider::with_base_url("http://127.0.0.1:1");
         assert_eq!(provider.id().as_str(), VENICE_PROVIDER_ID);
+    }
+
+    fn video_request() -> GenerationRequest {
+        GenerationRequest {
+            provider_id: VENICE_PROVIDER_ID.into(),
+            model_id: "seedance-2-0-text-to-video-basic".into(),
+            operation: crate::MediaOperation::TextToVideo,
+            prompt: "a comet".into(),
+            negative_prompt: None,
+            output_count: 1,
+            controls: BTreeMap::from([
+                (
+                    "duration".into(),
+                    ControlValue::DurationSeconds { value: 10.0 },
+                ),
+                (
+                    "resolution".into(),
+                    ControlValue::Resolution {
+                        value: "1080p".into(),
+                    },
+                ),
+                (
+                    "aspect_ratio".into(),
+                    ControlValue::AspectRatio {
+                        width: 16,
+                        height: 9,
+                    },
+                ),
+                ("audio".into(), ControlValue::Boolean { value: true }),
+            ]),
+            inputs: Vec::new(),
+            manifest_version: "v1".into(),
+            display_aspect_ratio: (16, 9),
+        }
+    }
+
+    #[test]
+    fn video_quote_payload_sends_pricing_inputs() {
+        let value = video_quote_payload(&video_request()).unwrap();
+        assert_eq!(value["model"], "seedance-2-0-text-to-video-basic");
+        assert_eq!(value["duration"], "10s");
+        assert_eq!(value["resolution"], "1080p");
+        assert_eq!(value["aspect_ratio"], "16:9");
+        assert_eq!(value["audio"], true);
+    }
+
+    #[test]
+    fn video_quote_requires_duration() {
+        let mut request = video_request();
+        request.controls.remove(&crate::ControlId::from("duration"));
+        assert_eq!(
+            video_quote_payload(&request).unwrap_err().kind,
+            ProviderErrorKind::InvalidRequest
+        );
+    }
+
+    #[tokio::test]
+    async fn image_quote_is_catalog_only() {
+        let provider = VeniceMediaProvider::with_base_url("http://127.0.0.1:1");
+        let quoted = provider
+            .quote(&Secret::new("token"), &request())
+            .await
+            .unwrap();
+        assert!(quoted.is_none());
+    }
+
+    #[tokio::test]
+    async fn video_quote_reads_the_provider_amount() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut incoming = vec![0_u8; 4096];
+            let _ = stream.read(&mut incoming).await;
+            let body = r#"{"quote":0.085}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        let provider = VeniceMediaProvider::with_base_url(format!("http://{addr}"));
+        let quoted = provider
+            .quote(&Secret::new("token"), &video_request())
+            .await
+            .unwrap()
+            .expect("venice video quote");
+        assert_eq!(quoted.source, crate::QuoteSource::Provider);
+        assert_eq!(quoted.currency, "USD");
+        assert!((quoted.amount - 0.085).abs() < f64::EPSILON);
+        server.await.unwrap();
     }
 }

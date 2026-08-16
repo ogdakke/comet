@@ -308,6 +308,7 @@ mod tests {
             state: StudioRunState::Succeeded,
             progress: None,
             error: None,
+            quote: None,
             artifacts: Vec::new(),
         }
     }

@@ -75,6 +75,19 @@ fn rejects_unknown_controls_instead_of_forwarding_them() {
 }
 
 #[test]
+fn drops_unknown_controls_before_rebinding_a_reused_form() {
+    let mut request = request();
+    request.controls.insert(
+        ControlId::new("safe_mode"),
+        ControlValue::Boolean { value: false },
+    );
+
+    request.drop_unknown_controls(&model());
+    request.bind_to(&model()).unwrap();
+    assert!(!request.controls.contains_key(&ControlId::new("safe_mode")));
+}
+
+#[test]
 fn binds_a_compatible_request_to_the_current_manifest() {
     let mut request = request();
     request.manifest_version = "old".to_owned();

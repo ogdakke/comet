@@ -174,6 +174,16 @@ impl GenerationRequest {
         self.manifest_version = model.manifest_version.clone();
         Ok(())
     }
+
+    /// Drop controls the current catalog does not advertise.
+    ///
+    /// Reused jobs can carry connection-level or retired keys (for example
+    /// `safe_mode` injected after an earlier bind). Those must not fail a new
+    /// submit against a catalog that never listed them.
+    pub fn drop_unknown_controls(&mut self, model: &MediaModel) {
+        self.controls
+            .retain(|id, _| model.controls.iter().any(|control| &control.id == id));
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]

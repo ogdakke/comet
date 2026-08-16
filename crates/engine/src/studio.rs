@@ -19,9 +19,9 @@ use zeron_proto::{
     StudioConversationView, StudioRunState, StudioRunView, StudioTurnView,
 };
 use zeron_studio::{
-    GenerationRequest, MediaModel, MediaProvider, ProviderArtifact, ProviderId, StudioArtifactId,
-    StudioAttemptId, StudioBatchId, StudioConversationId, StudioRunId, StudioTurnId,
-    SubmissionCapabilities,
+    GenerationRequest, MediaModel, MediaProvider, ProviderArtifact, ProviderId, Quote,
+    StudioArtifactId, StudioAttemptId, StudioBatchId, StudioConversationId, StudioRunId,
+    StudioTurnId, SubmissionCapabilities,
 };
 
 const DATABASE_FILE: &str = "studio.sqlite3";
@@ -284,6 +284,7 @@ pub enum StudioStoreError {
 pub struct PreparedStudioRun {
     pub model: MediaModel,
     pub request: GenerationRequest,
+    pub quote: Option<Quote>,
 }
 
 #[derive(Clone, Debug)]
@@ -548,9 +549,19 @@ impl StudioStore {
             let request_json = serde_json::to_string(&prepared.request)
                 .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
             let request_hash = format!("{:x}", Sha256::digest(request_json.as_bytes()));
+            let quote = prepared.quote.clone().or_else(|| {
+                prepared
+                    .model
+                    .estimate_cost(&prepared.request.controls, prepared.request.output_count)
+            });
+            let quote_json = quote
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
             transaction.execute(
-                "INSERT INTO studio_runs (id, batch_id, position, provider_id, model_id, operation, model_manifest_json, settings_json, owner_device_id, state, output_count, display_aspect_width, display_aspect_height, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'queued', ?10, ?11, ?12, ?13, ?13)",
-                rusqlite::params![run_id.0.to_string(), batch_id.0.to_string(), position as i64, prepared.request.provider_id.as_str(), prepared.request.model_id.as_str(), operation_name(prepared.request.operation), model_json, settings_json, owner_device_id, prepared.request.output_count, prepared.request.display_aspect_ratio.0, prepared.request.display_aspect_ratio.1, now],
+                "INSERT INTO studio_runs (id, batch_id, position, provider_id, model_id, operation, model_manifest_json, settings_json, owner_device_id, state, quote_json, output_count, display_aspect_width, display_aspect_height, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'queued', ?10, ?11, ?12, ?13, ?14, ?14)",
+                rusqlite::params![run_id.0.to_string(), batch_id.0.to_string(), position as i64, prepared.request.provider_id.as_str(), prepared.request.model_id.as_str(), operation_name(prepared.request.operation), model_json, settings_json, owner_device_id, quote_json, prepared.request.output_count, prepared.request.display_aspect_ratio.0, prepared.request.display_aspect_ratio.1, now],
             )?;
             transaction.execute(
                 "INSERT INTO studio_attempts (id, run_id, attempt_number, idempotency_key, request_json, request_wire_hash, state, provider_connection_id, created_at) VALUES (?1, ?2, 1, ?3, ?4, ?5, 'prepared', ?6, ?7)",
@@ -915,7 +926,7 @@ impl StudioStore {
         let mut turns = Vec::with_capacity(turn_rows.len());
         for (turn_id, position, prompt, source_id, batch_id, created_at) in turn_rows {
             let mut runs_statement = connection.prepare(
-                "SELECT id, position, provider_id, model_manifest_json, settings_json, output_count, display_aspect_width, display_aspect_height, state, progress, error_json FROM studio_runs WHERE batch_id = ?1 ORDER BY position",
+                "SELECT id, position, provider_id, model_manifest_json, settings_json, output_count, display_aspect_width, display_aspect_height, state, progress, error_json, quote_json FROM studio_runs WHERE batch_id = ?1 ORDER BY position",
             )?;
             let run_rows = runs_statement
                 .query_map([batch_id.clone()], |row| {
@@ -931,6 +942,7 @@ impl StudioStore {
                         row.get::<_, String>(8)?,
                         row.get::<_, Option<f32>>(9)?,
                         row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -947,6 +959,7 @@ impl StudioStore {
                 state,
                 progress,
                 error_json,
+                quote_json,
             ) in run_rows
             {
                 let mut artifacts_statement = connection.prepare(
@@ -967,6 +980,11 @@ impl StudioStore {
                             .and_then(|message| message.as_str())
                             .map(str::to_owned)
                     });
+                let quote = quote_json
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
                 run_views.push(StudioRunView {
                     id: StudioRunId(parse_uuid(&run_id)?),
                     position: run_position,
@@ -978,6 +996,7 @@ impl StudioStore {
                     state: parse_run_state(&state)?,
                     progress,
                     error,
+                    quote,
                     artifacts,
                 });
             }

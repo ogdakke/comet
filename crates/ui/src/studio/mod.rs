@@ -10,6 +10,7 @@
 
 mod artifact;
 mod composer;
+mod cost;
 mod defaults;
 mod draft;
 mod feed;
