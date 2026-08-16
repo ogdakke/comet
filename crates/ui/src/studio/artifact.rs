@@ -29,9 +29,12 @@ const ARTIFACT_SWIPE_FLICK: f32 = 500.0;
 const ARTIFACT_DECEL_RATE: f32 = 0.998;
 /// Photos-like settle: ease-out, no overshoot.
 const ARTIFACT_SNAP_DURATION: Duration = Duration::from_millis(220);
+/// If macOS never sends Ended, snap once the wheel goes idle.
+const ARTIFACT_SWIPE_IDLE: Duration = Duration::from_millis(48);
 /// Apple rubber-band coefficient (WWDC / UIScrollView).
 const ARTIFACT_RUBBER_COEFF: f32 = 0.55;
 const ARTIFACT_FILMSTRIP_STEP: f32 = 38.0;
+const ARTIFACT_ZOOM_MAX: f32 = 24.0;
 
 /// Ease from `from` to `to` after fingers lift. `to` is 0, +page, or −page.
 #[derive(Debug, Clone, Copy)]
@@ -129,6 +132,10 @@ fn apply_lightbox_swipe_delta(
     } else {
         0.0
     }
+}
+
+fn lightbox_pan_range(stage: f32, zoom: f32) -> f32 {
+    stage.max(1.0) * (zoom - 1.0).max(0.0) / 2.0
 }
 
 fn snap_offset_at(from: f32, to: f32, elapsed: f32, duration: f32) -> f32 {
@@ -299,11 +306,20 @@ impl StudioPage {
         self.lightbox_swipe_last_tick = None;
     }
 
+    pub(super) fn lightbox_motion_pending(&self) -> bool {
+        self.lightbox_snap.is_some()
+            || (self.lightbox_swipe_x.abs() > 0.5
+                && self
+                    .lightbox_swipe_last_tick
+                    .is_some_and(|last| last.elapsed() >= ARTIFACT_SWIPE_IDLE))
+    }
+
     pub(super) fn reset_lightbox_viewer(&mut self) {
         self.lightbox_zoom = 1.0;
         self.lightbox_pan = Point::default();
         self.lightbox_drag = None;
         self.reset_lightbox_swipe();
+        self.lightbox_swipe_locked = false;
     }
 
     pub(super) fn adopt_artifact_index(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
@@ -330,6 +346,7 @@ impl StudioPage {
     pub(super) fn select_artifact_index(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
         let changed = self.adopt_artifact_index(index, cx);
         self.reset_lightbox_swipe();
+        self.lightbox_swipe_locked = false;
         changed
     }
 
@@ -417,11 +434,41 @@ impl StudioPage {
         self.lightbox_stage_width.max(1.0)
     }
 
+    fn lightbox_stage_size(&self) -> (f32, f32) {
+        (
+            if self.lightbox_stage_width > 1.0 {
+                self.lightbox_stage_width
+            } else {
+                1200.0
+            },
+            if self.lightbox_stage_height > 1.0 {
+                self.lightbox_stage_height
+            } else {
+                800.0
+            },
+        )
+    }
+
+    fn clamp_lightbox_pan(&mut self) {
+        let (limit_x, limit_y) = self.lightbox_pan_limits();
+        self.lightbox_pan.x = px(f32::from(self.lightbox_pan.x).clamp(-limit_x, limit_x));
+        self.lightbox_pan.y = px(f32::from(self.lightbox_pan.y).clamp(-limit_y, limit_y));
+    }
+
+    fn lightbox_pan_limits(&self) -> (f32, f32) {
+        let (width, height) = self.lightbox_stage_size();
+        (
+            lightbox_pan_range(width, self.lightbox_zoom),
+            lightbox_pan_range(height, self.lightbox_zoom),
+        )
+    }
+
     pub(super) fn adjust_lightbox_zoom(&mut self, factor: f32, cx: &mut Context<Self>) {
-        self.lightbox_zoom = (self.lightbox_zoom * factor).clamp(1.0, 8.0);
+        self.lightbox_zoom = (self.lightbox_zoom * factor).clamp(1.0, ARTIFACT_ZOOM_MAX);
         if self.lightbox_zoom > 1.001 {
             self.reset_lightbox_swipe();
         }
+        self.clamp_lightbox_pan();
         cx.notify();
     }
 
@@ -478,18 +525,26 @@ impl StudioPage {
         cx.notify();
     }
 
-    pub(super) fn step_lightbox_snap(&mut self, cx: &mut Context<Self>) {
-        let Some(snap) = self.lightbox_snap else {
-            return;
-        };
-        let duration = ARTIFACT_SNAP_DURATION.as_secs_f32() * motion::speed_scale();
-        let elapsed = snap.started.elapsed().as_secs_f32();
-        self.lightbox_swipe_x = snap_offset_at(snap.from, snap.to, elapsed, duration);
-        if elapsed >= duration {
-            self.commit_lightbox_snap_target(snap.to, cx);
+    pub(super) fn step_lightbox_motion(&mut self, cx: &mut Context<Self>) {
+        if self.lightbox_snap.is_some() {
+            let snap = self.lightbox_snap.unwrap();
+            let duration = ARTIFACT_SNAP_DURATION.as_secs_f32() * motion::speed_scale();
+            let elapsed = snap.started.elapsed().as_secs_f32();
+            self.lightbox_swipe_x = snap_offset_at(snap.from, snap.to, elapsed, duration);
+            if elapsed >= duration {
+                self.commit_lightbox_snap_target(snap.to, cx);
+                return;
+            }
+            cx.notify();
             return;
         }
-        cx.notify();
+        if self.lightbox_swipe_x.abs() > 0.5
+            && self
+                .lightbox_swipe_last_tick
+                .is_some_and(|last| last.elapsed() >= ARTIFACT_SWIPE_IDLE)
+        {
+            self.finish_lightbox_swipe(cx);
+        }
     }
 
     pub(super) fn finish_lightbox_swipe(&mut self, cx: &mut Context<Self>) {
@@ -507,13 +562,8 @@ impl StudioPage {
             index > 0,
             index + 1 < artifacts.len(),
         );
-        self.lightbox_ignore_scroll_until = Some(Instant::now() + ARTIFACT_SNAP_DURATION);
+        self.lightbox_swipe_locked = true;
         if crate::motion::reduced_motion(cx) || (target - offset).abs() < 0.5 {
-            self.lightbox_snap = Some(LightboxSnap {
-                from: offset,
-                to: target,
-                started: Instant::now(),
-            });
             self.commit_lightbox_snap_target(target, cx);
             return;
         }
@@ -531,14 +581,26 @@ impl StudioPage {
         let horizontal = f32::from(delta.x);
         let vertical = f32::from(delta.y);
         if event.touch_phase == TouchPhase::Started {
-            self.lightbox_ignore_scroll_until = None;
+            self.lightbox_swipe_locked = false;
             self.lightbox_snap = None;
             self.lightbox_swipe_last_tick = None;
         }
-        if self
-            .lightbox_ignore_scroll_until
-            .is_some_and(|until| Instant::now() < until)
-        {
+        if event.modifiers.platform {
+            let movement = if vertical.abs() >= horizontal.abs() {
+                vertical
+            } else {
+                horizontal
+            };
+            if movement.abs() > f32::EPSILON {
+                self.adjust_lightbox_zoom((movement * 0.01).exp(), cx);
+                if self.lightbox_zoom <= 1.001 {
+                    self.fit_lightbox(cx);
+                }
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if self.lightbox_swipe_locked {
             cx.stop_propagation();
             return;
         }
@@ -559,20 +621,12 @@ impl StudioPage {
             cx.stop_propagation();
             return;
         }
-        if vertical.abs() > horizontal.abs() {
-            let factor = (vertical * 0.004).exp();
-            self.adjust_lightbox_zoom(factor, cx);
-            if self.lightbox_zoom <= 1.001 {
-                self.fit_lightbox(cx);
-            }
-            cx.stop_propagation();
-            return;
-        }
         if horizontal.abs() < f32::EPSILON {
             cx.stop_propagation();
             return;
         }
         if !event.delta.precise() {
+            self.lightbox_swipe_locked = false;
             let direction = if horizontal < 0.0 { 1 } else { -1 };
             self.navigate_artifact_with_wrap(direction, false, cx);
             cx.stop_propagation();
@@ -608,9 +662,9 @@ impl StudioPage {
     }
 
     fn pan_lightbox(&mut self, dx: f32, dy: f32, cx: &mut Context<Self>) {
-        let limit = 420.0 * (self.lightbox_zoom - 1.0).max(0.0);
-        self.lightbox_pan.x = px((f32::from(self.lightbox_pan.x) + dx).clamp(-limit, limit));
-        self.lightbox_pan.y = px((f32::from(self.lightbox_pan.y) + dy).clamp(-limit, limit));
+        self.lightbox_pan.x = px(f32::from(self.lightbox_pan.x) + dx);
+        self.lightbox_pan.y = px(f32::from(self.lightbox_pan.y) + dy);
+        self.clamp_lightbox_pan();
         cx.notify();
     }
 
@@ -686,15 +740,24 @@ impl StudioPage {
         } else {
             self.lightbox_zoom
         };
+        let measured = self.lightbox_stage_width > 1.0 && self.lightbox_stage_height > 1.0;
         if let Some(image) = image {
-            frame
-                .child(
-                    img(image)
-                        .w(gpui::relative(zoom))
-                        .h(gpui::relative(zoom))
-                        .object_fit(ObjectFit::Contain),
-                )
-                .into_any_element()
+            let picture = img(image).flex_none().object_fit(ObjectFit::Contain);
+            let picture = if let Some((_, width)) = page {
+                let height = if self.lightbox_stage_height > 1.0 {
+                    self.lightbox_stage_height
+                } else {
+                    width
+                };
+                picture.w(px(width)).h(px(height))
+            } else if measured {
+                picture
+                    .w(px(self.lightbox_stage_width * zoom))
+                    .h(px(self.lightbox_stage_height * zoom))
+            } else {
+                picture.w(gpui::relative(zoom)).h(gpui::relative(zoom))
+            };
+            frame.child(picture).into_any_element()
         } else {
             frame
                 .child(
@@ -847,10 +910,14 @@ impl StudioPage {
                 canvas(
                     move |bounds, _, cx| {
                         let width = f32::from(bounds.size.width);
+                        let height = f32::from(bounds.size.height);
                         measure_entity
                             .update(cx, |page, cx| {
-                                if (page.lightbox_stage_width - width).abs() > 0.5 {
+                                let dw = (page.lightbox_stage_width - width).abs();
+                                let dh = (page.lightbox_stage_height - height).abs();
+                                if dw > 0.5 || dh > 0.5 {
                                     page.lightbox_stage_width = width;
+                                    page.lightbox_stage_height = height;
                                     cx.notify();
                                 }
                             })
@@ -1173,6 +1240,14 @@ mod tests {
         );
         let resisted = apply_lightbox_swipe_delta(0.0, -200.0, 800.0, true, false);
         assert!(resisted < 0.0 && resisted > -200.0, "resisted={resisted}");
+    }
+
+    #[test]
+    fn lightbox_pan_limits_cover_the_zoomed_stage() {
+        assert!((lightbox_pan_range(900.0, 2.0) - 450.0).abs() < 0.01);
+        assert!(lightbox_pan_range(900.0, 2.0) > 420.0);
+        assert!((lightbox_pan_range(1400.0, 3.0) - 1400.0).abs() < 0.01);
+        assert_eq!(lightbox_pan_range(900.0, 1.0), 0.0);
     }
 
     #[test]

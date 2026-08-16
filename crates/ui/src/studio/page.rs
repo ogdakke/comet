@@ -63,8 +63,9 @@ pub struct StudioPage {
     pub(super) lightbox_snap: Option<super::artifact::LightboxSnap>,
     pub(super) lightbox_swipe_scheduled: bool,
     pub(super) lightbox_swipe_last_tick: Option<Instant>,
-    pub(super) lightbox_ignore_scroll_until: Option<Instant>,
+    pub(super) lightbox_swipe_locked: bool,
     pub(super) lightbox_stage_width: f32,
+    pub(super) lightbox_stage_height: f32,
     pub(super) filmstrip_scroll_accum: f32,
     pub(super) focus: FocusHandle,
     pub(super) loading: bool,
@@ -139,8 +140,9 @@ impl StudioPage {
             lightbox_snap: None,
             lightbox_swipe_scheduled: false,
             lightbox_swipe_last_tick: None,
-            lightbox_ignore_scroll_until: None,
+            lightbox_swipe_locked: false,
             lightbox_stage_width: 0.0,
+            lightbox_stage_height: 0.0,
             filmstrip_scroll_accum: 0.0,
             focus: cx.focus_handle(),
             loading: false,
@@ -647,16 +649,16 @@ impl Focusable for StudioPage {
 
 impl Render for StudioPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.lightbox_snap.is_some() && crate::motion::reduced_motion(cx) {
+        if self.lightbox_motion_pending() && crate::motion::reduced_motion(cx) {
             self.finish_lightbox_snap_immediate(cx);
-        } else if self.lightbox_snap.is_some() && !self.lightbox_swipe_scheduled {
+        } else if self.lightbox_motion_pending() && !self.lightbox_swipe_scheduled {
             self.lightbox_swipe_scheduled = true;
             let entity = cx.weak_entity();
             window.on_next_frame(move |_, cx| {
                 entity
                     .update(cx, |page: &mut StudioPage, cx| {
                         page.lightbox_swipe_scheduled = false;
-                        page.step_lightbox_snap(cx);
+                        page.step_lightbox_motion(cx);
                     })
                     .ok();
             });
