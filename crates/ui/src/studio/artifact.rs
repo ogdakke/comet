@@ -34,6 +34,12 @@ const ARTIFACT_SWIPE_IDLE: Duration = Duration::from_millis(48);
 /// Apple rubber-band coefficient (WWDC / UIScrollView).
 const ARTIFACT_RUBBER_COEFF: f32 = 0.55;
 const ARTIFACT_FILMSTRIP_STEP: f32 = 38.0;
+const ARTIFACT_FILMSTRIP_GAP: f32 = 8.0;
+const ARTIFACT_FILMSTRIP_SELECTED: f32 = 58.0;
+const ARTIFACT_FILMSTRIP_THUMB: f32 = 50.0;
+const ARTIFACT_FILMSTRIP_HEIGHT: f32 = 78.0;
+const ARTIFACT_FILMSTRIP_WIDTH_FRACTION: f32 = 0.9;
+const ARTIFACT_FILMSTRIP_FADE: f32 = 28.0;
 const ARTIFACT_ZOOM_MAX: f32 = 24.0;
 const INSPECTOR_WIDTH: f32 = 320.0;
 const INSPECTOR_PAD_X: f32 = 18.0;
@@ -47,6 +53,63 @@ const INSPECTOR_PROMPT_ADVANCE: f32 = super::feed::PROMPT_AVG_CHAR_ADVANCE * (12
 
 fn inspector_prompt_inner_width() -> f32 {
     (INSPECTOR_WIDTH - INSPECTOR_PAD_X * 2.0 - INSPECTOR_COPY_SIZE - INSPECTOR_COPY_GAP).max(1.0)
+}
+
+fn filmstrip_thumb_size(index: usize, selected: usize) -> f32 {
+    if index == selected {
+        ARTIFACT_FILMSTRIP_SELECTED
+    } else {
+        ARTIFACT_FILMSTRIP_THUMB
+    }
+}
+
+/// Distance from the strip's left edge to the selected thumb's center.
+fn filmstrip_selected_center(selected: usize) -> f32 {
+    selected as f32 * (ARTIFACT_FILMSTRIP_THUMB + ARTIFACT_FILMSTRIP_GAP)
+        + ARTIFACT_FILMSTRIP_SELECTED / 2.0
+}
+
+fn filmstrip_content_width(count: usize) -> f32 {
+    if count == 0 {
+        0.0
+    } else {
+        ARTIFACT_FILMSTRIP_SELECTED
+            + count.saturating_sub(1) as f32 * (ARTIFACT_FILMSTRIP_THUMB + ARTIFACT_FILMSTRIP_GAP)
+    }
+}
+
+fn filmstrip_viewport_width(stage_width: f32) -> f32 {
+    let stage = if stage_width > 1.0 {
+        stage_width
+    } else {
+        1200.0
+    };
+    stage * ARTIFACT_FILMSTRIP_WIDTH_FRACTION
+}
+
+/// Shift that puts the selected thumb on the viewport midline.
+fn filmstrip_offset(selected: usize, viewport: f32) -> f32 {
+    viewport / 2.0 - filmstrip_selected_center(selected)
+}
+
+/// Neighbor slides only while a swipe is in flight. The resting image fills
+/// the live stage so a resize cannot leave it stuck at a stale pixel size.
+fn lightbox_uses_paging_slides(
+    zoomed: bool,
+    page_width: f32,
+    swipe_x: f32,
+    snapping: bool,
+) -> bool {
+    !zoomed && page_width > 1.0 && (swipe_x.abs() > 0.5 || snapping)
+}
+
+fn lightbox_stage_size_changed(
+    current_width: f32,
+    current_height: f32,
+    width: f32,
+    height: f32,
+) -> bool {
+    (current_width - width).abs() > 0.5 || (current_height - height).abs() > 0.5
 }
 
 /// Ease from `from` to `to` after fingers lift. `to` is 0, +page, or −page.
@@ -355,7 +418,6 @@ impl StudioPage {
         if changed {
             self.inspector_scroll.set_offset(Point::default());
         }
-        self.artifact_filmstrip_scroll.scroll_to_item(index);
         if let Some(conversation_id) = self.selected_conversation {
             cx.emit(StudioEvent::OpenArtifact {
                 conversation_id,
@@ -433,13 +495,6 @@ impl StudioPage {
             self.selected_artifact = Some(artifact_id);
             self.reset_lightbox_viewer();
             self.inspector_scroll.set_offset(Point::default());
-            if let Some(index) = self
-                .artifact_sequence()
-                .iter()
-                .position(|candidate| *candidate == artifact_id)
-            {
-                self.artifact_filmstrip_scroll.scroll_to_item(index);
-            }
             changed = true;
         }
         if changed {
@@ -729,6 +784,7 @@ impl StudioPage {
         if matches!(event.touch_phase, TouchPhase::Ended | TouchPhase::Cancelled) {
             self.filmstrip_scroll_accum = 0.0;
         }
+        cx.stop_propagation();
     }
 
     pub(super) fn render_lightbox_slide(
@@ -767,20 +823,19 @@ impl StudioPage {
         };
         let measured = self.lightbox_stage_width > 1.0 && self.lightbox_stage_height > 1.0;
         if let Some(image) = image {
-            let picture = img(image).flex_none().object_fit(ObjectFit::Contain);
-            let picture = if let Some((_, width)) = page {
-                let height = if self.lightbox_stage_height > 1.0 {
-                    self.lightbox_stage_height
-                } else {
-                    width
-                };
-                picture.w(px(width)).h(px(height))
+            let picture = img(image).object_fit(ObjectFit::Contain);
+            let picture = if page.is_some() || zoom <= 1.001 {
+                picture.size_full()
             } else if measured {
                 picture
+                    .flex_none()
                     .w(px(self.lightbox_stage_width * zoom))
                     .h(px(self.lightbox_stage_height * zoom))
             } else {
-                picture.w(gpui::relative(zoom)).h(gpui::relative(zoom))
+                picture
+                    .flex_none()
+                    .w(gpui::relative(zoom))
+                    .h(gpui::relative(zoom))
             };
             let picture = if page.is_none() && self.lightbox_zoom > 1.001 {
                 picture
@@ -837,7 +892,7 @@ impl StudioPage {
             .enumerate()
             .map(|(index, artifact_id)| {
                 let thumbnail = self.images.get(artifact_id).cloned();
-                let frame_size = if index == selected_index { 58.0 } else { 50.0 };
+                let frame_size = filmstrip_thumb_size(index, selected_index);
                 div()
                     .id(SharedString::from(format!("studio-thumbnail-{index}")))
                     .size(px(frame_size))
@@ -876,11 +931,21 @@ impl StudioPage {
                     })
             })
             .collect::<Vec<_>>();
+        let filmstrip_viewport = filmstrip_viewport_width(self.lightbox_stage_width);
+        let filmstrip_x = filmstrip_offset(selected_index, filmstrip_viewport);
+        let filmstrip_span = filmstrip_content_width(sequence.len());
+        let fade_left = filmstrip_x < -0.5;
+        let fade_right = filmstrip_x + filmstrip_span > filmstrip_viewport + 0.5;
 
         let zoomed = self.lightbox_zoom > 1.001;
         let page_width = self.lightbox_stage_width;
         let mut slides = Vec::new();
-        if zoomed || page_width <= 1.0 {
+        if !lightbox_uses_paging_slides(
+            zoomed,
+            page_width,
+            self.lightbox_swipe_x,
+            self.lightbox_snap.is_some(),
+        ) {
             slides.push(self.render_lightbox_slide(Some(id), None, theme));
         } else {
             if selected_index > 0 {
@@ -942,20 +1007,31 @@ impl StudioPage {
             }))
             .child(
                 canvas(
-                    move |bounds, _, cx| {
+                    move |bounds, window, cx| {
                         let width = f32::from(bounds.size.width);
                         let height = f32::from(bounds.size.height);
-                        measure_entity
-                            .update(cx, |page, cx| {
-                                let dw = (page.lightbox_stage_width - width).abs();
-                                let dh = (page.lightbox_stage_height - height).abs();
-                                if dw > 0.5 || dh > 0.5 {
-                                    page.lightbox_stage_width = width;
-                                    page.lightbox_stage_height = height;
-                                    cx.notify();
+                        let changed = measure_entity
+                            .update(cx, |page, _| {
+                                if !lightbox_stage_size_changed(
+                                    page.lightbox_stage_width,
+                                    page.lightbox_stage_height,
+                                    width,
+                                    height,
+                                ) {
+                                    return false;
                                 }
+                                page.lightbox_stage_width = width;
+                                page.lightbox_stage_height = height;
+                                page.clamp_lightbox_pan();
+                                true
                             })
-                            .ok();
+                            .unwrap_or(false);
+                        if changed {
+                            // `notify` during prepaint does not mark the window
+                            // dirty (draw is already in progress), so the new
+                            // size would sit unused until the next click/cycle.
+                            window.request_animation_frame();
+                        }
                     },
                     |_, _, _, _| {},
                 )
@@ -1248,19 +1324,41 @@ impl StudioPage {
                                 .bottom_0()
                                 .left_0()
                                 .right_0()
-                                .h(px(78.0))
-                                .overflow_x_scroll()
-                                .track_scroll(&self.artifact_filmstrip_scroll)
+                                .h(px(ARTIFACT_FILMSTRIP_HEIGHT))
+                                .flex()
+                                .justify_center()
+                                .occlude()
                                 .on_scroll_wheel(cx.listener(|page, event, _, cx| {
                                     page.on_filmstrip_scroll(event, cx)
                                 }))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .gap(px(8.0))
-                                .px(px(16.0))
-                                .occlude()
-                                .children(thumbnails),
+                                .child(
+                                    crate::edge_fade::edge_faded(
+                                        ARTIFACT_FILMSTRIP_FADE,
+                                        false,
+                                        false,
+                                        div()
+                                            .w(px(filmstrip_viewport))
+                                            .h_full()
+                                            .flex_none()
+                                            .overflow_hidden()
+                                            .relative()
+                                            .child(
+                                                div()
+                                                    .absolute()
+                                                    .top_0()
+                                                    .bottom_0()
+                                                    .left(px(filmstrip_x))
+                                                    .w(px(filmstrip_span.max(1.0)))
+                                                    .flex()
+                                                    .flex_none()
+                                                    .items_center()
+                                                    .gap(px(ARTIFACT_FILMSTRIP_GAP))
+                                                    .children(thumbnails),
+                                            ),
+                                    )
+                                    .fade_left(fade_left)
+                                    .fade_right(fade_right),
+                                ),
                         ),
                 )
                 .child(div().w(px(INSPECTOR_WIDTH)).h_full().flex_none().child(
@@ -1345,6 +1443,55 @@ mod tests {
     #[test]
     fn inspector_prompt_inner_width_leaves_room_for_copy() {
         assert!((inspector_prompt_inner_width() - 252.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn filmstrip_content_width_counts_one_selected_thumb() {
+        assert!((filmstrip_content_width(0) - 0.0).abs() < 0.01);
+        assert!((filmstrip_content_width(1) - ARTIFACT_FILMSTRIP_SELECTED).abs() < 0.01);
+        assert!(
+            (filmstrip_content_width(4)
+                - (ARTIFACT_FILMSTRIP_SELECTED
+                    + 3.0 * (ARTIFACT_FILMSTRIP_THUMB + ARTIFACT_FILMSTRIP_GAP)))
+                .abs()
+                < 0.01
+        );
+    }
+
+    #[test]
+    fn filmstrip_keeps_the_selected_thumb_centered() {
+        let viewport = 800.0;
+        for selected in 0..12 {
+            let offset = filmstrip_offset(selected, viewport);
+            let center = offset + filmstrip_selected_center(selected);
+            assert!(
+                (center - viewport / 2.0).abs() < 0.01,
+                "selected {selected} landed at {center}, expected {}",
+                viewport / 2.0
+            );
+        }
+    }
+
+    #[test]
+    fn filmstrip_viewport_uses_ninety_percent_of_the_stage() {
+        assert!((filmstrip_viewport_width(1000.0) - 900.0).abs() < 0.01);
+        assert!((filmstrip_viewport_width(0.0) - 1080.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn lightbox_rests_on_a_live_stage_and_pages_only_while_swiping() {
+        assert!(!lightbox_uses_paging_slides(false, 1200.0, 0.0, false));
+        assert!(lightbox_uses_paging_slides(false, 1200.0, -80.0, false));
+        assert!(lightbox_uses_paging_slides(false, 1200.0, 0.0, true));
+        assert!(!lightbox_uses_paging_slides(true, 1200.0, -80.0, false));
+        assert!(!lightbox_uses_paging_slides(false, 0.0, -80.0, false));
+    }
+
+    #[test]
+    fn lightbox_stage_tracks_a_resize() {
+        assert!(lightbox_stage_size_changed(1200.0, 800.0, 900.0, 800.0));
+        assert!(lightbox_stage_size_changed(1200.0, 800.0, 1200.0, 600.0));
+        assert!(!lightbox_stage_size_changed(1200.0, 800.0, 1200.2, 800.1));
     }
 
     #[test]
