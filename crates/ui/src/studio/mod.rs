@@ -5,10 +5,12 @@
 //! - [`composer`] — model picker, per-model controls, and generate;
 //! - [`artifact`] — full-bleed image strip, filmstrip, and inspector;
 //! - [`providers`] — connect / validate / remove image accounts;
-//! - [`draft`] — per-model draft settings and control chrome.
+//! - [`draft`] — per-model draft settings and control chrome;
+//! - [`defaults`] — sticky last-used models and settings.
 
 mod artifact;
 mod composer;
+mod defaults;
 mod draft;
 mod feed;
 mod page;

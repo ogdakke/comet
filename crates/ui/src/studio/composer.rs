@@ -64,6 +64,7 @@ impl StudioPage {
         if !self.selected_models.remove(&id) {
             self.selected_models.insert(id);
         }
+        self.persist_composer_defaults(cx);
         cx.notify();
     }
 
@@ -170,8 +171,11 @@ impl StudioPage {
         if let Some(draft) = self.draft_runs.get_mut(model_id) {
             draft.output_count =
                 (draft.output_count as i32 + delta).clamp(1, maximum as i32) as u32;
-            cx.notify();
+        } else {
+            return;
         }
+        self.persist_composer_defaults(cx);
+        cx.notify();
     }
 
     pub(super) fn cycle_control(
@@ -180,56 +184,61 @@ impl StudioPage {
         control: &zeron_studio::ModelControl,
         cx: &mut Context<Self>,
     ) {
-        let Some(draft) = self.draft_runs.get_mut(model_id) else {
-            return;
-        };
-        let current = draft.controls.get(&control.id).cloned();
-        let next = if !control.choices.is_empty() {
-            let index = control
-                .choices
-                .iter()
-                .position(|choice| Some(&choice.value) == current.as_ref())
-                .map(|index| (index + 1) % control.choices.len())
-                .unwrap_or(0);
-            Some(control.choices[index].value.clone())
-        } else if control.kind == zeron_studio::ControlKind::Boolean {
-            let value = match current {
-                Some(zeron_studio::ControlValue::Boolean { value }) => !value,
-                _ => !matches!(
-                    control.default,
-                    Some(zeron_studio::ControlValue::Boolean { value: true })
-                ),
+        {
+            let Some(draft) = self.draft_runs.get_mut(model_id) else {
+                return;
             };
-            Some(zeron_studio::ControlValue::Boolean { value })
-        } else if let Some(zeron_studio::ControlValue::Integer { value }) = current {
-            let step = control.step.unwrap_or(1.0).max(1.0) as i64;
-            let minimum = control.minimum.unwrap_or(value as f64) as i64;
-            let maximum = control.maximum.unwrap_or((value + step) as f64) as i64;
-            Some(zeron_studio::ControlValue::Integer {
-                value: if value + step > maximum {
-                    minimum
-                } else {
-                    value + step
-                },
-            })
-        } else if let Some(zeron_studio::ControlValue::Number { value }) = current {
-            let step = control.step.unwrap_or(1.0);
-            let minimum = control.minimum.unwrap_or(value);
-            let maximum = control.maximum.unwrap_or(value + step);
-            Some(zeron_studio::ControlValue::Number {
-                value: if value + step > maximum {
-                    minimum
-                } else {
-                    value + step
-                },
-            })
-        } else {
-            None
-        };
-        if let Some(next) = next {
-            draft.controls.insert(control.id.clone(), next);
-            cx.notify();
+            let current = draft.controls.get(&control.id).cloned();
+            let next = if !control.choices.is_empty() {
+                let index = control
+                    .choices
+                    .iter()
+                    .position(|choice| Some(&choice.value) == current.as_ref())
+                    .map(|index| (index + 1) % control.choices.len())
+                    .unwrap_or(0);
+                Some(control.choices[index].value.clone())
+            } else if control.kind == zeron_studio::ControlKind::Boolean {
+                let value = match current {
+                    Some(zeron_studio::ControlValue::Boolean { value }) => !value,
+                    _ => !matches!(
+                        control.default,
+                        Some(zeron_studio::ControlValue::Boolean { value: true })
+                    ),
+                };
+                Some(zeron_studio::ControlValue::Boolean { value })
+            } else if let Some(zeron_studio::ControlValue::Integer { value }) = current {
+                let step = control.step.unwrap_or(1.0).max(1.0) as i64;
+                let minimum = control.minimum.unwrap_or(value as f64) as i64;
+                let maximum = control.maximum.unwrap_or((value + step) as f64) as i64;
+                Some(zeron_studio::ControlValue::Integer {
+                    value: if value + step > maximum {
+                        minimum
+                    } else {
+                        value + step
+                    },
+                })
+            } else if let Some(zeron_studio::ControlValue::Number { value }) = current {
+                let step = control.step.unwrap_or(1.0);
+                let minimum = control.minimum.unwrap_or(value);
+                let maximum = control.maximum.unwrap_or(value + step);
+                Some(zeron_studio::ControlValue::Number {
+                    value: if value + step > maximum {
+                        minimum
+                    } else {
+                        value + step
+                    },
+                })
+            } else {
+                None
+            };
+            if let Some(next) = next {
+                draft.controls.insert(control.id.clone(), next);
+            } else {
+                return;
+            }
         }
+        self.persist_composer_defaults(cx);
+        cx.notify();
     }
 
     pub(super) fn render_composer(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -339,6 +348,7 @@ impl StudioPage {
                                     .hover(|style| style.bg(crate::theme::wash(0.10)))
                                     .on_click(cx.listener(move |page, _, _, cx| {
                                         page.selected_models.remove(&remove_id);
+                                        page.persist_composer_defaults(cx);
                                         cx.notify();
                                     }))
                                     .child(
@@ -510,6 +520,7 @@ impl StudioPage {
                         if !page.selected_models.remove(&id) {
                             page.selected_models.insert(id.clone());
                         }
+                        page.persist_composer_defaults(cx);
                         cx.notify();
                     }))
                     .child(

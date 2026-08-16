@@ -22,7 +22,11 @@ use crate::theme::Theme;
 
 use super::StudioEvent;
 use super::artifact::read_artifact_image;
-use super::draft::{DraftRunConfig, draft_aspect};
+use super::defaults::StudioDefaults;
+use super::draft::{
+    DraftRunConfig, apply_remembered_drafts, apply_remembered_selection, apply_turn_models,
+    draft_aspect, select_first_model,
+};
 use super::feed::{STUDIO_COMPOSER_CLEARANCE, STUDIO_RAIL_GUTTER};
 
 pub struct StudioPage {
@@ -32,6 +36,8 @@ pub struct StudioPage {
     pub(super) models: Vec<zeron_studio::MediaModel>,
     pub(super) selected_models: BTreeSet<zeron_studio::ModelId>,
     pub(super) draft_runs: HashMap<zeron_studio::ModelId, DraftRunConfig>,
+    pub(super) remembered: StudioDefaults,
+    pub(super) composer_seeded_for: Option<StudioConversationId>,
     pub(super) selected_conversation: Option<StudioConversationId>,
     pub(super) conversation: Option<StudioConversationView>,
     pub(super) prompt: Entity<ComposerInput>,
@@ -93,6 +99,12 @@ impl StudioPage {
                 ComposerInputEvent::Submitted => page.activate_model_picker_row(cx),
                 _ => {}
             });
+        let remembered = state
+            .read(cx)
+            .data_dir
+            .as_deref()
+            .map(StudioDefaults::load)
+            .unwrap_or_default();
         let mut page = Self {
             state,
             conversations: Vec::new(),
@@ -100,6 +112,8 @@ impl StudioPage {
             models: Vec::new(),
             selected_models: BTreeSet::new(),
             draft_runs: HashMap::new(),
+            remembered,
+            composer_seeded_for: None,
             selected_conversation: None,
             conversation: None,
             prompt,
@@ -194,11 +208,7 @@ impl StudioPage {
                             .map(|value| value.conversations)
                             .unwrap_or_default();
                         page.apply_models(models.models);
-                        if page.selected_models.is_empty()
-                            && let Some(model) = page.models.first()
-                        {
-                            page.selected_models.insert(model.id.clone());
-                        }
+                        page.apply_remembered_or_default_models();
                         if page.selected_conversation.is_none()
                             && let Some(conversation) = page.conversations.first()
                         {
@@ -228,6 +238,7 @@ impl StudioPage {
         };
         if self.selected_conversation != Some(id) {
             self.close_artifact(cx);
+            self.composer_seeded_for = None;
         }
         self.selected_conversation = Some(id);
         self.conversation = None;
@@ -265,6 +276,7 @@ impl StudioPage {
                             .scroll_after_turn_count
                             .is_some_and(|before| view.turns.len() > before);
                         page.conversation = Some(view);
+                        page.seed_composer_from_conversation(cx);
                         if submitted_turn_arrived {
                             page.scroll_after_turn_count = None;
                             page.feed_scroll.scroll_to_bottom();
@@ -279,6 +291,23 @@ impl StudioPage {
             }
         }));
         cx.notify();
+    }
+
+    pub(super) fn forget_artifact(&mut self, artifact_id: StudioArtifactId) {
+        self.images.remove(&artifact_id);
+        self.loading_images.remove(&artifact_id);
+        self.image_tasks.remove(&artifact_id);
+        if self.selected_artifact == Some(artifact_id) {
+            self.selected_artifact = None;
+            self.reset_lightbox_viewer();
+        }
+        if let Some(view) = self.conversation.as_mut() {
+            for turn in &mut view.turns {
+                for run in &mut turn.runs {
+                    run.artifacts.retain(|artifact| artifact.id != artifact_id);
+                }
+            }
+        }
     }
 
     pub(super) fn start_missing_image_loads(&mut self, cx: &mut Context<Self>) {
@@ -424,6 +453,7 @@ impl StudioPage {
                     Ok(_) => {
                         page.prompt.update(cx, |input, cx| input.set_text("", cx));
                         page.source_turn = None;
+                        page.persist_composer_defaults(cx);
                     }
                     Err(error) => {
                         page.scroll_after_turn_count = None;
@@ -438,27 +468,67 @@ impl StudioPage {
 
     pub(super) fn apply_models(&mut self, models: Vec<zeron_studio::MediaModel>) {
         self.models = models;
-        for model in &self.models {
-            self.draft_runs
-                .entry(model.id.clone())
-                .or_insert_with(|| DraftRunConfig::from_model(model));
+        apply_remembered_drafts(&mut self.draft_runs, &self.models, &self.remembered.drafts);
+    }
+
+    pub(super) fn apply_remembered_or_default_models(&mut self) {
+        apply_remembered_selection(
+            &mut self.selected_models,
+            &self.models,
+            &self.remembered.selected_model_ids,
+        );
+        select_first_model(&mut self.selected_models, &self.models);
+    }
+
+    pub(super) fn seed_composer_from_conversation(&mut self, cx: &mut Context<Self>) {
+        let Some((conversation_id, last_turn)) = self.conversation.as_ref().and_then(|view| {
+            let conversation_id = view.conversation.id;
+            if self.selected_conversation != Some(conversation_id)
+                || self.composer_seeded_for == Some(conversation_id)
+            {
+                return None;
+            }
+            Some((conversation_id, view.turns.last().cloned()))
+        }) else {
+            return;
+        };
+        if let Some(turn) = last_turn.as_ref() {
+            apply_turn_models(
+                &mut self.selected_models,
+                &mut self.draft_runs,
+                &self.models,
+                turn,
+            );
+        }
+        self.apply_remembered_or_default_models();
+        self.composer_seeded_for = Some(conversation_id);
+        self.persist_composer_defaults(cx);
+    }
+
+    pub(super) fn persist_composer_defaults(&mut self, cx: &Context<Self>) {
+        let Some(dir) = self.state.read(cx).data_dir.clone() else {
+            return;
+        };
+        self.remembered = StudioDefaults::capture(&self.selected_models, &self.draft_runs);
+        if let Err(err) = self.remembered.save(&dir) {
+            tracing::warn!(error = %err, "studio-defaults save failed");
         }
     }
 
     pub(super) fn use_prompt(&mut self, turn: &StudioTurnView, cx: &mut Context<Self>) {
         self.prompt
             .update(cx, |input, cx| input.set_text(turn.prompt.clone(), cx));
-        self.selected_models = turn.runs.iter().map(|run| run.model.id.clone()).collect();
-        for run in &turn.runs {
-            self.draft_runs.insert(
-                run.model.id.clone(),
-                DraftRunConfig {
-                    output_count: run.output_count,
-                    controls: run.controls.clone(),
-                },
-            );
+        apply_turn_models(
+            &mut self.selected_models,
+            &mut self.draft_runs,
+            &self.models,
+            turn,
+        );
+        if let Some(conversation_id) = self.selected_conversation {
+            self.composer_seeded_for = Some(conversation_id);
         }
         self.source_turn = Some(turn.id);
+        self.persist_composer_defaults(cx);
         cx.notify();
     }
 
