@@ -1406,32 +1406,17 @@ impl StudioPage {
         let viewport_h = f32::from(self.feed_list.viewport_bounds().size.height);
         let capacity = rail::rail_slots(if viewport_h > 0.0 { viewport_h } else { 600.0 });
         let buckets = rail::tick_buckets(ticks.len(), capacity);
+        let bucket_n = buckets.len();
         let active_bucket = active.and_then(|ix| rail::bucket_of(&buckets, ix));
         let now = Utc::now();
 
-        div()
-            .absolute()
-            .left(px(16.0))
-            .top_0()
-            .bottom_0()
-            .w(px(26.0))
-            .flex()
-            .flex_col()
-            .items_start()
-            .justify_center()
-            .gap(px(rail::TICK_GAP))
+        rail::rail_stack()
             .children(buckets.into_iter().enumerate().map(|(ix, (start, end))| {
                 let rep = active.filter(|&a| a >= start && a < end).unwrap_or(start);
                 let tick = ticks[rep].clone();
                 let bucket_len = end - start;
                 let is_active = active_bucket == Some(ix);
                 let is_hovered = hover == Some(ix);
-                let bar_width = if is_hovered { 20.0 } else { 12.0 };
-                let bar_color = if is_active || is_hovered {
-                    theme.text.opacity(0.8)
-                } else {
-                    crate::theme::ink(0.16)
-                };
                 let prompt = rail::truncate_preview(&tick.prompt, rail::PREVIEW_PROMPT_CHARS);
                 let models = format_studio_models(&tick.models);
                 let sent = format_studio_tick_time(tick.created_at, now, &chrono::Local);
@@ -1481,36 +1466,21 @@ impl StudioPage {
                     crate::frost::frosted(12.0, crate::frost::MENU_BLUR, card).into_any_element()
                 });
                 let turn_ix = tick.turn_ix;
-                div()
-                    .id(("studio-rail-tick", ix))
-                    .relative()
-                    .h(px(rail::TICK_SLOT))
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .cursor_pointer()
-                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                        this.rail_hover = if *hovered { Some(ix) } else { None };
-                        cx.notify();
-                    }))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.scroll_to_turn(turn_ix, cx);
-                    }))
-                    .child(
-                        div()
-                            .h(px(2.0))
-                            .w(px(bar_width))
-                            .rounded(px(1.0))
-                            .bg(bar_color),
-                    )
-                    .when_some(card, |el, card| {
-                        el.child(gpui::deferred(
-                            gpui::anchored()
-                                .anchor(gpui::Anchor::LeftCenter)
-                                .snap_to_window_with_margin(px(8.0))
-                                .child(div().pl(px(26.0)).child(card)),
-                        ))
-                    })
+                rail::rail_tick(
+                    ("studio-rail-tick", ix),
+                    ix,
+                    bucket_n,
+                    rail::rail_bar_width(is_hovered),
+                    rail::rail_bar_color(theme, is_active, is_hovered),
+                    card,
+                )
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    rail::apply_rail_hover(&mut this.rail_hover, ix, *hovered);
+                    cx.notify();
+                }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.scroll_to_turn(turn_ix, cx);
+                }))
             }))
             .into_any_element()
     }

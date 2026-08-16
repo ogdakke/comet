@@ -4,10 +4,14 @@
 //! row. Hidden below a 48rem container width.
 //!
 //! Pure logic (tick extraction, active detection, width gate, previews) lives
-//! in free functions with unit tests; rendering is an `impl Transcript`
-//! extension since the rail shares the transcript's rows and `ListState`.
+//! in free functions with unit tests. Tick chrome ([`rail_stack`], [`rail_tick`])
+//! is shared with Studio; chat rendering is an `impl Transcript` extension
+//! because it needs the transcript rows and `ListState`.
 
-use gpui::{AnyElement, Context, ListOffset, SharedString, div, prelude::*, px};
+use gpui::{
+    AnyElement, Context, Div, ElementId, Hsla, ListOffset, SharedString, Stateful, div, prelude::*,
+    px,
+};
 use std::time::{Duration, Instant};
 
 use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
@@ -115,7 +119,8 @@ pub fn active_tick(tick_rows: &[usize], top_row: usize) -> Option<usize> {
 // Fixed-footprint outline (shadcn MessageScroller "Transcript Outline")
 // ---------------------------------------------------------------------------
 
-/// One tick's hit-row height and the gap between ticks (message-rail.tsx).
+/// One tick's visual slot height and the gap between visual bars.
+/// Hit rows absorb the nearer half of each gap so the stack has no dead space.
 pub const TICK_SLOT: f32 = 10.0;
 pub const TICK_GAP: f32 = 3.0;
 /// Vertical breathing room kept clear above/below the tick stack.
@@ -136,6 +141,130 @@ pub fn rail_capacity(height: f32) -> usize {
 /// [`MAX_RAIL_TICKS`] so the outline stays compact even on tall windows.
 pub fn rail_slots(height: f32) -> usize {
     rail_capacity(height).min(MAX_RAIL_TICKS)
+}
+
+/// Hit-row height for tick `ix` of `n` so the gap between visual slots
+/// belongs to the nearer tick.
+pub fn tick_hit_height(ix: usize, n: usize) -> f32 {
+    if n <= 1 {
+        return if n == 0 { 0.0 } else { TICK_SLOT };
+    }
+    let half = TICK_GAP / 2.0;
+    if ix == 0 || ix + 1 == n {
+        TICK_SLOT + half
+    } else {
+        TICK_SLOT + TICK_GAP
+    }
+}
+
+/// Top offset of the visual [`TICK_SLOT`] inside [`tick_hit_height`], so the
+/// 2px bar stays where the old gapped layout painted it.
+pub fn tick_hit_bar_offset(ix: usize, n: usize) -> f32 {
+    if n <= 1 || ix == 0 {
+        0.0
+    } else {
+        TICK_GAP / 2.0
+    }
+}
+
+/// Which tick owns `y` (0 at the top of the stack). Used by tests to lock
+/// the "nearest tick" contract the hit rows implement in layout.
+pub fn nearest_tick(y: f32, n: usize) -> Option<usize> {
+    if n == 0 {
+        return None;
+    }
+    let mut acc = 0.0;
+    for i in 0..n {
+        acc += tick_hit_height(i, n);
+        if y < acc {
+            return Some(i);
+        }
+    }
+    Some(n - 1)
+}
+
+/// Update rail hover from a tick's `on_hover`.
+///
+/// Hit rows now share an edge, so sliding to the next tick can fire
+/// `enter(next)` then `leave(prev)` in that order. Clearing on every leave
+/// would drop the hover we just set (cards appear going up, vanish going
+/// down). Only the tick that currently owns hover may clear it.
+pub fn apply_rail_hover(current: &mut Option<usize>, ix: usize, hovered: bool) {
+    if hovered {
+        *current = Some(ix);
+    } else if *current == Some(ix) {
+        *current = None;
+    }
+}
+
+pub fn rail_bar_width(hovered: bool) -> f32 {
+    if hovered { 20.0 } else { 12.0 }
+}
+
+pub fn rail_bar_color(theme: &Theme, active: bool, hovered: bool) -> Hsla {
+    if active || hovered {
+        theme.text.opacity(0.8)
+    } else {
+        crate::theme::ink(0.16)
+    }
+}
+
+/// Column that holds rail ticks. No gap — each tick's hit row absorbs the
+/// nearer half of the inter-tick space.
+pub fn rail_stack() -> Div {
+    div()
+        .absolute()
+        .left(px(16.0))
+        .top_0()
+        .bottom_0()
+        .w(px(26.0))
+        .flex()
+        .flex_col()
+        .items_start()
+        .justify_center()
+}
+
+/// Visual + hit chrome for one tick. Hover and click attach on the returned
+/// row; `card` is the already-frosted preview.
+pub fn rail_tick(
+    id: impl Into<ElementId>,
+    ix: usize,
+    n: usize,
+    bar_width: f32,
+    bar_color: impl Into<Hsla>,
+    card: Option<AnyElement>,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .relative()
+        .h(px(tick_hit_height(ix, n)))
+        .w_full()
+        .cursor_pointer()
+        .child(
+            div()
+                .absolute()
+                .top(px(tick_hit_bar_offset(ix, n)))
+                .left_0()
+                .h(px(TICK_SLOT))
+                .w_full()
+                .flex()
+                .items_center()
+                .child(
+                    div()
+                        .h(px(2.0))
+                        .w(px(bar_width))
+                        .rounded(px(1.0))
+                        .bg(bar_color.into()),
+                )
+                .when_some(card, |el, card| {
+                    el.child(gpui::deferred(
+                        gpui::anchored()
+                            .anchor(gpui::Anchor::LeftCenter)
+                            .snap_to_window_with_margin(px(8.0))
+                            .child(div().pl(px(26.0)).child(card)),
+                    ))
+                }),
+        )
 }
 
 /// shadcn's Transcript Outline keeps the always-visible rail a FIXED footprint
@@ -465,19 +594,10 @@ impl Transcript {
         let viewport_h = f32::from(self.list_state().viewport_bounds().size.height);
         let capacity = rail_slots(if viewport_h > 0.0 { viewport_h } else { 600.0 });
         let buckets = tick_buckets(pairs.len(), capacity);
+        let n = buckets.len();
         let active_bucket = active.and_then(|ix| bucket_of(&buckets, ix));
 
-        div()
-            .absolute()
-            .left(px(16.0))
-            .top_0()
-            .bottom_0()
-            .w(px(26.0))
-            .flex()
-            .flex_col()
-            .items_start()
-            .justify_center()
-            .gap(px(TICK_GAP))
+        rail_stack()
             .children(buckets.into_iter().enumerate().map(|(ix, (start, end))| {
                 // The bucket's representative prompt: the ACTIVE tick when it
                 // falls inside (hover then previews what you're reading),
@@ -488,14 +608,6 @@ impl Transcript {
                 let bucket_len = end - start;
                 let is_active = active_bucket == Some(ix);
                 let is_hovered = hover == Some(ix);
-                // Only hover grows the tick; the active one just reads brighter
-                // (message-rail.tsx: w-3 rest, w-5 hovered).
-                let bar_width = if is_hovered { 20.0 } else { 12.0 };
-                let bar_color = if is_active || is_hovered {
-                    theme.text.opacity(0.8)
-                } else {
-                    crate::theme::ink(0.16)
-                };
                 let prompt = truncate_preview(&tick.prompt, PREVIEW_PROMPT_CHARS);
                 let reply = tick
                     .reply
@@ -536,36 +648,23 @@ impl Transcript {
                     // mount helper), so the frost wrap happens here.
                     crate::frost::frosted(12.0, crate::frost::MENU_BLUR, card).into_any_element()
                 });
-                div()
-                    .id(("rail-tick", ix))
-                    .relative()
-                    .h(px(TICK_SLOT))
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .cursor_pointer()
-                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                        this.set_rail_hover(if *hovered { Some(ix) } else { None });
-                        cx.notify();
-                    }))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.scroll_to_row(row, cx);
-                    }))
-                    .child(
-                        div()
-                            .h(px(2.0))
-                            .w(px(bar_width))
-                            .rounded(px(1.0))
-                            .bg(bar_color),
-                    )
-                    .when_some(card, |el, card| {
-                        el.child(gpui::deferred(
-                            gpui::anchored()
-                                .anchor(gpui::Anchor::LeftCenter)
-                                .snap_to_window_with_margin(px(8.0))
-                                .child(div().pl(px(26.0)).child(card)),
-                        ))
-                    })
+                rail_tick(
+                    ("rail-tick", ix),
+                    ix,
+                    n,
+                    rail_bar_width(is_hovered),
+                    rail_bar_color(&theme, is_active, is_hovered),
+                    card,
+                )
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    let mut hover = this.rail_hover();
+                    apply_rail_hover(&mut hover, ix, *hovered);
+                    this.set_rail_hover(hover);
+                    cx.notify();
+                }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.scroll_to_row(row, cx);
+                }))
             }))
             .into_any_element()
     }
@@ -603,6 +702,56 @@ mod tests {
         assert_eq!(rail_slots(2000.0), MAX_RAIL_TICKS);
         // Short rails still shrink below the cap.
         assert!(rail_slots(100.0) < MAX_RAIL_TICKS);
+    }
+
+    #[test]
+    fn hit_rows_absorb_the_gap_so_the_nearest_tick_owns_it() {
+        assert_eq!(tick_hit_height(0, 0), 0.0);
+        assert_eq!(tick_hit_height(0, 1), TICK_SLOT);
+        // Two ticks: the 3px gap splits 1.5 / 1.5.
+        assert_eq!(tick_hit_height(0, 2), TICK_SLOT + TICK_GAP / 2.0);
+        assert_eq!(tick_hit_height(1, 2), TICK_SLOT + TICK_GAP / 2.0);
+        // Three: ends keep a half-gap, the middle takes a full gap.
+        assert_eq!(tick_hit_height(0, 3), TICK_SLOT + TICK_GAP / 2.0);
+        assert_eq!(tick_hit_height(1, 3), TICK_SLOT + TICK_GAP);
+        assert_eq!(tick_hit_height(2, 3), TICK_SLOT + TICK_GAP / 2.0);
+        let n = 5;
+        let stack: f32 = (0..n).map(|i| tick_hit_height(i, n)).sum();
+        assert_eq!(stack, n as f32 * TICK_SLOT + (n - 1) as f32 * TICK_GAP);
+        // Visual bars stay in the original gapped slots.
+        assert_eq!(tick_hit_bar_offset(0, 3), 0.0);
+        assert_eq!(tick_hit_bar_offset(1, 3), TICK_GAP / 2.0);
+        assert_eq!(tick_hit_bar_offset(2, 3), TICK_GAP / 2.0);
+    }
+
+    #[test]
+    fn apply_rail_hover_does_not_let_the_previous_tick_clear_the_next() {
+        let mut hover = None;
+        apply_rail_hover(&mut hover, 0, true);
+        assert_eq!(hover, Some(0));
+        // Sliding down: enter(1) then leave(0) — 0 must not wipe 1.
+        apply_rail_hover(&mut hover, 1, true);
+        apply_rail_hover(&mut hover, 0, false);
+        assert_eq!(hover, Some(1));
+        // Sliding up: enter(0) then leave(1).
+        apply_rail_hover(&mut hover, 0, true);
+        apply_rail_hover(&mut hover, 1, false);
+        assert_eq!(hover, Some(0));
+        // Leaving the stack entirely.
+        apply_rail_hover(&mut hover, 0, false);
+        assert_eq!(hover, None);
+    }
+
+    #[test]
+    fn nearest_tick_maps_the_whole_stack_with_no_dead_band() {
+        assert_eq!(nearest_tick(0.0, 0), None);
+        // Midpoint of the first/second gap (y = 11.5) belongs to tick 1.
+        assert_eq!(nearest_tick(0.0, 3), Some(0));
+        assert_eq!(nearest_tick(11.4, 3), Some(0));
+        assert_eq!(nearest_tick(11.5, 3), Some(1));
+        assert_eq!(nearest_tick(24.4, 3), Some(1));
+        assert_eq!(nearest_tick(24.5, 3), Some(2));
+        assert_eq!(nearest_tick(100.0, 3), Some(2));
     }
 
     #[test]
