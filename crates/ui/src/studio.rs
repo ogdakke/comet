@@ -23,6 +23,11 @@ use crate::popover;
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
+/// Scroll runway below the final Studio turn. The composer floats 18px above
+/// the viewport and is 191px tall at its largest first-release configuration;
+/// the remaining space keeps the last image clear of the glass card.
+const STUDIO_COMPOSER_CLEARANCE: f32 = 256.0;
+
 pub fn grid_columns(content_width: f32) -> usize {
     if content_width < 520.0 {
         1
@@ -167,6 +172,8 @@ pub struct StudioPage {
     model_picker_active: Option<usize>,
     model_picker_scroll: gpui::ScrollHandle,
     model_picker_focus: FocusHandle,
+    feed_scroll: gpui::ScrollHandle,
+    scroll_after_turn_count: Option<usize>,
     source_turn: Option<zeron_studio::StudioTurnId>,
     images: HashMap<StudioArtifactId, Arc<Image>>,
     loading_images: HashSet<StudioArtifactId>,
@@ -222,6 +229,8 @@ impl StudioPage {
             model_picker_active: None,
             model_picker_scroll: gpui::ScrollHandle::new(),
             model_picker_focus: cx.focus_handle(),
+            feed_scroll: gpui::ScrollHandle::new(),
+            scroll_after_turn_count: None,
             source_turn: None,
             images: HashMap::new(),
             loading_images: HashSet::new(),
@@ -480,6 +489,8 @@ impl StudioPage {
         };
         self.selected_conversation = Some(id);
         self.conversation = None;
+        self.scroll_after_turn_count = None;
+        self.feed_scroll.set_offset(Point::default());
         cx.emit(StudioEvent::SidebarChanged);
         self.watch_task = Some(cx.spawn(async move |this, cx| {
             let stream = engine
@@ -506,7 +517,14 @@ impl StudioPage {
                 };
                 if this
                     .update(cx, |page, cx| {
+                        let submitted_turn_arrived = page
+                            .scroll_after_turn_count
+                            .is_some_and(|before| view.turns.len() > before);
                         page.conversation = Some(view);
+                        if submitted_turn_arrived {
+                            page.scroll_after_turn_count = None;
+                            page.feed_scroll.scroll_to_bottom();
+                        }
                         page.start_missing_image_loads(cx);
                         cx.notify();
                     })
@@ -615,6 +633,12 @@ impl StudioPage {
             })
             .collect::<Vec<_>>();
         let source = self.source_turn;
+        self.scroll_after_turn_count = Some(
+            self.conversation
+                .as_ref()
+                .map_or(0, |view| view.turns.len()),
+        );
+        self.feed_scroll.scroll_to_bottom();
         self.busy = true;
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
@@ -634,7 +658,10 @@ impl StudioPage {
                         page.prompt.update(cx, |input, cx| input.set_text("", cx));
                         page.source_turn = None;
                     }
-                    Err(error) => page.error = Some(error.to_string().into()),
+                    Err(error) => {
+                        page.scroll_after_turn_count = None;
+                        page.error = Some(error.to_string().into());
+                    }
                 }
                 cx.notify();
             })
@@ -1186,7 +1213,7 @@ impl StudioPage {
             .flex()
             .flex_col()
             .gap(px(28.0))
-            .pb(px(190.0));
+            .pb(px(STUDIO_COMPOSER_CLEARANCE));
         for (turn_ix, turn) in turns.iter().enumerate() {
             let turn_for_prompt = turn.clone();
             let turn_for_again = turn.clone();
@@ -1896,8 +1923,10 @@ impl StudioPage {
         let stage_image = if let Some(image) = image {
             div()
                 .id("studio-artifact-image")
-                .max_w_full()
-                .max_h_full()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
                 .relative()
                 .left(self.lightbox_pan.x)
                 .top(self.lightbox_pan.y)
@@ -2007,7 +2036,7 @@ impl StudioPage {
             .border_color(theme.border)
             .bg(theme.glass_overlay())
             .px(px(18.0))
-            .pt(px(18.0))
+            .pt(px(Theme::TITLEBAR_HEIGHT + 18.0))
             .pb(px(16.0))
             .when_some(details, |inspector, (prompt, model, mime, size)| {
                 let copy_prompt = prompt.clone();
@@ -2118,7 +2147,6 @@ impl StudioPage {
         Some(
             div()
                 .size_full()
-                .pt(px(Theme::TITLEBAR_HEIGHT))
                 .flex()
                 .min_w_0()
                 .track_focus(&self.focus)
@@ -2147,10 +2175,11 @@ impl StudioPage {
                         .overflow_hidden()
                         .child(
                             div()
-                                .h(px(44.0))
+                                .h(px(Theme::TITLEBAR_HEIGHT))
                                 .flex_none()
                                 .flex()
                                 .items_center()
+                                .pt(px(Theme::TITLEBAR_TOP_PAD))
                                 .px(px(16.0))
                                 .child(back_button),
                         )
@@ -2287,6 +2316,7 @@ impl Render for StudioPage {
                         .id("studio-feed-scroll")
                         .size_full()
                         .overflow_y_scroll()
+                        .track_scroll(&self.feed_scroll)
                         .when(has_turns, |feed| feed.px(px(24.0)).pt(px(22.0)))
                         .child(self.render_feed(window, &theme, cx)),
                 )
