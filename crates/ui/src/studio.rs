@@ -65,6 +65,10 @@ fn draft_aspect(model: &zeron_studio::MediaModel, draft: &DraftRunConfig) -> (u3
         .unwrap_or_else(|| default_aspect(model))
 }
 
+fn write_artifact_file(destination: PathBuf, bytes: Vec<u8>) -> Result<(), String> {
+    std::fs::write(destination, bytes).map_err(|error| error.to_string())
+}
+
 fn control_value_label(value: &zeron_studio::ControlValue) -> String {
     use zeron_studio::ControlValue;
     match value {
@@ -834,9 +838,11 @@ impl StudioPage {
                 }
             };
             let result = match read_artifact_bytes(&engine, artifact_id).await {
-                Ok((_, _, bytes)) => tokio::fs::write(destination, bytes)
-                    .await
-                    .map_err(|error| error.to_string()),
+                Ok((_, _, bytes)) => {
+                    cx.background_executor()
+                        .spawn(async move { write_artifact_file(destination, bytes) })
+                        .await
+                }
                 Err(error) => Err(error),
             };
             if let Err(error) = result {
@@ -2606,5 +2612,18 @@ mod tests {
         assert_eq!(grid_columns(900.0), 3);
         assert_eq!(grid_columns(1239.0), 3);
         assert_eq!(grid_columns(1240.0), 4);
+    }
+
+    #[test]
+    fn artifact_file_write_does_not_require_a_tokio_runtime() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let destination = dir.path().join("download.png");
+
+        write_artifact_file(destination.clone(), b"image bytes".to_vec()).expect("artifact write");
+
+        assert_eq!(
+            std::fs::read(destination).expect("saved artifact"),
+            b"image bytes"
+        );
     }
 }
