@@ -30,8 +30,9 @@ use super::page::StudioPage;
 
 /// Scroll runway below the final Studio turn. The composer floats 18px above
 /// the viewport and is 191px tall at its largest first-release configuration;
-/// the remaining space keeps the last image clear of the glass card.
-pub(super) const STUDIO_COMPOSER_CLEARANCE: f32 = 256.0;
+/// a 30px generate-more pill sits 10px above that. The remaining space keeps
+/// the last image clear of the glass card.
+pub(super) const STUDIO_COMPOSER_CLEARANCE: f32 = 296.0;
 /// Extra left inset so the tick rail (16px + 20px hover bar) does not cover
 /// the prompt header. Matches the chat transcript's wide-gutter band.
 pub(super) const STUDIO_RAIL_GUTTER: f32 = 28.0;
@@ -311,7 +312,9 @@ pub(super) fn prompt_exceeds_lines(
     prompt_visual_lines_at(prompt, inner_width, char_advance) > max_lines
 }
 
-/// Quiet text action under a prompt bubble or image grid (`Use prompt`, `Generate more`).
+/// Quiet text action under a prompt bubble or image grid (`Use prompt`,
+/// earlier-turn `Generate more`). The latest turn's generate-more lives on
+/// the floating composer pill instead.
 pub(super) fn turn_action(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
@@ -817,7 +820,10 @@ impl StudioPage {
             div()
                 .id("studio-feed-scroll")
                 .size_full()
-                .pt(px(Theme::TITLEBAR_HEIGHT + Theme::TRANSCRIPT_FADE_BAND))
+                // Start the scroll viewport at the fade edge. Previously it
+                // began below the whole band, so no painted row could ever
+                // enter the EdgeFade ramp.
+                .pt(px(Theme::TITLEBAR_HEIGHT))
                 .child(list_element)
                 .into_any_element()
         } else {
@@ -850,9 +856,17 @@ impl StudioPage {
                 ))
                 .into_any_element()
         };
-        let feed = crate::edge_fade::edge_faded(Theme::TRANSCRIPT_FADE_BAND, true, false, body)
-            .inset_top(Theme::TITLEBAR_HEIGHT)
-            .band_top(Theme::TRANSCRIPT_FADE_BAND);
+        let top = self.feed_list.logical_scroll_top();
+        let fade_top = top.item_ix > 0 || f32::from(top.offset_in_item) > 1.0;
+        let fade_bottom = self.feed_list.is_scrolled_to_end() == Some(false);
+        let feed =
+            crate::edge_fade::edge_faded(Theme::TRANSCRIPT_FADE_BAND, fade_top, fade_bottom, body)
+                .inset_top(Theme::TITLEBAR_HEIGHT)
+                .band_top(Theme::TRANSCRIPT_FADE_BAND)
+                // The transcript scrolls underneath the floating composer. Fade
+                // it before the composer chrome instead of clipping the last row
+                // against a hard edge.
+                .band_bottom(112.0);
         let scrub = cx.weak_entity();
         div()
             .relative()
@@ -958,8 +972,8 @@ impl StudioPage {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let turn_for_prompt = turn.clone();
-        let turn_for_more = turn.clone();
         let turn_for_fork = turn.clone();
+        let is_latest = turn_ix + 1 == self.feed_turns().len();
         let turn_id = turn.id;
         let expanded = self.expanded_prompts.contains(&turn.id);
         let bubble_width = content_width
@@ -1121,16 +1135,19 @@ impl StudioPage {
                     ),
             )
             .child(grid)
-            .child(
-                turn_action(
-                    format!("studio-generate-more-{turn_ix}"),
-                    "Generate more",
-                    theme,
+            .when(!is_latest, |el| {
+                let turn_for_more = turn.clone();
+                el.child(
+                    turn_action(
+                        format!("studio-generate-more-{turn_ix}"),
+                        "Generate more",
+                        theme,
+                    )
+                    .on_click(
+                        cx.listener(move |page, _, _, cx| page.generate_more(&turn_for_more, cx)),
+                    ),
                 )
-                .on_click(
-                    cx.listener(move |page, _, _, cx| page.generate_more(&turn_for_more, cx)),
-                ),
-            )
+            })
             .into_any_element()
     }
 

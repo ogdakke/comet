@@ -8,11 +8,14 @@ use gpui::{
 };
 use zeron_studio::{MediaModel, ModelFeature, ModelId};
 
+use crate::motion;
 use crate::popover;
 use crate::theme::Theme;
 
-use super::draft::{DraftRunConfig, boolean_control_chip, control_value_label, draft_aspect};
+use super::draft::{DraftRunConfig, control_value_label, draft_aspect};
 use super::page::StudioPage;
+
+const COMPACT_ACTIONS_INSET: f32 = 205.0;
 
 /// Catalog rows visible in the Studio model picker after favorites, feature
 /// filters, and search. Starred models stay floated to the top.
@@ -53,6 +56,38 @@ fn visible_model_indices(
 }
 
 impl StudioPage {
+    fn close_model_config_menu(&mut self, cx: &mut Context<Self>) {
+        if self.model_config_menu.begin_close() {
+            popover::reap_popup(cx, |page: &mut Self| &mut page.model_config_menu);
+        }
+        cx.notify();
+    }
+
+    fn toggle_model_config_menu(&mut self, model_id: ModelId, cx: &mut Context<Self>) {
+        let pressed_open = self.model_config_menu.take_press_was_open();
+        if self.model_config_menu.is_open() && self.model_config_menu.as_open() == Some(&model_id) {
+            self.close_model_config_menu(cx);
+        } else if !pressed_open {
+            self.model_config_menu.open(model_id);
+            cx.notify();
+        }
+    }
+
+    fn set_control(
+        &mut self,
+        model_id: &ModelId,
+        control_id: &zeron_studio::ControlId,
+        value: zeron_studio::ControlValue,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(draft) = self.draft_runs.get_mut(model_id) else {
+            return;
+        };
+        draft.controls.insert(control_id.clone(), value);
+        self.persist_composer_defaults(cx);
+        cx.notify();
+    }
+
     pub(super) fn close_model_picker(&mut self, cx: &mut Context<Self>) {
         if self.model_picker.begin_close() {
             popover::reap_popup(cx, |page: &mut Self| &mut page.model_picker);
@@ -251,330 +286,424 @@ impl StudioPage {
         cx.notify();
     }
 
-    pub(super) fn cycle_control(
+    fn adjust_numeric_control(
         &mut self,
-        model_id: &zeron_studio::ModelId,
+        model_id: &ModelId,
         control: &zeron_studio::ModelControl,
+        direction: f64,
         cx: &mut Context<Self>,
     ) {
-        {
-            let Some(draft) = self.draft_runs.get_mut(model_id) else {
-                return;
-            };
-            let current = draft.controls.get(&control.id).cloned();
-            let next = if !control.choices.is_empty() {
-                let index = control
-                    .choices
-                    .iter()
-                    .position(|choice| Some(&choice.value) == current.as_ref())
-                    .map(|index| (index + 1) % control.choices.len())
-                    .unwrap_or(0);
-                Some(control.choices[index].value.clone())
-            } else if control.kind == zeron_studio::ControlKind::Boolean {
-                let value = match current {
-                    Some(zeron_studio::ControlValue::Boolean { value }) => !value,
-                    _ => !matches!(
-                        control.default,
-                        Some(zeron_studio::ControlValue::Boolean { value: true })
-                    ),
-                };
-                Some(zeron_studio::ControlValue::Boolean { value })
-            } else if let Some(zeron_studio::ControlValue::Integer { value }) = current {
-                let step = control.step.unwrap_or(1.0).max(1.0) as i64;
-                let minimum = control.minimum.unwrap_or(value as f64) as i64;
-                let maximum = control.maximum.unwrap_or((value + step) as f64) as i64;
-                Some(zeron_studio::ControlValue::Integer {
-                    value: if value + step > maximum {
-                        minimum
-                    } else {
-                        value + step
-                    },
-                })
-            } else if let Some(zeron_studio::ControlValue::Number { value }) = current {
-                let step = control.step.unwrap_or(1.0);
-                let minimum = control.minimum.unwrap_or(value);
-                let maximum = control.maximum.unwrap_or(value + step);
-                Some(zeron_studio::ControlValue::Number {
-                    value: if value + step > maximum {
-                        minimum
-                    } else {
-                        value + step
-                    },
-                })
-            } else {
-                None
-            };
-            if let Some(next) = next {
-                draft.controls.insert(control.id.clone(), next);
-            } else {
-                return;
+        let Some(draft) = self.draft_runs.get_mut(model_id) else {
+            return;
+        };
+        let current = draft.controls.get(&control.id).or(control.default.as_ref());
+        let step = control.step.unwrap_or(1.0).max(f64::EPSILON) * direction;
+        let next = match current {
+            Some(zeron_studio::ControlValue::Integer { value }) => {
+                let minimum = control.minimum.unwrap_or(*value as f64);
+                let maximum = control.maximum.unwrap_or(*value as f64);
+                zeron_studio::ControlValue::Integer {
+                    value: ((*value as f64 + step).clamp(minimum, maximum)).round() as i64,
+                }
             }
-        }
+            Some(zeron_studio::ControlValue::Number { value }) => {
+                zeron_studio::ControlValue::Number {
+                    value: (*value + step).clamp(
+                        control.minimum.unwrap_or(*value),
+                        control.maximum.unwrap_or(*value),
+                    ),
+                }
+            }
+            Some(zeron_studio::ControlValue::DurationSeconds { value }) => {
+                zeron_studio::ControlValue::DurationSeconds {
+                    value: (*value + step).clamp(
+                        control.minimum.unwrap_or(*value),
+                        control.maximum.unwrap_or(*value),
+                    ),
+                }
+            }
+            _ => return,
+        };
+        draft.controls.insert(control.id.clone(), next);
         self.persist_composer_defaults(cx);
         cx.notify();
     }
 
-    pub(super) fn render_composer(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let model_configs = self
+    fn render_model_control(
+        &self,
+        model_id: &ModelId,
+        control: &zeron_studio::ModelControl,
+        draft: &DraftRunConfig,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let current = draft.controls.get(&control.id).or(control.default.as_ref());
+        let mut choices = div().flex().flex_wrap().gap(px(5.0));
+        if control.kind == zeron_studio::ControlKind::Boolean {
+            let on = current.is_some_and(|value| {
+                matches!(value, zeron_studio::ControlValue::Boolean { value: true })
+            });
+            for (label, value) in [("Off", false), ("On", true)] {
+                let click_model = model_id.clone();
+                let click_control = control.id.clone();
+                choices = choices.child(
+                    config_choice(
+                        format!(
+                            "studio-control-{}-{}-{label}",
+                            model_id.as_str(),
+                            control.id.as_str()
+                        ),
+                        label,
+                        on == value,
+                        theme,
+                    )
+                    .on_click(cx.listener(move |page, _, _, cx| {
+                        page.set_control(
+                            &click_model,
+                            &click_control,
+                            zeron_studio::ControlValue::Boolean { value },
+                            cx,
+                        )
+                    })),
+                );
+            }
+        } else if !control.choices.is_empty() {
+            for choice in &control.choices {
+                let active = current == Some(&choice.value);
+                let click_model = model_id.clone();
+                let click_control = control.id.clone();
+                let value = choice.value.clone();
+                let id = format!(
+                    "studio-control-{}-{}-{}",
+                    model_id.as_str(),
+                    control.id.as_str(),
+                    choice.label
+                );
+                let button = if control.kind == zeron_studio::ControlKind::AspectRatio {
+                    config_aspect_choice(id, choice.label.clone(), &choice.value, active, theme)
+                } else {
+                    config_choice(id, choice.label.clone(), active, theme)
+                };
+                choices = choices.child(button.on_click(cx.listener(move |page, _, _, cx| {
+                    page.set_control(&click_model, &click_control, value.clone(), cx)
+                })));
+            }
+        } else {
+            let minus_model = model_id.clone();
+            let plus_model = model_id.clone();
+            let minus_control = control.clone();
+            let plus_control = control.clone();
+            let value = current
+                .map(control_value_label)
+                .unwrap_or_else(|| "Default".into());
+            choices = choices.child(
+                div()
+                    .h(px(30.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(7.0))
+                    .bg(crate::theme::wash(0.05))
+                    .child(config_step_button(
+                        format!(
+                            "studio-control-minus-{}-{}",
+                            model_id.as_str(),
+                            control.id.as_str()
+                        ),
+                        "−",
+                        move |page, cx| {
+                            page.adjust_numeric_control(&minus_model, &minus_control, -1.0, cx)
+                        },
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .min_w(px(28.0))
+                            .text_center()
+                            .text_size(px(10.5))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(SharedString::from(value)),
+                    )
+                    .child(config_step_button(
+                        format!(
+                            "studio-control-plus-{}-{}",
+                            model_id.as_str(),
+                            control.id.as_str()
+                        ),
+                        "+",
+                        move |page, cx| {
+                            page.adjust_numeric_control(&plus_model, &plus_control, 1.0, cx)
+                        },
+                        cx,
+                    )),
+            );
+        }
+        let label = if control.id.as_str() == "steps" {
+            SharedString::from("Inference steps")
+        } else {
+            SharedString::from(control.label.clone())
+        };
+        config_section(label, theme).child(choices)
+    }
+
+    fn render_model_config_menu(
+        &self,
+        model: &MediaModel,
+        draft: &DraftRunConfig,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let model_id = model.id.clone();
+        let maximum = model.maximum_output_count.max(1);
+        let count = draft.output_count;
+        let minus_id = model_id.clone();
+        let plus_id = model_id.clone();
+        let mut controls = div().flex().flex_col().gap(px(12.0));
+
+        controls = controls.child(
+            config_section("Amount", theme).child(
+                div()
+                    .w(px(92.0))
+                    .h(px(32.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(8.0))
+                    .bg(crate::theme::wash(0.06))
+                    .child(config_step_button(
+                        format!("studio-output-minus-{}", model.id.as_str()),
+                        "−",
+                        move |page, cx| page.adjust_output_count(&minus_id, -1, maximum, cx),
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .min_w(px(28.0))
+                            .text_center()
+                            .text_size(px(11.5))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(SharedString::from(count.to_string())),
+                    )
+                    .child(config_step_button(
+                        format!("studio-output-plus-{}", model.id.as_str()),
+                        "+",
+                        move |page, cx| page.adjust_output_count(&plus_id, 1, maximum, cx),
+                        cx,
+                    )),
+            ),
+        );
+
+        if let Some(aspect) = model
+            .controls
+            .iter()
+            .find(|control| control.id.as_str() == "aspect_ratio")
+        {
+            controls =
+                controls.child(self.render_model_control(&model_id, aspect, draft, theme, cx));
+        }
+
+        let mut resolution_reasoning = div().w_full().flex().items_start().gap(px(12.0));
+        let mut has_resolution_reasoning = false;
+        for id in ["resolution", "reasoning"] {
+            if let Some(control) = model
+                .controls
+                .iter()
+                .find(|control| control.id.as_str() == id)
+            {
+                has_resolution_reasoning = true;
+                resolution_reasoning = resolution_reasoning.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(self.render_model_control(&model_id, control, draft, theme, cx)),
+                );
+            }
+        }
+        if has_resolution_reasoning {
+            controls = controls.child(resolution_reasoning);
+        }
+
+        let mut steps_format = div().w_full().flex().items_start().gap(px(12.0));
+        let mut has_steps_format = false;
+        for id in ["steps", "format"] {
+            if let Some(control) = model
+                .controls
+                .iter()
+                .find(|control| control.id.as_str() == id)
+            {
+                has_steps_format = true;
+                steps_format = steps_format.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(self.render_model_control(&model_id, control, draft, theme, cx)),
+                );
+            }
+        }
+        if has_steps_format {
+            controls = controls.child(steps_format);
+        }
+
+        for control in &model.controls {
+            if matches!(
+                control.id.as_str(),
+                "aspect_ratio" | "resolution" | "reasoning" | "steps" | "format" | "safe_mode"
+            ) {
+                continue;
+            }
+            controls =
+                controls.child(self.render_model_control(&model_id, control, draft, theme, cx));
+        }
+
+        popover::popover_card(theme)
+            .id(SharedString::from(format!(
+                "studio-model-options-{}",
+                model.id.as_str()
+            )))
+            .w(px(320.0))
+            .max_h(px(420.0))
+            .overflow_y_scroll()
+            .p(px(12.0))
+            .on_mouse_down_out(cx.listener(|page, _, _, cx| page.close_model_config_menu(cx)))
+            .child(
+                div()
+                    .mb(px(12.0))
+                    .text_size(px(13.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(SharedString::from(model.display_name.clone())),
+            )
+            .child(controls)
+            .into_any_element()
+    }
+
+    fn render_model_config(
+        &mut self,
+        model: MediaModel,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let draft = self
+            .draft_runs
+            .get(&model.id)
+            .cloned()
+            .unwrap_or_else(|| DraftRunConfig::from_model(&model));
+        let amount = draft.output_count;
+        let aspect = draft_aspect(&model, &draft);
+        let aspect_label = model
+            .controls
+            .iter()
+            .find(|control| control.id.as_str() == "aspect_ratio")
+            .and_then(|control| draft.controls.get(&control.id).or(control.default.as_ref()))
+            .map(control_value_label)
+            .unwrap_or_else(|| format!("{}:{}", aspect.0, aspect.1));
+        let resolution_label = model
+            .controls
+            .iter()
+            .find(|control| control.id.as_str() == "resolution")
+            .and_then(|control| draft.controls.get(&control.id).or(control.default.as_ref()))
+            .map(control_value_label)
+            .unwrap_or_else(|| "Auto".into());
+        let menu_here = self.model_config_menu.get() == Some(&model.id);
+        let menu = menu_here.then(|| {
+            popover::anchored_menu_above(
+                SharedString::from(format!("studio-model-options-menu-{}", model.id.as_str())),
+                self.render_model_config_menu(&model, &draft, theme, cx),
+                self.model_config_menu.closing_since(),
+            )
+        });
+        let trigger_id = model.id.clone();
+        let press_id = model.id.clone();
+        let remove_id = model.id.clone();
+
+        div()
+            .id(SharedString::from(format!(
+                "studio-model-config-{}",
+                model.id.as_str()
+            )))
+            .relative()
+            .h(px(34.0))
+            .max_w(px(310.0))
+            .flex_none()
+            .rounded(px(14.0))
+            .border_1()
+            .border_color(if menu_here {
+                theme.border_strong
+            } else {
+                theme.border
+            })
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .pl(px(12.0))
+            .pr(px(7.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(crate::theme::wash(0.075)))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |page, _, _, _| {
+                    page.model_config_menu
+                        .note_trigger_press_matching(|id| id == &press_id)
+                }),
+            )
+            .on_click(cx.listener(move |page, _, _, cx| {
+                page.toggle_model_config_menu(trigger_id.clone(), cx)
+            }))
+            .when_some(menu, |card, menu| card.child(menu))
+            .child(
+                div()
+                    .max_w(px(132.0))
+                    .truncate()
+                    .text_size(px(11.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .child(SharedString::from(model.display_name)),
+            )
+            .child(config_readout(
+                SharedString::from(format!("{amount}×")),
+                theme,
+            ))
+            .child(config_readout(SharedString::from(aspect_label), theme))
+            .child(config_readout(SharedString::from(resolution_label), theme))
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "studio-remove-model-{}",
+                        remove_id.as_str()
+                    )))
+                    .size(px(22.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_click(cx.listener(move |page, _, _, cx| {
+                        cx.stop_propagation();
+                        page.selected_models.remove(&remove_id);
+                        page.close_model_config_menu(cx);
+                        page.persist_composer_defaults(cx);
+                    }))
+                    .child(
+                        crate::icons::icon(crate::icons::CLOSE)
+                            .size(px(11.0))
+                            .text_color(theme.text_muted),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    pub(super) fn render_composer(
+        &mut self,
+        window: &mut Window,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected = self
             .models
             .clone()
             .into_iter()
             .filter(|model| self.selected_models.contains(&model.id))
-            .map(|model| {
-                let remove_id = model.id.clone();
-                let output_count = self
-                    .draft_runs
-                    .get(&model.id)
-                    .map(|draft| draft.output_count)
-                    .unwrap_or(1);
-                let maximum_output_count = model.maximum_output_count.max(1);
-                let decrement_id = model.id.clone();
-                let increment_id = model.id.clone();
-                let aspect_control = model
-                    .controls
-                    .iter()
-                    .find(|control| control.id.as_str() == "aspect_ratio")
-                    .cloned();
-                let resolution_control = model
-                    .controls
-                    .iter()
-                    .find(|control| control.id.as_str() == "resolution")
-                    .cloned();
-                let reasoning_control = model
-                    .controls
-                    .iter()
-                    .find(|control| control.id.as_str() == "reasoning")
-                    .cloned();
-                let draft = self
-                    .draft_runs
-                    .get(&model.id)
-                    .cloned()
-                    .unwrap_or_else(|| DraftRunConfig::from_model(&model));
-                let aspect = draft_aspect(&model, &draft);
-                let aspect_label = aspect_control
-                    .as_ref()
-                    .and_then(|control| draft.controls.get(&control.id))
-                    .map(control_value_label)
-                    .unwrap_or_else(|| format!("{}:{}", aspect.0, aspect.1));
-                let aspect_ratio = aspect.0 as f32 / aspect.1.max(1) as f32;
-                let (indicator_w, indicator_h) = if aspect_ratio >= 1.0 {
-                    (18.0, (18.0 / aspect_ratio).clamp(7.0_f32, 18.0))
-                } else {
-                    ((18.0 * aspect_ratio).clamp(7.0_f32, 18.0), 18.0)
-                };
-                let resolution_label = resolution_control
-                    .as_ref()
-                    .and_then(|control| draft.controls.get(&control.id))
-                    .map(control_value_label)
-                    .unwrap_or_else(|| "Auto".into());
-                let reasoning_on = reasoning_control
-                    .as_ref()
-                    .and_then(|control| draft.controls.get(&control.id))
-                    .is_some_and(|value| {
-                        matches!(value, zeron_studio::ControlValue::Boolean { value: true })
-                    });
-                let run_quote = super::cost::run_quote(&model, &draft, &self.live_quotes);
-                let aspect_model_id = model.id.clone();
-                let resolution_model_id = model.id.clone();
-                let reasoning_model_id = model.id.clone();
-                div()
-                    .id(SharedString::from(format!(
-                        "studio-model-config-{}",
-                        model.id.as_str()
-                    )))
-                    .w(px(292.0))
-                    .flex_none()
-                    .rounded(px(10.0))
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(crate::theme::wash(0.025))
-                    .px(px(10.0))
-                    .py(px(8.0))
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(11.0))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .child(SharedString::from(model.display_name.clone())),
-                            )
-                            .when_some(run_quote.as_ref(), |row, quote| {
-                                row.child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(px(10.5))
-                                        .text_color(theme.text_muted)
-                                        .child(SharedString::from(super::cost::format_quote(
-                                            quote,
-                                        ))),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "studio-remove-model-{}",
-                                        remove_id.as_str()
-                                    )))
-                                    .size(px(18.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(5.0))
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(crate::theme::wash(0.10)))
-                                    .on_click(cx.listener(move |page, _, _, cx| {
-                                        page.selected_models.remove(&remove_id);
-                                        page.persist_composer_defaults(cx);
-                                        cx.notify();
-                                    }))
-                                    .child(
-                                        crate::icons::icon(crate::icons::CLOSE)
-                                            .size(px(11.0))
-                                            .text_color(theme.text_muted),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .rounded(px(7.0))
-                                    .bg(crate::theme::wash(0.07))
-                                    .text_size(px(10.5))
-                                    .child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "studio-output-minus-{}",
-                                                decrement_id.as_str()
-                                            )))
-                                            .cursor_pointer()
-                                            .px(px(6.0))
-                                            .py(px(5.0))
-                                            .on_click(cx.listener(move |page, _, _, cx| {
-                                                page.adjust_output_count(
-                                                    &decrement_id,
-                                                    -1,
-                                                    maximum_output_count,
-                                                    cx,
-                                                );
-                                            }))
-                                            .child("−"),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w(px(16.0))
-                                            .text_center()
-                                            .text_color(theme.text_muted)
-                                            .child(SharedString::from(output_count.to_string())),
-                                    )
-                                    .child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "studio-output-plus-{}",
-                                                increment_id.as_str()
-                                            )))
-                                            .cursor_pointer()
-                                            .px(px(6.0))
-                                            .py(px(5.0))
-                                            .on_click(cx.listener(move |page, _, _, cx| {
-                                                page.adjust_output_count(
-                                                    &increment_id,
-                                                    1,
-                                                    maximum_output_count,
-                                                    cx,
-                                                );
-                                            }))
-                                            .child("+"),
-                                    ),
-                            )
-                            .when_some(aspect_control, |row, control| {
-                                row.child(
-                                    div()
-                                        .id(SharedString::from(format!(
-                                            "studio-aspect-{}",
-                                            aspect_model_id.as_str()
-                                        )))
-                                        .h(px(27.0))
-                                        .px(px(7.0))
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(5.0))
-                                        .rounded(px(7.0))
-                                        .bg(crate::theme::wash(0.07))
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(move |page, _, _, cx| {
-                                            page.cycle_control(&aspect_model_id, &control, cx)
-                                        }))
-                                        .child(
-                                            div()
-                                                .w(px(indicator_w))
-                                                .h(px(indicator_h))
-                                                .rounded(px(2.0))
-                                                .border_1()
-                                                .border_color(theme.text_muted.opacity(0.75)),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(10.5))
-                                                .text_color(theme.text_muted)
-                                                .child(SharedString::from(aspect_label)),
-                                        ),
-                                )
-                            })
-                            .when_some(resolution_control, |row, control| {
-                                row.child(
-                                    div()
-                                        .id(SharedString::from(format!(
-                                            "studio-resolution-{}",
-                                            resolution_model_id.as_str()
-                                        )))
-                                        .h(px(27.0))
-                                        .px(px(7.0))
-                                        .flex()
-                                        .items_center()
-                                        .rounded(px(7.0))
-                                        .bg(crate::theme::wash(0.07))
-                                        .cursor_pointer()
-                                        .text_size(px(10.5))
-                                        .text_color(theme.text_muted)
-                                        .on_click(cx.listener(move |page, _, _, cx| {
-                                            page.cycle_control(&resolution_model_id, &control, cx)
-                                        }))
-                                        .child(SharedString::from(resolution_label)),
-                                )
-                            })
-                            .when_some(reasoning_control, |row, control| {
-                                row.child(
-                                    boolean_control_chip(
-                                        format!("studio-reasoning-{}", reasoning_model_id.as_str()),
-                                        "Reasoning",
-                                        reasoning_on,
-                                        theme,
-                                    )
-                                    .on_click(cx.listener(
-                                        move |page, _, _, cx| {
-                                            page.cycle_control(&reasoning_model_id, &control, cx)
-                                        },
-                                    )),
-                                )
-                            }),
-                    )
-            })
             .collect::<Vec<_>>();
+        let mut model_configs = Vec::with_capacity(selected.len());
+        for model in selected {
+            model_configs.push(self.render_model_config(model, theme, cx));
+        }
+        let has_model_configs = !model_configs.is_empty();
 
         let visible_model_indices = self.filtered_model_indices(cx);
         let favorites_view = self.model_picker_favorites;
@@ -852,42 +981,105 @@ impl StudioPage {
         let blocked = self.busy
             || self.selected_models.is_empty()
             || self.prompt.read(cx).text().trim().is_empty();
-        let composer = div()
-            .w_full()
-            .max_w(px(920.0))
-            .occlude()
-            .rounded(px(26.0))
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.input_glass_bg())
-            .when(!theme.is_glass(), |composer| composer.shadow_lg())
-            .px(px(12.0))
-            .pt(px(10.0))
-            .pb(px(10.0))
-            .flex()
-            .flex_col()
-            .gap(px(10.0))
-            .child(
-                div()
-                    .id("studio-model-configs")
-                    .flex()
-                    .flex_row()
-                    .gap(px(7.0))
-                    .overflow_x_scroll()
-                    .children(model_configs),
+        let (content_height, text_width, layout_width, has_newline) = {
+            let input = self.prompt.read(cx);
+            (
+                input.measured_content_height(),
+                input.measured_text_width(),
+                input.measured_layout_width(),
+                input.has_newline(),
             )
+        };
+        let compact_capacity = if self.prompt_expanded {
+            layout_width - COMPACT_ACTIONS_INSET
+        } else {
+            layout_width
+        };
+        let prompt_expanded = if layout_width > 0.0 {
+            crate::composer::composer_flip(
+                self.prompt_expanded,
+                text_width,
+                compact_capacity,
+                has_newline,
+                false,
+            )
+        } else {
+            self.prompt_expanded
+        };
+        self.prompt_expanded = prompt_expanded;
+        self.prompt
+            .update(cx, |input, _| input.set_soft_wrap(prompt_expanded));
+
+        let prompt_height = (content_height + 12.0).clamp(32.0, 220.0);
+        let body_target = if prompt_expanded {
+            prompt_height + 36.0
+        } else {
+            32.0
+        };
+        let now_ms =
+            self.prompt_morph_clock.elapsed().as_secs_f32() * 1000.0 / crate::motion::speed_scale();
+        if self.prompt_target_height > 0.0 && (body_target - self.prompt_target_height).abs() > 0.5
+        {
+            self.prompt_morph = if crate::motion::reduced_motion(cx) {
+                None
+            } else {
+                Some(crate::composer::FlipMorph {
+                    from: self.prompt_last_height,
+                    start_ms: now_ms,
+                })
+            };
+        }
+        self.prompt_target_height = body_target;
+        let (body_height, morphing) = match self.prompt_morph {
+            Some(morph) if !morph.done(now_ms) => (morph.height(body_target, now_ms), true),
+            _ => {
+                self.prompt_morph = None;
+                (body_target, false)
+            }
+        };
+        self.prompt_last_height = body_height;
+        if morphing {
+            window.request_animation_frame();
+        }
+        let body = div()
+            .relative()
+            .w_full()
+            .h(px(body_height))
+            .overflow_hidden()
             .child(
                 div()
-                    .min_h(px(54.0))
-                    .px(px(4.0))
-                    .py(px(4.0))
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(prompt_height))
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .overflow_hidden()
+                    .when(!prompt_expanded, |input| {
+                        input.pr(px(COMPACT_ACTIONS_INSET))
+                    })
                     .child(self.prompt.clone()),
             )
             .child(
                 div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .h(px(32.0))
                     .flex()
                     .items_center()
                     .gap(px(8.0))
+                    .when(self.source_turn.is_some() && prompt_expanded, |row| {
+                        row.child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(theme.text_faint)
+                                .child("Using previous settings"),
+                        )
+                    })
+                    .child(div().flex_1().min_w_0())
                     .child(
                         div()
                             .relative()
@@ -933,15 +1125,6 @@ impl StudioPage {
                                     ),
                             ),
                     )
-                    .when(self.source_turn.is_some(), |row| {
-                        row.child(
-                            div()
-                                .text_size(px(10.5))
-                                .text_color(theme.text_faint)
-                                .child("Using previous settings"),
-                        )
-                    })
-                    .child(div().flex_1())
                     .when_some(batch_quote.as_ref(), |row, quote| {
                         row.child(
                             div()
@@ -974,6 +1157,35 @@ impl StudioPage {
                             ),
                     ),
             );
+        let composer = div()
+            .relative()
+            .w_full()
+            // Match the agent composer column (`max-w-3xl`).
+            .max_w(px(768.0))
+            .occlude()
+            .rounded(px(26.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.input_glass_bg())
+            .when(!theme.is_glass(), |composer| composer.shadow_lg())
+            .px(px(8.0))
+            .pt(px(8.0))
+            .pb(px(8.0))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .when(has_model_configs, |composer| {
+                composer.child(
+                    div()
+                        .id("studio-model-configs")
+                        .flex()
+                        .flex_row()
+                        .gap(px(7.0))
+                        .overflow_x_scroll()
+                        .children(model_configs),
+                )
+            })
+            .child(body);
 
         div()
             .absolute()
@@ -981,10 +1193,214 @@ impl StudioPage {
             .right(px(24.0))
             .bottom(px(18.0))
             .flex()
-            .justify_center()
+            .flex_col()
+            .items_center()
+            .gap(px(10.0))
+            .children(self.render_generate_more_pill(theme, cx))
             .child(crate::frost::frosted(26.0, 16.0, composer))
             .into_any_element()
     }
+
+    /// "Generate more" chip — same chrome as the agent-chat jump-to-bottom
+    /// pill, floating just above the composer. Extends the latest turn.
+    fn render_generate_more_pill(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.latest_extendable_turn().is_none() {
+            return None;
+        }
+        let busy = self.busy;
+        Some(
+            motion::dialog_in(
+                "studio-generate-more",
+                div()
+                    .id("studio-generate-more-btn")
+                    .h(px(30.0))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(theme.border)
+                    .shadow_md()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .pl(px(11.0))
+                    .pr(px(13.0))
+                    .bg(motion::hover_blend(
+                        "studio-generate-more-pill",
+                        theme.surface_raised,
+                        theme.surface_raised_hover,
+                    ))
+                    .when(busy, |pill| pill.opacity(0.35))
+                    .when(!busy, |pill| {
+                        pill.cursor_pointer()
+                            .on_hover(motion::hover_listener("studio-generate-more-pill"))
+                            .on_click(cx.listener(|page, _, _, cx| page.generate_more_latest(cx)))
+                    })
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from("+")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(theme.text)
+                            .child(SharedString::from("Generate more")),
+                    ),
+            )
+            .into_any_element(),
+        )
+    }
+}
+
+fn config_section(label: impl Into<SharedString>, theme: &Theme) -> gpui::Div {
+    div().flex().flex_col().gap(px(6.0)).child(
+        div()
+            .text_size(px(10.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme.text_faint)
+            .child(label.into()),
+    )
+}
+
+fn config_choice(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    active: bool,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id.into())
+        .h(px(28.0))
+        .px(px(9.0))
+        .flex()
+        .items_center()
+        .rounded(px(7.0))
+        .border_1()
+        .border_color(if active {
+            theme.border_strong
+        } else {
+            theme.border
+        })
+        .bg(if active {
+            crate::theme::card_selected_bg()
+        } else {
+            crate::theme::wash(0.035)
+        })
+        .text_size(px(10.5))
+        .text_color(if active { theme.text } else { theme.text_muted })
+        .cursor_pointer()
+        .hover(|style| style.bg(crate::theme::wash(0.09)))
+        .child(label.into())
+}
+
+fn config_aspect_choice(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    value: &zeron_studio::ControlValue,
+    active: bool,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    let dimensions = value.aspect_ratio_dimensions();
+    let (width, height) = dimensions
+        .map(|(width, height)| {
+            let ratio = width as f32 / height.max(1) as f32;
+            if ratio >= 1.0 {
+                (22.0, (22.0 / ratio).clamp(7.0, 18.0))
+            } else {
+                ((18.0 * ratio).clamp(7.0, 18.0), 18.0)
+            }
+        })
+        .unwrap_or((18.0, 18.0));
+    let preview = div()
+        .w(px(24.0))
+        .h(px(20.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .w(px(width))
+                .h(px(height))
+                .rounded(px(2.0))
+                .border_1()
+                .border_color(if active {
+                    theme.text_muted
+                } else {
+                    theme.text_faint
+                })
+                .when(dimensions.is_none(), |preview| {
+                    preview
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(8.0))
+                        .text_color(theme.text_faint)
+                        .child("A")
+                }),
+        );
+    div()
+        .id(id.into())
+        .w(px(67.0))
+        .h(px(50.0))
+        .flex_none()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(3.0))
+        .rounded(px(7.0))
+        .border_1()
+        .border_color(if active {
+            theme.border_strong
+        } else {
+            theme.border
+        })
+        .bg(if active {
+            crate::theme::card_selected_bg()
+        } else {
+            crate::theme::wash(0.035)
+        })
+        .text_size(px(9.5))
+        .text_color(if active { theme.text } else { theme.text_muted })
+        .cursor_pointer()
+        .hover(|style| style.bg(crate::theme::wash(0.09)))
+        .child(preview)
+        .child(label.into())
+}
+
+fn config_readout(label: SharedString, theme: &Theme) -> gpui::Div {
+    div()
+        .flex_none()
+        .px(px(5.0))
+        .py(px(2.0))
+        .rounded(px(5.0))
+        .bg(crate::theme::wash(0.065))
+        .text_size(px(10.0))
+        .text_color(theme.text_muted)
+        .child(label)
+}
+
+fn config_step_button(
+    id: impl Into<SharedString>,
+    label: &'static str,
+    click: impl Fn(&mut StudioPage, &mut Context<StudioPage>) + 'static,
+    cx: &mut Context<StudioPage>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id.into())
+        .size(px(32.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(8.0))
+        .cursor_pointer()
+        .hover(|style| style.bg(crate::theme::wash(0.10)))
+        .on_click(cx.listener(move |page, _, _, cx| click(page, cx)))
+        .child(label)
 }
 
 fn feature_badge(theme: &Theme, feature: ModelFeature) -> gpui::Div {

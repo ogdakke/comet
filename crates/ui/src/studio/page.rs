@@ -46,6 +46,11 @@ pub struct StudioPage {
     pub(super) selected_conversation: Option<StudioConversationId>,
     pub(super) conversation: Option<StudioConversationView>,
     pub(super) prompt: Entity<ComposerInput>,
+    pub(super) prompt_expanded: bool,
+    pub(super) prompt_morph: Option<crate::composer::FlipMorph>,
+    pub(super) prompt_last_height: f32,
+    pub(super) prompt_target_height: f32,
+    pub(super) prompt_morph_clock: Instant,
     pub(super) model_search: Entity<ComposerInput>,
     pub(super) model_picker: popover::Popup<()>,
     pub(super) model_picker_active: Option<usize>,
@@ -53,6 +58,7 @@ pub struct StudioPage {
     pub(super) model_picker_focus: FocusHandle,
     pub(super) model_picker_favorites: bool,
     pub(super) model_picker_filters: BTreeSet<zeron_studio::ModelFeature>,
+    pub(super) model_config_menu: popover::Popup<zeron_studio::ModelId>,
     pub(super) feed_list: gpui::ListState,
     pub(super) feed_width: f32,
     pub(super) feed_columns: usize,
@@ -152,6 +158,11 @@ impl StudioPage {
             selected_conversation: None,
             conversation: None,
             prompt,
+            prompt_expanded: false,
+            prompt_morph: None,
+            prompt_last_height: 0.0,
+            prompt_target_height: 0.0,
+            prompt_morph_clock: Instant::now(),
             model_search,
             model_picker: popover::Popup::default(),
             model_picker_active: None,
@@ -159,6 +170,7 @@ impl StudioPage {
             model_picker_focus: cx.focus_handle(),
             model_picker_favorites: false,
             model_picker_filters: BTreeSet::new(),
+            model_config_menu: popover::Popup::default(),
             feed_list: new_feed_list(cx),
             feed_width: 0.0,
             feed_columns: 0,
@@ -740,6 +752,22 @@ impl StudioPage {
         cx.notify();
     }
 
+    /// Latest turn that can accept another generate-more batch. Empty-run
+    /// turns (no model specs to copy) stay hidden from the composer pill.
+    pub(super) fn latest_extendable_turn(&self) -> Option<&StudioTurnView> {
+        self.conversation
+            .as_ref()
+            .and_then(|view| view.turns.last())
+            .filter(|turn| !turn.runs.is_empty())
+    }
+
+    pub(super) fn generate_more_latest(&mut self, cx: &mut Context<Self>) {
+        let Some(turn) = self.latest_extendable_turn().cloned() else {
+            return;
+        };
+        self.generate_more(&turn, cx);
+    }
+
     pub(super) fn generate_more(&mut self, turn: &StudioTurnView, cx: &mut Context<Self>) {
         let Some(engine) = self.engine(cx) else {
             return;
@@ -1037,7 +1065,7 @@ impl Render for StudioPage {
                 .h_full()
                 .overflow_hidden()
                 .child(self.render_conversation_feed(window, &theme, cx))
-                .child(self.render_composer(&theme, cx))
+                .child(self.render_composer(window, &theme, cx))
                 .into_any_element()
         };
         div()

@@ -679,6 +679,9 @@ impl StudioPage {
         self.request_visible_gallery_images(cx);
         let selected_count = self.gallery_selected.len();
         let empty = self.gallery.is_empty();
+        let top = self.gallery_list.logical_scroll_top();
+        let fade_top = top.item_ix > 0 || f32::from(top.offset_in_item) > 1.0;
+        let fade_bottom = self.gallery_list.is_scrolled_to_end() == Some(false);
         let measure_entity = cx.weak_entity();
         let list_element = list(
             self.gallery_list.clone(),
@@ -726,7 +729,9 @@ impl StudioPage {
             div()
                 .id("studio-gallery-scroll")
                 .size_full()
-                .pt(px(Theme::TITLEBAR_HEIGHT + Theme::TRANSCRIPT_FADE_BAND))
+                // The list must underlap the fade band; padding it past the
+                // band made the existing EdgeFade scope visually inert.
+                .pt(px(Theme::TITLEBAR_HEIGHT))
                 .child(list_element)
                 .into_any_element()
         };
@@ -773,9 +778,15 @@ impl StudioPage {
                     // Same titlebar underlap fade as the chat transcript:
                     // fully gone by the title text, ramping in the band
                     // just below it so tiles dissolve through the glass.
-                    crate::edge_fade::edge_faded(Theme::TRANSCRIPT_FADE_BAND, true, false, body)
-                        .inset_top(Theme::TITLEBAR_HEIGHT)
-                        .band_top(Theme::TRANSCRIPT_FADE_BAND),
+                    crate::edge_fade::edge_faded(
+                        Theme::TRANSCRIPT_FADE_BAND,
+                        fade_top,
+                        fade_bottom,
+                        body,
+                    )
+                    .inset_top(Theme::TITLEBAR_HEIGHT)
+                    .band_top(Theme::TRANSCRIPT_FADE_BAND)
+                    .band_bottom(Theme::TRANSCRIPT_FADE_BAND),
                 ),
             )
             .when(!empty, |el| {
