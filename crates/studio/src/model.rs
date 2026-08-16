@@ -237,7 +237,9 @@ pub struct MediaModel {
     pub maximum_output_count: u32,
     pub controls: Vec<ModelControl>,
     pub pricing: Option<PricingMetadata>,
-    /// Changes whenever the normalized, submit-relevant manifest changes.
+    /// Changes whenever submit-relevant constraints or controls change.
+    /// Display copy and pricing are excluded so a catalog refresh does not
+    /// invalidate an otherwise identical form.
     pub manifest_version: String,
     pub fetched_at: DateTime<Utc>,
 }

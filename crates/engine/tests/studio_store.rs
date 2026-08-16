@@ -16,9 +16,9 @@ use zeron_proto::{
 };
 use zeron_rpc::{memory_client, methods};
 use zeron_studio::{
-    FakeMediaProvider, FakeSubmissionMode, GenerationRequest, MediaKind, MediaModel,
-    MediaOperation, ProviderArtifact, ProviderError, ProviderErrorKind, ProviderId, Secret,
-    StudioArtifactId,
+    ControlKind, ControlValue, FakeMediaProvider, FakeSubmissionMode, GenerationRequest, MediaKind,
+    MediaModel, MediaOperation, ModelControl, ProviderArtifact, ProviderError, ProviderErrorKind,
+    ProviderId, Secret, StudioArtifactId,
 };
 
 #[derive(Default)]
@@ -780,4 +780,227 @@ async fn multi_model_turn_persists_successful_siblings_and_failed_runs() {
             .is_err()
     );
     reopened.shutdown().await;
+}
+
+fn image_model_with_seed(provider_id: &str, version: &str, maximum: f64) -> MediaModel {
+    let mut model = image_model(provider_id);
+    model.manifest_version = version.into();
+    model.controls = vec![ModelControl {
+        id: "seed".into(),
+        label: "Seed".into(),
+        description: None,
+        kind: ControlKind::Integer,
+        required: false,
+        default: Some(ControlValue::Integer { value: 0 }),
+        minimum: Some(0.0),
+        maximum: Some(maximum),
+        step: Some(1.0),
+        choices: Vec::new(),
+        visible_when: Vec::new(),
+    }];
+    model
+}
+
+async fn studio_client_with_fake(
+    root: &std::path::Path,
+    provider: std::sync::Arc<FakeMediaProvider>,
+) -> (EngineCore, zeron_rpc::RpcClient) {
+    let profile = EngineProfile::synced(root, "org", "catalog-user");
+    let mut engine = EngineCore::assemble_with_profile(
+        profile,
+        std::sync::Arc::new(default_registry()),
+        HarnessId::Mock,
+        None,
+    )
+    .unwrap();
+    engine.studio_credentials = std::sync::Arc::new(
+        StudioCredentials::with_backend(root, std::sync::Arc::new(MemorySecrets::default()))
+            .unwrap(),
+    );
+    engine.studio_providers.register(provider).unwrap();
+    let client = memory_client(engine.rpc_service());
+    client
+        .call(
+            methods::SET_STUDIO_PROVIDER_CREDENTIAL,
+            serde_json::json!({
+                "providerId": "fake",
+                "displayLabel": "Fake",
+                "secret": "valid"
+            }),
+        )
+        .await
+        .unwrap();
+    (engine, client)
+}
+
+async fn create_conversation(client: &zeron_rpc::RpcClient) -> StudioConversationSummary {
+    serde_json::from_value(
+        client
+            .call(
+                methods::CREATE_STUDIO_CONVERSATION,
+                serde_json::json!({ "title": "Catalog" }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn submit_uses_the_cached_catalog_instead_of_refetching() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![image_model("fake")],
+        FakeSubmissionMode::Complete(Vec::new()),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider.clone()).await;
+    client
+        .call(
+            methods::LIST_STUDIO_MODELS,
+            serde_json::json!({ "providerId": "fake", "mediaKind": "image" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(provider.list_call_count(), 1);
+    provider.set_models(vec![image_model_with_seed("fake", "live-v2", 4.0)]);
+
+    let conversation = create_conversation(&client).await;
+    client
+        .call(
+            methods::CREATE_STUDIO_TURN,
+            serde_json::json!({
+                "conversationId": conversation.id,
+                "prompt": "a comet",
+                "runs": [{
+                    "providerId": "fake",
+                    "modelId": "image-model",
+                    "operation": "text_to_image",
+                    "outputCount": 1,
+                    "controls": {},
+                    "inputs": [],
+                    "manifestVersion": "fixture-v1",
+                    "displayAspectRatio": [1, 1]
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        provider.list_call_count(),
+        1,
+        "a fresh cache must be the same catalog the picker used"
+    );
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn submit_silently_rebinds_a_compatible_request_to_the_current_catalog() {
+    let root = tempdir().unwrap();
+    let current = image_model_with_seed("fake", "current-v2", 10.0);
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![current.clone()],
+        FakeSubmissionMode::Complete(Vec::new()),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider.clone()).await;
+    engine
+        .studio
+        .cache_models(
+            &"fake".into(),
+            &[current],
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+
+    let conversation = create_conversation(&client).await;
+    let view: StudioConversationView = serde_json::from_value(
+        client
+            .call(
+                methods::CREATE_STUDIO_TURN,
+                serde_json::json!({
+                    "conversationId": conversation.id,
+                    "prompt": "a comet",
+                    "runs": [{
+                        "providerId": "fake",
+                        "modelId": "image-model",
+                        "operation": "text_to_image",
+                        "outputCount": 1,
+                        "controls": { "seed": { "type": "integer", "value": 4 } },
+                        "inputs": [],
+                        "manifestVersion": "old-picker-version",
+                        "displayAspectRatio": [1, 1]
+                    }]
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(view.turns[0].runs[0].model.manifest_version, "current-v2");
+    assert_eq!(provider.list_call_count(), 0);
+
+    let request_json: String = engine
+        .studio
+        .connection()
+        .unwrap()
+        .query_row("SELECT request_json FROM studio_attempts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let request: serde_json::Value = serde_json::from_str(&request_json).unwrap();
+    assert_eq!(request["manifest_version"], "current-v2");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn submit_reports_the_real_constraint_error_when_settings_no_longer_fit() {
+    let root = tempdir().unwrap();
+    let current = image_model_with_seed("fake", "current-v2", 4.0);
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![current.clone()],
+        FakeSubmissionMode::Complete(Vec::new()),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+    engine
+        .studio
+        .cache_models(
+            &"fake".into(),
+            &[current],
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+
+    let conversation = create_conversation(&client).await;
+    let error = client
+        .call(
+            methods::CREATE_STUDIO_TURN,
+            serde_json::json!({
+                "conversationId": conversation.id,
+                "prompt": "a comet",
+                "runs": [{
+                    "providerId": "fake",
+                    "modelId": "image-model",
+                    "operation": "text_to_image",
+                    "outputCount": 1,
+                    "controls": { "seed": { "type": "integer", "value": 11 } },
+                    "inputs": [],
+                    "manifestVersion": "old-picker-version",
+                    "displayAspectRatio": [1, 1]
+                }]
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("above maximum"),
+        "expected the control error, got {error}"
+    );
+    assert!(
+        !error.to_lowercase().contains("manifest"),
+        "catalog identity must not leak to the user: {error}"
+    );
+    engine.shutdown().await;
 }

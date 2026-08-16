@@ -6,6 +6,7 @@ use std::{
     io::{Read, Seek, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard, RwLock},
+    time::Duration,
 };
 
 use base64::Engine as _;
@@ -26,6 +27,7 @@ use zeron_studio::{
 const DATABASE_FILE: &str = "studio.sqlite3";
 const SCHEMA_VERSION: i64 = 1;
 pub(crate) const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const STUDIO_CATALOG_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const ARTIFACT_READ_CHUNK_BYTES: u64 = 192_000;
 const ARTIFACT_FORMATS: &[(&str, &str)] = &[
     ("webp", "image/webp"),

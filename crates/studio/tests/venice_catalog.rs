@@ -131,7 +131,7 @@ fn reasoning_is_exposed_only_when_the_model_advertises_it() {
 }
 
 #[test]
-fn manifest_version_ignores_fetch_time_but_tracks_constraints() {
+fn manifest_version_ignores_display_copy_but_tracks_constraints() {
     let first = normalize_model_catalog(IMAGE, fetched_at())
         .unwrap()
         .remove(0);
@@ -139,6 +139,15 @@ fn manifest_version_ignores_fetch_time_but_tracks_constraints() {
         .unwrap()
         .remove(0);
     assert_eq!(first.manifest_version, later.manifest_version);
+
+    let mut renamed: serde_json::Value = serde_json::from_slice(IMAGE).unwrap();
+    renamed["data"][0]["model_spec"]["name"] = "Seedream 5.0".into();
+    renamed["data"][0]["model_spec"]["description"] = "new marketing copy".into();
+    renamed["data"][0]["model_spec"]["pricing"] = serde_json::json!({ "usd": 0.02 });
+    let renamed = normalize_model_catalog(&serde_json::to_vec(&renamed).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(first.manifest_version, renamed.manifest_version);
 
     let mut changed: serde_json::Value = serde_json::from_slice(IMAGE).unwrap();
     changed["data"][0]["model_spec"]["constraints"]["steps"]["max"] = 51.into();

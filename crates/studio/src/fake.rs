@@ -1,6 +1,12 @@
 //! Deterministic provider used by engine, RPC, and conformance tests.
 
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 
@@ -40,7 +46,8 @@ struct State {
 pub struct FakeMediaProvider {
     id: ProviderId,
     accepted_secret: String,
-    models: Vec<MediaModel>,
+    models: Mutex<Vec<MediaModel>>,
+    list_calls: AtomicUsize,
     quote: Option<Quote>,
     mode: FakeSubmissionMode,
     state: Mutex<State>,
@@ -51,7 +58,8 @@ impl FakeMediaProvider {
         Self {
             id: ProviderId::new(id),
             accepted_secret: "valid".to_owned(),
-            models,
+            models: Mutex::new(models),
+            list_calls: AtomicUsize::new(0),
             quote: None,
             mode,
             state: Mutex::new(State {
@@ -60,6 +68,14 @@ impl FakeMediaProvider {
                 submissions: HashMap::new(),
             }),
         }
+    }
+
+    pub fn set_models(&self, models: Vec<MediaModel>) {
+        *self.models.lock().expect("fake provider lock poisoned") = models;
+    }
+
+    pub fn list_call_count(&self) -> usize {
+        self.list_calls.load(Ordering::SeqCst)
     }
 
     pub fn with_accepted_secret(mut self, secret: impl Into<String>) -> Self {
@@ -108,7 +124,12 @@ impl MediaProvider for FakeMediaProvider {
 
     async fn list_models(&self, secret: &Secret) -> ProviderResult<Vec<MediaModel>> {
         self.authenticate(secret)?;
-        Ok(self.models.clone())
+        self.list_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self
+            .models
+            .lock()
+            .expect("fake provider lock poisoned")
+            .clone())
     }
 
     async fn quote(

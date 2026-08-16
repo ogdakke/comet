@@ -66,12 +66,17 @@ pub struct GenerationRequest {
     pub output_count: u32,
     pub controls: BTreeMap<ControlId, ControlValue>,
     pub inputs: Vec<GenerationInput>,
+    /// Snapshot identity of the model this request was validated against.
+    /// The engine stamps this from the current catalog after control validation.
     pub manifest_version: String,
     pub display_aspect_ratio: (u32, u32),
 }
 
 impl GenerationRequest {
     /// Validate the provider-neutral request before an adapter is allowed to translate it.
+    ///
+    /// `manifest_version` is not a freshness lock. Call [`Self::bind_to`] so the
+    /// persisted snapshot matches the catalog that actually accepted the form.
     pub fn validate_against(&self, model: &MediaModel) -> Result<(), RequestValidationError> {
         if self.provider_id != model.provider_id {
             return Err(RequestValidationError::ProviderMismatch);
@@ -81,9 +86,6 @@ impl GenerationRequest {
         }
         if self.operation != model.operation {
             return Err(RequestValidationError::OperationMismatch);
-        }
-        if self.manifest_version != model.manifest_version {
-            return Err(RequestValidationError::StaleManifest);
         }
         if self.output_count == 0 || self.output_count > model.maximum_output_count {
             return Err(RequestValidationError::InvalidOutputCount {
@@ -165,6 +167,13 @@ impl GenerationRequest {
         }
         Ok(())
     }
+
+    /// Accept the request against `model` and stamp that model's manifest version.
+    pub fn bind_to(&mut self, model: &MediaModel) -> Result<(), RequestValidationError> {
+        self.validate_against(model)?;
+        self.manifest_version = model.manifest_version.clone();
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
@@ -175,8 +184,6 @@ pub enum RequestValidationError {
     ModelMismatch,
     #[error("request operation does not match model operation")]
     OperationMismatch,
-    #[error("request manifest version is stale")]
-    StaleManifest,
     #[error("requested {requested} outputs, model maximum is {maximum}")]
     InvalidOutputCount { requested: u32, maximum: u32 },
     #[error("display aspect ratio must have non-zero dimensions")]

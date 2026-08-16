@@ -471,11 +471,16 @@ fn pricing_metadata(pricing: Option<&serde_json::Value>) -> Option<PricingMetada
     })
 }
 
+/// Hash the schema a request must satisfy. Display copy, pricing, and fetch
+/// time can change without invalidating an already-valid form.
 fn finish_manifest(mut model: MediaModel) -> Result<MediaModel, VeniceCatalogError> {
     let mut submit_relevant = serde_json::to_value(&model)?;
     if let Some(object) = submit_relevant.as_object_mut() {
         object.remove("fetched_at");
         object.remove("manifest_version");
+        object.remove("display_name");
+        object.remove("description");
+        object.remove("pricing");
     }
     let bytes = serde_json::to_vec(&submit_relevant)?;
     let digest = Sha256::digest(bytes);

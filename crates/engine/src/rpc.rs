@@ -61,10 +61,11 @@ use zeron_proto::{
     ArchiveStudioConversationRequest, ChatConfig, CreateStudioConversationRequest,
     CreateStudioTurnRequest, DeleteStudioArtifactRequest, EngineInfo, HarnessId,
     ListStudioConversationsRequest, ListStudioConversationsResponse, ListStudioModelsRequest,
-    ListStudioProvidersResponse, ProviderValidationState, ReadStudioArtifactChunkRequest,
-    RenameStudioConversationRequest, RetryStudioRunRequest, SetStudioProviderCredentialRequest,
-    SetStudioProviderPreferencesRequest, StudioProviderConnection, StudioProviderRequest, ToolCall,
-    WatchStudioConversationRequest, WorkspaceScope,
+    ListStudioModelsResponse, ListStudioProvidersResponse, ProviderValidationState,
+    ReadStudioArtifactChunkRequest, RenameStudioConversationRequest, RetryStudioRunRequest,
+    SetStudioProviderCredentialRequest, SetStudioProviderPreferencesRequest,
+    StudioProviderConnection, StudioProviderRequest, ToolCall, WatchStudioConversationRequest,
+    WorkspaceScope,
 };
 use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
@@ -475,6 +476,48 @@ impl EngineRpc {
         self.updater
             .as_ref()
             .ok_or_else(|| RpcError::Failed("updates unavailable".into()))
+    }
+
+    /// Shared catalog for the picker and submit. Fresh cache is the source of
+    /// truth so the form and the validator see the same schema. Live fetch only
+    /// happens when the cache is missing, expired, or a caller asked to refresh.
+    async fn studio_catalog(
+        &self,
+        provider_id: &zeron_studio::ProviderId,
+        refresh: bool,
+    ) -> Result<ListStudioModelsResponse, RpcError> {
+        let cached = self
+            .studio
+            .cached_models(provider_id)
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+        if !refresh
+            && let Some(response) = cached.clone()
+            && !response.stale
+        {
+            return Ok(response);
+        }
+        let provider = self
+            .studio_providers
+            .get(provider_id)
+            .map_err(|error| RpcError::Failed(error.to_string()))?
+            .ok_or_else(|| RpcError::Failed("unknown studio provider".into()))?;
+        let secret = self
+            .studio_credentials
+            .secret(provider_id)
+            .await
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+        match provider.list_models(&secret).await {
+            Ok(models) => self
+                .studio
+                .cache_models(provider_id, &models, crate::studio::STUDIO_CATALOG_TTL)
+                .map_err(|error| RpcError::Failed(error.to_string())),
+            Err(error) => cached
+                .map(|mut response| {
+                    response.stale = true;
+                    response
+                })
+                .ok_or_else(|| RpcError::Failed(error.to_string())),
+        }
     }
 
     fn local_importer(&self) -> Result<&crate::local_import::LocalImporter, RpcError> {
@@ -1142,50 +1185,9 @@ impl RpcService for EngineRpc {
             }
             methods::LIST_STUDIO_MODELS => {
                 let request: ListStudioModelsRequest = parse_params(params)?;
-                let cached = self
-                    .studio
-                    .cached_models(&request.provider_id)
-                    .map_err(|error| RpcError::Failed(error.to_string()))?;
-                if !request.refresh
-                    && let Some(mut response) = cached.clone()
-                    && !response.stale
-                {
-                    if let Some(kind) = request.media_kind {
-                        response.models.retain(|model| model.output_kind == kind);
-                    }
-                    return RpcReply::value(&response);
-                }
-                let provider = self
-                    .studio_providers
-                    .get(&request.provider_id)
-                    .map_err(|error| RpcError::Failed(error.to_string()))?
-                    .ok_or_else(|| RpcError::Failed("unknown studio provider".into()))?;
-                let secret = self
-                    .studio_credentials
-                    .secret(&request.provider_id)
-                    .await
-                    .map_err(|error| RpcError::Failed(error.to_string()))?;
-                let models = match provider.list_models(&secret).await {
-                    Ok(models) => models,
-                    Err(error) => {
-                        if let Some(mut response) = cached {
-                            response.stale = true;
-                            if let Some(kind) = request.media_kind {
-                                response.models.retain(|model| model.output_kind == kind);
-                            }
-                            return RpcReply::value(&response);
-                        }
-                        return Err(RpcError::Failed(error.to_string()));
-                    }
-                };
                 let mut response = self
-                    .studio
-                    .cache_models(
-                        &request.provider_id,
-                        &models,
-                        Duration::from_secs(6 * 60 * 60),
-                    )
-                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                    .studio_catalog(&request.provider_id, request.refresh)
+                    .await?;
                 if let Some(kind) = request.media_kind {
                     response.models.retain(|model| model.output_kind == kind);
                 }
@@ -1248,6 +1250,10 @@ impl RpcService for EngineRpc {
             }
             methods::CREATE_STUDIO_TURN => {
                 let request: CreateStudioTurnRequest = parse_params(params)?;
+                let mut catalogs = std::collections::BTreeMap::<
+                    zeron_studio::ProviderId,
+                    ListStudioModelsResponse,
+                >::new();
                 let mut prepared = Vec::with_capacity(request.runs.len());
                 for spec in request.runs {
                     if !matches!(spec.operation, zeron_studio::MediaOperation::TextToImage) {
@@ -1256,23 +1262,28 @@ impl RpcService for EngineRpc {
                                 .into(),
                         ));
                     }
-                    let provider = self
-                        .studio_providers
-                        .get(&spec.provider_id)
-                        .map_err(|error| RpcError::Failed(error.to_string()))?
-                        .ok_or_else(|| RpcError::Failed("unknown studio provider".into()))?;
-                    let secret = self
-                        .studio_credentials
-                        .secret(&spec.provider_id)
-                        .await
-                        .map_err(|error| RpcError::Failed(error.to_string()))?;
-                    let models = provider
-                        .list_models(&secret)
-                        .await
-                        .map_err(|error| RpcError::Failed(error.to_string()))?;
-                    let model = models
-                        .into_iter()
+                    let catalog = match catalogs.get(&spec.provider_id) {
+                        Some(catalog) => catalog.clone(),
+                        None => {
+                            let catalog = self.studio_catalog(&spec.provider_id, false).await?;
+                            catalogs.insert(spec.provider_id.clone(), catalog.clone());
+                            catalog
+                        }
+                    };
+                    let mut model = catalog
+                        .models
+                        .iter()
                         .find(|model| model.id == spec.model_id)
+                        .cloned();
+                    if model.is_none() {
+                        let catalog = self.studio_catalog(&spec.provider_id, true).await?;
+                        catalogs.insert(spec.provider_id.clone(), catalog.clone());
+                        model = catalog
+                            .models
+                            .into_iter()
+                            .find(|model| model.id == spec.model_id);
+                    }
+                    let model = model
                         .ok_or_else(|| RpcError::Failed("studio model is unavailable".into()))?;
                     let mut generation = zeron_studio::GenerationRequest {
                         provider_id: spec.provider_id,
@@ -1287,7 +1298,7 @@ impl RpcService for EngineRpc {
                         display_aspect_ratio: spec.display_aspect_ratio,
                     };
                     generation
-                        .validate_against(&model)
+                        .bind_to(&model)
                         .map_err(|error| RpcError::Failed(error.to_string()))?;
                     if generation.provider_id.as_str() == zeron_studio::venice::VENICE_PROVIDER_ID
                         && let Some(connection) = self
@@ -2121,6 +2132,21 @@ async fn execute_studio_run(
             true,
         ),
         Err(error) => {
+            if error.kind == zeron_studio::ProviderErrorKind::InvalidRequest
+                && let Ok(models) = provider.list_models(&secret).await
+                && let Err(store_error) = store.cache_models(
+                    &run.request.provider_id,
+                    &models,
+                    crate::studio::STUDIO_CATALOG_TTL,
+                )
+            {
+                tracing::warn!(
+                    run_id = %run.run_id.0,
+                    provider = %run.request.provider_id.as_str(),
+                    error = %store_error,
+                    "studio catalog refresh after invalid request failed"
+                );
+            }
             let unknown = error.kind == zeron_studio::ProviderErrorKind::Transient
                 && !capabilities.accepts_idempotency_key
                 && !capabilities.can_reconcile;

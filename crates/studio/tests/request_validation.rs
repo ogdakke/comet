@@ -75,20 +75,22 @@ fn rejects_unknown_controls_instead_of_forwarding_them() {
 }
 
 #[test]
-fn rejects_stale_manifest_and_out_of_range_values() {
-    let mut stale = request();
-    stale.manifest_version = "old".to_owned();
-    assert_eq!(
-        stale.validate_against(&model()),
-        Err(RequestValidationError::StaleManifest)
-    );
+fn binds_a_compatible_request_to_the_current_manifest() {
+    let mut request = request();
+    request.manifest_version = "old".to_owned();
+    request.bind_to(&model()).unwrap();
+    assert_eq!(request.manifest_version, "fixture-v1");
+}
 
+#[test]
+fn rejects_out_of_range_values_against_the_current_manifest() {
     let mut invalid = request();
+    invalid.manifest_version = "old".to_owned();
     invalid
         .controls
         .insert(ControlId::new("seed"), ControlValue::Integer { value: 11 });
     assert!(matches!(
-        invalid.validate_against(&model()),
+        invalid.bind_to(&model()),
         Err(RequestValidationError::Control(
             ControlValidationError::AboveMaximum { .. }
         ))

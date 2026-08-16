@@ -607,12 +607,7 @@ impl StudioPage {
                         page.conversations = serde_json::from_value::<ListStudioConversationsResponse>(conversations)
                             .map(|value| value.conversations)
                             .unwrap_or_default();
-                        page.models = models.models;
-                        for model in &page.models {
-                            page.draft_runs
-                                .entry(model.id.clone())
-                                .or_insert_with(|| DraftRunConfig::from_model(model));
-                        }
+                        page.apply_models(models.models);
                         if page.selected_models.is_empty()
                             && let Some(model) = page.models.first()
                         {
@@ -793,6 +788,11 @@ impl StudioPage {
             })
             .collect::<Vec<_>>();
         let source = self.source_turn;
+        let provider_id = self
+            .providers
+            .iter()
+            .find(|provider| provider.configured)
+            .map(|provider| provider.provider_id.clone());
         self.scroll_after_turn_count = Some(
             self.conversation
                 .as_ref()
@@ -811,8 +811,26 @@ impl StudioPage {
                     }),
                 )
                 .await;
+            let models = if let Some(provider_id) = provider_id {
+                engine
+                    .client()
+                    .call(
+                        methods::LIST_STUDIO_MODELS,
+                        serde_json::json!({ "providerId": provider_id, "mediaKind": "image" }),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|value| {
+                        serde_json::from_value::<ListStudioModelsResponse>(value).ok()
+                    })
+            } else {
+                None
+            };
             this.update(cx, |page, cx| {
                 page.busy = false;
+                if let Some(models) = models {
+                    page.apply_models(models.models);
+                }
                 match result {
                     Ok(_) => {
                         page.prompt.update(cx, |input, cx| input.set_text("", cx));
@@ -827,6 +845,15 @@ impl StudioPage {
             })
             .ok();
         }));
+    }
+
+    fn apply_models(&mut self, models: Vec<zeron_studio::MediaModel>) {
+        self.models = models;
+        for model in &self.models {
+            self.draft_runs
+                .entry(model.id.clone())
+                .or_insert_with(|| DraftRunConfig::from_model(model));
+        }
     }
 
     fn use_prompt(&mut self, turn: &StudioTurnView, cx: &mut Context<Self>) {
