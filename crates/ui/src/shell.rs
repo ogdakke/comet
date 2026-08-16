@@ -1831,6 +1831,47 @@ impl Shell {
         cx.notify();
     }
 
+    fn close_studio(&mut self, cx: &mut Context<Self>) {
+        self.route = Route::Chat;
+        self.nav.push(NavEntry::Chat(self.active_chat.clone()));
+        cx.notify();
+    }
+
+    fn ensure_studio_page(&mut self, cx: &mut Context<Self>) -> Entity<StudioPage> {
+        if let Some(page) = self.studio_page.as_ref() {
+            return page.clone();
+        }
+        let state = self.state.clone();
+        let page = cx.new(|cx| StudioPage::new(state, cx));
+        self.studio_sub = Some(cx.subscribe(&page, |shell, _, event, cx| match event {
+            StudioEvent::OpenProviders => {
+                shell.open_settings(SettingsSection::Providers, cx);
+            }
+            StudioEvent::SidebarChanged => cx.notify(),
+            StudioEvent::OpenArtifact {
+                conversation_id,
+                artifact_id,
+            } => {
+                shell.route = Route::StudioArtifact {
+                    conversation_id: *conversation_id,
+                    artifact_id: *artifact_id,
+                };
+                shell.nav.push(NavEntry::StudioArtifact {
+                    conversation_id: *conversation_id,
+                    artifact_id: *artifact_id,
+                });
+                cx.notify();
+            }
+            StudioEvent::CloseArtifact => {
+                if matches!(shell.route, Route::StudioArtifact { .. }) {
+                    shell.navigate_back(cx);
+                }
+            }
+        }));
+        self.studio_page = Some(page.clone());
+        page
+    }
+
     // ---- back/forward (route history) ----
 
     fn navigate_back(&mut self, cx: &mut Context<Self>) {
@@ -2930,9 +2971,8 @@ impl Shell {
         let theme = Theme::of(cx).clone();
         let inner: AnyElement = match self.route {
             Route::Settings(section) => self.render_settings_nav(section, &theme, cx),
-            Route::Chat | Route::Studio | Route::StudioArtifact { .. } => {
-                self.render_chat_sidebar(&theme, cx)
-            }
+            Route::Chat => self.render_chat_sidebar(&theme, cx),
+            Route::Studio | Route::StudioArtifact { .. } => self.render_studio_sidebar(&theme, cx),
         };
         let target = self.sidebar_target();
         // Transparent — the sidebar sits directly on the frost shell; the main
@@ -3347,6 +3387,266 @@ impl Shell {
                             ))
                     }),
             )
+            .into_any_element()
+    }
+
+    fn render_studio_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let page = self.ensure_studio_page(cx);
+        let (conversations, selected) = {
+            let page = page.read(cx);
+            (page.conversations().to_vec(), page.selected_conversation())
+        };
+        let now = Utc::now();
+        let rows = conversations
+            .into_iter()
+            .map(|conversation| {
+                let is_selected = selected == Some(conversation.id);
+                let select_page = page.clone();
+                let archive_page = page.clone();
+                let select_id = conversation.id;
+                let archive_id = conversation.id;
+                let group: SharedString =
+                    format!("studio-conversation-row-{}", conversation.id.0).into();
+                let age: SharedString = format_time_ago(conversation.updated_at, now).into();
+                let count = conversation.turn_count;
+                div()
+                    .id(SharedString::from(format!(
+                        "studio-conversation-{}",
+                        conversation.id.0
+                    )))
+                    .group(group.clone())
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .rounded(px(8.0))
+                    .px(px(Theme::SPACE_SM))
+                    .py(px(6.0))
+                    .cursor_pointer()
+                    .bg(if is_selected {
+                        crate::theme::glass_selected_bg()
+                    } else {
+                        crate::theme::wash(0.0)
+                    })
+                    .hover(|style| {
+                        style.bg(if is_selected {
+                            crate::theme::glass_selected_bg()
+                        } else {
+                            theme.glass_hover()
+                        })
+                    })
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        select_page.update(cx, |page, cx| page.open_conversation(select_id, cx));
+                    }))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(11.0))
+                                    .line_height(px(14.0))
+                                    .text_color(theme.text_muted.opacity(0.5))
+                                    .child("Studio"),
+                            )
+                            .child(
+                                div()
+                                    .relative()
+                                    .h(px(14.0))
+                                    .min_w(px(18.0))
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .inset_0()
+                                            .text_size(px(10.0))
+                                            .text_color(theme.text_muted.opacity(0.5))
+                                            .group_hover(group.clone(), |style| style.opacity(0.0))
+                                            .child(age),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "archive-studio-conversation-{}",
+                                                archive_id.0
+                                            )))
+                                            .absolute()
+                                            .inset_0()
+                                            .flex()
+                                            .justify_end()
+                                            .opacity(0.0)
+                                            .group_hover(group.clone(), |style| style.opacity(1.0))
+                                            .on_click(cx.listener(move |_, _, _, cx| {
+                                                cx.stop_propagation();
+                                                archive_page.update(cx, |page, cx| {
+                                                    page.archive_conversation(archive_id, cx)
+                                                });
+                                            }))
+                                            .child(
+                                                icon(icons::ARCHIVE_MINIMALISTIC)
+                                                    .size(px(12.0))
+                                                    .text_color(theme.text_muted),
+                                            ),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .truncate()
+                            .text_size(px(13.0))
+                            .line_height(px(17.0))
+                            .text_color(if is_selected {
+                                theme.text
+                            } else {
+                                theme.text.opacity(0.8)
+                            })
+                            .child(SharedString::from(conversation.title)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.0))
+                            .text_size(px(11.0))
+                            .line_height(px(14.0))
+                            .text_color(theme.text_muted.opacity(0.5))
+                            .child(icon(icons::WIDGET).size(px(11.0)))
+                            .child(SharedString::from(format!(
+                                "{count} generation{}",
+                                if count == 1 { "" } else { "s" }
+                            ))),
+                    )
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+
+        let new_page = page.clone();
+        let header = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .px(px(Theme::SPACE_SM))
+            .pt(px(8.0))
+            .pb(px(4.0))
+            .child(
+                div()
+                    .h(px(29.0))
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(Theme::SPACE_SM))
+                    .rounded(px(8.0))
+                    .px(px(Theme::SPACE_SM))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text.opacity(0.8))
+                    .child(
+                        icon(icons::WIDGET)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child("Studio"),
+            )
+            .child(
+                div()
+                    .id("studio-new-conversation")
+                    .size(px(24.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(crate::theme::wash(0.14)))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        new_page.update(cx, |page, cx| page.new_conversation(cx));
+                    }))
+                    .child(
+                        icon(icons::PLUS)
+                            .size(px(14.0))
+                            .text_color(theme.text_muted.opacity(0.7)),
+                    ),
+            );
+
+        let (user, workspace_scope) = {
+            let state = self.state.read(cx);
+            (state.auth_user().cloned(), state.workspace_scope)
+        };
+        let (user_line, trigger_subline, menu_identity): (
+            SharedString,
+            Option<SharedString>,
+            SharedString,
+        ) = match workspace_scope {
+            Some(WorkspaceScope::Local) => {
+                ("Local only".into(), None, "Stored on this device".into())
+            }
+            Some(WorkspaceScope::Development) => (
+                "Development".into(),
+                Some("Local development runtime".into()),
+                "Authentication disabled".into(),
+            ),
+            Some(WorkspaceScope::Synced) | None => {
+                let line: SharedString = user
+                    .as_ref()
+                    .map(|user| {
+                        user.name
+                            .clone()
+                            .unwrap_or_else(|| user.email.clone())
+                            .into()
+                    })
+                    .unwrap_or_else(|| SharedString::from("Not signed in"));
+                let email = user
+                    .as_ref()
+                    .map(|user| SharedString::from(user.email.clone()))
+                    .unwrap_or_else(|| line.clone());
+                (line, Some("Alpha".into()), email)
+            }
+        };
+        let user_menu = self.render_user_menu(user_line, trigger_subline, menu_identity, theme, cx);
+
+        div()
+            .w(px(self.settings.sidebar_width))
+            .h_full()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(
+                div()
+                    .id("studio-conversation-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px(px(Theme::SPACE_SM))
+                    .pt(px(4.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .children(rows),
+            )
+            .child(
+                div().px(px(Theme::SPACE_SM)).pb(px(Theme::SPACE_SM)).child(
+                    div()
+                        .id("close-studio")
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .rounded(px(8.0))
+                        .px(px(Theme::SPACE_SM))
+                        .py(px(7.0))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.glass_hover()))
+                        .on_click(cx.listener(|this, _, _, cx| this.close_studio(cx)))
+                        .child(
+                            icon(icons::ALT_ARROW_LEFT)
+                                .size(px(15.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child("Back to chats"),
+                ),
+            )
+            .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
             .into_any_element()
     }
 
@@ -4518,50 +4818,17 @@ impl Shell {
         }
 
         if matches!(self.route, Route::Studio | Route::StudioArtifact { .. }) {
-            if self.studio_page.is_none() {
-                let state = self.state.clone();
-                let page = cx.new(|cx| StudioPage::new(state, cx));
-                self.studio_sub = Some(cx.subscribe(&page, |shell, _, event, cx| match event {
-                    StudioEvent::OpenProviders => {
-                        shell.open_settings(SettingsSection::Providers, cx);
-                    }
-                    StudioEvent::OpenArtifact {
-                        conversation_id,
-                        artifact_id,
-                    } => {
-                        shell.route = Route::StudioArtifact {
-                            conversation_id: *conversation_id,
-                            artifact_id: *artifact_id,
-                        };
-                        shell.nav.push(NavEntry::StudioArtifact {
-                            conversation_id: *conversation_id,
-                            artifact_id: *artifact_id,
-                        });
-                        cx.notify();
-                    }
-                    StudioEvent::CloseArtifact => {
-                        if matches!(shell.route, Route::StudioArtifact { .. }) {
-                            shell.navigate_back(cx);
-                        }
-                    }
-                }));
-                self.studio_page = Some(page);
-            }
+            let studio_page = self.ensure_studio_page(cx);
             if let Route::StudioArtifact {
                 conversation_id,
                 artifact_id,
             } = self.route
-                && let Some(page) = self.studio_page.as_ref()
             {
-                page.update(cx, |page, cx| {
+                studio_page.update(cx, |page, cx| {
                     page.show_artifact(conversation_id, artifact_id, cx)
                 });
             }
-            return self
-                .studio_page
-                .as_ref()
-                .map(|page| page.clone().into_any_element())
-                .unwrap_or_else(|| Empty.into_any_element());
+            return studio_page.into_any_element();
         }
 
         let _ = (text, border);

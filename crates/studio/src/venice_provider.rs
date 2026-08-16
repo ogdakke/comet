@@ -251,6 +251,13 @@ fn image_payload(request: &GenerationRequest, binary: bool) -> ProviderResult<se
             ("aspect_ratio", ControlValue::AspectRatio { width, height }) => {
                 format!("{width}:{height}").into()
             }
+            ("reasoning", ControlValue::Boolean { value }) => {
+                payload.insert(
+                    "disable_prompt_optimization_thinking".into(),
+                    (!value).into(),
+                );
+                continue;
+            }
             (
                 "safe_mode"
                 | "hide_watermark"
@@ -397,6 +404,7 @@ mod tests {
                         value: "png".into(),
                     },
                 ),
+                ("reasoning".into(), ControlValue::Boolean { value: true }),
             ]),
             inputs: Vec::new(),
             manifest_version: "v1".into(),
@@ -409,6 +417,7 @@ mod tests {
         let value = image_payload(&request(), true).unwrap();
         assert_eq!(value["aspect_ratio"], "16:9");
         assert_eq!(value["format"], "png");
+        assert_eq!(value["disable_prompt_optimization_thinking"], false);
         assert_eq!(value["return_binary"], true);
         assert!(value.get("variants").is_none());
     }

@@ -53,6 +53,8 @@ struct ModelSpec {
     description: Option<String>,
     constraints: serde_json::Value,
     pricing: Option<serde_json::Value>,
+    #[serde(default, rename = "supportsOptimizePromptThinking")]
+    supports_optimize_prompt_thinking: bool,
 }
 
 #[derive(Deserialize)]
@@ -155,6 +157,21 @@ fn normalize_image(
             &constraints.qualities,
             constraints.default_quality.as_deref(),
         ));
+    }
+    if model.model_spec.supports_optimize_prompt_thinking {
+        controls.push(ModelControl {
+            id: ControlId::from("reasoning"),
+            label: "Reasoning".to_owned(),
+            description: Some("Use provider-supported prompt optimization reasoning".to_owned()),
+            kind: ControlKind::Boolean,
+            required: false,
+            default: Some(ControlValue::Boolean { value: true }),
+            minimum: None,
+            maximum: None,
+            step: None,
+            choices: Vec::new(),
+            visible_when: Vec::new(),
+        });
     }
     controls.push(ModelControl {
         id: ControlId::from("steps"),

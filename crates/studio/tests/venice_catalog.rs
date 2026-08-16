@@ -78,6 +78,26 @@ fn auto_aspect_ratio_keeps_the_catalog_usable_and_omits_a_default_override() {
 }
 
 #[test]
+fn reasoning_is_exposed_only_when_the_model_advertises_it() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(IMAGE).unwrap();
+    fixture["data"][0]["model_spec"]["supportsOptimizePromptThinking"] = serde_json::json!(true);
+
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    let reasoning = model
+        .controls
+        .iter()
+        .find(|control| control.id == ControlId::from("reasoning"))
+        .unwrap();
+    assert_eq!(reasoning.kind, ControlKind::Boolean);
+    assert_eq!(
+        reasoning.default,
+        Some(zeron_studio::ControlValue::Boolean { value: true })
+    );
+}
+
+#[test]
 fn manifest_version_ignores_fetch_time_but_tracks_constraints() {
     let first = normalize_model_catalog(IMAGE, fetched_at())
         .unwrap()

@@ -68,8 +68,8 @@ fn control_value_label(value: &zeron_studio::ControlValue) -> String {
             value.to_string()
         }
         ControlValue::Boolean { value } => if *value { "On" } else { "Off" }.into(),
-        ControlValue::Dimensions { width, height }
-        | ControlValue::AspectRatio { width, height } => format!("{width}×{height}"),
+        ControlValue::Dimensions { width, height } => format!("{width}×{height}"),
+        ControlValue::AspectRatio { width, height } => format!("{width}:{height}"),
     }
 }
 
@@ -119,6 +119,7 @@ async fn read_artifact_bytes(
 #[derive(Clone, Debug)]
 pub enum StudioEvent {
     OpenProviders,
+    SidebarChanged,
     OpenArtifact {
         conversation_id: StudioConversationId,
         artifact_id: StudioArtifactId,
@@ -160,9 +161,7 @@ pub struct StudioPage {
     selected_conversation: Option<StudioConversationId>,
     conversation: Option<StudioConversationView>,
     prompt: Entity<ComposerInput>,
-    search: Entity<ComposerInput>,
-    rename: Entity<ComposerInput>,
-    renaming: bool,
+    model_picker_open: bool,
     source_turn: Option<zeron_studio::StudioTurnId>,
     images: HashMap<StudioArtifactId, Arc<Image>>,
     loading_images: HashSet<StudioArtifactId>,
@@ -180,30 +179,16 @@ pub struct StudioPage {
     image_tasks: HashMap<StudioArtifactId, Task<()>>,
     _observe: Subscription,
     _prompt_events: Subscription,
-    _search_events: Subscription,
-    _rename_events: Subscription,
 }
 
 impl StudioPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
         let prompt = cx.new(|cx| ComposerInput::new("Describe the image you want to create", cx));
-        let search = cx.new(|cx| ComposerInput::new("Search conversations", cx));
-        let rename = cx.new(|cx| ComposerInput::new("Conversation name", cx));
-        let prompt_events = cx.subscribe(&prompt, |page: &mut Self, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
-                page.submit(cx);
-            }
-        });
-        let search_events = cx.subscribe(&search, |_: &mut Self, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Edited) {
-                cx.notify();
-            }
-        });
-        let rename_events = cx.subscribe(&rename, |page: &mut Self, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
-                page.rename_current(cx);
-            }
+        let prompt_events = cx.subscribe(&prompt, |page: &mut Self, _, event, cx| match event {
+            ComposerInputEvent::Submitted => page.submit(cx),
+            ComposerInputEvent::Edited => cx.notify(),
+            _ => {}
         });
         let mut page = Self {
             state,
@@ -215,9 +200,7 @@ impl StudioPage {
             selected_conversation: None,
             conversation: None,
             prompt,
-            search,
-            rename,
-            renaming: false,
+            model_picker_open: false,
             source_turn: None,
             images: HashMap::new(),
             loading_images: HashSet::new(),
@@ -235,8 +218,6 @@ impl StudioPage {
             image_tasks: HashMap::new(),
             _observe: observe,
             _prompt_events: prompt_events,
-            _search_events: search_events,
-            _rename_events: rename_events,
         };
         page.load(cx);
         page
@@ -307,6 +288,7 @@ impl StudioPage {
                         {
                             page.open_conversation(conversation.id, cx);
                         }
+                        cx.emit(StudioEvent::SidebarChanged);
                     }
                     (Err(error), _, _) | (_, Err(error), _) => page.error = Some(error.to_string().into()),
                     (_, _, Err(error)) => page.error = Some(error.into()),
@@ -316,12 +298,21 @@ impl StudioPage {
         }));
     }
 
-    fn open_conversation(&mut self, id: StudioConversationId, cx: &mut Context<Self>) {
+    pub fn conversations(&self) -> &[StudioConversationSummary] {
+        &self.conversations
+    }
+
+    pub fn selected_conversation(&self) -> Option<StudioConversationId> {
+        self.selected_conversation
+    }
+
+    pub fn open_conversation(&mut self, id: StudioConversationId, cx: &mut Context<Self>) {
         let Some(engine) = self.engine(cx) else {
             return;
         };
         self.selected_conversation = Some(id);
         self.conversation = None;
+        cx.emit(StudioEvent::SidebarChanged);
         self.watch_task = Some(cx.spawn(async move |this, cx| {
             let stream = engine
                 .client()
@@ -392,7 +383,7 @@ impl StudioPage {
         }
     }
 
-    fn new_conversation(&mut self, cx: &mut Context<Self>) {
+    pub fn new_conversation(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.engine(cx) else {
             return;
         };
@@ -414,6 +405,7 @@ impl StudioPage {
                     Ok(conversation) => {
                         page.conversations.insert(0, conversation.clone());
                         page.open_conversation(conversation.id, cx);
+                        cx.emit(StudioEvent::SidebarChanged);
                     }
                     Err(error) => page.error = Some(error.to_string().into()),
                 }
@@ -540,11 +532,12 @@ impl StudioPage {
         }));
     }
 
-    fn archive_current(&mut self, cx: &mut Context<Self>) {
+    pub fn archive_conversation(
+        &mut self,
+        conversation_id: StudioConversationId,
+        cx: &mut Context<Self>,
+    ) {
         let Some(engine) = self.engine(cx) else {
-            return;
-        };
-        let Some(conversation_id) = self.selected_conversation else {
             return;
         };
         self.action_task = Some(cx.spawn(async move |this, cx| {
@@ -559,68 +552,14 @@ impl StudioPage {
                 match result {
                     Ok(_) => {
                         page.conversations.retain(|item| item.id != conversation_id);
-                        page.selected_conversation = None;
-                        page.conversation = None;
-                        if let Some(next) = page.conversations.first() {
-                            page.open_conversation(next.id, cx);
+                        if page.selected_conversation == Some(conversation_id) {
+                            page.selected_conversation = None;
+                            page.conversation = None;
+                            if let Some(next) = page.conversations.first() {
+                                page.open_conversation(next.id, cx);
+                            }
                         }
-                    }
-                    Err(error) => page.error = Some(error.to_string().into()),
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-    }
-
-    fn begin_rename(&mut self, cx: &mut Context<Self>) {
-        let title = self
-            .conversation
-            .as_ref()
-            .map(|view| view.conversation.title.clone())
-            .unwrap_or_default();
-        self.rename
-            .update(cx, |input, cx| input.set_text(title, cx));
-        self.renaming = true;
-        cx.notify();
-    }
-
-    fn rename_current(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.engine(cx) else {
-            return;
-        };
-        let Some(conversation_id) = self.selected_conversation else {
-            return;
-        };
-        let title = self.rename.read(cx).text().trim().to_owned();
-        if title.is_empty() {
-            return;
-        }
-        self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(
-                    methods::RENAME_STUDIO_CONVERSATION,
-                    serde_json::json!({ "conversationId": conversation_id, "title": title }),
-                )
-                .await;
-            this.update(cx, |page, cx| {
-                match result.and_then(|value| {
-                    serde_json::from_value::<StudioConversationSummary>(value)
-                        .map_err(|error| zeron_rpc::RpcError::Failed(error.to_string()))
-                }) {
-                    Ok(summary) => {
-                        if let Some(item) = page
-                            .conversations
-                            .iter_mut()
-                            .find(|item| item.id == conversation_id)
-                        {
-                            *item = summary.clone();
-                        }
-                        if let Some(view) = page.conversation.as_mut() {
-                            view.conversation = summary;
-                        }
-                        page.renaming = false;
+                        cx.emit(StudioEvent::SidebarChanged);
                     }
                     Err(error) => page.error = Some(error.to_string().into()),
                 }
@@ -930,165 +869,6 @@ impl StudioPage {
         }
     }
 
-    fn render_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let query = self.search.read(cx).text().trim().to_lowercase();
-        let rows = self
-            .conversations
-            .clone()
-            .into_iter()
-            .filter(|conversation| {
-                query.is_empty() || conversation.title.to_lowercase().contains(&query)
-            })
-            .map(|conversation| {
-                let selected = Some(conversation.id) == self.selected_conversation;
-                div()
-                    .id(SharedString::from(format!(
-                        "studio-conversation-{}",
-                        conversation.id.0
-                    )))
-                    .rounded(px(8.0))
-                    .px(px(10.0))
-                    .py(px(7.0))
-                    .cursor_pointer()
-                    .bg(if selected {
-                        crate::theme::glass_selected_bg()
-                    } else {
-                        gpui::transparent_black()
-                    })
-                    .hover(|style| style.bg(theme.glass_hover()))
-                    .on_click(cx.listener(move |page, _, _, cx| {
-                        page.open_conversation(conversation.id, cx)
-                    }))
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(px(13.0))
-                            .text_color(theme.text)
-                            .child(SharedString::from(conversation.title)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.5))
-                            .text_color(theme.text_faint)
-                            .child(SharedString::from(format!(
-                                "{} turns",
-                                conversation.turn_count
-                            ))),
-                    )
-            })
-            .collect::<Vec<_>>();
-        div()
-            .w(px(240.0))
-            .h_full()
-            .flex_none()
-            .border_r_1()
-            .border_color(theme.border)
-            .flex()
-            .flex_col()
-            .pt(px(12.0))
-            .px(px(8.0))
-            .child(
-                div()
-                    .mb(px(8.0))
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(theme.border)
-                    .px(px(8.0))
-                    .py(px(5.0))
-                    .child(self.search.clone()),
-            )
-            .child(
-                div()
-                    .id("studio-sidebar-header")
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px(px(4.0))
-                    .pb(px(10.0))
-                    .child(
-                        div()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child("Studio"),
-                    )
-                    .child(
-                        div()
-                            .id("studio-new-conversation")
-                            .cursor_pointer()
-                            .rounded(px(6.0))
-                            .px(px(8.0))
-                            .py(px(4.0))
-                            .bg(crate::theme::ink(0.08))
-                            .on_click(cx.listener(|page, _, _, cx| page.new_conversation(cx)))
-                            .child("New"),
-                    ),
-            )
-            .child(
-                div()
-                    .id("studio-conversation-list")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .children(rows),
-            )
-            .when(self.selected_conversation.is_some(), |sidebar| {
-                sidebar.child(
-                    div()
-                        .mb(px(6.0))
-                        .when(self.renaming, |actions| {
-                            actions.child(
-                                div()
-                                    .rounded(px(7.0))
-                                    .border_1()
-                                    .border_color(theme.border)
-                                    .px(px(8.0))
-                                    .py(px(5.0))
-                                    .child(self.rename.clone()),
-                            )
-                        })
-                        .when(!self.renaming, |actions| {
-                            actions.child(
-                                div()
-                                    .flex()
-                                    .gap(px(4.0))
-                                    .child(
-                                        div()
-                                            .id("studio-rename-conversation")
-                                            .cursor_pointer()
-                                            .px(px(10.0))
-                                            .py(px(8.0))
-                                            .rounded(px(7.0))
-                                            .text_size(px(11.0))
-                                            .text_color(theme.text_muted)
-                                            .hover(|style| style.bg(theme.glass_hover()))
-                                            .on_click(
-                                                cx.listener(|page, _, _, cx| page.begin_rename(cx)),
-                                            )
-                                            .child("Rename"),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("studio-archive-conversation")
-                                            .cursor_pointer()
-                                            .px(px(10.0))
-                                            .py(px(8.0))
-                                            .rounded(px(7.0))
-                                            .text_size(px(11.0))
-                                            .text_color(theme.text_muted)
-                                            .hover(|style| style.bg(theme.glass_hover()))
-                                            .on_click(cx.listener(|page, _, _, cx| {
-                                                page.archive_current(cx)
-                                            }))
-                                            .child("Archive"),
-                                    ),
-                            )
-                        }),
-                )
-            })
-            .into_any_element()
-    }
-
     fn render_tile(
         &self,
         turn_ix: usize,
@@ -1333,211 +1113,465 @@ impl StudioPage {
     }
 
     fn render_composer(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let model_cards = self
+        let model_configs = self
             .models
             .clone()
             .into_iter()
+            .filter(|model| self.selected_models.contains(&model.id))
             .map(|model| {
-                let selected = self.selected_models.contains(&model.id);
-                let id = model.id.clone();
+                let remove_id = model.id.clone();
                 let output_count = self
                     .draft_runs
                     .get(&model.id)
                     .map(|draft| draft.output_count)
                     .unwrap_or(1);
                 let maximum_output_count = model.maximum_output_count.max(1);
-                let controls = if selected {
-                    model
-                        .controls
-                        .iter()
-                        .filter(|control| {
-                            !control.choices.is_empty()
-                                || matches!(
-                                    control.kind,
-                                    zeron_studio::ControlKind::Boolean
-                                        | zeron_studio::ControlKind::Integer
-                                        | zeron_studio::ControlKind::Number
-                                )
-                        })
-                        .map(|control| {
-                            let model_id = model.id.clone();
-                            let control = control.clone();
-                            let value = self
-                                .draft_runs
-                                .get(&model.id)
-                                .and_then(|draft| draft.controls.get(&control.id))
-                                .map(control_value_label)
-                                .unwrap_or_else(|| "Default".into());
-                            let label = control.label.clone();
-                            div()
-                                .id(SharedString::from(format!(
-                                    "studio-control-{}-{}",
-                                    model_id.as_str(),
-                                    control.id.as_str()
-                                )))
-                                .cursor_pointer()
-                                .rounded(px(5.0))
-                                .px(px(5.0))
-                                .py(px(3.0))
-                                .bg(crate::theme::ink(0.05))
-                                .text_size(px(10.0))
-                                .on_click(cx.listener(move |page, _, _, cx| {
-                                    cx.stop_propagation();
-                                    page.cycle_control(&model_id, &control, cx);
-                                }))
-                                .child(SharedString::from(format!("{label}: {value}")))
-                        })
-                        .collect::<Vec<_>>()
-                } else {
-                    Vec::new()
-                };
                 let decrement_id = model.id.clone();
                 let increment_id = model.id.clone();
+                let aspect_control = model
+                    .controls
+                    .iter()
+                    .find(|control| control.id.as_str() == "aspect_ratio")
+                    .cloned();
+                let resolution_control = model
+                    .controls
+                    .iter()
+                    .find(|control| control.id.as_str() == "resolution")
+                    .cloned();
+                let reasoning_control = model
+                    .controls
+                    .iter()
+                    .find(|control| control.id.as_str() == "reasoning")
+                    .cloned();
+                let draft = self
+                    .draft_runs
+                    .get(&model.id)
+                    .cloned()
+                    .unwrap_or_else(|| DraftRunConfig::from_model(&model));
+                let aspect = draft_aspect(&model, &draft);
+                let aspect_label = format!("{}:{}", aspect.0, aspect.1);
+                let aspect_ratio = aspect.0 as f32 / aspect.1.max(1) as f32;
+                let (indicator_w, indicator_h) = if aspect_ratio >= 1.0 {
+                    (18.0, (18.0 / aspect_ratio).clamp(7.0, 18.0))
+                } else {
+                    ((18.0 * aspect_ratio).clamp(7.0, 18.0), 18.0)
+                };
+                let resolution_label = resolution_control
+                    .as_ref()
+                    .and_then(|control| draft.controls.get(&control.id))
+                    .map(control_value_label)
+                    .unwrap_or_else(|| "Auto".into());
+                let reasoning_on = reasoning_control
+                    .as_ref()
+                    .and_then(|control| draft.controls.get(&control.id))
+                    .is_some_and(|value| {
+                        matches!(value, zeron_studio::ControlValue::Boolean { value: true })
+                    });
+                let aspect_model_id = model.id.clone();
+                let resolution_model_id = model.id.clone();
+                let reasoning_model_id = model.id.clone();
+                div()
+                    .id(SharedString::from(format!(
+                        "studio-model-config-{}",
+                        model.id.as_str()
+                    )))
+                    .w(px(292.0))
+                    .flex_none()
+                    .rounded(px(10.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(crate::theme::wash(0.025))
+                    .px(px(10.0))
+                    .py(px(8.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(11.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .child(SharedString::from(model.display_name.clone())),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "studio-remove-model-{}",
+                                        remove_id.as_str()
+                                    )))
+                                    .size(px(18.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(5.0))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(crate::theme::wash(0.10)))
+                                    .on_click(cx.listener(move |page, _, _, cx| {
+                                        page.selected_models.remove(&remove_id);
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        crate::icons::icon(crate::icons::CLOSE)
+                                            .size(px(11.0))
+                                            .text_color(theme.text_muted),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(7.0))
+                                    .bg(crate::theme::wash(0.07))
+                                    .text_size(px(10.5))
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "studio-output-minus-{}",
+                                                decrement_id.as_str()
+                                            )))
+                                            .cursor_pointer()
+                                            .px(px(6.0))
+                                            .py(px(5.0))
+                                            .on_click(cx.listener(move |page, _, _, cx| {
+                                                page.adjust_output_count(
+                                                    &decrement_id,
+                                                    -1,
+                                                    maximum_output_count,
+                                                    cx,
+                                                );
+                                            }))
+                                            .child("−"),
+                                    )
+                                    .child(div().text_color(theme.text_muted).child(
+                                        SharedString::from(format!(
+                                            "{output_count} variation{}",
+                                            if output_count == 1 { "" } else { "s" }
+                                        )),
+                                    ))
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "studio-output-plus-{}",
+                                                increment_id.as_str()
+                                            )))
+                                            .cursor_pointer()
+                                            .px(px(6.0))
+                                            .py(px(5.0))
+                                            .on_click(cx.listener(move |page, _, _, cx| {
+                                                page.adjust_output_count(
+                                                    &increment_id,
+                                                    1,
+                                                    maximum_output_count,
+                                                    cx,
+                                                );
+                                            }))
+                                            .child("+"),
+                                    ),
+                            )
+                            .when_some(aspect_control, |row, control| {
+                                row.child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "studio-aspect-{}",
+                                            aspect_model_id.as_str()
+                                        )))
+                                        .h(px(27.0))
+                                        .px(px(7.0))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(5.0))
+                                        .rounded(px(7.0))
+                                        .bg(crate::theme::wash(0.07))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(move |page, _, _, cx| {
+                                            page.cycle_control(&aspect_model_id, &control, cx)
+                                        }))
+                                        .child(
+                                            div()
+                                                .w(px(indicator_w))
+                                                .h(px(indicator_h))
+                                                .rounded(px(2.0))
+                                                .border_1()
+                                                .border_color(theme.text_muted.opacity(0.75)),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(10.5))
+                                                .text_color(theme.text_muted)
+                                                .child(SharedString::from(aspect_label)),
+                                        ),
+                                )
+                            })
+                            .when_some(resolution_control, |row, control| {
+                                row.child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "studio-resolution-{}",
+                                            resolution_model_id.as_str()
+                                        )))
+                                        .h(px(27.0))
+                                        .px(px(7.0))
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(7.0))
+                                        .bg(crate::theme::wash(0.07))
+                                        .cursor_pointer()
+                                        .text_size(px(10.5))
+                                        .text_color(theme.text_muted)
+                                        .on_click(cx.listener(move |page, _, _, cx| {
+                                            page.cycle_control(&resolution_model_id, &control, cx)
+                                        }))
+                                        .child(SharedString::from(resolution_label)),
+                                )
+                            })
+                            .when_some(reasoning_control, |row, control| {
+                                row.child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "studio-reasoning-{}",
+                                            reasoning_model_id.as_str()
+                                        )))
+                                        .h(px(27.0))
+                                        .px(px(7.0))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(5.0))
+                                        .rounded(px(7.0))
+                                        .bg(crate::theme::wash(if reasoning_on {
+                                            0.12
+                                        } else {
+                                            0.07
+                                        }))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(move |page, _, _, cx| {
+                                            page.cycle_control(&reasoning_model_id, &control, cx)
+                                        }))
+                                        .child(
+                                            div()
+                                                .w(px(18.0))
+                                                .h(px(10.0))
+                                                .rounded_full()
+                                                .bg(if reasoning_on {
+                                                    theme.text_muted
+                                                } else {
+                                                    theme.border_strong
+                                                })
+                                                .p(px(2.0))
+                                                .child(
+                                                    div()
+                                                        .size(px(6.0))
+                                                        .rounded_full()
+                                                        .bg(theme.surface)
+                                                        .when(reasoning_on, |dot| dot.ml(px(8.0))),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(10.5))
+                                                .text_color(theme.text_muted)
+                                                .child("Reasoning"),
+                                        ),
+                                )
+                            }),
+                    )
+            })
+            .collect::<Vec<_>>();
+
+        let picker_rows = self
+            .models
+            .clone()
+            .into_iter()
+            .map(|model| {
+                let selected = self.selected_models.contains(&model.id);
+                let id = model.id.clone();
                 div()
                     .id(SharedString::from(format!("studio-model-{}", id.as_str())))
+                    .h(px(38.0))
+                    .px(px(10.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .rounded(px(7.0))
                     .cursor_pointer()
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(if selected { theme.accent } else { theme.border })
-                    .px(px(9.0))
-                    .py(px(6.0))
+                    .bg(if selected {
+                        crate::theme::wash(0.10)
+                    } else {
+                        crate::theme::wash(0.0)
+                    })
+                    .hover(|style| style.bg(crate::theme::wash(0.08)))
                     .on_click(cx.listener(move |page, _, _, cx| {
                         if !page.selected_models.remove(&id) {
                             page.selected_models.insert(id.clone());
                         }
                         cx.notify();
                     }))
-                    .flex()
-                    .flex_col()
-                    .gap(px(5.0))
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap(px(7.0))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_size(px(11.0))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .child(SharedString::from(model.display_name)),
-                            )
-                            .when(selected, |row| {
-                                row.child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(4.0))
-                                        .child(
-                                            div()
-                                                .id(SharedString::from(format!(
-                                                    "studio-output-minus-{}",
-                                                    decrement_id.as_str()
-                                                )))
-                                                .px(px(4.0))
-                                                .on_click(cx.listener(move |page, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    page.adjust_output_count(
-                                                        &decrement_id,
-                                                        -1,
-                                                        maximum_output_count,
-                                                        cx,
-                                                    );
-                                                }))
-                                                .child("−"),
-                                        )
-                                        .child(SharedString::from(format!("{output_count}×")))
-                                        .child(
-                                            div()
-                                                .id(SharedString::from(format!(
-                                                    "studio-output-plus-{}",
-                                                    increment_id.as_str()
-                                                )))
-                                                .px(px(4.0))
-                                                .on_click(cx.listener(move |page, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    page.adjust_output_count(
-                                                        &increment_id,
-                                                        1,
-                                                        maximum_output_count,
-                                                        cx,
-                                                    );
-                                                }))
-                                                .child("+"),
-                                        ),
-                                )
-                            }),
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(12.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(SharedString::from(model.display_name)),
                     )
-                    .children(controls)
+                    .when(selected, |row| {
+                        row.child(
+                            crate::icons::icon(crate::icons::CHECK)
+                                .size(px(12.0))
+                                .text_color(theme.text_muted),
+                        )
+                    })
             })
             .collect::<Vec<_>>();
-        div()
+
+        let picker = self.model_picker_open.then(|| {
+            div()
+                .id("studio-model-picker")
+                .absolute()
+                .left_0()
+                .bottom(px(34.0))
+                .w(px(300.0))
+                .max_h(px(300.0))
+                .overflow_y_scroll()
+                .rounded(px(12.0))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.glass_overlay())
+                .p(px(6.0))
+                .when(!theme.is_glass(), |picker| picker.shadow_lg())
+                .children(picker_rows)
+        });
+
+        let blocked = self.busy
+            || self.selected_models.is_empty()
+            || self.prompt.read(cx).text().trim().is_empty();
+        let composer = div()
             .absolute()
             .left(px(24.0))
             .right(px(24.0))
             .bottom(px(18.0))
             .mx_auto()
-            .max_w(px(1000.0))
-            .rounded(px(16.0))
+            .max_w(px(920.0))
+            .rounded(px(18.0))
             .border_1()
             .border_color(theme.border)
-            .bg(theme.surface.opacity(0.97))
-            .p(px(12.0))
+            .bg(theme.input_glass_bg())
+            .when(!theme.is_glass(), |composer| composer.shadow_lg())
+            .px(px(12.0))
+            .pt(px(10.0))
+            .pb(px(10.0))
             .flex()
             .flex_col()
             .gap(px(10.0))
             .child(
                 div()
-                    .id("studio-composer-models")
+                    .id("studio-model-configs")
                     .flex()
                     .flex_row()
-                    .gap(px(8.0))
+                    .gap(px(7.0))
                     .overflow_x_scroll()
-                    .children(model_cards),
+                    .children(model_configs),
             )
             .child(
                 div()
-                    .min_h(px(46.0))
-                    .px(px(8.0))
-                    .py(px(6.0))
+                    .min_h(px(54.0))
+                    .px(px(4.0))
+                    .py(px(4.0))
                     .child(self.prompt.clone()),
             )
             .child(
                 div()
                     .flex()
-                    .justify_between()
                     .items_center()
+                    .gap(px(8.0))
                     .child(
                         div()
-                            .text_size(px(10.5))
-                            .text_color(theme.text_faint)
-                            .child(if self.source_turn.is_some() {
-                                "Using a previous turn"
-                            } else {
-                                "Each model keeps independent settings"
-                            }),
+                            .relative()
+                            .when_some(picker, |button, picker| button.child(picker))
+                            .child(
+                                div()
+                                    .id("studio-model-picker-toggle")
+                                    .h(px(28.0))
+                                    .px(px(8.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .rounded(px(7.0))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(crate::theme::wash(0.08)))
+                                    .on_click(cx.listener(|page, _, _, cx| {
+                                        page.model_picker_open = !page.model_picker_open;
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        crate::icons::icon(crate::icons::WIDGET)
+                                            .size(px(13.0))
+                                            .text_color(theme.text_muted),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .child(SharedString::from(format!(
+                                                "{} model{}",
+                                                self.selected_models.len(),
+                                                if self.selected_models.len() == 1 {
+                                                    ""
+                                                } else {
+                                                    "s"
+                                                }
+                                            ))),
+                                    ),
+                            ),
                     )
+                    .when(self.source_turn.is_some(), |row| {
+                        row.child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(theme.text_faint)
+                                .child("Using previous settings"),
+                        )
+                    })
+                    .child(div().flex_1())
                     .child(
                         div()
                             .id("studio-generate")
-                            .cursor_pointer()
-                            .rounded(px(8.0))
-                            .px(px(14.0))
-                            .py(px(7.0))
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.surface)
-                            .text_color(theme.text)
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .on_click(cx.listener(|page, _, _, cx| page.submit(cx)))
-                            .child(if self.busy {
-                                "Submitting…"
-                            } else {
-                                "Generate"
-                            }),
+                            .size(px(28.0))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(theme.text)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(blocked, |button| button.opacity(0.35))
+                            .when(!blocked, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .hover(|style| style.opacity(0.85))
+                                    .on_click(cx.listener(|page, _, _, cx| page.submit(cx)))
+                            })
+                            .child(
+                                crate::icons::icon(crate::icons::ARROW_UP)
+                                    .size(px(14.0))
+                                    .text_color(theme.bg),
+                            ),
                     ),
-            )
-            .into_any_element()
+            );
+
+        crate::frost::frosted(18.0, 16.0, composer).into_any_element()
     }
 
     fn render_lightbox(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1963,10 +1997,7 @@ impl Render for StudioPage {
         div()
             .relative()
             .size_full()
-            .flex()
-            .flex_row()
             .track_focus(&self.focus)
-            .child(self.render_sidebar(&theme, cx))
             .child(body)
             .when_some(self.error.clone(), |el, error| {
                 el.child(
