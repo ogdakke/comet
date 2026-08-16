@@ -2046,13 +2046,11 @@ async fn execute_studio_run(
         Ok(Some(provider)) => provider,
         Ok(None) => {
             let message = "unknown studio provider".to_owned();
-            let _ = store.fail_run(&run, &message, false);
-            return Err(message);
+            return fail_studio_run(&store, &run, &message, false);
         }
         Err(error) => {
             let message = error.to_string();
-            let _ = store.fail_run(&run, &message, false);
-            return Err(message);
+            return fail_studio_run(&store, &run, &message, false);
         }
     };
     let capabilities = provider.submission_capabilities();
@@ -2060,8 +2058,7 @@ async fn execute_studio_run(
         Ok(secret) => secret,
         Err(error) => {
             let message = error.to_string();
-            let _ = store.fail_run(&run, &message, false);
-            return Err(message);
+            return fail_studio_run(&store, &run, &message, false);
         }
     };
     store
@@ -2075,28 +2072,74 @@ async fn execute_studio_run(
         Ok(zeron_studio::Submission::Completed { artifacts }) => {
             if let Err(error) = store.complete_run(&run, &artifacts) {
                 let message = error.to_string();
-                let _ = store.fail_run(&run, &message, false);
-                Err(message)
+                fail_studio_run(&store, &run, &message, false)
             } else {
                 Ok(())
             }
         }
-        Ok(zeron_studio::Submission::Queued { .. }) => store
-            .fail_run(
-                &run,
-                "provider queued an image job that this release cannot poll",
-                true,
-            )
-            .map_err(|error| error.to_string()),
+        Ok(zeron_studio::Submission::Queued { .. }) => fail_studio_run(
+            &store,
+            &run,
+            "provider queued an image job that this release cannot poll",
+            true,
+        ),
         Err(error) => {
             let unknown = error.kind == zeron_studio::ProviderErrorKind::Transient
                 && !capabilities.accepts_idempotency_key
                 && !capabilities.can_reconcile;
+            tracing::warn!(
+                run_id = %run.run_id.0,
+                attempt_id = %run.attempt_id.0,
+                provider = %run.request.provider_id.as_str(),
+                model = %run.request.model_id.as_str(),
+                error_kind = ?error.kind,
+                provider_code = error.provider_code.as_deref(),
+                retry_after_seconds = error.retry_after_seconds,
+                submission_unknown = unknown,
+                error = %error,
+                "studio generation failed"
+            );
             store
                 .fail_run(&run, &error.to_string(), unknown)
-                .map_err(|store_error| store_error.to_string())
+                .map_err(|store_error| {
+                    tracing::error!(
+                        run_id = %run.run_id.0,
+                        attempt_id = %run.attempt_id.0,
+                        error = %store_error,
+                        "studio generation failure could not be persisted"
+                    );
+                    store_error.to_string()
+                })
         }
     }
+}
+
+fn fail_studio_run(
+    store: &StudioStore,
+    run: &StoredStudioRun,
+    message: &str,
+    submission_unknown: bool,
+) -> Result<(), String> {
+    tracing::warn!(
+        run_id = %run.run_id.0,
+        attempt_id = %run.attempt_id.0,
+        provider = %run.request.provider_id.as_str(),
+        model = %run.request.model_id.as_str(),
+        submission_unknown,
+        error = message,
+        "studio generation failed"
+    );
+    store
+        .fail_run(&run, message, submission_unknown)
+        .map_err(|store_error| {
+            tracing::error!(
+                run_id = %run.run_id.0,
+                attempt_id = %run.attempt_id.0,
+                error = %store_error,
+                "studio generation failure could not be persisted"
+            );
+            store_error.to_string()
+        })
 }
 
 #[cfg(test)]
