@@ -1312,6 +1312,12 @@ impl ComposerInput {
         Self::with_context(placeholder, "Composer", cx)
     }
 
+    /// A picker/filter input whose bare navigation keys are owned by its
+    /// surrounding menu rather than consumed as editor cursor movement.
+    pub fn palette_search(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
+        Self::with_context(placeholder, "PaletteSearch", cx)
+    }
+
     /// An input in a custom KEY context — palettes use `"PaletteSearch"`,
     /// whose keymap binds only text-editing keys so navigation keys bubble to
     /// the surrounding frame (see `init`).

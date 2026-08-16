@@ -191,7 +191,7 @@ impl StudioPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
         let prompt = cx.new(|cx| ComposerInput::new("Describe the image you want to create", cx));
-        let model_search = cx.new(|cx| ComposerInput::new("Search models…", cx));
+        let model_search = cx.new(|cx| ComposerInput::palette_search("Search models…", cx));
         let prompt_events = cx.subscribe(&prompt, |page: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => page.submit(cx),
             ComposerInputEvent::Edited => cx.notify(),
