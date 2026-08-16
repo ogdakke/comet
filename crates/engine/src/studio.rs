@@ -722,11 +722,19 @@ impl StudioStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
+        let models: Vec<MediaModel> = serde_json::from_str(&catalog)
+            .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
+        let expired = chrono::Utc::now().timestamp_millis() >= expires_at;
+        let placeholder_pricing = models.iter().any(|model| {
+            model
+                .pricing
+                .as_ref()
+                .is_some_and(zeron_studio::PricingMetadata::is_placeholder)
+        });
         Ok(Some(ListStudioModelsResponse {
-            models: serde_json::from_str(&catalog)
-                .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?,
+            models,
             fetched_at: timestamp(fetched_at)?,
-            stale: chrono::Utc::now().timestamp_millis() >= expires_at,
+            stale: expired || placeholder_pricing,
         }))
     }
 

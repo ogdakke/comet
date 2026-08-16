@@ -253,6 +253,12 @@ pub struct PricingMetadata {
 }
 
 impl PricingMetadata {
+    /// True when a catalog claimed pricing exists but recorded no amount.
+    /// Pre-cost snapshots used this shape; they must be refetched.
+    pub fn is_placeholder(&self) -> bool {
+        self.amount.is_none() && self.entries.is_empty()
+    }
+
     fn resolve_unit_amount(&self, controls: &BTreeMap<ControlId, ControlValue>) -> Option<f64> {
         let mut best: Option<(usize, f64)> = None;
         for entry in &self.entries {

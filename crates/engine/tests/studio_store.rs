@@ -108,6 +108,43 @@ fn studio_catalog_is_profile_scoped_and_migrated() {
 }
 
 #[test]
+fn cached_catalog_with_placeholder_pricing_is_stale() {
+    let root = tempdir().unwrap();
+    let store = StudioStore::open(root.path(), 1024).unwrap();
+    let mut placeholder = image_model("fake");
+    placeholder.pricing = Some(PricingMetadata {
+        currency: "USD".into(),
+        unit: PricingUnit::PerOutput,
+        unit_label: "provider-defined generation".into(),
+        amount: None,
+        entries: Vec::new(),
+        detail: Some("Price varies with the selected model controls".into()),
+    });
+    store
+        .cache_models(
+            &"fake".into(),
+            &[placeholder],
+            std::time::Duration::from_secs(6 * 60 * 60),
+        )
+        .unwrap();
+    let cached = store.cached_models(&"fake".into()).unwrap().unwrap();
+    assert!(
+        cached.stale,
+        "pre-cost catalog snapshots must be refetched"
+    );
+
+    store
+        .cache_models(
+            &"fake".into(),
+            &[priced_image_model("fake", 0.05)],
+            std::time::Duration::from_secs(6 * 60 * 60),
+        )
+        .unwrap();
+    let fresh = store.cached_models(&"fake".into()).unwrap().unwrap();
+    assert!(!fresh.stale);
+}
+
+#[test]
 fn restart_turns_interrupted_image_submissions_into_explicit_retry_states() {
     let root = tempdir().unwrap();
     let model = image_model("fake");
