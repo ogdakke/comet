@@ -60,6 +60,9 @@ pub struct StudioPage {
     pub(super) source_turn: Option<zeron_studio::StudioTurnId>,
     /// Turns whose prompt bubble is fully expanded past the 3-line clamp.
     pub(super) expanded_prompts: HashSet<zeron_studio::StudioTurnId>,
+    /// Turns whose inspector prompt is fully expanded past the 10-line clamp.
+    pub(super) expanded_inspector_prompts: HashSet<zeron_studio::StudioTurnId>,
+    pub(super) inspector_scroll: gpui::ScrollHandle,
     pub(super) images: HashMap<StudioArtifactId, Arc<Image>>,
     pub(super) loading_images: HashSet<StudioArtifactId>,
     pub(super) selected_artifact: Option<StudioArtifactId>,
@@ -143,6 +146,8 @@ impl StudioPage {
             rail_hover: None,
             source_turn: None,
             expanded_prompts: HashSet::new(),
+            expanded_inspector_prompts: HashSet::new(),
+            inspector_scroll: gpui::ScrollHandle::new(),
             images: HashMap::new(),
             loading_images: HashSet::new(),
             selected_artifact: None,
@@ -318,6 +323,8 @@ impl StudioPage {
             self.close_artifact(cx);
             self.composer_seeded_for = None;
             self.expanded_prompts.clear();
+            self.expanded_inspector_prompts.clear();
+            self.inspector_scroll.set_offset(Point::default());
         }
         self.selected_conversation = Some(id);
         self.conversation = None;
@@ -671,6 +678,17 @@ impl StudioPage {
     ) {
         if !self.expanded_prompts.remove(&turn_id) {
             self.expanded_prompts.insert(turn_id);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn toggle_inspector_prompt_expanded(
+        &mut self,
+        turn_id: zeron_studio::StudioTurnId,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.expanded_inspector_prompts.remove(&turn_id) {
+            self.expanded_inspector_prompts.insert(turn_id);
         }
         cx.notify();
     }

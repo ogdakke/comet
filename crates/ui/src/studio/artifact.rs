@@ -35,6 +35,19 @@ const ARTIFACT_SWIPE_IDLE: Duration = Duration::from_millis(48);
 const ARTIFACT_RUBBER_COEFF: f32 = 0.55;
 const ARTIFACT_FILMSTRIP_STEP: f32 = 38.0;
 const ARTIFACT_ZOOM_MAX: f32 = 24.0;
+const INSPECTOR_WIDTH: f32 = 320.0;
+const INSPECTOR_PAD_X: f32 = 18.0;
+const INSPECTOR_COPY_SIZE: f32 = 24.0;
+const INSPECTOR_COPY_GAP: f32 = 8.0;
+/// Collapsed inspector prompt: ten rows of 12px sidebar type, then Show more.
+const INSPECTOR_PROMPT_COLLAPSED_LINES: usize = 10;
+const INSPECTOR_PROMPT_LINE_HEIGHT: f32 = 18.0;
+/// Geist 12px Latin advance — scaled from the 14px chat-bubble estimate.
+const INSPECTOR_PROMPT_ADVANCE: f32 = super::feed::PROMPT_AVG_CHAR_ADVANCE * (12.0 / 14.0);
+
+fn inspector_prompt_inner_width() -> f32 {
+    (INSPECTOR_WIDTH - INSPECTOR_PAD_X * 2.0 - INSPECTOR_COPY_SIZE - INSPECTOR_COPY_GAP).max(1.0)
+}
 
 /// Ease from `from` to `to` after fingers lift. `to` is 0, +page, or −page.
 #[derive(Debug, Clone, Copy)]
@@ -339,6 +352,9 @@ impl StudioPage {
         self.lightbox_zoom = 1.0;
         self.lightbox_pan = Point::default();
         self.lightbox_drag = None;
+        if changed {
+            self.inspector_scroll.set_offset(Point::default());
+        }
         self.artifact_filmstrip_scroll.scroll_to_item(index);
         if let Some(conversation_id) = self.selected_conversation {
             cx.emit(StudioEvent::OpenArtifact {
@@ -416,6 +432,7 @@ impl StudioPage {
         if self.selected_artifact != Some(artifact_id) {
             self.selected_artifact = Some(artifact_id);
             self.reset_lightbox_viewer();
+            self.inspector_scroll.set_offset(Point::default());
             if let Some(index) = self
                 .artifact_sequence()
                 .iter()
@@ -805,6 +822,7 @@ impl StudioPage {
                         .find(|artifact| artifact.id == id)
                         .map(|artifact| {
                             (
+                                turn.id,
                                 turn.prompt.clone(),
                                 run.model.display_name.clone(),
                                 artifact.mime_type.clone(),
@@ -1004,69 +1022,115 @@ impl StudioPage {
             );
 
         let inspector = div()
+            .id("studio-artifact-inspector")
             .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&self.inspector_scroll)
             .flex()
             .flex_col()
             .border_l_1()
             .border_color(theme.border)
             .bg(theme.glass_overlay())
-            .px(px(18.0))
+            .px(px(INSPECTOR_PAD_X))
             .pt(px(Theme::TITLEBAR_HEIGHT + 18.0))
             .pb(px(16.0))
-            .when_some(details, |inspector, (prompt, model, mime, size)| {
-                let copy_prompt = prompt.clone();
-                inspector
-                    .child(
-                        div()
-                            .flex()
-                            .items_start()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_size(px(12.0))
-                                    .line_height(px(18.0))
-                                    .text_color(theme.text)
-                                    .child(SharedString::from(prompt)),
-                            )
-                            .child(
-                                div()
-                                    .id("studio-copy-prompt")
-                                    .size(px(24.0))
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(6.0))
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(crate::theme::wash(0.14)))
-                                    .on_click(move |_, _, cx| {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            copy_prompt.clone(),
-                                        ));
-                                    })
-                                    .child(
-                                        crate::icons::icon(crate::icons::COPY)
-                                            .size(px(14.0))
-                                            .text_color(theme.text_muted.opacity(0.7)),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .mt(px(14.0))
-                            .text_size(px(11.0))
-                            .text_color(theme.text_muted)
-                            .child(SharedString::from(format!(
-                                "{model} · {mime} · {:.1} KB",
-                                size as f64 / 1024.0
-                            ))),
-                    )
-            })
+            .when_some(
+                details,
+                |inspector, (turn_id, prompt, model, mime, size)| {
+                    let copy_prompt = prompt.clone();
+                    let expanded = self.expanded_inspector_prompts.contains(&turn_id);
+                    let clampable = super::feed::prompt_exceeds_lines(
+                        &prompt,
+                        inspector_prompt_inner_width(),
+                        INSPECTOR_PROMPT_ADVANCE,
+                        INSPECTOR_PROMPT_COLLAPSED_LINES,
+                    );
+                    let collapsed = clampable && !expanded;
+                    inspector
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_start()
+                                .gap(px(INSPECTOR_COPY_GAP))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(6.0))
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .text_size(px(12.0))
+                                                .line_height(px(INSPECTOR_PROMPT_LINE_HEIGHT))
+                                                .text_color(theme.text)
+                                                .when(collapsed, |box_| {
+                                                    box_.max_h(px(INSPECTOR_PROMPT_LINE_HEIGHT
+                                                        * INSPECTOR_PROMPT_COLLAPSED_LINES as f32))
+                                                        .overflow_hidden()
+                                                })
+                                                .child(SharedString::from(prompt)),
+                                        )
+                                        .when(clampable, |col| {
+                                            col.child(
+                                                super::feed::show_more_action(
+                                                    format!(
+                                                        "studio-inspector-toggle-prompt-{}",
+                                                        turn_id.0
+                                                    ),
+                                                    expanded,
+                                                    theme,
+                                                )
+                                                .on_click(cx.listener(move |page, _, _, cx| {
+                                                    page.toggle_inspector_prompt_expanded(
+                                                        turn_id, cx,
+                                                    );
+                                                })),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .id("studio-copy-prompt")
+                                        .size(px(INSPECTOR_COPY_SIZE))
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(6.0))
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(crate::theme::wash(0.14)))
+                                        .on_click(move |_, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                copy_prompt.clone(),
+                                            ));
+                                        })
+                                        .child(
+                                            crate::icons::icon(crate::icons::COPY)
+                                                .size(px(14.0))
+                                                .text_color(theme.text_muted.opacity(0.7)),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .mt(px(14.0))
+                                .text_size(px(11.0))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(format!(
+                                    "{model} · {mime} · {:.1} KB",
+                                    size as f64 / 1024.0
+                                ))),
+                        )
+                },
+            )
             .child(div().flex_1())
             .child(
                 div()
+                    .flex_none()
                     .flex()
                     .items_center()
                     .gap(px(8.0))
@@ -1199,17 +1263,9 @@ impl StudioPage {
                                 .children(thumbnails),
                         ),
                 )
-                .child(
-                    div()
-                        .w(px(320.0))
-                        .h_full()
-                        .flex_none()
-                        .child(crate::frost::frosted(
-                            0.0,
-                            crate::frost::MENU_BLUR,
-                            inspector,
-                        )),
-                )
+                .child(div().w(px(INSPECTOR_WIDTH)).h_full().flex_none().child(
+                    crate::frost::frosted(0.0, crate::frost::MENU_BLUR, inspector),
+                ))
                 .into_any_element(),
         )
     }
@@ -1284,6 +1340,11 @@ mod tests {
             previous = position;
         }
         assert!((snap_offset_at(from, to, 0.22, 0.22) - to).abs() < 0.01);
+    }
+
+    #[test]
+    fn inspector_prompt_inner_width_leaves_room_for_copy() {
+        assert!((inspector_prompt_inner_width() - 252.0).abs() < 0.01);
     }
 
     #[test]

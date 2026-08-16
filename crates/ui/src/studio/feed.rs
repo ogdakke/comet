@@ -31,7 +31,7 @@ const PROMPT_COLLAPSED_LINES: usize = 3;
 const PROMPT_LINE_HEIGHT: f32 = 22.0;
 const PROMPT_BUBBLE_PAD_X: f32 = 16.0;
 /// Approximate Geist 14px Latin advance — wrap estimates without a layout pass.
-const PROMPT_AVG_CHAR_ADVANCE: f32 = 7.4;
+pub(super) const PROMPT_AVG_CHAR_ADVANCE: f32 = 7.4;
 
 /// One feed-rail tick: a Studio turn's prompt, the models that ran it, and
 /// when it was sent.
@@ -121,7 +121,13 @@ pub fn grid_columns(content_width: f32) -> usize {
 /// Visual rows a prompt would occupy at `inner_width` (bubble minus padding).
 /// Newlines always take a row, including blank ones.
 fn prompt_visual_lines(prompt: &str, inner_width: f32) -> usize {
-    let cols = (inner_width / PROMPT_AVG_CHAR_ADVANCE).floor().max(1.0) as usize;
+    prompt_visual_lines_at(prompt, inner_width, PROMPT_AVG_CHAR_ADVANCE)
+}
+
+/// Same wrap estimate as [`prompt_visual_lines`], with an explicit advance so
+/// the 12px inspector prompt can share the math.
+pub(super) fn prompt_visual_lines_at(prompt: &str, inner_width: f32, char_advance: f32) -> usize {
+    let cols = (inner_width / char_advance.max(0.1)).floor().max(1.0) as usize;
     prompt
         .split('\n')
         .map(|line| {
@@ -132,11 +138,25 @@ fn prompt_visual_lines(prompt: &str, inner_width: f32) -> usize {
 }
 
 fn prompt_exceeds_collapsed_lines(prompt: &str, inner_width: f32) -> bool {
-    prompt_visual_lines(prompt, inner_width) > PROMPT_COLLAPSED_LINES
+    prompt_exceeds_lines(
+        prompt,
+        inner_width,
+        PROMPT_AVG_CHAR_ADVANCE,
+        PROMPT_COLLAPSED_LINES,
+    )
+}
+
+pub(super) fn prompt_exceeds_lines(
+    prompt: &str,
+    inner_width: f32,
+    char_advance: f32,
+    max_lines: usize,
+) -> bool {
+    prompt_visual_lines_at(prompt, inner_width, char_advance) > max_lines
 }
 
 /// Quiet text action under a prompt bubble (`Use prompt`, `Show more`).
-fn turn_action(
+pub(super) fn turn_action(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
     theme: &Theme,
@@ -159,6 +179,35 @@ fn turn_action(
         ))
         .on_hover(motion::hover_listener(SharedString::from(fade)))
         .child(label.into())
+}
+
+/// Inline clamp toggle used by the feed bubble and the artifact inspector.
+pub(super) fn show_more_action(
+    id: impl Into<SharedString>,
+    expanded: bool,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    let more = !expanded;
+    let fade = id.into();
+    let chevron = if more {
+        icons::ALT_ARROW_DOWN
+    } else {
+        icons::ARROW_UP
+    };
+    turn_action(
+        fade.clone(),
+        if more { "Show more" } else { "Show less" },
+        theme,
+    )
+    .child(
+        icons::icon(chevron)
+            .size(px(11.0))
+            .text_color(motion::hover_blend(
+                &fade,
+                theme.text_muted.opacity(0.7),
+                theme.text,
+            )),
+    )
 }
 
 /// Tiles to paint for a run. In-flight and failed runs keep a slot for every
@@ -486,26 +535,10 @@ impl StudioPage {
             })
             .collect::<Vec<_>>();
         let show_more = clampable.then(|| {
-            let more = !expanded;
-            let fade = format!("studio-toggle-prompt-{}", turn_id.0);
-            let chevron = if more {
-                icons::ALT_ARROW_DOWN
-            } else {
-                icons::ARROW_UP
-            };
-            turn_action(
-                fade.clone(),
-                if more { "Show more" } else { "Show less" },
+            show_more_action(
+                format!("studio-toggle-prompt-{}", turn_id.0),
+                expanded,
                 theme,
-            )
-            .child(
-                icons::icon(chevron)
-                    .size(px(11.0))
-                    .text_color(motion::hover_blend(
-                        &fade,
-                        theme.text_muted.opacity(0.7),
-                        theme.text,
-                    )),
             )
             .on_click(cx.listener(move |page, _, _, cx| {
                 page.toggle_prompt_expanded(turn_id, cx);
@@ -898,6 +931,18 @@ mod tests {
         let chat_inner = transcript::MAX_CONTENT_WIDTH * 0.8 - PROMPT_BUBBLE_PAD_X * 2.0;
         assert!(!prompt_exceeds_collapsed_lines("cute dog", chat_inner));
         assert_eq!(prompt_visual_lines("cute dog", chat_inner), 1);
+    }
+
+    #[test]
+    fn inspector_prompt_clamps_after_ten_visual_lines() {
+        // 320 sidebar − 18px padding each side − 24px copy − 8px gap.
+        let inner = 252.0;
+        let advance = PROMPT_AVG_CHAR_ADVANCE * (12.0 / 14.0);
+        let ten = ["line"; 10].join("\n");
+        let eleven = format!("{ten}\nline");
+        assert!(!prompt_exceeds_lines(&ten, inner, advance, 10));
+        assert!(prompt_exceeds_lines(&eleven, inner, advance, 10));
+        assert!(!prompt_exceeds_lines("short", inner, advance, 10));
     }
 
     #[test]
