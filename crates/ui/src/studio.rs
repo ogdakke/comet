@@ -1737,6 +1737,7 @@ impl StudioPage {
         let composer = div()
             .w_full()
             .max_w(px(920.0))
+            .occlude()
             .rounded(px(26.0))
             .border_1()
             .border_color(theme.border)
