@@ -28,8 +28,6 @@ pub enum VeniceCatalogError {
         model_id: String,
         model_type: String,
     },
-    #[error("Venice model {model_id} has invalid aspect ratio {value}")]
-    InvalidAspectRatio { model_id: String, value: String },
     #[error("Venice model {model_id} has invalid duration {value}")]
     InvalidDuration { model_id: String, value: String },
 }
@@ -101,18 +99,19 @@ fn default_video_prompt_limit() -> u32 {
 /// Normalize one or more Venice `GET /api/v1/models` responses.
 ///
 /// Non-Studio model types are ignored so callers may safely pass an unfiltered catalog. Unknown
-/// video operation types fail closed rather than being guessed from the model ID.
+/// video operation types and models with unusable constraints are skipped rather than failing the
+/// whole catalog — one vendor row must not mark the provider unavailable.
 pub fn normalize_model_catalog(
     json: &[u8],
     fetched_at: DateTime<Utc>,
 ) -> Result<Vec<MediaModel>, VeniceCatalogError> {
     let response: CatalogResponse = serde_json::from_slice(json)?;
-    response
+    Ok(response
         .data
         .into_iter()
         .filter(|model| matches!(model.media_type.as_str(), "image" | "video"))
-        .map(|model| normalize_model(model, fetched_at))
-        .collect()
+        .filter_map(|model| normalize_model(model, fetched_at).ok())
+        .collect())
 }
 
 fn normalize_model(
@@ -133,12 +132,11 @@ fn normalize_image(
     let constraints: ImageConstraints = serde_json::from_value(model.model_spec.constraints)?;
     let mut controls = Vec::new();
 
-    if !constraints.aspect_ratios.is_empty() {
-        controls.push(aspect_ratio_control(
-            &model.id,
-            &constraints.aspect_ratios,
-            constraints.default_aspect_ratio.as_deref(),
-        )?);
+    if let Some(control) = aspect_ratio_control(
+        &constraints.aspect_ratios,
+        constraints.default_aspect_ratio.as_deref(),
+    ) {
+        controls.push(control);
     }
     if !constraints.resolutions.is_empty() {
         controls.push(choice_control(
@@ -270,12 +268,8 @@ fn normalize_video(
     };
 
     let mut controls = Vec::new();
-    if !constraints.aspect_ratios.is_empty() {
-        controls.push(aspect_ratio_control(
-            &model.id,
-            &constraints.aspect_ratios,
-            None,
-        )?);
+    if let Some(control) = aspect_ratio_control(&constraints.aspect_ratios, None) {
+        controls.push(control);
     }
     if !constraints.resolutions.is_empty() {
         controls.push(choice_control(
@@ -327,47 +321,42 @@ fn normalize_video(
     })
 }
 
-fn aspect_ratio_control(
-    model_id: &str,
-    values: &[String],
-    default: Option<&str>,
-) -> Result<ModelControl, VeniceCatalogError> {
+fn parse_aspect_ratio(value: &str) -> Option<(u32, u32)> {
+    let value = value.trim();
+    // Venice uses `auto` to mean "omit aspect_ratio and let the model decide".
+    if value.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    let (width, height) = value.split_once(':')?;
+    let width = width.parse().ok()?;
+    let height = height.parse().ok()?;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+fn aspect_ratio_control(values: &[String], default: Option<&str>) -> Option<ModelControl> {
     let choices = values
         .iter()
-        // Venice uses `auto` to mean "omit aspect_ratio and let the model decide". It is not a
-        // geometric ratio and must not poison the rest of an otherwise valid live catalog.
-        .filter(|value| value.as_str() != "auto")
-        .map(|value| {
-            let (width, height) =
-                value
-                    .split_once(':')
-                    .ok_or_else(|| VeniceCatalogError::InvalidAspectRatio {
-                        model_id: model_id.to_owned(),
-                        value: value.clone(),
-                    })?;
-            let width = width
-                .parse()
-                .map_err(|_| VeniceCatalogError::InvalidAspectRatio {
-                    model_id: model_id.to_owned(),
-                    value: value.clone(),
-                })?;
-            let height = height
-                .parse()
-                .map_err(|_| VeniceCatalogError::InvalidAspectRatio {
-                    model_id: model_id.to_owned(),
-                    value: value.clone(),
-                })?;
-            Ok(ControlChoice {
+        .filter_map(|value| {
+            let (width, height) = parse_aspect_ratio(value)?;
+            Some(ControlChoice {
                 value: ControlValue::AspectRatio { width, height },
                 label: value.clone(),
             })
         })
-        .collect::<Result<Vec<_>, VeniceCatalogError>>()?;
+        .collect::<Vec<_>>();
+    if choices.is_empty() {
+        return None;
+    }
     let default = default
-        .filter(|value| *value != "auto")
-        .and_then(|value| choices.iter().find(|choice| choice.label == value))
+        .and_then(parse_aspect_ratio)
+        .and_then(|parsed| {
+            choices.iter().find(|choice| match choice.value {
+                ControlValue::AspectRatio { width, height } => (width, height) == parsed,
+                _ => false,
+            })
+        })
         .map(|choice| choice.value.clone());
-    Ok(ModelControl {
+    Some(ModelControl {
         id: ControlId::from("aspect_ratio"),
         label: "Aspect ratio".to_owned(),
         description: None,

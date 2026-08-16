@@ -88,6 +88,29 @@ fn auto_aspect_ratio_keeps_the_catalog_usable_and_omits_a_default_override() {
 }
 
 #[test]
+fn one_unusable_model_does_not_fail_the_catalog() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(IMAGE).unwrap();
+    let good = fixture["data"][0].clone();
+    let mut broken = good.clone();
+    broken["id"] = "flux-2-max".into();
+    broken["model_spec"]["constraints"]["aspectRatios"] = serde_json::json!(["auto"]);
+    broken["model_spec"]["constraints"]["defaultAspectRatio"] = serde_json::json!("auto");
+    fixture["data"] = serde_json::json!([broken, good]);
+
+    let models =
+        normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at()).unwrap();
+    assert_eq!(models.len(), 2);
+    assert_eq!(models[0].id.as_str(), "flux-2-max");
+    assert!(
+        models[0]
+            .controls
+            .iter()
+            .all(|control| control.id.as_str() != "aspect_ratio")
+    );
+    assert_eq!(models[1].id.as_str(), "gpt-image-2");
+}
+
+#[test]
 fn reasoning_is_exposed_only_when_the_model_advertises_it() {
     let mut fixture: serde_json::Value = serde_json::from_slice(IMAGE).unwrap();
     fixture["data"][0]["model_spec"]["supportsOptimizePromptThinking"] = serde_json::json!(true);
