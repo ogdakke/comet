@@ -1852,14 +1852,20 @@ impl Shell {
                 conversation_id,
                 artifact_id,
             } => {
+                let replacing_artifact = matches!(shell.route, Route::StudioArtifact { .. });
                 shell.route = Route::StudioArtifact {
                     conversation_id: *conversation_id,
                     artifact_id: *artifact_id,
                 };
-                shell.nav.push(NavEntry::StudioArtifact {
+                let entry = NavEntry::StudioArtifact {
                     conversation_id: *conversation_id,
                     artifact_id: *artifact_id,
-                });
+                };
+                if replacing_artifact {
+                    shell.nav.replace(entry);
+                } else {
+                    shell.nav.push(entry);
+                }
                 cx.notify();
             }
             StudioEvent::CloseArtifact => {

@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use gpui::{
-    AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, Image, ImageFormat,
-    KeyDownEvent, ObjectFit, Pixels, Point, Render, SharedString, Subscription, Task, Window, div,
-    img, prelude::*, px,
+    AnyElement, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, Image,
+    ImageFormat, KeyDownEvent, ObjectFit, Pixels, Point, Render, SharedString, Subscription, Task,
+    Window, div, img, prelude::*, px,
 };
 use zeron_proto::{
     ListStudioConversationsResponse, ListStudioModelsResponse, ListStudioProvidersResponse,
@@ -754,6 +754,7 @@ impl StudioPage {
                     Ok(_) => {
                         page.selected_artifact = None;
                         page.images.remove(&artifact_id);
+                        cx.emit(StudioEvent::CloseArtifact);
                     }
                     Err(error) => page.error = Some(error.to_string().into()),
                 }
@@ -1713,7 +1714,7 @@ impl StudioPage {
             .bottom(px(18.0))
             .mx_auto()
             .max_w(px(920.0))
-            .rounded(px(18.0))
+            .rounded(px(26.0))
             .border_1()
             .border_color(theme.border)
             .bg(theme.input_glass_bg())
@@ -1824,12 +1825,12 @@ impl StudioPage {
                     ),
             );
 
-        crate::frost::frosted(18.0, 16.0, composer).into_any_element()
+        crate::frost::frosted(26.0, 16.0, composer).into_any_element()
     }
 
-    fn render_lightbox(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_artifact_page(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let id = self.selected_artifact?;
-        let image = self.images.get(&id)?.clone();
+        let image = self.images.get(&id).cloned();
         let sequence = self.artifact_sequence();
         let selected_index = sequence
             .iter()
@@ -1855,45 +1856,271 @@ impl StudioPage {
         let thumbnails = sequence
             .iter()
             .enumerate()
-            .filter_map(|(index, artifact_id)| {
-                let thumbnail = self.images.get(artifact_id)?.clone();
+            .map(|(index, artifact_id)| {
+                let thumbnail = self.images.get(artifact_id).cloned();
                 let artifact_id = *artifact_id;
-                Some(
-                    div()
-                        .id(SharedString::from(format!("studio-thumbnail-{index}")))
-                        .w(px(if index == selected_index { 64.0 } else { 54.0 }))
-                        .h(px(if index == selected_index { 64.0 } else { 54.0 }))
-                        .flex_none()
-                        .rounded(px(6.0))
-                        .overflow_hidden()
-                        .border_1()
-                        .border_color(if index == selected_index {
-                            theme.accent
-                        } else {
-                            theme.border
-                        })
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |page, _, _, cx| {
-                            page.selected_artifact = Some(artifact_id);
-                            page.lightbox_zoom = 1.0;
-                            page.lightbox_pan = Point::default();
-                            if let Some(conversation_id) = page.selected_conversation {
-                                cx.emit(StudioEvent::OpenArtifact {
-                                    conversation_id,
-                                    artifact_id,
-                                });
-                            }
-                            cx.notify();
-                        }))
-                        .child(img(thumbnail).size_full().object_fit(ObjectFit::Cover)),
-                )
+                div()
+                    .id(SharedString::from(format!("studio-thumbnail-{index}")))
+                    .w(px(if index == selected_index { 58.0 } else { 50.0 }))
+                    .h(px(if index == selected_index { 58.0 } else { 50.0 }))
+                    .flex_none()
+                    .rounded(px(8.0))
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(if index == selected_index {
+                        theme.text_muted
+                    } else {
+                        theme.border
+                    })
+                    .bg(crate::theme::wash(0.04))
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(0.82))
+                    .on_click(cx.listener(move |page, _, _, cx| {
+                        page.selected_artifact = Some(artifact_id);
+                        page.lightbox_zoom = 1.0;
+                        page.lightbox_pan = Point::default();
+                        if let Some(conversation_id) = page.selected_conversation {
+                            cx.emit(StudioEvent::OpenArtifact {
+                                conversation_id,
+                                artifact_id,
+                            });
+                        }
+                        cx.notify();
+                    }))
+                    .when_some(thumbnail, |thumb, thumbnail| {
+                        thumb.child(img(thumbnail).size_full().object_fit(ObjectFit::Cover))
+                    })
             })
             .collect::<Vec<_>>();
+
+        let stage_image = if let Some(image) = image {
+            div()
+                .id("studio-artifact-image")
+                .max_w_full()
+                .max_h_full()
+                .relative()
+                .left(self.lightbox_pan.x)
+                .top(self.lightbox_pan.y)
+                .cursor_pointer()
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|page, event: &gpui::MouseDownEvent, _, cx| {
+                        page.begin_lightbox_pan(event.position, cx);
+                    }),
+                )
+                .on_mouse_move(cx.listener(|page, event: &gpui::MouseMoveEvent, _, cx| {
+                    if event.dragging() {
+                        page.update_lightbox_pan(event.position, cx);
+                    }
+                }))
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|page, _, _, cx| page.end_lightbox_pan(cx)),
+                )
+                .on_mouse_up_out(
+                    gpui::MouseButton::Left,
+                    cx.listener(|page, _, _, cx| page.end_lightbox_pan(cx)),
+                )
+                .on_click(cx.listener(|page, event: &gpui::ClickEvent, _, cx| {
+                    if event.click_count() == 2 {
+                        if page.lightbox_zoom > 1.0 {
+                            page.fit_lightbox(cx);
+                        } else {
+                            page.adjust_lightbox_zoom(2.0, cx);
+                        }
+                    }
+                }))
+                .child(
+                    img(image)
+                        .w(gpui::relative(self.lightbox_zoom))
+                        .h(gpui::relative(self.lightbox_zoom))
+                        .object_fit(ObjectFit::Contain),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .text_size(px(12.0))
+                .text_color(theme.text_faint)
+                .child("Loading image…")
+                .into_any_element()
+        };
+
+        let back_button = div()
+            .id("studio-artifact-back")
+            .size(px(28.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(crate::theme::wash(0.11)))
+            .on_click(cx.listener(|page, _, _, cx| {
+                page.selected_artifact = None;
+                cx.emit(StudioEvent::CloseArtifact);
+                cx.notify();
+            }))
+            .child(
+                crate::icons::icon(crate::icons::ARROW_LEFT)
+                    .size(px(16.0))
+                    .text_color(theme.text_muted),
+            );
+
+        let previous = div()
+            .id("studio-artifact-previous")
+            .size(px(32.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(7.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(crate::theme::wash(0.11)))
+            .on_click(cx.listener(|page, _, _, cx| page.navigate_artifact(-1, cx)))
+            .child(
+                crate::icons::icon(crate::icons::ALT_ARROW_LEFT)
+                    .size(px(18.0))
+                    .text_color(theme.text_muted),
+            );
+        let next = div()
+            .id("studio-artifact-next")
+            .size(px(32.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(7.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(crate::theme::wash(0.11)))
+            .on_click(cx.listener(|page, _, _, cx| page.navigate_artifact(1, cx)))
+            .child(
+                crate::icons::icon(crate::icons::ALT_ARROW_RIGHT)
+                    .size(px(18.0))
+                    .text_color(theme.text_muted),
+            );
+
+        let inspector = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .border_l_1()
+            .border_color(theme.border)
+            .bg(theme.glass_overlay())
+            .px(px(18.0))
+            .pt(px(18.0))
+            .pb(px(16.0))
+            .when_some(details, |inspector, (prompt, model, mime, size)| {
+                let copy_prompt = prompt.clone();
+                inspector
+                    .child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(12.0))
+                                    .line_height(px(18.0))
+                                    .text_color(theme.text)
+                                    .child(SharedString::from(prompt)),
+                            )
+                            .child(
+                                div()
+                                    .id("studio-copy-prompt")
+                                    .size(px(28.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(6.0))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(crate::theme::wash(0.11)))
+                                    .on_click(move |_, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            copy_prompt.clone(),
+                                        ));
+                                    })
+                                    .child(
+                                        crate::icons::icon(crate::icons::COPY)
+                                            .size(px(14.0))
+                                            .text_color(theme.text_muted),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .mt(px(14.0))
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(format!(
+                                "{model} · {mime} · {:.1} KB",
+                                size as f64 / 1024.0
+                            ))),
+                    )
+            })
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .id("studio-download-artifact")
+                            .h(px(32.0))
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(7.0))
+                            .rounded(px(7.0))
+                            .border_1()
+                            .border_color(theme.border)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(crate::theme::wash(0.09)))
+                            .on_click(
+                                cx.listener(move |page, _, _, cx| page.download_artifact(id, cx)),
+                            )
+                            .child(
+                                crate::icons::icon(crate::icons::ARROW_DOWN)
+                                    .size(px(14.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child("Download"),
+                    )
+                    .child(
+                        div()
+                            .id("studio-delete-artifact")
+                            .h(px(32.0))
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(7.0))
+                            .rounded(px(7.0))
+                            .cursor_pointer()
+                            .text_color(theme.danger)
+                            .hover(|style| style.bg(theme.danger.opacity(0.08)))
+                            .on_click(
+                                cx.listener(move |page, _, _, cx| page.delete_artifact(id, cx)),
+                            )
+                            .child(
+                                crate::icons::icon(crate::icons::TRASH_BIN_MINIMALISTIC)
+                                    .size(px(14.0))
+                                    .text_color(theme.danger),
+                            )
+                            .child("Delete"),
+                    ),
+            );
+
         Some(
             div()
-                .absolute()
-                .inset_0()
-                .bg(gpui::black().opacity(0.96))
+                .size_full()
+                .pt(px(Theme::TITLEBAR_HEIGHT))
+                .flex()
+                .min_w_0()
                 .track_focus(&self.focus)
                 .on_key_down(cx.listener(|page, event: &gpui::KeyDownEvent, _, cx| {
                     match event.keystroke.key.as_str() {
@@ -1906,260 +2133,74 @@ impl StudioPage {
                         "right" => page.navigate_artifact(1, cx),
                         "home" => page.select_artifact_edge(false, cx),
                         "end" => page.select_artifact_edge(true, cx),
-                        "+" | "=" => page.adjust_lightbox_zoom(1.2, cx),
-                        "-" => page.adjust_lightbox_zoom(1.0 / 1.2, cx),
-                        "0" => page.fit_lightbox(cx),
                         _ => {}
                     }
                 }))
                 .child(
                     div()
-                        .absolute()
-                        .top(px(16.0))
-                        .left(px(16.0))
-                        .id("studio-lightbox-close")
-                        .cursor_pointer()
-                        .rounded(px(8.0))
-                        .px(px(10.0))
-                        .py(px(6.0))
-                        .bg(crate::theme::ink(0.15))
-                        .on_click(cx.listener(|page, _, _, cx| {
-                            page.selected_artifact = None;
-                            cx.emit(StudioEvent::CloseArtifact);
-                            cx.notify();
-                        }))
-                        .child("Close"),
-                )
-                .child(
-                    div()
-                        .id("studio-lightbox-stage")
-                        .size_full()
-                        .pr(px(320.0))
-                        .pb(px(88.0))
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .relative()
+                        .flex()
+                        .flex_col()
                         .overflow_hidden()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .on_click(cx.listener(|page, _, _, cx| {
-                            page.selected_artifact = None;
-                            cx.emit(StudioEvent::CloseArtifact);
-                            cx.notify();
-                        }))
                         .child(
                             div()
-                                .id("studio-lightbox-image")
-                                .max_w_full()
-                                .max_h_full()
-                                .relative()
-                                .left(self.lightbox_pan.x)
-                                .top(self.lightbox_pan.y)
-                                .cursor_pointer()
-                                .on_mouse_down(
-                                    gpui::MouseButton::Left,
-                                    cx.listener(|page, event: &gpui::MouseDownEvent, _, cx| {
-                                        cx.stop_propagation();
-                                        page.begin_lightbox_pan(event.position, cx);
-                                    }),
-                                )
-                                .on_mouse_move(cx.listener(
-                                    |page, event: &gpui::MouseMoveEvent, _, cx| {
-                                        if event.dragging() {
-                                            page.update_lightbox_pan(event.position, cx);
-                                        }
-                                    },
-                                ))
-                                .on_mouse_up(
-                                    gpui::MouseButton::Left,
-                                    cx.listener(|page, _, _, cx| page.end_lightbox_pan(cx)),
-                                )
-                                .on_mouse_up_out(
-                                    gpui::MouseButton::Left,
-                                    cx.listener(|page, _, _, cx| page.end_lightbox_pan(cx)),
-                                )
-                                .on_click(cx.listener(|page, event: &gpui::ClickEvent, _, cx| {
-                                    cx.stop_propagation();
-                                    if event.click_count() == 2 {
-                                        if page.lightbox_zoom > 1.0 {
-                                            page.fit_lightbox(cx);
-                                        } else {
-                                            page.adjust_lightbox_zoom(2.0, cx);
-                                        }
-                                    }
-                                }))
+                                .h(px(44.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .px(px(16.0))
+                                .child(back_button),
+                        )
+                        .child(
+                            div()
+                                .id("studio-artifact-stage")
+                                .flex_1()
+                                .min_h_0()
+                                .flex()
+                                .items_center()
+                                .gap(px(12.0))
+                                .px(px(16.0))
+                                .child(previous)
                                 .child(
-                                    img(image)
-                                        .w(gpui::relative(self.lightbox_zoom))
-                                        .h(gpui::relative(self.lightbox_zoom))
-                                        .object_fit(ObjectFit::Contain),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .top(px(16.0))
-                        .left(px(100.0))
-                        .flex()
-                        .gap(px(6.0))
-                        .child(
-                            div()
-                                .id("studio-zoom-out")
-                                .cursor_pointer()
-                                .rounded(px(7.0))
-                                .px(px(9.0))
-                                .py(px(6.0))
-                                .bg(crate::theme::ink(0.15))
-                                .on_click(cx.listener(|page, _, _, cx| {
-                                    page.adjust_lightbox_zoom(1.0 / 1.2, cx)
-                                }))
-                                .child("−"),
-                        )
-                        .child(
-                            div()
-                                .id("studio-zoom-fit")
-                                .cursor_pointer()
-                                .rounded(px(7.0))
-                                .px(px(9.0))
-                                .py(px(6.0))
-                                .bg(crate::theme::ink(0.15))
-                                .on_click(cx.listener(|page, _, _, cx| page.fit_lightbox(cx)))
-                                .child(SharedString::from(format!(
-                                    "{}%",
-                                    (self.lightbox_zoom * 100.0).round() as u32
-                                ))),
-                        )
-                        .child(
-                            div()
-                                .id("studio-zoom-in")
-                                .cursor_pointer()
-                                .rounded(px(7.0))
-                                .px(px(9.0))
-                                .py(px(6.0))
-                                .bg(crate::theme::ink(0.15))
-                                .on_click(
-                                    cx.listener(|page, _, _, cx| {
-                                        page.adjust_lightbox_zoom(1.2, cx)
-                                    }),
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .h_full()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .overflow_hidden()
+                                        .child(stage_image),
                                 )
-                                .child("+"),
+                                .child(next),
+                        )
+                        .child(
+                            div()
+                                .id("studio-artifact-filmstrip")
+                                .h(px(78.0))
+                                .flex_none()
+                                .overflow_x_scroll()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .gap(px(8.0))
+                                .px(px(16.0))
+                                .children(thumbnails),
                         ),
                 )
                 .child(
                     div()
-                        .absolute()
-                        .left(px(18.0))
-                        .top_1_2()
-                        .id("studio-lightbox-previous")
-                        .cursor_pointer()
-                        .text_size(px(30.0))
-                        .on_click(cx.listener(|page, _, _, cx| page.navigate_artifact(-1, cx)))
-                        .child("‹"),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .right(px(338.0))
-                        .top_1_2()
-                        .id("studio-lightbox-next")
-                        .cursor_pointer()
-                        .text_size(px(30.0))
-                        .on_click(cx.listener(|page, _, _, cx| page.navigate_artifact(1, cx)))
-                        .child("›"),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(16.0))
-                        .right(px(336.0))
-                        .bottom(px(12.0))
-                        .h(px(72.0))
-                        .id("studio-lightbox-filmstrip")
-                        .overflow_x_scroll()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .gap(px(8.0))
-                        .children(thumbnails),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .right_0()
-                        .bottom_0()
                         .w(px(320.0))
-                        .border_l_1()
-                        .border_color(theme.border)
-                        .bg(theme.surface)
-                        .p(px(20.0))
-                        .child(
-                            div()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .child("Artifact inspector"),
-                        )
-                        .child(
-                            div()
-                                .mt(px(8.0))
-                                .text_size(px(11.0))
-                                .text_color(theme.text_faint)
-                                .child(SharedString::from(id.0.to_string())),
-                        )
-                        .when_some(details, |inspector, (prompt, model, mime, size)| {
-                            inspector
-                                .child(
-                                    div()
-                                        .mt(px(20.0))
-                                        .text_size(px(12.0))
-                                        .text_color(theme.text)
-                                        .child(SharedString::from(prompt)),
-                                )
-                                .child(
-                                    div()
-                                        .mt(px(12.0))
-                                        .text_size(px(11.0))
-                                        .text_color(theme.text_muted)
-                                        .child(SharedString::from(format!(
-                                            "{model} · {mime} · {:.1} KB",
-                                            size as f64 / 1024.0
-                                        ))),
-                                )
-                        })
-                        .child(
-                            div()
-                                .id("studio-delete-artifact")
-                                .mt(px(20.0))
-                                .cursor_pointer()
-                                .rounded(px(7.0))
-                                .border_1()
-                                .border_color(theme.danger)
-                                .text_color(theme.danger)
-                                .px(px(10.0))
-                                .py(px(6.0))
-                                .on_click(
-                                    cx.listener(move |page, _, _, cx| page.delete_artifact(id, cx)),
-                                )
-                                .child("Delete artifact"),
-                        )
-                        .child(
-                            div()
-                                .id("studio-download-artifact")
-                                .mt(px(8.0))
-                                .cursor_pointer()
-                                .rounded(px(7.0))
-                                .border_1()
-                                .border_color(theme.border)
-                                .bg(theme.surface)
-                                .text_color(theme.text)
-                                .px(px(10.0))
-                                .py(px(6.0))
-                                .on_click(
-                                    cx.listener(move |page, _, _, cx| {
-                                        page.download_artifact(id, cx)
-                                    }),
-                                )
-                                .child("Download"),
-                        ),
+                        .h_full()
+                        .flex_none()
+                        .child(crate::frost::frosted(
+                            0.0,
+                            crate::frost::MENU_BLUR,
+                            inspector,
+                        )),
                 )
                 .into_any_element(),
         )
@@ -2176,7 +2217,9 @@ impl Focusable for StudioPage {
 impl Render for StudioPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        let body = if self.providers.iter().all(|provider| !provider.configured) {
+        let body = if let Some(page) = self.render_artifact_page(&theme, cx) {
+            page
+        } else if self.providers.iter().all(|provider| !provider.configured) {
             div()
                 .flex_1()
                 .flex()
@@ -2268,9 +2311,6 @@ impl Render for StudioPage {
                         .py(px(6.0))
                         .child(error),
                 )
-            })
-            .when_some(self.render_lightbox(&theme, cx), |el, lightbox| {
-                el.child(lightbox)
             })
     }
 }
