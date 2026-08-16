@@ -224,6 +224,9 @@ impl StudioPage {
         let Some(engine) = self.engine(cx) else {
             return;
         };
+        if self.selected_conversation != Some(id) {
+            self.close_artifact(cx);
+        }
         self.selected_conversation = Some(id);
         self.conversation = None;
         self.scroll_after_turn_count = None;

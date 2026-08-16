@@ -1837,6 +1837,20 @@ impl Shell {
         cx.notify();
     }
 
+    /// Leave the artifact viewer without a history back-step: sidebar chat
+    /// clicks should land on that conversation's feed, not keep the lightbox
+    /// route which `render_main` would re-apply on the next frame.
+    fn dismiss_studio_artifact(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.route, Route::StudioArtifact { .. }) {
+            return;
+        }
+        self.route = Route::Studio;
+        self.nav.replace(NavEntry::Studio);
+        if let Some(page) = self.studio_page.as_ref() {
+            page.update(cx, |page, cx| page.close_artifact(cx));
+        }
+    }
+
     fn ensure_studio_page(&mut self, cx: &mut Context<Self>) -> Entity<StudioPage> {
         if let Some(page) = self.studio_page.as_ref() {
             return page.clone();
@@ -3440,7 +3454,8 @@ impl Shell {
                             theme.glass_hover()
                         })
                     })
-                    .on_click(cx.listener(move |_, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.dismiss_studio_artifact(cx);
                         select_page.update(cx, |page, cx| page.open_conversation(select_id, cx));
                     }))
                     .child(
@@ -3565,7 +3580,8 @@ impl Shell {
                     .rounded(px(6.0))
                     .cursor_pointer()
                     .hover(|style| style.bg(crate::theme::wash(0.14)))
-                    .on_click(cx.listener(move |_, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.dismiss_studio_artifact(cx);
                         new_page.update(cx, |page, cx| page.new_conversation(cx));
                     }))
                     .child(
