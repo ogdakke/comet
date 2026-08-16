@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use gpui::{
@@ -25,11 +25,14 @@ const ARTIFACT_SWIPE_COMMIT_MIN: f32 = 56.0;
 const ARTIFACT_SWIPE_FLICK: f32 = 650.0;
 const ARTIFACT_SWIPE_EDGE_RESISTANCE: f32 = 0.28;
 const ARTIFACT_SWIPE_EDGE_LIMIT_FRACTION: f32 = 0.22;
-/// Critically-damped-ish snap toward the selected page. ω ≈ 26, ζ ≈ 0.75
-/// settles an 800px page in ~250ms with a hair of overshoot.
-const ARTIFACT_SNAP_OMEGA: f32 = 26.0;
-const ARTIFACT_SNAP_ZETA: f32 = 0.75;
+/// Slightly overdamped snap. Underdamped leftovers after a flick flew
+/// through the next page; ζ > 1 kills that bounce. ω ≈ 36 settles ~150ms.
+const ARTIFACT_SNAP_OMEGA: f32 = 36.0;
+const ARTIFACT_SNAP_ZETA: f32 = 1.08;
 const ARTIFACT_FILMSTRIP_STEP: f32 = 38.0;
+/// macOS sends inertial wheel events after TouchPhase::Ended. Drop them
+/// until the next finger-down so a flick cannot start a second page turn.
+const ARTIFACT_SWIPE_INERTIA_GUARD: Duration = Duration::from_millis(180);
 
 fn stepped_artifact_index(index: usize, len: usize, delta: isize, wraps: bool) -> usize {
     if len == 0 {
@@ -110,6 +113,19 @@ fn apply_lightbox_swipe_delta(
 
 fn remap_lightbox_swipe_after_commit(offset: f32, delta: isize, width: f32) -> f32 {
     offset + delta as f32 * width.max(1.0)
+}
+
+/// Cap leftover flick speed so the snap cannot fly through 0.
+fn clip_snap_velocity(position: f32, velocity: f32) -> f32 {
+    if position.abs() < f32::EPSILON {
+        return 0.0;
+    }
+    let limit = (ARTIFACT_SNAP_OMEGA * position.abs() * 0.35).min(1600.0);
+    if velocity * position < 0.0 {
+        (-position.signum() * velocity.abs()).clamp(-limit, limit)
+    } else {
+        velocity.clamp(-limit * 0.2, limit * 0.2)
+    }
 }
 
 pub(super) fn write_artifact_file(destination: PathBuf, bytes: Vec<u8>) -> Result<(), String> {
@@ -404,15 +420,12 @@ impl StudioPage {
         let Some(previous) = self.lightbox_drag else {
             return;
         };
-        let limit = 420.0 * (self.lightbox_zoom - 1.0);
-        self.lightbox_pan.x = px((f32::from(self.lightbox_pan.x)
-            + f32::from(position.x - previous.x))
-        .clamp(-limit, limit));
-        self.lightbox_pan.y = px((f32::from(self.lightbox_pan.y)
-            + f32::from(position.y - previous.y))
-        .clamp(-limit, limit));
+        self.pan_lightbox(
+            f32::from(position.x - previous.x),
+            f32::from(position.y - previous.y),
+            cx,
+        );
         self.lightbox_drag = Some(position);
-        cx.notify();
     }
 
     pub(super) fn end_lightbox_pan(&mut self, cx: &mut Context<Self>) {
@@ -468,23 +481,46 @@ impl StudioPage {
                 self.lightbox_swipe_x = remap_lightbox_swipe_after_commit(offset, delta, width);
             }
         }
+        self.lightbox_ignore_scroll_until = Some(Instant::now() + ARTIFACT_SWIPE_INERTIA_GUARD);
         if crate::motion::reduced_motion(cx) {
             self.reset_lightbox_swipe();
             cx.notify();
             return;
         }
-        self.wake_lightbox_swipe_spring(release_velocity, cx);
+        let velocity = clip_snap_velocity(self.lightbox_swipe_x, release_velocity);
+        self.wake_lightbox_swipe_spring(velocity, cx);
     }
 
     pub(super) fn on_lightbox_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
         let delta = event.delta.pixel_delta(px(16.0));
         let horizontal = f32::from(delta.x);
         let vertical = f32::from(delta.y);
+        if event.touch_phase == TouchPhase::Started {
+            self.lightbox_ignore_scroll_until = None;
+            self.lightbox_swipe_spring = false;
+            self.lightbox_swipe_last_tick = None;
+        }
+        if self
+            .lightbox_ignore_scroll_until
+            .is_some_and(|until| Instant::now() < until)
+        {
+            cx.stop_propagation();
+            return;
+        }
+        if self.lightbox_drag.is_some() {
+            cx.stop_propagation();
+            return;
+        }
         if matches!(event.touch_phase, TouchPhase::Ended | TouchPhase::Cancelled)
             && self.lightbox_zoom <= 1.001
             && self.lightbox_swipe_x.abs() > f32::EPSILON
         {
             self.finish_lightbox_swipe(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if self.lightbox_zoom > 1.001 {
+            self.pan_lightbox(horizontal, vertical, cx);
             cx.stop_propagation();
             return;
         }
@@ -497,13 +533,9 @@ impl StudioPage {
             cx.stop_propagation();
             return;
         }
-        if self.lightbox_zoom > 1.001 || horizontal.abs() < f32::EPSILON {
+        if horizontal.abs() < f32::EPSILON {
             cx.stop_propagation();
             return;
-        }
-        if event.touch_phase == TouchPhase::Started {
-            self.lightbox_swipe_spring = false;
-            self.lightbox_swipe_last_tick = None;
         }
         if !event.delta.precise() {
             let direction = if horizontal < 0.0 { 1 } else { -1 };
@@ -530,13 +562,21 @@ impl StudioPage {
             index > 0,
             index + 1 < artifacts.len(),
         );
-        self.lightbox_swipe_velocity = horizontal / dt;
+        let sample = horizontal / dt;
+        self.lightbox_swipe_velocity = self.lightbox_swipe_velocity * 0.35 + sample * 0.65;
         if matches!(event.touch_phase, TouchPhase::Ended | TouchPhase::Cancelled) {
             self.finish_lightbox_swipe(cx);
         } else {
             cx.notify();
         }
         cx.stop_propagation();
+    }
+
+    fn pan_lightbox(&mut self, dx: f32, dy: f32, cx: &mut Context<Self>) {
+        let limit = 420.0 * (self.lightbox_zoom - 1.0).max(0.0);
+        self.lightbox_pan.x = px((f32::from(self.lightbox_pan.x) + dx).clamp(-limit, limit));
+        self.lightbox_pan.y = px((f32::from(self.lightbox_pan.y) + dy).clamp(-limit, limit));
+        cx.notify();
     }
 
     pub(super) fn on_lightbox_pinch(&mut self, event: &PinchEvent, cx: &mut Context<Self>) {
@@ -1128,6 +1168,23 @@ mod tests {
     fn lightbox_swipe_remap_keeps_the_visual_page() {
         assert_eq!(remap_lightbox_swipe_after_commit(-200.0, 1, 800.0), 600.0);
         assert_eq!(remap_lightbox_swipe_after_commit(200.0, -1, 800.0), -600.0);
+    }
+
+    #[test]
+    fn lightbox_snap_does_not_fly_through_the_page() {
+        let start = remap_lightbox_swipe_after_commit(-200.0, 1, 800.0);
+        let mut velocity = clip_snap_velocity(start, -4000.0);
+        let mut position = start;
+        let mut farthest = start;
+        for _ in 0..90 {
+            (position, velocity) = step_lightbox_snap_spring(position, velocity, 1.0 / 60.0);
+            farthest = farthest.min(position);
+        }
+        assert!(position.abs() < 0.5, "position={position}");
+        assert!(
+            farthest > -80.0,
+            "overshot past the page: farthest={farthest}"
+        );
     }
 
     #[test]
