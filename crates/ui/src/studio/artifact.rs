@@ -6,8 +6,10 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use gpui::{
-    AnyElement, ClipboardItem, Context, Image, ImageFormat, ObjectFit, PinchEvent, Pixels, Point,
-    ScrollWheelEvent, SharedString, TouchPhase, canvas, div, img, prelude::*, px,
+    AnyElement, App, Bounds, ClipboardItem, Context, Element, GlobalElementId, Image, ImageFormat,
+    InspectorElementId, IntoElement, LayoutId, ObjectFit, PinchEvent, Pixels, Point, Refineable,
+    ScrollWheelEvent, SharedString, Style, StyleRefinement, Styled, TouchPhase, Window, canvas,
+    div, img, prelude::*, px,
 };
 use zeron_rpc::methods;
 use zeron_studio::{StudioArtifactId, StudioConversationId};
@@ -38,7 +40,7 @@ const ARTIFACT_FILMSTRIP_GAP: f32 = 8.0;
 const ARTIFACT_FILMSTRIP_SELECTED: f32 = 58.0;
 const ARTIFACT_FILMSTRIP_THUMB: f32 = 50.0;
 const ARTIFACT_FILMSTRIP_HEIGHT: f32 = 78.0;
-const ARTIFACT_FILMSTRIP_WIDTH_FRACTION: f32 = 0.9;
+const ARTIFACT_FILMSTRIP_WIDTH_FRACTION: f32 = 0.94;
 const ARTIFACT_FILMSTRIP_FADE: f32 = 28.0;
 const ARTIFACT_ZOOM_MAX: f32 = 24.0;
 const INSPECTOR_WIDTH: f32 = 320.0;
@@ -110,6 +112,105 @@ fn lightbox_stage_size_changed(
     height: f32,
 ) -> bool {
     (current_width - width).abs() > 0.5 || (current_height - height).abs() > 0.5
+}
+
+/// Square cover crop. `img` stamps the photo's aspect ratio onto its layout
+/// box, so a portrait grows out of the thumb and `overflow_hidden` only
+/// slices a rectangle — leaving a tiny unrounded crop. This element never
+/// takes an aspect ratio: it lays out as the square we asked for and paints
+/// Cover + corner radii into those bounds.
+fn filmstrip_cover(image: Arc<Image>) -> FilmstripCover {
+    FilmstripCover {
+        image,
+        style: StyleRefinement::default(),
+    }
+}
+
+struct FilmstripCover {
+    image: Arc<Image>,
+    style: StyleRefinement,
+}
+
+impl Styled for FilmstripCover {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
+impl Element for FilmstripCover {
+    type RequestLayoutState = Style;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Style) {
+        let _ = self.image.clone().use_render_image(window, cx);
+        let mut style = Style::default();
+        style.refine(&self.style);
+        let layout_id = window.request_layout(style.clone(), [], cx);
+        (layout_id, style)
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Style,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        style: &mut Style,
+        _prepaint: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(data) = self.image.clone().use_render_image(window, cx) else {
+            return;
+        };
+        if data.frame_count() == 0 {
+            return;
+        }
+        let fitted = ObjectFit::Cover.get_bounds(bounds, data.size(0));
+        let visible = bounds.intersect(&fitted);
+        if visible.size.width <= px(0.0) || visible.size.height <= px(0.0) {
+            return;
+        }
+        let corner_radii = style
+            .corner_radii
+            .to_pixels(window.rem_size())
+            .clamp_radii_for_quad_size(visible.size);
+        window
+            .paint_image_fitted(visible, fitted, corner_radii, data, 0, false)
+            .ok();
+    }
+}
+
+impl IntoElement for FilmstripCover {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
 }
 
 /// Ease from `from` to `to` after fingers lift. `to` is 0, +page, or −page.
@@ -893,42 +994,29 @@ impl StudioPage {
             .map(|(index, artifact_id)| {
                 let thumbnail = self.images.get(artifact_id).cloned();
                 let frame_size = filmstrip_thumb_size(index, selected_index);
+                let border = if index == selected_index {
+                    theme.text_muted
+                } else {
+                    theme.border
+                };
                 div()
                     .id(SharedString::from(format!("studio-thumbnail-{index}")))
                     .size(px(frame_size))
                     .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
                     .rounded(px(8.0))
                     .overflow_hidden()
                     .border_1()
-                    .border_color(if index == selected_index {
-                        theme.text_muted
-                    } else {
-                        theme.border
-                    })
+                    .border_color(border)
                     .bg(crate::theme::wash(0.04))
                     .cursor_pointer()
                     .hover(|style| style.opacity(0.82))
                     .on_click(cx.listener(move |page, _, _, cx| {
                         page.select_artifact_index(index, cx);
                     }))
-                    .when_some(thumbnail, |thumb, thumbnail| {
-                        thumb.child(
-                            div()
-                                .size(px(frame_size - 2.0))
-                                .flex_none()
-                                .rounded(px(7.0))
-                                .overflow_hidden()
-                                .child(
-                                    img(thumbnail)
-                                        .size_full()
-                                        .rounded(px(7.0))
-                                        .object_fit(ObjectFit::Cover),
-                                ),
-                        )
+                    .when_some(thumbnail, |frame, thumbnail| {
+                        frame.child(filmstrip_cover(thumbnail).size_full().rounded(px(7.0)))
                     })
+                    .into_any_element()
             })
             .collect::<Vec<_>>();
         let filmstrip_viewport = filmstrip_viewport_width(self.lightbox_stage_width);
@@ -1473,9 +1561,9 @@ mod tests {
     }
 
     #[test]
-    fn filmstrip_viewport_uses_ninety_percent_of_the_stage() {
-        assert!((filmstrip_viewport_width(1000.0) - 900.0).abs() < 0.01);
-        assert!((filmstrip_viewport_width(0.0) - 1080.0).abs() < 0.01);
+    fn filmstrip_viewport_uses_most_of_the_stage() {
+        assert!((filmstrip_viewport_width(1000.0) - 940.0).abs() < 0.01);
+        assert!((filmstrip_viewport_width(0.0) - 1128.0).abs() < 0.01);
     }
 
     #[test]
