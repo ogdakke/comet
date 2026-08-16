@@ -1915,7 +1915,12 @@ impl StudioPage {
                         cx.notify();
                     }))
                     .when_some(thumbnail, |thumb, thumbnail| {
-                        thumb.child(img(thumbnail).size_full().object_fit(ObjectFit::Cover))
+                        thumb.child(
+                            img(thumbnail)
+                                .size_full()
+                                .rounded(px(7.0))
+                                .object_fit(ObjectFit::Cover),
+                        )
                     })
             })
             .collect::<Vec<_>>();
