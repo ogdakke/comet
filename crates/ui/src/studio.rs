@@ -1735,11 +1735,7 @@ impl StudioPage {
             || self.selected_models.is_empty()
             || self.prompt.read(cx).text().trim().is_empty();
         let composer = div()
-            .absolute()
-            .left(px(24.0))
-            .right(px(24.0))
-            .bottom(px(18.0))
-            .mx_auto()
+            .w_full()
             .max_w(px(920.0))
             .rounded(px(26.0))
             .border_1()
@@ -1852,7 +1848,15 @@ impl StudioPage {
                     ),
             );
 
-        crate::frost::frosted(26.0, 16.0, composer).into_any_element()
+        div()
+            .absolute()
+            .left(px(24.0))
+            .right(px(24.0))
+            .bottom(px(18.0))
+            .flex()
+            .justify_center()
+            .child(crate::frost::frosted(26.0, 16.0, composer))
+            .into_any_element()
     }
 
     fn render_artifact_page(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
