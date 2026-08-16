@@ -10,7 +10,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use gpui::{
     AnyElement, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, Image,
     ImageFormat, KeyDownEvent, ObjectFit, PinchEvent, Pixels, Point, Render, ScrollWheelEvent,
-    SharedString, Subscription, Task, TouchPhase, Window, div, img, prelude::*, px,
+    SharedString, Subscription, Task, TouchPhase, Window, canvas, div, img, prelude::*, px,
 };
 use zeron_proto::{
     ListStudioConversationsResponse, ListStudioModelsResponse, ListStudioProvidersResponse,
@@ -34,8 +34,17 @@ use crate::transcript::format_timestamp;
 /// the viewport and is 191px tall at its largest first-release configuration;
 /// the remaining space keeps the last image clear of the glass card.
 const STUDIO_COMPOSER_CLEARANCE: f32 = 256.0;
-const ARTIFACT_SWIPE_COMMIT: f32 = 64.0;
-const ARTIFACT_SWIPE_LIMIT: f32 = 180.0;
+/// Fraction of the stage width that commits a page turn on release.
+const ARTIFACT_SWIPE_COMMIT_FRACTION: f32 = 0.18;
+const ARTIFACT_SWIPE_COMMIT_MIN: f32 = 56.0;
+/// Horizontal flick speed (px/s) that commits even before the distance gate.
+const ARTIFACT_SWIPE_FLICK: f32 = 650.0;
+const ARTIFACT_SWIPE_EDGE_RESISTANCE: f32 = 0.28;
+const ARTIFACT_SWIPE_EDGE_LIMIT_FRACTION: f32 = 0.22;
+/// Critically-damped-ish snap toward the selected page. ω ≈ 26, ζ ≈ 0.75
+/// settles an 800px page in ~250ms with a hair of overshoot.
+const ARTIFACT_SNAP_OMEGA: f32 = 26.0;
+const ARTIFACT_SNAP_ZETA: f32 = 0.75;
 const ARTIFACT_FILMSTRIP_STEP: f32 = 38.0;
 /// Extra left inset so the tick rail (16px + 20px hover bar) does not cover
 /// the prompt header. Matches the chat transcript's wide-gutter band.
@@ -110,15 +119,74 @@ fn stepped_artifact_index(index: usize, len: usize, delta: isize, wraps: bool) -
     }
 }
 
-fn step_artifact_swipe_spring(mut position: f32, mut velocity: f32, mut frames: f32) -> (f32, f32) {
-    while frames > 0.0 {
-        let step = frames.min(1.0);
-        frames -= step;
-        velocity += -position * 0.18 * step;
-        velocity *= 0.76_f32.powf(step);
+/// Spring `position` toward 0. `velocity` is px/s.
+fn step_lightbox_snap_spring(mut position: f32, mut velocity: f32, mut dt: f32) -> (f32, f32) {
+    dt = dt.clamp(1.0 / 240.0, 1.0 / 20.0);
+    while dt > 0.0 {
+        let step = dt.min(1.0 / 60.0);
+        dt -= step;
+        let accel = -ARTIFACT_SNAP_OMEGA * ARTIFACT_SNAP_OMEGA * position
+            - 2.0 * ARTIFACT_SNAP_ZETA * ARTIFACT_SNAP_OMEGA * velocity;
+        velocity += accel * step;
         position += velocity * step;
     }
     (position, velocity)
+}
+
+/// `+1` selects the next image (swipe left), `-1` the previous, `0` stays.
+fn lightbox_swipe_commit_delta(
+    offset: f32,
+    velocity: f32,
+    width: f32,
+    can_prev: bool,
+    can_next: bool,
+) -> isize {
+    let width = width.max(1.0);
+    let distance = (width * ARTIFACT_SWIPE_COMMIT_FRACTION).max(ARTIFACT_SWIPE_COMMIT_MIN);
+    if can_next && (offset <= -distance || (offset < 0.0 && velocity <= -ARTIFACT_SWIPE_FLICK)) {
+        1
+    } else if can_prev && (offset >= distance || (offset > 0.0 && velocity >= ARTIFACT_SWIPE_FLICK))
+    {
+        -1
+    } else {
+        0
+    }
+}
+
+fn apply_lightbox_swipe_delta(
+    offset: f32,
+    delta: f32,
+    width: f32,
+    can_prev: bool,
+    can_next: bool,
+) -> f32 {
+    let width = width.max(1.0);
+    let proposed = offset + delta;
+    if proposed > 0.0 {
+        if can_prev {
+            proposed.min(width)
+        } else if delta > 0.0 {
+            (offset + delta * ARTIFACT_SWIPE_EDGE_RESISTANCE)
+                .clamp(0.0, width * ARTIFACT_SWIPE_EDGE_LIMIT_FRACTION)
+        } else {
+            (offset + delta).max(0.0)
+        }
+    } else if proposed < 0.0 {
+        if can_next {
+            proposed.max(-width)
+        } else if delta < 0.0 {
+            (offset + delta * ARTIFACT_SWIPE_EDGE_RESISTANCE)
+                .clamp(-width * ARTIFACT_SWIPE_EDGE_LIMIT_FRACTION, 0.0)
+        } else {
+            (offset + delta).min(0.0)
+        }
+    } else {
+        0.0
+    }
+}
+
+fn remap_lightbox_swipe_after_commit(offset: f32, delta: isize, width: f32) -> f32 {
+    offset + delta as f32 * width.max(1.0)
 }
 
 pub fn grid_columns(content_width: f32) -> usize {
@@ -139,9 +207,18 @@ fn default_aspect(model: &zeron_studio::MediaModel) -> (u32, u32) {
         .iter()
         .find(|control| control.id.as_str() == "aspect_ratio")
         .and_then(|control| control.default.as_ref())
-        .and_then(|value| match value {
-            zeron_studio::ControlValue::AspectRatio { width, height } => Some((*width, *height)),
-            _ => None,
+        .and_then(zeron_studio::ControlValue::aspect_ratio_dimensions)
+        .or_else(|| {
+            model
+                .controls
+                .iter()
+                .find(|control| control.id.as_str() == "aspect_ratio")
+                .and_then(|control| {
+                    control
+                        .choices
+                        .iter()
+                        .find_map(|choice| choice.value.aspect_ratio_dimensions())
+                })
         })
         .unwrap_or((1, 1))
 }
@@ -150,11 +227,7 @@ fn draft_aspect(model: &zeron_studio::MediaModel, draft: &DraftRunConfig) -> (u3
     draft
         .controls
         .values()
-        .find_map(|value| match value {
-            zeron_studio::ControlValue::AspectRatio { width, height } => Some((*width, *height)),
-            zeron_studio::ControlValue::Dimensions { width, height } => Some((*width, *height)),
-            _ => None,
-        })
+        .find_map(zeron_studio::ControlValue::aspect_ratio_dimensions)
         .unwrap_or_else(|| default_aspect(model))
 }
 
@@ -216,6 +289,7 @@ fn control_value_label(value: &zeron_studio::ControlValue) -> String {
         ControlValue::Boolean { value } => if *value { "On" } else { "Off" }.into(),
         ControlValue::Dimensions { width, height } => format!("{width}×{height}"),
         ControlValue::AspectRatio { width, height } => format!("{width}:{height}"),
+        ControlValue::AspectRatioAuto => "Auto".into(),
     }
 }
 
@@ -329,6 +403,7 @@ pub struct StudioPage {
     lightbox_swipe_spring: bool,
     lightbox_swipe_scheduled: bool,
     lightbox_swipe_last_tick: Option<Instant>,
+    lightbox_stage_width: f32,
     filmstrip_scroll_accum: f32,
     focus: FocusHandle,
     loading: bool,
@@ -395,6 +470,7 @@ impl StudioPage {
             lightbox_swipe_spring: false,
             lightbox_swipe_scheduled: false,
             lightbox_swipe_last_tick: None,
+            lightbox_stage_width: 0.0,
             filmstrip_scroll_accum: 0.0,
             focus: cx.focus_handle(),
             loading: false,
@@ -1048,7 +1124,21 @@ impl StudioPage {
             .collect()
     }
 
-    fn select_artifact_index(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
+    fn reset_lightbox_swipe(&mut self) {
+        self.lightbox_swipe_x = 0.0;
+        self.lightbox_swipe_velocity = 0.0;
+        self.lightbox_swipe_spring = false;
+        self.lightbox_swipe_last_tick = None;
+    }
+
+    fn reset_lightbox_viewer(&mut self) {
+        self.lightbox_zoom = 1.0;
+        self.lightbox_pan = Point::default();
+        self.lightbox_drag = None;
+        self.reset_lightbox_swipe();
+    }
+
+    fn adopt_artifact_index(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
         let artifacts = self.artifact_sequence();
         let Some(artifact_id) = artifacts.get(index).copied() else {
             return false;
@@ -1058,10 +1148,6 @@ impl StudioPage {
         self.lightbox_zoom = 1.0;
         self.lightbox_pan = Point::default();
         self.lightbox_drag = None;
-        self.lightbox_swipe_x = 0.0;
-        self.lightbox_swipe_velocity = 0.0;
-        self.lightbox_swipe_spring = false;
-        self.lightbox_swipe_last_tick = None;
         self.artifact_filmstrip_scroll.scroll_to_item(index);
         if let Some(conversation_id) = self.selected_conversation {
             cx.emit(StudioEvent::OpenArtifact {
@@ -1070,6 +1156,12 @@ impl StudioPage {
             });
         }
         cx.notify();
+        changed
+    }
+
+    fn select_artifact_index(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
+        let changed = self.adopt_artifact_index(index, cx);
+        self.reset_lightbox_swipe();
         changed
     }
 
@@ -1099,29 +1191,12 @@ impl StudioPage {
 
     fn select_artifact_edge(&mut self, last: bool, cx: &mut Context<Self>) {
         let artifacts = self.artifact_sequence();
-        self.selected_artifact = if last {
-            artifacts.last().copied()
+        let index = if last {
+            artifacts.len().saturating_sub(1)
         } else {
-            artifacts.first().copied()
+            0
         };
-        self.lightbox_zoom = 1.0;
-        self.lightbox_pan = Point::default();
-        if let Some(index) = self.selected_artifact.and_then(|artifact| {
-            artifacts
-                .iter()
-                .position(|candidate| *candidate == artifact)
-        }) {
-            self.artifact_filmstrip_scroll.scroll_to_item(index);
-        }
-        if let (Some(conversation_id), Some(artifact_id)) =
-            (self.selected_conversation, self.selected_artifact)
-        {
-            cx.emit(StudioEvent::OpenArtifact {
-                conversation_id,
-                artifact_id,
-            });
-        }
-        cx.notify();
+        self.select_artifact_index(index, cx);
     }
 
     pub fn show_artifact(
@@ -1137,8 +1212,7 @@ impl StudioPage {
         }
         if self.selected_artifact != Some(artifact_id) {
             self.selected_artifact = Some(artifact_id);
-            self.lightbox_zoom = 1.0;
-            self.lightbox_pan = Point::default();
+            self.reset_lightbox_viewer();
             if let Some(index) = self
                 .artifact_sequence()
                 .iter()
@@ -1155,18 +1229,20 @@ impl StudioPage {
 
     pub fn close_artifact(&mut self, cx: &mut Context<Self>) {
         if self.selected_artifact.take().is_some() {
-            self.lightbox_zoom = 1.0;
-            self.lightbox_pan = Point::default();
-            self.lightbox_drag = None;
-            self.lightbox_swipe_x = 0.0;
-            self.lightbox_swipe_velocity = 0.0;
-            self.lightbox_swipe_spring = false;
+            self.reset_lightbox_viewer();
             cx.notify();
         }
     }
 
+    fn lightbox_page_width(&self) -> f32 {
+        self.lightbox_stage_width.max(1.0)
+    }
+
     fn adjust_lightbox_zoom(&mut self, factor: f32, cx: &mut Context<Self>) {
         self.lightbox_zoom = (self.lightbox_zoom * factor).clamp(1.0, 8.0);
+        if self.lightbox_zoom > 1.001 {
+            self.reset_lightbox_swipe();
+        }
         cx.notify();
     }
 
@@ -1216,37 +1292,47 @@ impl StudioPage {
             return;
         }
         let now = Instant::now();
-        let frames = self
+        let dt = self
             .lightbox_swipe_last_tick
-            .map(|last| (now.duration_since(last).as_secs_f32() * 60.0).clamp(0.25, 3.0))
-            .unwrap_or(1.0);
+            .map(|last| now.duration_since(last).as_secs_f32())
+            .unwrap_or(1.0 / 60.0);
         self.lightbox_swipe_last_tick = Some(now);
         (self.lightbox_swipe_x, self.lightbox_swipe_velocity) =
-            step_artifact_swipe_spring(self.lightbox_swipe_x, self.lightbox_swipe_velocity, frames);
-        if self.lightbox_swipe_x.abs() < 0.35 && self.lightbox_swipe_velocity.abs() < 0.35 {
-            self.lightbox_swipe_x = 0.0;
-            self.lightbox_swipe_velocity = 0.0;
-            self.lightbox_swipe_spring = false;
-            self.lightbox_swipe_last_tick = None;
+            step_lightbox_snap_spring(self.lightbox_swipe_x, self.lightbox_swipe_velocity, dt);
+        if self.lightbox_swipe_x.abs() < 0.35 && self.lightbox_swipe_velocity.abs() < 20.0 {
+            self.reset_lightbox_swipe();
         }
         cx.notify();
     }
 
     fn finish_lightbox_swipe(&mut self, cx: &mut Context<Self>) {
+        let width = self.lightbox_page_width();
         let offset = self.lightbox_swipe_x;
         let release_velocity = self.lightbox_swipe_velocity;
-        let delta = if offset > ARTIFACT_SWIPE_COMMIT {
-            -1
-        } else if offset < -ARTIFACT_SWIPE_COMMIT {
-            1
-        } else {
-            0
-        };
-        let changed = delta != 0 && self.navigate_artifact_with_wrap(delta, false, cx);
-        if changed {
-            self.lightbox_swipe_x = -(offset.signum()) * 36.0;
+        let artifacts = self.artifact_sequence();
+        let index = self
+            .selected_artifact
+            .and_then(|selected| artifacts.iter().position(|id| *id == selected))
+            .unwrap_or(0);
+        let delta = lightbox_swipe_commit_delta(
+            offset,
+            release_velocity,
+            width,
+            index > 0,
+            index + 1 < artifacts.len(),
+        );
+        if delta != 0 {
+            let next = stepped_artifact_index(index, artifacts.len(), delta, false);
+            if next != index && self.adopt_artifact_index(next, cx) {
+                self.lightbox_swipe_x = remap_lightbox_swipe_after_commit(offset, delta, width);
+            }
         }
-        self.wake_lightbox_swipe_spring(release_velocity * 0.35, cx);
+        if crate::motion::reduced_motion(cx) {
+            self.reset_lightbox_swipe();
+            cx.notify();
+            return;
+        }
+        self.wake_lightbox_swipe_spring(release_velocity, cx);
     }
 
     fn on_lightbox_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
@@ -1275,24 +1361,36 @@ impl StudioPage {
             return;
         }
         if event.touch_phase == TouchPhase::Started {
-            self.lightbox_swipe_x = 0.0;
-            self.lightbox_swipe_velocity = 0.0;
             self.lightbox_swipe_spring = false;
+            self.lightbox_swipe_last_tick = None;
         }
+        if !event.delta.precise() {
+            let direction = if horizontal < 0.0 { 1 } else { -1 };
+            self.navigate_artifact_with_wrap(direction, false, cx);
+            cx.stop_propagation();
+            return;
+        }
+        let now = Instant::now();
+        let dt = self
+            .lightbox_swipe_last_tick
+            .map(|last| now.duration_since(last).as_secs_f32())
+            .unwrap_or(1.0 / 60.0)
+            .clamp(1.0 / 240.0, 1.0 / 20.0);
+        self.lightbox_swipe_last_tick = Some(now);
         let artifacts = self.artifact_sequence();
         let index = self
             .selected_artifact
             .and_then(|selected| artifacts.iter().position(|id| *id == selected))
             .unwrap_or(0);
-        let pushing_past_edge =
-            (index == 0 && horizontal > 0.0) || (index + 1 == artifacts.len() && horizontal < 0.0);
-        let applied = horizontal * if pushing_past_edge { 0.28 } else { 1.0 };
-        self.lightbox_swipe_x =
-            (self.lightbox_swipe_x + applied).clamp(-ARTIFACT_SWIPE_LIMIT, ARTIFACT_SWIPE_LIMIT);
-        self.lightbox_swipe_velocity = applied;
-        if matches!(event.touch_phase, TouchPhase::Ended | TouchPhase::Cancelled)
-            || (!event.delta.precise() && self.lightbox_swipe_x.abs() >= ARTIFACT_SWIPE_COMMIT)
-        {
+        self.lightbox_swipe_x = apply_lightbox_swipe_delta(
+            self.lightbox_swipe_x,
+            horizontal,
+            self.lightbox_page_width(),
+            index > 0,
+            index + 1 < artifacts.len(),
+        );
+        self.lightbox_swipe_velocity = horizontal / dt;
+        if matches!(event.touch_phase, TouchPhase::Ended | TouchPhase::Cancelled) {
             self.finish_lightbox_swipe(cx);
         } else {
             cx.notify();
@@ -1472,17 +1570,22 @@ impl StudioPage {
             return base
                 .cursor_pointer()
                 .on_click(cx.listener(move |page, _, window, cx| {
-                    page.selected_artifact = Some(id);
-                    page.lightbox_zoom = 1.0;
-                    page.lightbox_pan = Point::default();
-                    if let Some(conversation_id) = conversation_id {
-                        cx.emit(StudioEvent::OpenArtifact {
-                            conversation_id,
-                            artifact_id: id,
-                        });
+                    if let Some(index) =
+                        page.artifact_sequence().iter().position(|item| *item == id)
+                    {
+                        page.select_artifact_index(index, cx);
+                    } else {
+                        page.selected_artifact = Some(id);
+                        page.reset_lightbox_viewer();
+                        if let Some(conversation_id) = conversation_id {
+                            cx.emit(StudioEvent::OpenArtifact {
+                                conversation_id,
+                                artifact_id: id,
+                            });
+                        }
+                        cx.notify();
                     }
                     window.focus(&page.focus, cx);
-                    cx.notify();
                 }))
                 .child(crate::motion::fade_quick(
                     SharedString::from(format!("studio-image-reveal-{}", id.0)),
@@ -1959,7 +2062,11 @@ impl StudioPage {
                     .cloned()
                     .unwrap_or_else(|| DraftRunConfig::from_model(&model));
                 let aspect = draft_aspect(&model, &draft);
-                let aspect_label = format!("{}:{}", aspect.0, aspect.1);
+                let aspect_label = aspect_control
+                    .as_ref()
+                    .and_then(|control| draft.controls.get(&control.id))
+                    .map(control_value_label)
+                    .unwrap_or_else(|| format!("{}:{}", aspect.0, aspect.1));
                 let aspect_ratio = aspect.0 as f32 / aspect.1.max(1) as f32;
                 let (indicator_w, indicator_h) = if aspect_ratio >= 1.0 {
                     (18.0, (18.0 / aspect_ratio).clamp(7.0, 18.0))
@@ -2421,9 +2528,64 @@ impl StudioPage {
             .into_any_element()
     }
 
+    /// One page in the lightbox strip. `page` is `(left, width)` in the stage;
+    /// `None` fills the viewport and applies the current zoom/pan.
+    fn render_lightbox_slide(
+        &self,
+        artifact_id: Option<StudioArtifactId>,
+        page: Option<(f32, f32)>,
+        theme: &Theme,
+    ) -> AnyElement {
+        let image = artifact_id.and_then(|id| self.images.get(&id).cloned());
+        let frame = if let Some((left, width)) = page {
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .w(px(width))
+                .left(px(left))
+                .overflow_hidden()
+                .flex()
+                .items_center()
+                .justify_center()
+        } else {
+            div()
+                .absolute()
+                .inset_0()
+                .left(self.lightbox_pan.x)
+                .top(self.lightbox_pan.y)
+                .flex()
+                .items_center()
+                .justify_center()
+        };
+        let zoom = if page.is_some() {
+            1.0
+        } else {
+            self.lightbox_zoom
+        };
+        if let Some(image) = image {
+            frame
+                .child(
+                    img(image)
+                        .w(gpui::relative(zoom))
+                        .h(gpui::relative(zoom))
+                        .object_fit(ObjectFit::Contain),
+                )
+                .into_any_element()
+        } else {
+            frame
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_faint)
+                        .child("Loading image…"),
+                )
+                .into_any_element()
+        }
+    }
+
     fn render_artifact_page(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let id = self.selected_artifact?;
-        let image = self.images.get(&id).cloned();
         let sequence = self.artifact_sequence();
         let selected_index = sequence
             .iter()
@@ -2491,63 +2653,88 @@ impl StudioPage {
             })
             .collect::<Vec<_>>();
 
-        let stage_image = if let Some(image) = image {
-            div()
-                .id("studio-artifact-image")
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .relative()
-                .left(self.lightbox_pan.x + px(self.lightbox_swipe_x))
-                .top(self.lightbox_pan.y)
-                .cursor_pointer()
-                .on_scroll_wheel(
-                    cx.listener(|page, event, _, cx| page.on_lightbox_scroll(event, cx)),
-                )
-                .on_pinch(cx.listener(|page, event, _, cx| page.on_lightbox_pinch(event, cx)))
-                .on_mouse_down(
-                    gpui::MouseButton::Left,
-                    cx.listener(|page, event: &gpui::MouseDownEvent, _, cx| {
-                        page.begin_lightbox_pan(event.position, cx);
-                    }),
-                )
-                .on_mouse_move(cx.listener(|page, event: &gpui::MouseMoveEvent, _, cx| {
-                    if event.dragging() {
-                        page.update_lightbox_pan(event.position, cx);
-                    }
-                }))
-                .on_mouse_up(
-                    gpui::MouseButton::Left,
-                    cx.listener(|page, _, _, cx| page.end_lightbox_pan(cx)),
-                )
-                .on_mouse_up_out(
-                    gpui::MouseButton::Left,
-                    cx.listener(|page, _, _, cx| page.end_lightbox_pan(cx)),
-                )
-                .on_click(cx.listener(|page, event: &gpui::ClickEvent, _, cx| {
-                    if event.click_count() == 2 {
-                        if page.lightbox_zoom > 1.0 {
-                            page.fit_lightbox(cx);
-                        } else {
-                            page.adjust_lightbox_zoom(2.0, cx);
-                        }
-                    }
-                }))
-                .child(
-                    img(image)
-                        .w(gpui::relative(self.lightbox_zoom))
-                        .h(gpui::relative(self.lightbox_zoom))
-                        .object_fit(ObjectFit::Contain),
-                )
-                .into_any_element()
+        let zoomed = self.lightbox_zoom > 1.001;
+        let page_width = self.lightbox_stage_width;
+        let mut slides = Vec::new();
+        if zoomed || page_width <= 1.0 {
+            slides.push(self.render_lightbox_slide(Some(id), None, theme));
         } else {
-            div()
-                .text_size(px(12.0))
-                .text_color(theme.text_faint)
-                .child("Loading image…")
-                .into_any_element()
-        };
+            if selected_index > 0 {
+                slides.push(self.render_lightbox_slide(
+                    Some(sequence[selected_index - 1]),
+                    Some((self.lightbox_swipe_x - page_width, page_width)),
+                    theme,
+                ));
+            }
+            slides.push(self.render_lightbox_slide(
+                Some(id),
+                Some((self.lightbox_swipe_x, page_width)),
+                theme,
+            ));
+            if let Some(next_id) = sequence.get(selected_index + 1).copied() {
+                slides.push(self.render_lightbox_slide(
+                    Some(next_id),
+                    Some((self.lightbox_swipe_x + page_width, page_width)),
+                    theme,
+                ));
+            }
+        }
+        let measure_entity = cx.weak_entity();
+        let stage = div()
+            .id("studio-artifact-stage")
+            .absolute()
+            .inset_0()
+            .overflow_hidden()
+            .cursor_pointer()
+            .on_scroll_wheel(cx.listener(|page, event, _, cx| page.on_lightbox_scroll(event, cx)))
+            .on_pinch(cx.listener(|page, event, _, cx| page.on_lightbox_pinch(event, cx)))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|page, event: &gpui::MouseDownEvent, _, cx| {
+                    page.begin_lightbox_pan(event.position, cx);
+                }),
+            )
+            .on_mouse_move(cx.listener(|page, event: &gpui::MouseMoveEvent, _, cx| {
+                if event.dragging() {
+                    page.update_lightbox_pan(event.position, cx);
+                }
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|page, _, _, cx| page.end_lightbox_pan(cx)),
+            )
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(|page, _, _, cx| page.end_lightbox_pan(cx)),
+            )
+            .on_click(cx.listener(|page, event: &gpui::ClickEvent, _, cx| {
+                if event.click_count() == 2 {
+                    if page.lightbox_zoom > 1.0 {
+                        page.fit_lightbox(cx);
+                    } else {
+                        page.adjust_lightbox_zoom(2.0, cx);
+                    }
+                }
+            }))
+            .child(
+                canvas(
+                    move |bounds, _, cx| {
+                        let width = f32::from(bounds.size.width);
+                        measure_entity
+                            .update(cx, |page, cx| {
+                                if (page.lightbox_stage_width - width).abs() > 0.5 {
+                                    page.lightbox_stage_width = width;
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .children(slides);
 
         let back_button = div()
             .id("studio-artifact-back")
@@ -2557,6 +2744,7 @@ impl StudioPage {
             .items_center()
             .justify_center()
             .rounded(px(6.0))
+            .occlude()
             .cursor_pointer()
             .hover(|style| style.bg(crate::theme::wash(0.14)))
             .on_click(cx.listener(|page, _, _, cx| {
@@ -2578,6 +2766,7 @@ impl StudioPage {
             .items_center()
             .justify_center()
             .rounded(px(7.0))
+            .occlude()
             .cursor_pointer()
             .hover(|style| style.bg(crate::theme::wash(0.11)))
             .on_click(cx.listener(|page, _, _, cx| page.navigate_artifact(-1, cx)))
@@ -2594,6 +2783,7 @@ impl StudioPage {
             .items_center()
             .justify_center()
             .rounded(px(7.0))
+            .occlude()
             .cursor_pointer()
             .hover(|style| style.bg(crate::theme::wash(0.11)))
             .on_click(cx.listener(|page, _, _, cx| page.navigate_artifact(1, cx)))
@@ -2745,47 +2935,46 @@ impl StudioPage {
                         .min_w_0()
                         .h_full()
                         .relative()
-                        .flex()
-                        .flex_col()
                         .overflow_hidden()
+                        .child(stage)
                         .child(
                             div()
+                                .absolute()
+                                .top(px(Theme::TITLEBAR_TOP_PAD))
+                                .left(px(16.0))
                                 .h(px(Theme::TITLEBAR_HEIGHT))
-                                .flex_none()
                                 .flex()
                                 .items_center()
-                                .pt(px(Theme::TITLEBAR_TOP_PAD))
-                                .px(px(16.0))
                                 .child(back_button),
                         )
                         .child(
                             div()
-                                .id("studio-artifact-stage")
-                                .flex_1()
-                                .min_h_0()
+                                .absolute()
+                                .left(px(16.0))
+                                .top_0()
+                                .bottom_0()
                                 .flex()
                                 .items_center()
-                                .gap(px(12.0))
-                                .px(px(16.0))
-                                .child(previous)
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .h_full()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .overflow_hidden()
-                                        .child(stage_image),
-                                )
+                                .child(previous),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .right(px(16.0))
+                                .top_0()
+                                .bottom_0()
+                                .flex()
+                                .items_center()
                                 .child(next),
                         )
                         .child(
                             div()
                                 .id("studio-artifact-filmstrip")
+                                .absolute()
+                                .bottom_0()
+                                .left_0()
+                                .right_0()
                                 .h(px(78.0))
-                                .flex_none()
                                 .overflow_x_scroll()
                                 .track_scroll(&self.artifact_filmstrip_scroll)
                                 .on_scroll_wheel(cx.listener(|page, event, _, cx| {
@@ -2796,6 +2985,7 @@ impl StudioPage {
                                 .justify_center()
                                 .gap(px(8.0))
                                 .px(px(16.0))
+                                .occlude()
                                 .children(thumbnails),
                         ),
                 )
@@ -2825,10 +3015,7 @@ impl Focusable for StudioPage {
 impl Render for StudioPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.lightbox_swipe_spring && crate::motion::reduced_motion(cx) {
-            self.lightbox_swipe_x = 0.0;
-            self.lightbox_swipe_velocity = 0.0;
-            self.lightbox_swipe_spring = false;
-            self.lightbox_swipe_last_tick = None;
+            self.reset_lightbox_swipe();
         } else if self.lightbox_swipe_spring && !self.lightbox_swipe_scheduled {
             self.lightbox_swipe_scheduled = true;
             let entity = cx.weak_entity();
@@ -3436,13 +3623,63 @@ mod tests {
     }
 
     #[test]
-    fn artifact_swipe_spring_settles_after_edge_resistance() {
-        let (mut position, mut velocity) = (80.0, 0.0);
-        for _ in 0..120 {
-            (position, velocity) = step_artifact_swipe_spring(position, velocity, 1.0);
+    fn lightbox_snap_spring_settles_from_a_page_width() {
+        let (mut position, mut velocity) = (800.0, 0.0);
+        for _ in 0..90 {
+            (position, velocity) = step_lightbox_snap_spring(position, velocity, 1.0 / 60.0);
         }
-        assert!(position.abs() < 0.35);
-        assert!(velocity.abs() < 0.35);
+        assert!(position.abs() < 0.35, "position={position}");
+        assert!(velocity.abs() < 20.0, "velocity={velocity}");
+    }
+
+    #[test]
+    fn lightbox_swipe_commits_on_distance_or_flick() {
+        assert_eq!(
+            lightbox_swipe_commit_delta(-200.0, 0.0, 800.0, true, true),
+            1
+        );
+        assert_eq!(
+            lightbox_swipe_commit_delta(200.0, 0.0, 800.0, true, true),
+            -1
+        );
+        assert_eq!(
+            lightbox_swipe_commit_delta(-40.0, 0.0, 800.0, true, true),
+            0
+        );
+        assert_eq!(
+            lightbox_swipe_commit_delta(-40.0, -800.0, 800.0, true, true),
+            1
+        );
+        assert_eq!(
+            lightbox_swipe_commit_delta(-200.0, 0.0, 800.0, true, false),
+            0
+        );
+        assert_eq!(
+            lightbox_swipe_commit_delta(200.0, 0.0, 800.0, false, true),
+            0
+        );
+    }
+
+    #[test]
+    fn lightbox_swipe_clamps_to_one_page_and_rubber_bands_edges() {
+        assert_eq!(
+            apply_lightbox_swipe_delta(0.0, -200.0, 800.0, true, true),
+            -200.0
+        );
+        assert_eq!(
+            apply_lightbox_swipe_delta(0.0, -900.0, 800.0, true, true),
+            -800.0
+        );
+        let resisted = apply_lightbox_swipe_delta(0.0, -200.0, 800.0, true, false);
+        assert!(resisted < 0.0 && resisted > -200.0);
+        let returning = apply_lightbox_swipe_delta(-20.0, 20.0, 800.0, true, false);
+        assert_eq!(returning, 0.0);
+    }
+
+    #[test]
+    fn lightbox_swipe_remap_keeps_the_visual_page() {
+        assert_eq!(remap_lightbox_swipe_after_commit(-200.0, 1, 800.0), 600.0);
+        assert_eq!(remap_lightbox_swipe_after_commit(200.0, -1, 800.0), -600.0);
     }
 
     #[test]
