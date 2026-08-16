@@ -3,9 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use chrono::{DateTime, TimeZone, Utc};
 use gpui::{
     AnyElement, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, Image,
     ImageFormat, KeyDownEvent, ObjectFit, PinchEvent, Pixels, Point, Render, ScrollWheelEvent,
@@ -21,10 +22,13 @@ use zeron_studio::{StudioArtifactId, StudioConversationId};
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons;
+use crate::motion;
 use crate::popover;
+use crate::rail;
 use crate::settings::widgets;
-use crate::state::{AppState, EngineHandle};
+use crate::state::{AppState, EngineHandle, format_time_ago};
 use crate::theme::Theme;
+use crate::transcript::format_timestamp;
 
 /// Scroll runway below the final Studio turn. The composer floats 18px above
 /// the viewport and is 191px tall at its largest first-release configuration;
@@ -33,6 +37,67 @@ const STUDIO_COMPOSER_CLEARANCE: f32 = 256.0;
 const ARTIFACT_SWIPE_COMMIT: f32 = 64.0;
 const ARTIFACT_SWIPE_LIMIT: f32 = 180.0;
 const ARTIFACT_FILMSTRIP_STEP: f32 = 38.0;
+/// Extra left inset so the tick rail (16px + 20px hover bar) does not cover
+/// the prompt header. Matches the chat transcript's wide-gutter band.
+const STUDIO_RAIL_GUTTER: f32 = 28.0;
+
+/// One feed-rail tick: a Studio turn's prompt, the models that ran it, and
+/// when it was sent.
+#[derive(Debug, Clone, PartialEq)]
+struct StudioRailTick {
+    turn_ix: usize,
+    prompt: String,
+    models: Vec<(String, u32)>,
+    created_at: DateTime<Utc>,
+}
+
+fn studio_rail_ticks(turns: &[StudioTurnView]) -> Vec<StudioRailTick> {
+    turns
+        .iter()
+        .enumerate()
+        .map(|(turn_ix, turn)| StudioRailTick {
+            turn_ix,
+            prompt: turn.prompt.clone(),
+            models: turn
+                .runs
+                .iter()
+                .map(|run| (run.model.display_name.clone(), run.output_count))
+                .collect(),
+            created_at: turn.created_at,
+        })
+        .collect()
+}
+
+/// Compact "model · n" list for the hover card. One model spells out
+/// "variation(s)"; several stay short so the card stays one-scan.
+fn format_studio_models(models: &[(String, u32)]) -> String {
+    match models {
+        [] => String::new(),
+        [(name, 1)] => format!("{name} · 1 variation"),
+        [(name, count)] => format!("{name} · {count} variations"),
+        many => many
+            .iter()
+            .map(|(name, count)| format!("{name} · {count}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
+}
+
+/// Sidebar-style relative time ("5m", "3h") plus the transcript's absolute
+/// send clock ("Jul 1, 3:45 PM"). Recent rows read like the chat list;
+/// older ones still name the moment they were sent.
+fn format_studio_tick_time<Tz: TimeZone>(then: DateTime<Utc>, now: DateTime<Utc>, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let relative = format_time_ago(then, now);
+    let absolute = format_timestamp(then.timestamp_millis(), tz);
+    if absolute.is_empty() {
+        relative
+    } else {
+        format!("{relative} · {absolute}")
+    }
+}
 
 fn stepped_artifact_index(index: usize, len: usize, delta: isize, wraps: bool) -> usize {
     if len == 0 {
@@ -250,6 +315,8 @@ pub struct StudioPage {
     feed_scroll: gpui::ScrollHandle,
     artifact_filmstrip_scroll: gpui::ScrollHandle,
     scroll_after_turn_count: Option<usize>,
+    scroll_task: Option<Task<()>>,
+    rail_hover: Option<usize>,
     source_turn: Option<zeron_studio::StudioTurnId>,
     images: HashMap<StudioArtifactId, Arc<Image>>,
     loading_images: HashSet<StudioArtifactId>,
@@ -314,6 +381,8 @@ impl StudioPage {
             feed_scroll: gpui::ScrollHandle::new(),
             artifact_filmstrip_scroll: gpui::ScrollHandle::new(),
             scroll_after_turn_count: None,
+            scroll_task: None,
+            rail_hover: None,
             source_turn: None,
             images: HashMap::new(),
             loading_images: HashSet::new(),
@@ -579,6 +648,8 @@ impl StudioPage {
         self.selected_conversation = Some(id);
         self.conversation = None;
         self.scroll_after_turn_count = None;
+        self.scroll_task = None;
+        self.rail_hover = None;
         self.feed_scroll.set_offset(Point::default());
         cx.emit(StudioEvent::SidebarChanged);
         self.watch_task = Some(cx.spawn(async move |this, cx| {
@@ -1435,171 +1506,393 @@ impl StudioPage {
             .into_any_element()
     }
 
+    fn feed_turns(&self) -> &[StudioTurnView] {
+        self.conversation
+            .as_ref()
+            .map(|view| view.turns.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn rail_should_show(&self, container_width: f32) -> bool {
+        rail::rail_visible(container_width) && self.feed_turns().len() >= 2
+    }
+
+    fn feed_container_width(&self, window: &Window) -> f32 {
+        let measured = f32::from(self.feed_scroll.bounds().size.width);
+        if measured > 0.0 {
+            measured
+        } else {
+            (f32::from(window.viewport_size().width) - crate::settings::SIDEBAR_DEFAULT).max(0.0)
+        }
+    }
+
+    /// Smooth-scroll the feed so `turn_ix` sits at the viewport top — same
+    /// 500ms ease-in-out timeline as the chat MessageRail.
+    fn scroll_to_turn(&mut self, turn_ix: usize, cx: &mut Context<Self>) {
+        if motion::reduced_motion(cx) {
+            self.feed_scroll.scroll_to_top_of_item(turn_ix);
+            cx.notify();
+            return;
+        }
+        if self.feed_scroll.bounds_for_item(turn_ix).is_none() {
+            self.feed_scroll.scroll_to_top_of_item(turn_ix);
+            cx.notify();
+            return;
+        }
+        self.scroll_task = Some(cx.spawn(async move |this, cx| {
+            let started = Instant::now();
+            let total = motion::SCROLL_GLIDE.total().mul_f32(motion::speed_scale());
+            let mut timeline = rail::GlideTimeline::new();
+            let frames = (total.as_millis() / 16) as usize + 90;
+            for _ in 0..frames {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let raw = (started.elapsed().as_secs_f32() / total.as_secs_f32()).min(1.0);
+                let eased = motion::SCROLL_GLIDE.curve.eval(raw);
+                let frac = timeline.step(eased);
+                let done = this.update(cx, |page, cx| {
+                    if raw >= 1.0 {
+                        page.feed_scroll.scroll_to_top_of_item(turn_ix);
+                        cx.notify();
+                        return true;
+                    }
+                    let here = f32::from(page.feed_scroll.offset().y);
+                    let target = page
+                        .feed_scroll
+                        .bounds_for_item(turn_ix)
+                        .map(|bounds| {
+                            let raw_target =
+                                f32::from(page.feed_scroll.bounds().top() - bounds.top());
+                            let max_y = f32::from(page.feed_scroll.max_offset().y);
+                            raw_target.clamp(-max_y, 0.0)
+                        })
+                        .unwrap_or(here);
+                    page.feed_scroll.set_offset(Point {
+                        x: px(0.0),
+                        y: px(here + frac * (target - here)),
+                    });
+                    cx.notify();
+                    false
+                });
+                match done {
+                    Ok(true) | Err(_) => return,
+                    Ok(false) => {}
+                }
+            }
+            this.update(cx, |page, cx| {
+                page.feed_scroll.scroll_to_top_of_item(turn_ix);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     fn render_feed(
         &mut self,
         window: &Window,
         theme: &Theme,
+        show_rail: bool,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> Vec<AnyElement> {
         let turns = self
             .conversation
             .clone()
             .map(|view| view.turns)
             .unwrap_or_default();
         if turns.is_empty() {
-            return div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .child(crate::motion::fade_in(
-                    "new-studio-canvas",
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .child(
-                            crate::icons::icon(crate::icons::ZERON_LOGO)
-                                .w(px(41.9))
-                                .h(px(48.0))
-                                .text_color(theme.text.opacity(0.2)),
-                        )
-                        .child(
-                            div()
-                                .mt(px(12.0))
-                                .text_size(px(14.0))
-                                .text_color(theme.text_muted.opacity(0.6))
-                                .child("Describe an image below to begin"),
-                        ),
-                ))
-                .into_any_element();
+            return vec![
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .child(crate::motion::fade_in(
+                        "new-studio-canvas",
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .child(
+                                crate::icons::icon(crate::icons::ZERON_LOGO)
+                                    .w(px(41.9))
+                                    .h(px(48.0))
+                                    .text_color(theme.text.opacity(0.2)),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(12.0))
+                                    .text_size(px(14.0))
+                                    .text_color(theme.text_muted.opacity(0.6))
+                                    .child("Describe an image below to begin"),
+                            ),
+                    ))
+                    .into_any_element(),
+            ];
         }
 
-        let available =
-            (f32::from(window.viewport_size().width) - 256.0 - 240.0 - 64.0).clamp(240.0, 1600.0);
+        let rail_gutter = if show_rail { STUDIO_RAIL_GUTTER } else { 0.0 };
+        let available = (f32::from(window.viewport_size().width)
+            - crate::settings::SIDEBAR_DEFAULT
+            - 240.0
+            - 64.0
+            - rail_gutter)
+            .clamp(240.0, 1600.0);
         let columns = grid_columns(available);
         let gap = if available < 520.0 { 12.0 } else { 16.0 };
         let tile_width = (available - gap * (columns.saturating_sub(1) as f32)) / columns as f32;
-        let mut feed = div()
+        turns
+            .iter()
+            .enumerate()
+            .map(|(turn_ix, turn)| self.render_turn(turn_ix, turn, tile_width, gap, theme, cx))
+            .collect()
+    }
+
+    fn render_turn(
+        &mut self,
+        turn_ix: usize,
+        turn: &StudioTurnView,
+        tile_width: f32,
+        gap: f32,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let turn_for_prompt = turn.clone();
+        let turn_for_again = turn.clone();
+        let turn_for_fork = turn.clone();
+        let mut grid = div().w_full().flex().flex_row().flex_wrap().gap(px(gap));
+        for (run_ix, run) in turn.runs.iter().enumerate() {
+            for output_ix in 0..run.output_count as usize {
+                let artifact = run
+                    .artifacts
+                    .iter()
+                    .find(|artifact| artifact.output_position as usize == output_ix)
+                    .map(|artifact| artifact.id);
+                grid = grid.child(self.render_tile(
+                    turn_ix,
+                    run_ix,
+                    output_ix,
+                    tile_width,
+                    run.display_aspect_ratio,
+                    run.state,
+                    artifact,
+                    theme,
+                    cx,
+                ));
+            }
+        }
+        let retry_runs = turn
+            .runs
+            .iter()
+            .filter(|run| run.state == StudioRunState::Failed)
+            .map(|run| {
+                (
+                    run.id,
+                    run.error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("may have completed")),
+                )
+            })
+            .collect::<Vec<_>>();
+        div()
+            .id(SharedString::from(format!("studio-turn-{turn_ix}")))
             .w_full()
             .max_w(px(1600.0))
             .mx_auto()
             .flex()
             .flex_col()
-            .gap(px(28.0))
-            .pb(px(STUDIO_COMPOSER_CLEARANCE));
-        for (turn_ix, turn) in turns.iter().enumerate() {
-            let turn_for_prompt = turn.clone();
-            let turn_for_again = turn.clone();
-            let turn_for_fork = turn.clone();
-            let mut grid = div().w_full().flex().flex_row().flex_wrap().gap(px(gap));
-            for (run_ix, run) in turn.runs.iter().enumerate() {
-                for output_ix in 0..run.output_count as usize {
-                    let artifact = run
-                        .artifacts
-                        .iter()
-                        .find(|artifact| artifact.output_position as usize == output_ix)
-                        .map(|artifact| artifact.id);
-                    grid = grid.child(self.render_tile(
-                        turn_ix,
-                        run_ix,
-                        output_ix,
-                        tile_width,
-                        run.display_aspect_ratio,
-                        run.state,
-                        artifact,
-                        theme,
-                        cx,
-                    ));
-                }
-            }
-            let retry_runs = turn
-                .runs
-                .iter()
-                .filter(|run| run.state == StudioRunState::Failed)
-                .map(|run| {
-                    (
-                        run.id,
-                        run.error
-                            .as_deref()
-                            .is_some_and(|error| error.contains("may have completed")),
-                    )
-                })
-                .collect::<Vec<_>>();
-            feed = feed.child(
+            .gap(px(10.0))
+            .child(
                 div()
-                    .id(SharedString::from(format!("studio-turn-{turn_ix}")))
                     .flex()
-                    .flex_col()
-                    .gap(px(10.0))
+                    .items_center()
+                    .gap(px(8.0))
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_size(px(13.0))
-                                    .text_color(theme.text_muted)
-                                    .child(SharedString::from(turn.prompt.clone())),
-                            )
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("studio-use-prompt-{turn_ix}")))
-                                    .cursor_pointer()
-                                    .text_size(px(11.0))
-                                    .text_color(theme.text_muted)
-                                    .on_click(cx.listener(move |page, _, _, cx| {
-                                        page.use_prompt(&turn_for_prompt, cx)
-                                    }))
-                                    .child("Use prompt"),
-                            )
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "studio-generate-again-{turn_ix}"
-                                    )))
-                                    .cursor_pointer()
-                                    .text_size(px(11.0))
-                                    .text_color(theme.text_muted)
-                                    .on_click(cx.listener(move |page, _, _, cx| {
-                                        page.generate_again(&turn_for_again, cx)
-                                    }))
-                                    .child("Generate again"),
-                            )
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("studio-fork-{turn_ix}")))
-                                    .cursor_pointer()
-                                    .text_size(px(11.0))
-                                    .text_color(theme.text_muted)
-                                    .on_click(cx.listener(move |page, _, _, cx| {
-                                        page.fork_from(&turn_for_fork, cx)
-                                    }))
-                                    .child("Fork"),
-                            )
-                            .children(retry_runs.into_iter().map(|(run_id, retry_anyway)| {
-                                div()
-                                    .id(SharedString::from(format!("studio-retry-{}", run_id.0)))
-                                    .cursor_pointer()
-                                    .text_size(px(11.0))
-                                    .text_color(theme.danger)
-                                    .on_click(cx.listener(move |page, _, _, cx| {
-                                        page.retry(run_id, retry_anyway, cx)
-                                    }))
-                                    .child(if retry_anyway {
-                                        "Retry anyway"
-                                    } else {
-                                        "Retry"
-                                    })
-                            })),
+                            .flex_1()
+                            .text_size(px(13.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(turn.prompt.clone())),
                     )
-                    .child(grid),
-            );
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("studio-use-prompt-{turn_ix}")))
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .on_click(cx.listener(move |page, _, _, cx| {
+                                page.use_prompt(&turn_for_prompt, cx)
+                            }))
+                            .child("Use prompt"),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "studio-generate-again-{turn_ix}"
+                            )))
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .on_click(cx.listener(move |page, _, _, cx| {
+                                page.generate_again(&turn_for_again, cx)
+                            }))
+                            .child("Generate again"),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("studio-fork-{turn_ix}")))
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .on_click(
+                                cx.listener(move |page, _, _, cx| {
+                                    page.fork_from(&turn_for_fork, cx)
+                                }),
+                            )
+                            .child("Fork"),
+                    )
+                    .children(retry_runs.into_iter().map(|(run_id, retry_anyway)| {
+                        div()
+                            .id(SharedString::from(format!("studio-retry-{}", run_id.0)))
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .text_color(theme.danger)
+                            .on_click(cx.listener(move |page, _, _, cx| {
+                                page.retry(run_id, retry_anyway, cx)
+                            }))
+                            .child(if retry_anyway {
+                                "Retry anyway"
+                            } else {
+                                "Retry"
+                            })
+                    })),
+            )
+            .child(grid)
+            .into_any_element()
+    }
+
+    /// Left-edge tick rail for the conversation feed — same chrome as the
+    /// chat MessageRail, with a Studio-specific hover card.
+    fn render_studio_rail(
+        &mut self,
+        window: &Window,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if !self.rail_should_show(self.feed_container_width(window)) {
+            return gpui::Empty.into_any_element();
         }
-        feed.into_any_element()
+        let ticks = studio_rail_ticks(self.feed_turns());
+        if ticks.len() < 2 {
+            return gpui::Empty.into_any_element();
+        }
+        let tick_rows: Vec<usize> = ticks.iter().map(|tick| tick.turn_ix).collect();
+        let top_row = self.feed_scroll.top_item();
+        let active = rail::active_tick(&tick_rows, top_row);
+        let hover = self.rail_hover;
+        let viewport_h = f32::from(self.feed_scroll.bounds().size.height);
+        let capacity = rail::rail_slots(if viewport_h > 0.0 { viewport_h } else { 600.0 });
+        let buckets = rail::tick_buckets(ticks.len(), capacity);
+        let active_bucket = active.and_then(|ix| rail::bucket_of(&buckets, ix));
+        let now = Utc::now();
+
+        div()
+            .absolute()
+            .left(px(16.0))
+            .top_0()
+            .bottom_0()
+            .w(px(26.0))
+            .flex()
+            .flex_col()
+            .items_start()
+            .justify_center()
+            .gap(px(rail::TICK_GAP))
+            .children(buckets.into_iter().enumerate().map(|(ix, (start, end))| {
+                let rep = active.filter(|&a| a >= start && a < end).unwrap_or(start);
+                let tick = ticks[rep].clone();
+                let bucket_len = end - start;
+                let is_active = active_bucket == Some(ix);
+                let is_hovered = hover == Some(ix);
+                let bar_width = if is_hovered { 20.0 } else { 12.0 };
+                let bar_color = if is_active || is_hovered {
+                    theme.text.opacity(0.8)
+                } else {
+                    crate::theme::ink(0.16)
+                };
+                let prompt = rail::truncate_preview(&tick.prompt, rail::PREVIEW_PROMPT_CHARS);
+                let models = format_studio_models(&tick.models);
+                let sent = format_studio_tick_time(tick.created_at, now, &chrono::Local);
+                let card: Option<AnyElement> = is_hovered.then(|| {
+                    let card = popover::popover_card(theme)
+                        .w(px(280.0))
+                        .p(px(Theme::SPACE_SM))
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(theme.text)
+                                .child(SharedString::from(prompt)),
+                        )
+                        .when(!models.is_empty(), |el| {
+                            el.child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text_muted)
+                                    .child(SharedString::from(models)),
+                            )
+                        })
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(theme.text_muted.opacity(0.7))
+                                .child(SharedString::from(sent)),
+                        )
+                        .when(bucket_len > 1, |el| {
+                            el.child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.text_muted.opacity(0.7))
+                                    .child(SharedString::from(format!("{bucket_len} turns"))),
+                            )
+                        });
+                    crate::frost::frosted(12.0, crate::frost::MENU_BLUR, card).into_any_element()
+                });
+                let turn_ix = tick.turn_ix;
+                div()
+                    .id(("studio-rail-tick", ix))
+                    .relative()
+                    .h(px(rail::TICK_SLOT))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        this.rail_hover = if *hovered { Some(ix) } else { None };
+                        cx.notify();
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.scroll_to_turn(turn_ix, cx);
+                    }))
+                    .child(
+                        div()
+                            .h(px(2.0))
+                            .w(px(bar_width))
+                            .rounded(px(1.0))
+                            .bg(bar_color),
+                    )
+                    .when_some(card, |el, card| {
+                        el.child(gpui::deferred(
+                            gpui::anchored()
+                                .anchor(gpui::Anchor::LeftCenter)
+                                .snap_to_window_with_margin(px(8.0))
+                                .child(div().pl(px(26.0)).child(card)),
+                        ))
+                    })
+            }))
+            .into_any_element()
     }
 
     fn render_composer(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -2581,6 +2874,13 @@ impl Render for StudioPage {
                 .conversation
                 .as_ref()
                 .is_some_and(|view| !view.turns.is_empty());
+            let show_rail = has_turns && self.rail_should_show(self.feed_container_width(window));
+            let left_pad = if show_rail {
+                24.0 + STUDIO_RAIL_GUTTER
+            } else {
+                24.0
+            };
+            let rail = self.render_studio_rail(window, &theme, cx);
             div()
                 .relative()
                 .flex_1()
@@ -2593,9 +2893,19 @@ impl Render for StudioPage {
                         .size_full()
                         .overflow_y_scroll()
                         .track_scroll(&self.feed_scroll)
-                        .when(has_turns, |feed| feed.px(px(24.0)).pt(px(22.0)))
-                        .child(self.render_feed(window, &theme, cx)),
+                        .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
+                        .when(has_turns, |feed| {
+                            feed.pt(px(22.0))
+                                .pl(px(left_pad))
+                                .pr(px(24.0))
+                                .pb(px(STUDIO_COMPOSER_CLEARANCE))
+                                .flex()
+                                .flex_col()
+                                .gap(px(28.0))
+                        })
+                        .children(self.render_feed(window, &theme, show_rail, cx)),
                 )
+                .child(rail)
                 .child(self.render_composer(&theme, cx))
                 .into_any_element()
         };
@@ -2666,13 +2976,66 @@ impl ProvidersPage {
                     serde_json::from_value::<ListStudioProvidersResponse>(value)
                         .map_err(|error| zeron_rpc::RpcError::Failed(error.to_string()))
                 }) {
-                    Ok(value) => page.providers = value.providers,
+                    Ok(value) => {
+                        page.providers = value.providers;
+                        page.revalidate_configured(cx);
+                    }
                     Err(error) => page.error = Some(error.to_string().into()),
                 }
                 cx.notify();
             })
             .ok();
         }));
+    }
+
+    fn revalidate_configured(&mut self, cx: &mut Context<Self>) {
+        let ids = self
+            .providers
+            .iter()
+            .filter(|provider| {
+                provider.configured && provider.validation_state != ProviderValidationState::Valid
+            })
+            .map(|provider| provider.provider_id.clone())
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.task =
+            Some(cx.spawn(async move |this, cx| {
+                for provider_id in ids {
+                    let result = engine
+                        .client()
+                        .call(
+                            methods::VALIDATE_STUDIO_PROVIDER,
+                            serde_json::json!({ "providerId": provider_id }),
+                        )
+                        .await;
+                    let stop = this
+                        .update(cx, |page, cx| {
+                            match result.and_then(|value| {
+                                serde_json::from_value::<StudioProviderConnection>(value)
+                                    .map_err(|error| zeron_rpc::RpcError::Failed(error.to_string()))
+                            }) {
+                                Ok(connection) => {
+                                    if let Some(slot) = page.providers.iter_mut().find(|provider| {
+                                        provider.provider_id == connection.provider_id
+                                    }) {
+                                        *slot = connection;
+                                    }
+                                }
+                                Err(error) => page.error = Some(error.to_string().into()),
+                            }
+                            cx.notify();
+                        })
+                        .is_err();
+                    if stop {
+                        break;
+                    }
+                }
+            }));
     }
 
     fn save(&mut self, provider_id: zeron_studio::ProviderId, cx: &mut Context<Self>) {
@@ -2780,6 +3143,10 @@ impl ProvidersPage {
         let configured = provider.configured;
         let safe_mode = provider.safe_mode;
         let venice = provider.provider_id.as_str() == "venice";
+        let validation_message = provider
+            .validation_message
+            .clone()
+            .filter(|_| provider.validation_state != ProviderValidationState::Valid);
         let label = if provider.display_label.eq_ignore_ascii_case("venice") {
             "Venice".to_owned()
         } else {
@@ -2938,6 +3305,9 @@ impl ProvidersPage {
                             .child(SharedString::from(label)),
                     ),
             )
+            .when_some(validation_message, |section, message| {
+                section.child(widgets::warning_strip(theme, message))
+            })
             .child(card)
             .into_any_element()
     }
@@ -3058,6 +3428,117 @@ mod tests {
         assert_eq!(
             std::fs::read(destination).expect("saved artifact"),
             b"image bytes"
+        );
+    }
+
+    fn test_model(display_name: &str) -> zeron_studio::MediaModel {
+        zeron_studio::MediaModel {
+            provider_id: "venice".into(),
+            id: display_name.into(),
+            display_name: display_name.into(),
+            description: None,
+            operation: zeron_studio::MediaOperation::TextToImage,
+            output_kind: zeron_studio::MediaKind::Image,
+            output_mime_types: vec!["image/png".into()],
+            input_constraints: Vec::new(),
+            prompt_maximum_chars: None,
+            negative_prompt_maximum_chars: None,
+            maximum_output_count: 8,
+            controls: Vec::new(),
+            pricing: None,
+            manifest_version: "test".into(),
+            fetched_at: Utc::now(),
+        }
+    }
+
+    fn test_run(display_name: &str, output_count: u32) -> zeron_proto::StudioRunView {
+        zeron_proto::StudioRunView {
+            id: zeron_studio::StudioRunId::new(),
+            position: 0,
+            provider_id: "venice".into(),
+            model: test_model(display_name),
+            controls: BTreeMap::new(),
+            output_count,
+            display_aspect_ratio: (1, 1),
+            state: StudioRunState::Succeeded,
+            progress: None,
+            error: None,
+            artifacts: Vec::new(),
+        }
+    }
+
+    fn test_turn(
+        prompt: &str,
+        created_at: DateTime<Utc>,
+        runs: Vec<zeron_proto::StudioRunView>,
+    ) -> StudioTurnView {
+        StudioTurnView {
+            id: zeron_studio::StudioTurnId::new(),
+            position: 0,
+            prompt: prompt.into(),
+            source_turn_id: None,
+            batch_id: zeron_studio::StudioBatchId::new(),
+            runs,
+            created_at,
+        }
+    }
+
+    #[test]
+    fn studio_rail_ticks_map_turns_to_models_and_variation_counts() {
+        let now = Utc::now();
+        let turns = vec![
+            test_turn(
+                "a fox in snow",
+                now,
+                vec![test_run("Flux", 4), test_run("Kling", 2)],
+            ),
+            test_turn("second prompt", now, vec![test_run("Flux", 1)]),
+        ];
+        let ticks = studio_rail_ticks(&turns);
+        assert_eq!(ticks.len(), 2);
+        assert_eq!(ticks[0].turn_ix, 0);
+        assert_eq!(ticks[0].prompt, "a fox in snow");
+        assert_eq!(
+            ticks[0].models,
+            vec![("Flux".into(), 4), ("Kling".into(), 2)]
+        );
+        assert_eq!(ticks[1].models, vec![("Flux".into(), 1)]);
+        assert!(studio_rail_ticks(&[]).is_empty());
+    }
+
+    #[test]
+    fn studio_model_line_names_variations_per_model() {
+        assert_eq!(format_studio_models(&[]), "");
+        assert_eq!(
+            format_studio_models(&[("Flux".into(), 1)]),
+            "Flux · 1 variation"
+        );
+        assert_eq!(
+            format_studio_models(&[("Flux".into(), 4)]),
+            "Flux · 4 variations"
+        );
+        assert_eq!(
+            format_studio_models(&[("Flux".into(), 4), ("Kling".into(), 2)]),
+            "Flux · 4, Kling · 2"
+        );
+    }
+
+    #[test]
+    fn studio_tick_time_pairs_sidebar_relative_with_absolute_clock() {
+        let tz = chrono::FixedOffset::west_opt(7 * 3600).unwrap();
+        let then = tz
+            .with_ymd_and_hms(2026, 7, 1, 15, 45, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        let now = then + chrono::TimeDelta::minutes(5);
+        assert_eq!(
+            format_studio_tick_time(then, now, &tz),
+            "5m · Jul 1, 3:45 PM"
+        );
+        let just_now = then + chrono::TimeDelta::seconds(10);
+        assert_eq!(
+            format_studio_tick_time(then, just_now, &tz),
+            "now · Jul 1, 3:45 PM"
         );
     }
 }
