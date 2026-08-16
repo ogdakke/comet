@@ -195,6 +195,24 @@ fn normalize_image(
         &["webp".to_owned(), "png".to_owned(), "jpeg".to_owned()],
         Some("webp"),
     ));
+    // Endpoint-level: Venice defaults this to true and returns a blurred placeholder
+    // for anything it classifies as adult content. Expose it so the chosen value is
+    // persisted on the job, and default it off so generations receive the original.
+    controls.push(ModelControl {
+        id: ControlId::from("safe_mode"),
+        label: "Safe mode".to_owned(),
+        description: Some(
+            "Blur images Venice classifies as adult content. Off by default.".to_owned(),
+        ),
+        kind: ControlKind::Boolean,
+        required: false,
+        default: Some(ControlValue::Boolean { value: false }),
+        minimum: None,
+        maximum: None,
+        step: None,
+        choices: Vec::new(),
+        visible_when: Vec::new(),
+    });
 
     finish_manifest(MediaModel {
         provider_id: ProviderId::from(VENICE_PROVIDER_ID),

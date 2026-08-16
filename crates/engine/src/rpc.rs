@@ -63,8 +63,8 @@ use zeron_proto::{
     ListStudioConversationsRequest, ListStudioConversationsResponse, ListStudioModelsRequest,
     ListStudioProvidersResponse, ProviderValidationState, ReadStudioArtifactChunkRequest,
     RenameStudioConversationRequest, RetryStudioRunRequest, SetStudioProviderCredentialRequest,
-    StudioProviderConnection, StudioProviderRequest, ToolCall, WatchStudioConversationRequest,
-    WorkspaceScope,
+    SetStudioProviderPreferencesRequest, StudioProviderConnection, StudioProviderRequest, ToolCall,
+    WatchStudioConversationRequest, WorkspaceScope,
 };
 use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
@@ -1051,12 +1051,13 @@ impl RpcService for EngineRpc {
                             .connection(&provider.id)
                             .map_err(|error| RpcError::Failed(error.to_string()))?
                             .unwrap_or_else(|| StudioProviderConnection {
-                                display_label: provider.id.as_str().to_owned(),
+                                display_label: studio_provider_label(&provider.id),
                                 provider_id: provider.id,
                                 configured: false,
                                 validation_state: ProviderValidationState::NotValidated,
                                 validated_at: None,
                                 validation_message: None,
+                                safe_mode: false,
                             }),
                     );
                 }
@@ -1091,6 +1092,22 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::SET_STUDIO_PROVIDER_PREFERENCES => {
+                let request: SetStudioProviderPreferencesRequest = parse_params(params)?;
+                if self
+                    .studio_providers
+                    .get(&request.provider_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
+                    .is_none()
+                {
+                    return Err(RpcError::Failed("unknown studio provider".into()));
+                }
+                let connection = self
+                    .studio_credentials
+                    .set_preferences(request.provider_id, request.safe_mode)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&connection)
             }
             methods::VALIDATE_STUDIO_PROVIDER => {
                 let request: StudioProviderRequest = parse_params(params)?;
@@ -1257,7 +1274,7 @@ impl RpcService for EngineRpc {
                         .into_iter()
                         .find(|model| model.id == spec.model_id)
                         .ok_or_else(|| RpcError::Failed("studio model is unavailable".into()))?;
-                    let generation = zeron_studio::GenerationRequest {
+                    let mut generation = zeron_studio::GenerationRequest {
                         provider_id: spec.provider_id,
                         model_id: spec.model_id,
                         operation: spec.operation,
@@ -1272,6 +1289,19 @@ impl RpcService for EngineRpc {
                     generation
                         .validate_against(&model)
                         .map_err(|error| RpcError::Failed(error.to_string()))?;
+                    if generation.provider_id.as_str() == zeron_studio::venice::VENICE_PROVIDER_ID
+                        && let Some(connection) = self
+                            .studio_credentials
+                            .connection(&generation.provider_id)
+                            .map_err(|error| RpcError::Failed(error.to_string()))?
+                    {
+                        generation.controls.insert(
+                            zeron_studio::ControlId::from("safe_mode"),
+                            zeron_studio::ControlValue::Boolean {
+                                value: connection.safe_mode,
+                            },
+                        );
+                    }
                     prepared.push(PreparedStudioRun {
                         model,
                         request: generation,
@@ -2033,6 +2063,13 @@ impl RpcService for EngineRpc {
             }
             other => Err(RpcError::UnknownMethod(other.to_string())),
         }
+    }
+}
+
+fn studio_provider_label(provider_id: &zeron_studio::ProviderId) -> String {
+    match provider_id.as_str() {
+        "venice" => "Venice".to_owned(),
+        other => other.to_owned(),
     }
 }
 

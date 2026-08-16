@@ -179,6 +179,8 @@ struct ConnectionMetadata {
     validation_state: ProviderValidationState,
     validated_at: Option<DateTime<Utc>>,
     validation_message: Option<String>,
+    #[serde(default)]
+    safe_mode: bool,
 }
 
 pub struct StudioCredentials {
@@ -240,13 +242,38 @@ impl StudioCredentials {
         secret: Secret,
     ) -> Result<StudioProviderConnection, StudioCredentialError> {
         self.backend.set(&provider_id, &secret).await?;
+        let existing = self
+            .connections
+            .lock()
+            .map_err(|_| StudioCredentialError::LockPoisoned)?
+            .get(&provider_id)
+            .cloned();
         let metadata = ConnectionMetadata {
             display_label,
             validation_state: ProviderValidationState::NotValidated,
             validated_at: None,
             validation_message: None,
+            safe_mode: existing.map(|metadata| metadata.safe_mode).unwrap_or(false),
         };
         self.update(provider_id, Some(metadata))
+    }
+
+    pub fn set_preferences(
+        &self,
+        provider_id: ProviderId,
+        safe_mode: bool,
+    ) -> Result<StudioProviderConnection, StudioCredentialError> {
+        let mut connections = self
+            .connections
+            .lock()
+            .map_err(|_| StudioCredentialError::LockPoisoned)?;
+        let metadata = connections
+            .get_mut(&provider_id)
+            .ok_or(StudioCredentialError::NotConfigured)?;
+        metadata.safe_mode = safe_mode;
+        let result = as_connection(provider_id, metadata);
+        persist(&self.metadata_path, &connections)?;
+        Ok(result)
     }
 
     pub async fn secret(&self, provider_id: &ProviderId) -> Result<Secret, StudioCredentialError> {
@@ -318,6 +345,7 @@ fn as_connection(
         validation_state: metadata.validation_state,
         validated_at: metadata.validated_at,
         validation_message: metadata.validation_message.clone(),
+        safe_mode: metadata.safe_mode,
     }
 }
 

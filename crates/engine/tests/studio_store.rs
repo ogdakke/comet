@@ -10,9 +10,9 @@ use zeron_engine::{
     StudioProviderRegistry, StudioSecretBackend, StudioStore, default_registry,
 };
 use zeron_proto::{
-    ListStudioConversationsResponse, ListStudioModelsResponse, ProviderValidationState,
-    StudioArtifactChunk, StudioConversationSummary, StudioConversationView,
-    StudioProviderConnection, StudioRunState,
+    ListStudioConversationsResponse, ListStudioModelsResponse, ListStudioProvidersResponse,
+    ProviderValidationState, StudioArtifactChunk, StudioConversationSummary,
+    StudioConversationView, StudioProviderConnection, StudioRunState,
 };
 use zeron_rpc::{memory_client, methods};
 use zeron_studio::{
@@ -478,6 +478,79 @@ async fn credentials_persist_only_metadata_and_provider_rpcs_use_the_secret_back
         .await
         .unwrap();
     assert!(engine.studio_credentials.list().unwrap().is_empty());
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn venice_safe_mode_defaults_off_and_persists_on_the_connection() {
+    let root = tempdir().unwrap();
+    let profile = EngineProfile::synced(root.path(), "org", "safe-mode-user");
+    let mut engine = EngineCore::assemble_with_profile(
+        profile.clone(),
+        std::sync::Arc::new(default_registry()),
+        HarnessId::Mock,
+        None,
+    )
+    .unwrap();
+    engine.studio_credentials = std::sync::Arc::new(
+        StudioCredentials::with_backend(root.path(), std::sync::Arc::new(MemorySecrets::default()))
+            .unwrap(),
+    );
+    let client = memory_client(engine.rpc_service());
+
+    let configured: StudioProviderConnection = serde_json::from_value(
+        client
+            .call(
+                methods::SET_STUDIO_PROVIDER_CREDENTIAL,
+                serde_json::json!({
+                    "providerId": "venice",
+                    "displayLabel": "Venice",
+                    "secret": "venice-key"
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!configured.safe_mode);
+
+    let updated: StudioProviderConnection = serde_json::from_value(
+        client
+            .call(
+                methods::SET_STUDIO_PROVIDER_PREFERENCES,
+                serde_json::json!({ "providerId": "venice", "safeMode": true }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(updated.safe_mode);
+
+    let listed: ListStudioProvidersResponse = serde_json::from_value(
+        client
+            .call(methods::LIST_STUDIO_PROVIDERS, serde_json::json!({}))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(listed.providers.len(), 1);
+    assert!(listed.providers[0].safe_mode);
+
+    let replaced: StudioProviderConnection = serde_json::from_value(
+        client
+            .call(
+                methods::SET_STUDIO_PROVIDER_CREDENTIAL,
+                serde_json::json!({
+                    "providerId": "venice",
+                    "displayLabel": "Venice",
+                    "secret": "venice-key"
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(replaced.safe_mode, "replacing the key must keep safe mode");
     engine.shutdown().await;
 }
 

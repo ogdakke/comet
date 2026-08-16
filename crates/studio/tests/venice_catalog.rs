@@ -21,6 +21,16 @@ fn real_catalog_fixtures_render_as_provider_neutral_controls() {
     assert_control(&image, "quality", ControlKind::Enum, 3);
     assert_control(&image, "steps", ControlKind::Integer, 0);
     assert_control(&image, "format", ControlKind::Enum, 3);
+    assert_control(&image, "safe_mode", ControlKind::Boolean, 0);
+    let safe_mode = image
+        .controls
+        .iter()
+        .find(|control| control.id == ControlId::from("safe_mode"))
+        .unwrap();
+    assert_eq!(
+        safe_mode.default,
+        Some(zeron_studio::ControlValue::Boolean { value: false })
+    );
 
     let text_video = normalize_model_catalog(TEXT_TO_VIDEO, fetched_at())
         .unwrap()

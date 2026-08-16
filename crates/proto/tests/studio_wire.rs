@@ -1,6 +1,7 @@
 use zeron_proto::{
     ListStudioProvidersResponse, ProviderValidationState, ReadStudioArtifactChunkRequest,
-    SetStudioProviderCredentialRequest, StudioProviderConnection,
+    SetStudioProviderCredentialRequest, SetStudioProviderPreferencesRequest,
+    StudioProviderConnection,
 };
 use zeron_studio::StudioArtifactId;
 
@@ -14,6 +15,7 @@ fn provider_responses_have_no_secret_field() {
             validation_state: ProviderValidationState::Valid,
             validated_at: None,
             validation_message: None,
+            safe_mode: false,
         }],
     };
     let json = serde_json::to_value(response).unwrap();
@@ -30,6 +32,17 @@ fn credential_request_uses_camel_case_wire_shape() {
     let json = serde_json::to_value(request).unwrap();
     assert_eq!(json["providerId"], "venice");
     assert_eq!(json["displayLabel"], "Personal");
+}
+
+#[test]
+fn provider_preferences_use_camel_case_wire_shape() {
+    let request = SetStudioProviderPreferencesRequest {
+        provider_id: "venice".into(),
+        safe_mode: true,
+    };
+    let json = serde_json::to_value(request).unwrap();
+    assert_eq!(json["providerId"], "venice");
+    assert_eq!(json["safeMode"], true);
 }
 
 #[test]

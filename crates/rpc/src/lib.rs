@@ -137,6 +137,7 @@ pub mod methods {
     pub const SET_STUDIO_PROVIDER_CREDENTIAL: &str = "SetStudioProviderCredential";
     pub const REMOVE_STUDIO_PROVIDER_CREDENTIAL: &str = "RemoveStudioProviderCredential";
     pub const VALIDATE_STUDIO_PROVIDER: &str = "ValidateStudioProvider";
+    pub const SET_STUDIO_PROVIDER_PREFERENCES: &str = "SetStudioProviderPreferences";
     pub const LIST_STUDIO_MODELS: &str = "ListStudioModels";
     pub const LIST_STUDIO_CONVERSATIONS: &str = "ListStudioConversations";
     pub const CREATE_STUDIO_CONVERSATION: &str = "CreateStudioConversation";

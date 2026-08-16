@@ -29,6 +29,10 @@ pub struct StudioProviderConnection {
     pub validated_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation_message: Option<String>,
+    /// Venice Safe Venice: when true, adult-classified images are returned blurred.
+    /// Defaults to off so generations receive the original output.
+    #[serde(default)]
+    pub safe_mode: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +53,13 @@ pub struct SetStudioProviderCredentialRequest {
 #[serde(rename_all = "camelCase")]
 pub struct StudioProviderRequest {
     pub provider_id: ProviderId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetStudioProviderPreferencesRequest {
+    pub provider_id: ProviderId,
+    pub safe_mode: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

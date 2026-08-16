@@ -134,6 +134,7 @@ impl MediaProvider for VeniceMediaProvider {
             .unwrap_or("")
             .trim()
             .to_ascii_lowercase();
+        let moderation = ModerationFlags::from_headers(response.headers());
         let response = require_success(response).await?;
         let bytes = read_limited(response, MAX_IMAGE_RESPONSE_BYTES).await?;
         let mime_type = requested_mime(request)?;
@@ -152,7 +153,7 @@ impl MediaProvider for VeniceMediaProvider {
                 width: None,
                 height: None,
                 duration_seconds: None,
-                metadata: serde_json::Value::Null,
+                metadata: moderation.metadata(None),
             }]
         } else {
             if content_type != "application/json" {
@@ -192,7 +193,7 @@ impl MediaProvider for VeniceMediaProvider {
                         width: None,
                         height: None,
                         duration_seconds: None,
-                        metadata: serde_json::json!({ "requestId": response.id }),
+                        metadata: moderation.metadata(Some(response.id.as_str())),
                     })
                 })
                 .collect::<ProviderResult<Vec<_>>>()?
@@ -235,6 +236,9 @@ fn image_payload(request: &GenerationRequest, binary: bool) -> ProviderResult<se
             serde_json::Value::String(request.prompt.clone()),
         ),
         ("return_binary".into(), serde_json::Value::Bool(binary)),
+        // Venice defaults `safe_mode` to true and returns a blurred placeholder
+        // for adult-classified images. Send false unless the job asked otherwise.
+        ("safe_mode".into(), serde_json::Value::Bool(false)),
     ]);
     if !binary {
         payload.insert("variants".into(), request.output_count.into());
@@ -305,6 +309,48 @@ fn requested_mime(request: &GenerationRequest) -> ProviderResult<String> {
 struct ImageResponse {
     id: String,
     images: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ModerationFlags {
+    blurred: Option<bool>,
+    content_violation: Option<bool>,
+}
+
+impl ModerationFlags {
+    fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
+        Self {
+            blurred: header_bool(headers, "x-venice-is-blurred"),
+            content_violation: header_bool(headers, "x-venice-is-content-violation"),
+        }
+    }
+
+    fn metadata(self, request_id: Option<&str>) -> serde_json::Value {
+        let mut metadata = serde_json::Map::new();
+        if let Some(request_id) = request_id {
+            metadata.insert("requestId".into(), request_id.into());
+        }
+        if let Some(blurred) = self.blurred {
+            metadata.insert("blurred".into(), blurred.into());
+        }
+        if let Some(content_violation) = self.content_violation {
+            metadata.insert("contentViolation".into(), content_violation.into());
+        }
+        if metadata.is_empty() {
+            serde_json::Value::Null
+        } else {
+            metadata.into()
+        }
+    }
+}
+
+fn header_bool(headers: &reqwest::header::HeaderMap, name: &str) -> Option<bool> {
+    let value = headers.get(name)?.to_str().ok()?.trim();
+    match value {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 async fn require_success(response: Response) -> ProviderResult<Response> {
@@ -419,7 +465,40 @@ mod tests {
         assert_eq!(value["format"], "png");
         assert_eq!(value["disable_prompt_optimization_thinking"], false);
         assert_eq!(value["return_binary"], true);
+        assert_eq!(value["safe_mode"], false);
         assert!(value.get("variants").is_none());
+    }
+
+    #[test]
+    fn omitted_safe_mode_disables_venice_adult_content_blur() {
+        let value = image_payload(&request(), true).unwrap();
+        assert_eq!(value["safe_mode"], false);
+    }
+
+    #[test]
+    fn explicit_safe_mode_is_forwarded() {
+        let mut request = request();
+        request
+            .controls
+            .insert("safe_mode".into(), ControlValue::Boolean { value: true });
+        let value = image_payload(&request, true).unwrap();
+        assert_eq!(value["safe_mode"], true);
+    }
+
+    #[test]
+    fn moderation_headers_are_recorded_on_artifacts() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-venice-is-blurred", "true".parse().unwrap());
+        headers.insert("x-venice-is-content-violation", "false".parse().unwrap());
+        let metadata = ModerationFlags::from_headers(&headers).metadata(Some("req-1"));
+        assert_eq!(
+            metadata,
+            serde_json::json!({
+                "requestId": "req-1",
+                "blurred": true,
+                "contentViolation": false,
+            })
+        );
     }
 
     #[test]
