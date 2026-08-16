@@ -26,6 +26,7 @@ serde_json.workspace = true
 pulldown-cmark.workspace = true
 alacritty_terminal.workspace = true
 base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 unicode-segmentation.workspace = true
 uuid.workspace = true
 chrono.workspace = true

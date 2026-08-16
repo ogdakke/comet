@@ -16,8 +16,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeron_proto::{
     ListStudioModelsResponse, StudioArtifactChunk, StudioArtifactView, StudioConversationSummary,
-    StudioConversationView, StudioModelRunSpec, StudioRunState, StudioRunView, StudioTurnView,
-    UNTITLED_STUDIO_TITLE,
+    StudioConversationView, StudioGalleryItem, StudioModelRunSpec, StudioRunState, StudioRunView,
+    StudioTurnView, UNTITLED_STUDIO_TITLE,
 };
 use zeron_studio::{
     GenerationRequest, MediaModel, MediaProvider, ProviderArtifact, ProviderId, Quote,
@@ -449,6 +449,23 @@ impl StudioStore {
              ORDER BY c.updated_at DESC, c.id DESC",
         )?;
         let rows = statement.query_map([include_archived], conversation_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_gallery(&self) -> Result<Vec<StudioGalleryItem>, StudioStoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT a.id, a.output_position, a.media_kind, a.mime_type, a.size_bytes,
+                    a.width, a.height, a.created_at,
+                    t.conversation_id, t.id, t.prompt, r.model_manifest_json
+             FROM studio_artifacts a
+             JOIN studio_runs r ON r.id = a.run_id
+             JOIN studio_batches b ON b.id = r.batch_id
+             JOIN studio_turns t ON t.id = b.turn_id
+             WHERE a.deleted_at IS NULL AND a.media_kind = 'image'
+             ORDER BY a.created_at DESC, a.id DESC",
+        )?;
+        let rows = statement.query_map([], gallery_item_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -1382,6 +1399,39 @@ fn parse_run_state(value: &str) -> Result<StudioRunState, StudioStoreError> {
             "unknown run state {value}"
         ))),
     }
+}
+
+fn gallery_item_from_row(row: &rusqlite::Row<'_>) -> Result<StudioGalleryItem, rusqlite::Error> {
+    use rusqlite::types::Type;
+    let parse_uuid = |index, value: String| {
+        Uuid::parse_str(&value).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(error))
+        })
+    };
+    let model_json: String = row.get(11)?;
+    let model: MediaModel = serde_json::from_str(&model_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(11, Type::Text, Box::new(error))
+    })?;
+    let created_at: i64 = row.get(7)?;
+    Ok(StudioGalleryItem {
+        id: StudioArtifactId(parse_uuid(0, row.get(0)?)?),
+        output_position: row.get(1)?,
+        media_kind: match row.get::<_, String>(2)?.as_str() {
+            "image" => zeron_studio::MediaKind::Image,
+            "video" => zeron_studio::MediaKind::Video,
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        },
+        mime_type: row.get(3)?,
+        size_bytes: row.get(4)?,
+        width: row.get(5)?,
+        height: row.get(6)?,
+        created_at: chrono::DateTime::from_timestamp_millis(created_at)
+            .ok_or(rusqlite::Error::InvalidQuery)?,
+        conversation_id: StudioConversationId(parse_uuid(8, row.get(8)?)?),
+        turn_id: StudioTurnId(parse_uuid(9, row.get(9)?)?),
+        prompt: row.get(10)?,
+        model_display_name: model.display_name,
+    })
 }
 
 fn artifact_from_row(row: &rusqlite::Row<'_>) -> Result<StudioArtifactView, rusqlite::Error> {

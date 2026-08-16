@@ -1,10 +1,10 @@
 use zeron_proto::{
-    ExtendStudioTurnRequest, ListStudioProvidersResponse, ProviderValidationState,
-    QuoteStudioBatchResponse, QuoteStudioRunView, ReadStudioArtifactChunkRequest,
-    SetStudioProviderCredentialRequest, SetStudioProviderPreferencesRequest,
-    StudioProviderConnection,
+    ExtendStudioTurnRequest, ListStudioArtifactsResponse, ListStudioProvidersResponse,
+    ProviderValidationState, QuoteStudioBatchResponse, QuoteStudioRunView,
+    ReadStudioArtifactChunkRequest, SetStudioProviderCredentialRequest,
+    SetStudioProviderPreferencesRequest, StudioGalleryItem, StudioProviderConnection,
 };
-use zeron_studio::{Quote, StudioArtifactId, StudioTurnId};
+use zeron_studio::{MediaKind, Quote, StudioArtifactId, StudioConversationId, StudioTurnId};
 
 #[test]
 fn provider_responses_have_no_secret_field() {
@@ -89,4 +89,31 @@ fn quote_batch_uses_camel_case_wire_shape() {
     assert_eq!(json["total"]["currency"], "USD");
     assert!(json["runs"][0]["quote"].get("expires_at").is_none());
     assert!(json["runs"][0]["quote"].get("expiresAt").is_some());
+}
+
+#[test]
+fn gallery_items_use_camel_case_wire_shape() {
+    let response = ListStudioArtifactsResponse {
+        artifacts: vec![StudioGalleryItem {
+            id: StudioArtifactId::new(),
+            conversation_id: StudioConversationId::new(),
+            turn_id: StudioTurnId::new(),
+            output_position: 0,
+            media_kind: MediaKind::Image,
+            mime_type: "image/png".into(),
+            size_bytes: 12,
+            width: Some(64),
+            height: Some(64),
+            prompt: "a comet".into(),
+            model_display_name: "Image model".into(),
+            created_at: chrono::Utc::now(),
+        }],
+    };
+    let json = serde_json::to_value(response).unwrap();
+    assert!(json["artifacts"][0].get("conversationId").is_some());
+    assert!(json["artifacts"][0].get("turnId").is_some());
+    assert!(json["artifacts"][0].get("modelDisplayName").is_some());
+    assert!(json["artifacts"][0].get("sizeBytes").is_some());
+    assert!(json["artifacts"][0].get("createdAt").is_some());
+    assert!(json["artifacts"][0].get("conversation_id").is_none());
 }

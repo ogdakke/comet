@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
-use gpui::{AnyElement, Context, ObjectFit, Point, SharedString, Window, div, img, prelude::*, px};
+use gpui::{AnyElement, Context, Point, SharedString, Window, div, prelude::*, px};
 use zeron_proto::{StudioRunState, StudioRunView, StudioTurnView};
 use zeron_studio::{MediaKind, StudioArtifactId};
 
@@ -16,7 +16,7 @@ use crate::state::format_time_ago;
 use crate::theme::Theme;
 use crate::transcript::{self, format_timestamp};
 
-use super::StudioEvent;
+use super::artifact::contain_image;
 use super::page::StudioPage;
 
 /// Scroll runway below the final Studio turn. The composer floats 18px above
@@ -267,6 +267,7 @@ impl StudioPage {
         artifact_id: Option<StudioArtifactId>,
         progress: Option<f32>,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let height = width * aspect.1 as f32 / aspect.0.max(1) as f32;
@@ -284,38 +285,35 @@ impl StudioPage {
             } else {
                 0.045
             }));
-        if let Some(id) = artifact_id
-            && let Some(image) = self.images.get(&id)
-        {
-            let conversation_id = self.selected_conversation;
-            return base
-                .cursor_pointer()
-                .on_click(cx.listener(move |page, _, window, cx| {
-                    if let Some(index) =
-                        page.artifact_sequence().iter().position(|item| *item == id)
-                    {
-                        page.select_artifact_index(index, cx);
-                    } else {
-                        page.selected_artifact = Some(id);
-                        page.reset_lightbox_viewer();
-                        if let Some(conversation_id) = conversation_id {
-                            cx.emit(StudioEvent::OpenArtifact {
-                                conversation_id,
-                                artifact_id: id,
-                            });
-                        }
-                        cx.notify();
-                    }
-                    window.focus(&page.focus, cx);
-                }))
-                .child(crate::motion::fade_quick(
-                    SharedString::from(format!("studio-image-reveal-{}", id.0)),
-                    img(image.clone())
-                        .size_full()
-                        .rounded(px(10.0))
-                        .object_fit(ObjectFit::Contain),
-                ))
-                .into_any_element();
+        if let Some(id) = artifact_id {
+            let (image, full) = self.display_layers(id, window, cx);
+            if let Some(image) = image {
+                return base
+                    .relative()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |page, _, window, cx| {
+                        let frames = page
+                            .conversation
+                            .as_ref()
+                            .map(super::artifact::frames_from_conversation)
+                            .unwrap_or_default();
+                        page.open_artifact_viewer(id, frames, cx);
+                        window.focus(&page.focus, cx);
+                    }))
+                    .child(crate::motion::fade_quick(
+                        SharedString::from(format!("studio-image-reveal-{}", id.0)),
+                        div()
+                            .size_full()
+                            .relative()
+                            .child(contain_image(image).size_full().rounded(px(10.0)))
+                            .when_some(full, |layer, full| {
+                                layer.child(
+                                    contain_image(full).absolute().inset_0().rounded(px(10.0)),
+                                )
+                            }),
+                    ))
+                    .into_any_element();
+            }
         }
         let pending = matches!(
             state,
@@ -434,7 +432,7 @@ impl StudioPage {
 
     pub(super) fn render_feed(
         &mut self,
-        window: &Window,
+        window: &mut Window,
         theme: &Theme,
         show_rail: bool,
         cx: &mut Context<Self>,
@@ -490,7 +488,7 @@ impl StudioPage {
             .iter()
             .enumerate()
             .map(|(turn_ix, turn)| {
-                self.render_turn(turn_ix, turn, tile_width, gap, available, theme, cx)
+                self.render_turn(turn_ix, turn, tile_width, gap, available, theme, window, cx)
             })
             .collect()
     }
@@ -503,6 +501,7 @@ impl StudioPage {
         gap: f32,
         content_width: f32,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let turn_for_prompt = turn.clone();
@@ -529,6 +528,7 @@ impl StudioPage {
                     artifact,
                     run.progress,
                     theme,
+                    window,
                     cx,
                 ));
             }

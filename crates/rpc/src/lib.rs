@@ -140,6 +140,8 @@ pub mod methods {
     pub const SET_STUDIO_PROVIDER_PREFERENCES: &str = "SetStudioProviderPreferences";
     pub const LIST_STUDIO_MODELS: &str = "ListStudioModels";
     pub const LIST_STUDIO_CONVERSATIONS: &str = "ListStudioConversations";
+    pub const LIST_STUDIO_ARTIFACTS: &str = "ListStudioArtifacts";
+    pub const WATCH_STUDIO_GALLERY: &str = "WatchStudioGallery";
     pub const CREATE_STUDIO_CONVERSATION: &str = "CreateStudioConversation";
     pub const RENAME_STUDIO_CONVERSATION: &str = "RenameStudioConversation";
     pub const ARCHIVE_STUDIO_CONVERSATION: &str = "ArchiveStudioConversation";

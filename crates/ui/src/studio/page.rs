@@ -1,20 +1,19 @@
 //! Studio conversation page: load, submit, and the feed/lightbox outlet.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    Context, Entity, EventEmitter, FocusHandle, Focusable, Image, Pixels, Point, Render,
-    SharedString, Subscription, Task, Window, div, prelude::*, px,
+    Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Point, Render, SharedString,
+    Subscription, Task, Window, div, prelude::*, px,
 };
 use zeron_proto::{
     ListStudioConversationsResponse, ListStudioModelsResponse, ListStudioProvidersResponse,
-    QuoteStudioBatchResponse, StudioConversationSummary, StudioConversationView,
+    QuoteStudioBatchResponse, StudioConversationSummary, StudioConversationView, StudioGalleryItem,
     StudioProviderConnection, StudioTurnView, UNTITLED_STUDIO_TITLE,
 };
 use zeron_rpc::methods;
-use zeron_studio::{StudioArtifactId, StudioConversationId};
+use zeron_studio::{MediaKind, StudioArtifactId, StudioConversationId};
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover;
@@ -22,13 +21,14 @@ use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
 use super::StudioEvent;
-use super::artifact::read_artifact_image;
 use super::defaults::StudioDefaults;
 use super::draft::{
     DraftRunConfig, apply_remembered_drafts, apply_remembered_selection, apply_turn_models,
     draft_aspect, select_first_model,
 };
 use super::feed::{STUDIO_COMPOSER_CLEARANCE, STUDIO_RAIL_GUTTER, conversation_image_count};
+use super::gallery::new_gallery_list;
+use super::images::StudioImages;
 
 pub struct StudioPage {
     pub(super) state: Entity<AppState>,
@@ -63,9 +63,20 @@ pub struct StudioPage {
     /// Turns whose inspector prompt is fully expanded past the 10-line clamp.
     pub(super) expanded_inspector_prompts: HashSet<zeron_studio::StudioTurnId>,
     pub(super) inspector_scroll: gpui::ScrollHandle,
-    pub(super) images: HashMap<StudioArtifactId, Arc<Image>>,
+    pub(super) images: StudioImages,
     pub(super) loading_images: HashSet<StudioArtifactId>,
+    pub(super) image_failed: HashSet<StudioArtifactId>,
+    pub(super) image_protect: HashSet<StudioArtifactId>,
+    pub(super) gallery: Vec<StudioGalleryItem>,
+    pub(super) gallery_list: gpui::ListState,
+    pub(super) gallery_width: f32,
+    pub(super) gallery_list_columns: usize,
+    pub(super) gallery_row_px: f32,
+    pub(super) gallery_visible_rows: std::ops::Range<usize>,
+    pub(super) gallery_selected: BTreeSet<StudioArtifactId>,
+    pub(super) gallery_anchor: Option<StudioArtifactId>,
     pub(super) selected_artifact: Option<StudioArtifactId>,
+    pub(super) lightbox_frames: Vec<super::artifact::ArtifactFrame>,
     pub(super) lightbox_zoom: f32,
     pub(super) lightbox_pan: Point<Pixels>,
     pub(super) lightbox_drag: Option<Point<Pixels>>,
@@ -84,6 +95,7 @@ pub struct StudioPage {
     pub(super) error: Option<SharedString>,
     pub(super) load_task: Option<Task<()>>,
     pub(super) watch_task: Option<Task<()>>,
+    pub(super) gallery_watch_task: Option<Task<()>>,
     pub(super) action_task: Option<Task<()>>,
     pub(super) image_tasks: HashMap<StudioArtifactId, Task<()>>,
     pub(super) _observe: Subscription,
@@ -148,9 +160,20 @@ impl StudioPage {
             expanded_prompts: HashSet::new(),
             expanded_inspector_prompts: HashSet::new(),
             inspector_scroll: gpui::ScrollHandle::new(),
-            images: HashMap::new(),
+            images: StudioImages::default(),
             loading_images: HashSet::new(),
+            image_failed: HashSet::new(),
+            image_protect: HashSet::new(),
+            gallery: Vec::new(),
+            gallery_list: new_gallery_list(cx),
+            gallery_width: 0.0,
+            gallery_list_columns: 0,
+            gallery_row_px: 0.0,
+            gallery_visible_rows: 0..0,
+            gallery_selected: BTreeSet::new(),
+            gallery_anchor: None,
             selected_artifact: None,
+            lightbox_frames: Vec::new(),
             lightbox_zoom: 1.0,
             lightbox_pan: Point::default(),
             lightbox_drag: None,
@@ -169,6 +192,7 @@ impl StudioPage {
             error: None,
             load_task: None,
             watch_task: None,
+            gallery_watch_task: None,
             action_task: None,
             image_tasks: HashMap::new(),
             _observe: observe,
@@ -231,11 +255,7 @@ impl StudioPage {
                         page.apply_models(models.models);
                         page.apply_remembered_or_default_models();
                         page.persist_composer_defaults(cx);
-                        if page.selected_conversation.is_none()
-                            && let Some(conversation) = page.conversations.first()
-                        {
-                            page.open_conversation(conversation.id, cx);
-                        }
+                        page.watch_gallery(cx);
                         cx.emit(StudioEvent::SidebarChanged);
                     }
                     (Err(error), _, _) | (_, Err(error), _) => page.error = Some(error.to_string().into()),
@@ -265,14 +285,20 @@ impl StudioPage {
     pub fn selected_title(&self) -> Option<String> {
         self.selected_conversation
             .and_then(|id| self.conversation_title(id))
+            .or_else(|| Some("Gallery".into()))
     }
 
-    /// Images currently on the open conversation. `None` until the view
-    /// arrives, so the titlebar does not flash "0 images" on a switch.
+    /// Images currently on the open conversation, or the gallery when no
+    /// conversation is selected. `None` until the conversation view arrives,
+    /// so the titlebar does not flash "0 images" on a switch.
     pub fn selected_image_count(&self) -> Option<u32> {
-        self.conversation
-            .as_ref()
-            .map(|view| conversation_image_count(&view.turns))
+        if self.selected_conversation.is_some() {
+            self.conversation
+                .as_ref()
+                .map(|view| conversation_image_count(&view.turns))
+        } else {
+            Some(self.gallery_image_count())
+        }
     }
 
     fn apply_conversation_summary(
@@ -393,7 +419,14 @@ impl StudioPage {
     pub(super) fn forget_artifact(&mut self, artifact_id: StudioArtifactId) {
         self.images.remove(&artifact_id);
         self.loading_images.remove(&artifact_id);
+        self.image_failed.remove(&artifact_id);
         self.image_tasks.remove(&artifact_id);
+        self.gallery.retain(|item| item.id != artifact_id);
+        self.gallery_selected.remove(&artifact_id);
+        if self.gallery_anchor == Some(artifact_id) {
+            self.gallery_anchor = None;
+        }
+        self.lightbox_frames.retain(|frame| frame.id != artifact_id);
         if self.selected_artifact == Some(artifact_id) {
             self.selected_artifact = None;
             self.reset_lightbox_viewer();
@@ -405,38 +438,32 @@ impl StudioPage {
                 }
             }
         }
+        self.sync_gallery_list(self.gallery_width.max(1.0));
+    }
+
+    pub(super) fn conversation_has_image(&self, id: StudioArtifactId) -> bool {
+        self.conversation
+            .iter()
+            .flat_map(|view| &view.turns)
+            .flat_map(|turn| &turn.runs)
+            .flat_map(|run| &run.artifacts)
+            .any(|artifact| artifact.id == id && artifact.media_kind == MediaKind::Image)
     }
 
     pub(super) fn start_missing_image_loads(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.engine(cx) else {
-            return;
-        };
         let ids = self
             .conversation
             .iter()
             .flat_map(|view| &view.turns)
             .flat_map(|turn| &turn.runs)
             .flat_map(|run| &run.artifacts)
+            .filter(|artifact| artifact.media_kind == MediaKind::Image)
             .map(|artifact| artifact.id)
-            .filter(|id| !self.images.contains_key(id) && !self.loading_images.contains(id))
             .collect::<Vec<_>>();
-        for id in ids {
-            self.loading_images.insert(id);
-            let engine = engine.clone();
-            let task = cx.spawn(async move |this, cx| {
-                let image = read_artifact_image(&engine, id).await;
-                this.update(cx, |page, cx| {
-                    page.loading_images.remove(&id);
-                    if let Ok(image) = image {
-                        page.images.insert(id, image);
-                    }
-                    page.image_tasks.remove(&id);
-                    cx.notify();
-                })
-                .ok();
-            });
-            self.image_tasks.insert(id, task);
-        }
+        self.image_protect = ids.iter().copied().collect();
+        self.image_protect
+            .extend(self.loading_images.iter().copied());
+        self.request_images(ids, true, cx);
     }
 
     pub fn new_conversation(&mut self, cx: &mut Context<Self>) {
@@ -951,7 +978,8 @@ impl Render for StudioPage {
             });
         }
         let theme = Theme::of(cx).clone();
-        let body = if let Some(page) = self.render_artifact_page(&theme, cx) {
+        self.images.flush(Some(window), cx);
+        let body = if let Some(page) = self.render_artifact_page(&theme, window, cx) {
             page
         } else if self.providers.iter().all(|provider| !provider.configured) {
             div()
@@ -1005,6 +1033,8 @@ impl Render for StudioPage {
                         .child("Add provider"),
                 )
                 .into_any_element()
+        } else if self.selected_conversation.is_none() {
+            self.render_gallery(window, &theme, cx)
         } else {
             let has_turns = self
                 .conversation
@@ -1050,6 +1080,11 @@ impl Render for StudioPage {
                 .overflow_hidden()
                 .child(feed)
                 .child(rail)
+                .child(
+                    crate::scrollbar::overlay("studio-feed", &self.feed_scroll)
+                        .inset_top(Theme::TITLEBAR_HEIGHT)
+                        .inset_bottom(STUDIO_COMPOSER_CLEARANCE),
+                )
                 .child(self.render_composer(&theme, cx))
                 .into_any_element()
         };

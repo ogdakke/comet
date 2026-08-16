@@ -10,9 +10,9 @@ use zeron_engine::{
     StudioProviderRegistry, StudioSecretBackend, StudioStore, default_registry,
 };
 use zeron_proto::{
-    ListStudioConversationsResponse, ListStudioModelsResponse, ListStudioProvidersResponse,
-    ProviderValidationState, StudioArtifactChunk, StudioConversationSummary,
-    StudioConversationView, StudioProviderConnection, StudioRunState,
+    ListStudioArtifactsResponse, ListStudioConversationsResponse, ListStudioModelsResponse,
+    ListStudioProvidersResponse, ProviderValidationState, StudioArtifactChunk,
+    StudioConversationSummary, StudioConversationView, StudioProviderConnection, StudioRunState,
 };
 use zeron_rpc::{memory_client, methods};
 use zeron_studio::{
@@ -1423,5 +1423,136 @@ async fn extend_turn_appends_runs_without_a_new_prompt() {
     .unwrap();
     assert_eq!(again.turns.len(), 1);
     assert_eq!(again.turns[0].runs.len(), 3);
+    engine.shutdown().await;
+}
+
+fn png_artifact() -> ProviderArtifact {
+    ProviderArtifact {
+        media_kind: MediaKind::Image,
+        mime_type: "image/png".into(),
+        bytes: b"\x89PNG\r\n\x1a\ngenerated image".to_vec(),
+        width: Some(64),
+        height: Some(64),
+        duration_seconds: None,
+        metadata: serde_json::json!({}),
+    }
+}
+
+async fn wait_for_gallery(
+    updates: &mut tokio::sync::mpsc::Receiver<serde_json::Value>,
+    count: usize,
+) -> ListStudioArtifactsResponse {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let list: ListStudioArtifactsResponse =
+                serde_json::from_value(updates.recv().await.unwrap()).unwrap();
+            if list.artifacts.len() >= count {
+                break list;
+            }
+        }
+    })
+    .await
+    .expect("gallery did not reach the expected artifact count")
+}
+
+#[tokio::test]
+async fn gallery_lists_images_across_conversations_newest_first() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![image_model("fake")],
+        FakeSubmissionMode::Complete(vec![png_artifact()]),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+    let first = create_conversation(&client).await;
+    let second = serde_json::from_value::<StudioConversationSummary>(
+        client
+            .call(
+                methods::CREATE_STUDIO_CONVERSATION,
+                serde_json::json!({ "title": "Later study" }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let run = serde_json::json!({
+        "providerId": "fake",
+        "modelId": "image-model",
+        "operation": "text_to_image",
+        "outputCount": 1,
+        "controls": {},
+        "inputs": [],
+        "manifestVersion": "fixture-v1",
+        "displayAspectRatio": [1, 1]
+    });
+    let mut gallery = client
+        .subscribe(methods::WATCH_STUDIO_GALLERY, serde_json::json!({}))
+        .await
+        .unwrap();
+    let empty = wait_for_gallery(&mut gallery, 0).await;
+    assert!(empty.artifacts.is_empty());
+
+    client
+        .call(
+            methods::CREATE_STUDIO_TURN,
+            serde_json::json!({
+                "conversationId": first.id,
+                "prompt": "older comet",
+                "runs": [run.clone()]
+            }),
+        )
+        .await
+        .unwrap();
+    let one = wait_for_gallery(&mut gallery, 1).await;
+    assert_eq!(one.artifacts.len(), 1);
+    assert_eq!(one.artifacts[0].conversation_id, first.id);
+    assert_eq!(one.artifacts[0].prompt, "older comet");
+    assert_eq!(one.artifacts[0].model_display_name, "Image model");
+
+    client
+        .call(
+            methods::CREATE_STUDIO_TURN,
+            serde_json::json!({
+                "conversationId": second.id,
+                "prompt": "newer comet",
+                "runs": [run]
+            }),
+        )
+        .await
+        .unwrap();
+    let two = wait_for_gallery(&mut gallery, 2).await;
+    assert_eq!(two.artifacts.len(), 2);
+    assert_eq!(two.artifacts[0].prompt, "newer comet");
+    assert_eq!(two.artifacts[1].prompt, "older comet");
+    assert_eq!(two.artifacts[0].conversation_id, second.id);
+
+    let listed: ListStudioArtifactsResponse = serde_json::from_value(
+        client
+            .call(methods::LIST_STUDIO_ARTIFACTS, serde_json::json!({}))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(listed.artifacts.len(), 2);
+
+    client
+        .call(
+            methods::DELETE_STUDIO_ARTIFACT,
+            serde_json::json!({ "artifactId": two.artifacts[0].id }),
+        )
+        .await
+        .unwrap();
+    let after = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let list: ListStudioArtifactsResponse =
+                serde_json::from_value(gallery.recv().await.unwrap()).unwrap();
+            if list.artifacts.len() == 1 {
+                break list;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(after.artifacts[0].prompt, "older comet");
     engine.shutdown().await;
 }

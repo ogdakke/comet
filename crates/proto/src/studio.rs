@@ -267,6 +267,29 @@ pub struct WatchStudioConversationRequest {
     pub conversation_id: StudioConversationId,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudioGalleryItem {
+    pub id: StudioArtifactId,
+    pub conversation_id: StudioConversationId,
+    pub turn_id: StudioTurnId,
+    pub output_position: u32,
+    pub media_kind: MediaKind,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub prompt: String,
+    pub model_display_name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListStudioArtifactsResponse {
+    pub artifacts: Vec<StudioGalleryItem>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteStudioArtifactRequest {

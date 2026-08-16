@@ -1,6 +1,7 @@
 //! First-release Studio viewport and provider settings.
 //!
 //! - [`page`] — conversation load/submit and the feed/lightbox outlet;
+//! - [`gallery`] — profile-wide image grid, multi-select, and bulk actions;
 //! - [`feed`] — tiles, turns, and the tick rail;
 //! - [`composer`] — model picker, per-model controls, and generate;
 //! - [`artifact`] — full-bleed image strip, filmstrip, and inspector;
@@ -14,6 +15,8 @@ mod cost;
 mod defaults;
 mod draft;
 mod feed;
+mod gallery;
+mod images;
 mod page;
 mod providers;
 

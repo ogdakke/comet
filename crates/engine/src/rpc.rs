@@ -60,13 +60,14 @@ use zeron_doc::{MessagePart, SessionCommandPayload};
 use zeron_proto::{
     ArchiveStudioConversationRequest, ChatConfig, CreateStudioConversationRequest,
     CreateStudioTurnRequest, DeleteStudioArtifactRequest, DeleteStudioConversationRequest,
-    EngineInfo, ExtendStudioTurnRequest, HarnessId, ListStudioConversationsRequest,
-    ListStudioConversationsResponse, ListStudioModelsRequest, ListStudioModelsResponse,
-    ListStudioProvidersResponse, ProviderValidationState, QuoteStudioBatchRequest,
-    QuoteStudioBatchResponse, QuoteStudioRunView, ReadStudioArtifactChunkRequest,
-    RenameStudioConversationRequest, RetryStudioRunRequest, SetStudioProviderCredentialRequest,
-    SetStudioProviderPreferencesRequest, StudioModelRunSpec, StudioProviderConnection,
-    StudioProviderRequest, ToolCall, WatchStudioConversationRequest, WorkspaceScope,
+    EngineInfo, ExtendStudioTurnRequest, HarnessId, ListStudioArtifactsResponse,
+    ListStudioConversationsRequest, ListStudioConversationsResponse, ListStudioModelsRequest,
+    ListStudioModelsResponse, ListStudioProvidersResponse, ProviderValidationState,
+    QuoteStudioBatchRequest, QuoteStudioBatchResponse, QuoteStudioRunView,
+    ReadStudioArtifactChunkRequest, RenameStudioConversationRequest, RetryStudioRunRequest,
+    SetStudioProviderCredentialRequest, SetStudioProviderPreferencesRequest, StudioModelRunSpec,
+    StudioProviderConnection, StudioProviderRequest, ToolCall, WatchStudioConversationRequest,
+    WorkspaceScope,
 };
 use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
@@ -1289,6 +1290,30 @@ impl RpcService for EngineRpc {
                     .list_conversations(request.include_archived)
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&ListStudioConversationsResponse { conversations })
+            }
+            methods::LIST_STUDIO_ARTIFACTS => {
+                let artifacts = self
+                    .studio
+                    .list_gallery()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&ListStudioArtifactsResponse { artifacts })
+            }
+            methods::WATCH_STUDIO_GALLERY => {
+                let changes = self.studio.subscribe_changes();
+                let store = self.studio.clone();
+                let stream = futures::stream::unfold(
+                    (changes, store, true),
+                    |(mut changes, store, first)| async move {
+                        if !first && changes.changed().await.is_err() {
+                            return None;
+                        }
+                        let value = store.list_gallery().ok().and_then(|artifacts| {
+                            serde_json::to_value(ListStudioArtifactsResponse { artifacts }).ok()
+                        })?;
+                        Some((value, (changes, store, false)))
+                    },
+                );
+                Ok(RpcReply::Stream(stream.boxed()))
             }
             methods::CREATE_STUDIO_CONVERSATION => {
                 let request: CreateStudioConversationRequest = parse_params(params)?;

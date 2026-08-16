@@ -9,10 +9,11 @@ use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, Element, GlobalElementId, Image, ImageFormat,
     InspectorElementId, IntoElement, LayoutId, ObjectFit, PinchEvent, Pixels, Point, Refineable,
     ScrollWheelEvent, SharedString, Style, StyleRefinement, Styled, TouchPhase, Window, canvas,
-    div, img, prelude::*, px,
+    div, prelude::*, px,
 };
+use zeron_proto::{StudioConversationView, StudioGalleryItem};
 use zeron_rpc::methods;
-use zeron_studio::{StudioArtifactId, StudioConversationId};
+use zeron_studio::{MediaKind, StudioArtifactId, StudioConversationId, StudioTurnId};
 
 use crate::state::EngineHandle;
 use crate::theme::Theme;
@@ -43,6 +44,8 @@ const ARTIFACT_FILMSTRIP_HEIGHT: f32 = 78.0;
 const ARTIFACT_FILMSTRIP_WIDTH_FRACTION: f32 = 0.94;
 const ARTIFACT_FILMSTRIP_FADE: f32 = 28.0;
 const ARTIFACT_ZOOM_MAX: f32 = 24.0;
+/// Full-size frames kept around the current filmstrip index.
+const LIGHTBOX_PREFETCH: usize = 6;
 const INSPECTOR_WIDTH: f32 = 320.0;
 const INSPECTOR_PAD_X: f32 = 18.0;
 const INSPECTOR_COPY_SIZE: f32 = 24.0;
@@ -52,6 +55,79 @@ const INSPECTOR_PROMPT_COLLAPSED_LINES: usize = 10;
 const INSPECTOR_PROMPT_LINE_HEIGHT: f32 = 18.0;
 /// Geist 12px Latin advance — scaled from the 14px chat-bubble estimate.
 const INSPECTOR_PROMPT_ADVANCE: f32 = super::feed::PROMPT_AVG_CHAR_ADVANCE * (12.0 / 14.0);
+
+/// One frame the artifact viewer can show. Callers build the list;
+/// the viewer never asks where it came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ArtifactFrame {
+    pub id: StudioArtifactId,
+    pub conversation_id: StudioConversationId,
+    pub turn_id: StudioTurnId,
+    pub prompt: String,
+    pub model_display_name: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+}
+
+pub(super) fn frames_from_gallery(items: &[StudioGalleryItem]) -> Vec<ArtifactFrame> {
+    items
+        .iter()
+        .map(|item| ArtifactFrame {
+            id: item.id,
+            conversation_id: item.conversation_id,
+            turn_id: item.turn_id,
+            prompt: item.prompt.clone(),
+            model_display_name: item.model_display_name.clone(),
+            mime_type: item.mime_type.clone(),
+            size_bytes: item.size_bytes,
+        })
+        .collect()
+}
+
+pub(super) fn frames_from_conversation(view: &StudioConversationView) -> Vec<ArtifactFrame> {
+    view.turns
+        .iter()
+        .flat_map(|turn| {
+            turn.runs.iter().flat_map(move |run| {
+                run.artifacts
+                    .iter()
+                    .filter(|artifact| artifact.media_kind == MediaKind::Image)
+                    .map(move |artifact| ArtifactFrame {
+                        id: artifact.id,
+                        conversation_id: view.conversation.id,
+                        turn_id: turn.id,
+                        prompt: turn.prompt.clone(),
+                        model_display_name: run.model.display_name.clone(),
+                        mime_type: artifact.mime_type.clone(),
+                        size_bytes: artifact.size_bytes,
+                    })
+            })
+        })
+        .collect()
+}
+
+pub(super) fn lightbox_neighbor_ids(
+    frames: &[ArtifactFrame],
+    selected: StudioArtifactId,
+) -> Vec<StudioArtifactId> {
+    let Some(index) = frames.iter().position(|frame| frame.id == selected) else {
+        return Vec::new();
+    };
+    let mut ids = Vec::with_capacity(LIGHTBOX_PREFETCH * 2 + 1);
+    ids.push(frames[index].id);
+    for step in 1..=LIGHTBOX_PREFETCH {
+        if let Some(frame) = frames.get(index + step) {
+            ids.push(frame.id);
+        }
+        if let Some(frame) = index
+            .checked_sub(step)
+            .and_then(|previous| frames.get(previous))
+        {
+            ids.push(frame.id);
+        }
+    }
+    ids
+}
 
 fn inspector_prompt_inner_width() -> f32 {
     (INSPECTOR_WIDTH - INSPECTOR_PAD_X * 2.0 - INSPECTOR_COPY_SIZE - INSPECTOR_COPY_GAP).max(1.0)
@@ -94,6 +170,26 @@ fn filmstrip_offset(selected: usize, viewport: f32) -> f32 {
     viewport / 2.0 - filmstrip_selected_center(selected)
 }
 
+fn filmstrip_thumb_origin(index: usize, selected: usize) -> f32 {
+    index as f32 * (ARTIFACT_FILMSTRIP_THUMB + ARTIFACT_FILMSTRIP_GAP)
+        + if index > selected {
+            ARTIFACT_FILMSTRIP_SELECTED - ARTIFACT_FILMSTRIP_THUMB
+        } else {
+            0.0
+        }
+}
+
+fn filmstrip_visible_range(selected: usize, count: usize, viewport: f32) -> std::ops::Range<usize> {
+    if count == 0 {
+        return 0..0;
+    }
+    let slot = ARTIFACT_FILMSTRIP_THUMB + ARTIFACT_FILMSTRIP_GAP;
+    let pad = ((viewport / (2.0 * slot)).ceil() as usize).saturating_add(3);
+    let start = selected.saturating_sub(pad);
+    let end = (selected + pad + 1).min(count);
+    start..end
+}
+
 /// Neighbor slides only while a swipe is in flight. The resting image fills
 /// the live stage so a resize cannot leave it stuck at a stale pixel size.
 fn lightbox_uses_paging_slides(
@@ -114,30 +210,39 @@ fn lightbox_stage_size_changed(
     (current_width - width).abs() > 0.5 || (current_height - height).abs() > 0.5
 }
 
-/// Square cover crop. `img` stamps the photo's aspect ratio onto its layout
-/// box, so a portrait grows out of the thumb and `overflow_hidden` only
-/// slices a rectangle — leaving a tiny unrounded crop. This element never
-/// takes an aspect ratio: it lays out as the square we asked for and paints
-/// Cover + corner radii into those bounds.
-fn filmstrip_cover(image: Arc<Image>) -> FilmstripCover {
-    FilmstripCover {
+/// Paint an image into the box we asked for. `img` stamps the photo's aspect
+/// ratio onto its layout box, so a portrait grows out of a square thumb and
+/// a 4K frame blows past the lightbox. This element never takes an aspect
+/// ratio: it lays out as the parent and paints Cover/Contain into those bounds.
+pub(super) fn cover_image(image: Arc<Image>) -> FittedImage {
+    fitted_image(image, ObjectFit::Cover)
+}
+
+pub(super) fn contain_image(image: Arc<Image>) -> FittedImage {
+    fitted_image(image, ObjectFit::Contain)
+}
+
+fn fitted_image(image: Arc<Image>, fit: ObjectFit) -> FittedImage {
+    FittedImage {
         image,
+        fit,
         style: StyleRefinement::default(),
     }
 }
 
-struct FilmstripCover {
+pub(super) struct FittedImage {
     image: Arc<Image>,
+    fit: ObjectFit,
     style: StyleRefinement,
 }
 
-impl Styled for FilmstripCover {
+impl Styled for FittedImage {
     fn style(&mut self) -> &mut StyleRefinement {
         &mut self.style
     }
 }
 
-impl Element for FilmstripCover {
+impl Element for FittedImage {
     type RequestLayoutState = Style;
     type PrepaintState = ();
 
@@ -190,7 +295,7 @@ impl Element for FilmstripCover {
         if data.frame_count() == 0 {
             return;
         }
-        let fitted = ObjectFit::Cover.get_bounds(bounds, data.size(0));
+        let fitted = self.fit.get_bounds(bounds, data.size(0));
         let visible = bounds.intersect(&fitted);
         if visible.size.width <= px(0.0) || visible.size.height <= px(0.0) {
             return;
@@ -205,7 +310,7 @@ impl Element for FilmstripCover {
     }
 }
 
-impl IntoElement for FilmstripCover {
+impl IntoElement for FittedImage {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -335,13 +440,25 @@ pub(super) fn write_artifact_file(destination: PathBuf, bytes: Vec<u8>) -> Resul
     std::fs::write(destination, bytes).map_err(|error| error.to_string())
 }
 
-pub(super) async fn read_artifact_image(
-    engine: &EngineHandle,
-    artifact_id: StudioArtifactId,
-) -> Result<Arc<Image>, String> {
-    let (_, mime, bytes) = read_artifact_bytes(engine, artifact_id).await?;
-    let format = ImageFormat::from_mime_type(&mime).unwrap_or(ImageFormat::Png);
-    Ok(Arc::new(Image::from_bytes(format, bytes)))
+/// Longest edge kept for gallery / filmstrip tiles. 2× a ~248px cell so
+/// retina still looks sharp without pinning a 4K frame in the cache.
+const GALLERY_THUMB_EDGE: u32 = 512;
+
+pub(super) fn downsample_gallery_thumb(bytes: Vec<u8>) -> Result<Arc<Image>, String> {
+    let image = image::load_from_memory(&bytes).map_err(|error| error.to_string())?;
+    let thumb = if image.width().max(image.height()) > GALLERY_THUMB_EDGE {
+        image.thumbnail(GALLERY_THUMB_EDGE, GALLERY_THUMB_EDGE)
+    } else {
+        image
+    };
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    thumb
+        .write_to(&mut encoded, image::ImageFormat::Jpeg)
+        .map_err(|error| error.to_string())?;
+    Ok(Arc::new(Image::from_bytes(
+        ImageFormat::Jpeg,
+        encoded.into_inner(),
+    )))
 }
 
 pub(super) async fn read_artifact_bytes(
@@ -384,29 +501,7 @@ impl StudioPage {
         artifact_id: StudioArtifactId,
         cx: &mut Context<Self>,
     ) {
-        let Some(engine) = self.engine(cx) else {
-            return;
-        };
-        self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(
-                    methods::DELETE_STUDIO_ARTIFACT,
-                    serde_json::json!({ "artifactId": artifact_id }),
-                )
-                .await;
-            this.update(cx, |page, cx| {
-                match result {
-                    Ok(_) => {
-                        page.forget_artifact(artifact_id);
-                        cx.emit(StudioEvent::CloseArtifact);
-                    }
-                    Err(error) => page.error = Some(error.to_string().into()),
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
+        self.delete_artifacts(vec![artifact_id], cx);
     }
 
     pub(super) fn download_artifact(
@@ -417,22 +512,7 @@ impl StudioPage {
         let Some(engine) = self.engine(cx) else {
             return;
         };
-        let suggested = self
-            .conversation
-            .iter()
-            .flat_map(|view| &view.turns)
-            .flat_map(|turn| &turn.runs)
-            .flat_map(|run| &run.artifacts)
-            .find(|artifact| artifact.id == artifact_id)
-            .map(|artifact| {
-                let extension = match artifact.mime_type.as_str() {
-                    "image/jpeg" => "jpg",
-                    "image/webp" => "webp",
-                    _ => "png",
-                };
-                format!("studio-{}.{}", artifact_id.0, extension)
-            })
-            .unwrap_or_else(|| format!("studio-{}.png", artifact_id.0));
+        let suggested = self.artifact_file_name(artifact_id);
         let receiver = cx.prompt_for_new_path(&PathBuf::new(), Some(&suggested));
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let destination = match receiver.await {
@@ -474,13 +554,49 @@ impl StudioPage {
     }
 
     pub(super) fn artifact_sequence(&self) -> Vec<StudioArtifactId> {
-        self.conversation
+        self.lightbox_frames.iter().map(|frame| frame.id).collect()
+    }
+
+    pub(super) fn artifact_frame(&self, artifact_id: StudioArtifactId) -> Option<&ArtifactFrame> {
+        self.lightbox_frames
             .iter()
-            .flat_map(|view| &view.turns)
-            .flat_map(|turn| &turn.runs)
-            .flat_map(|run| &run.artifacts)
-            .map(|artifact| artifact.id)
-            .collect()
+            .find(|frame| frame.id == artifact_id)
+    }
+
+    pub(super) fn artifact_conversation(
+        &self,
+        artifact_id: StudioArtifactId,
+    ) -> Option<StudioConversationId> {
+        self.artifact_frame(artifact_id)
+            .map(|frame| frame.conversation_id)
+    }
+
+    /// Open the viewer on `id` inside `frames`. The filmstrip, arrows, and
+    /// prefetch all walk this list and nothing else.
+    pub(super) fn open_artifact_viewer(
+        &mut self,
+        id: StudioArtifactId,
+        frames: Vec<ArtifactFrame>,
+        cx: &mut Context<Self>,
+    ) {
+        self.lightbox_frames = frames;
+        if let Some(index) = self.lightbox_frames.iter().position(|frame| frame.id == id) {
+            self.select_artifact_index(index, cx);
+            return;
+        }
+        if self.selected_artifact.take().is_some() {
+            self.reset_lightbox_viewer();
+            cx.emit(StudioEvent::CloseArtifact);
+        }
+        cx.notify();
+    }
+
+    fn surface_artifact_frames(&self) -> Vec<ArtifactFrame> {
+        if let Some(view) = &self.conversation {
+            frames_from_conversation(view)
+        } else {
+            frames_from_gallery(&self.gallery)
+        }
     }
 
     pub(super) fn reset_lightbox_swipe(&mut self) {
@@ -519,14 +635,33 @@ impl StudioPage {
         if changed {
             self.inspector_scroll.set_offset(Point::default());
         }
-        if let Some(conversation_id) = self.selected_conversation {
+        if let Some(conversation_id) = self.artifact_conversation(artifact_id) {
             cx.emit(StudioEvent::OpenArtifact {
                 conversation_id,
                 artifact_id,
             });
         }
+        if changed {
+            self.request_visible_gallery_images(cx);
+        }
         cx.notify();
         changed
+    }
+
+    pub(super) fn visible_filmstrip_ids(&self) -> Vec<StudioArtifactId> {
+        let Some(selected) = self.selected_artifact else {
+            return Vec::new();
+        };
+        let sequence = self.artifact_sequence();
+        let Some(index) = sequence.iter().position(|id| *id == selected) else {
+            return Vec::new();
+        };
+        let range = filmstrip_visible_range(
+            index,
+            sequence.len(),
+            filmstrip_viewport_width(self.lightbox_stage_width),
+        );
+        sequence.get(range).unwrap_or(&[]).to_vec()
     }
 
     pub(super) fn select_artifact_index(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
@@ -576,36 +711,33 @@ impl StudioPage {
         artifact_id: StudioArtifactId,
         cx: &mut Context<Self>,
     ) {
-        let mut changed = false;
-        if self.selected_conversation != Some(conversation_id) {
-            self.open_conversation(conversation_id, cx);
-            changed = true;
-        }
-        if self.conversation.is_some() && !self.artifact_sequence().contains(&artifact_id) {
-            if self.selected_artifact.take().is_some() {
-                self.reset_lightbox_viewer();
-                cx.emit(StudioEvent::CloseArtifact);
-                changed = true;
-            }
-            if changed {
-                cx.notify();
+        if self.artifact_frame(artifact_id).is_some() {
+            if self.selected_artifact != Some(artifact_id) {
+                if let Some(index) = self
+                    .lightbox_frames
+                    .iter()
+                    .position(|frame| frame.id == artifact_id)
+                {
+                    self.adopt_artifact_index(index, cx);
+                }
             }
             return;
         }
-        if self.selected_artifact != Some(artifact_id) {
-            self.selected_artifact = Some(artifact_id);
-            self.reset_lightbox_viewer();
-            self.inspector_scroll.set_offset(Point::default());
-            changed = true;
+        let frames = self.surface_artifact_frames();
+        if frames.iter().any(|frame| frame.id == artifact_id) {
+            self.open_artifact_viewer(artifact_id, frames, cx);
+            return;
         }
-        if changed {
-            cx.notify();
+        if self.selected_conversation != Some(conversation_id) {
+            self.open_conversation(conversation_id, cx);
         }
     }
 
     pub fn close_artifact(&mut self, cx: &mut Context<Self>) {
         if self.selected_artifact.take().is_some() {
+            self.lightbox_frames.clear();
             self.reset_lightbox_viewer();
+            self.request_visible_gallery_images(cx);
             cx.notify();
         }
     }
@@ -888,13 +1020,53 @@ impl StudioPage {
         cx.stop_propagation();
     }
 
+    /// Thumb (or full, if that is all we have) plus a GPU-ready full overlay.
+    /// The base stays mounted so swapping in the full frame cannot remount.
+    pub(super) fn display_layers(
+        &self,
+        id: StudioArtifactId,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> (Option<Arc<Image>>, Option<Arc<Image>>) {
+        let base = self.images.get_thumb(&id);
+        if let Some(base) = base.as_ref() {
+            let _ = base.clone().use_render_image(window, cx);
+        }
+        let overlay = self.images.get_full(&id).and_then(|full| {
+            let same_as_base = base.as_ref().is_some_and(|base| Arc::ptr_eq(base, &full));
+            if same_as_base {
+                return None;
+            }
+            full.clone().use_render_image(window, cx).map(|_| full)
+        });
+        (base, overlay)
+    }
+
+    fn warm_lightbox_neighbors(&self, window: &mut Window, cx: &mut gpui::App) {
+        let Some(selected) = self.selected_artifact else {
+            return;
+        };
+        for id in lightbox_neighbor_ids(&self.lightbox_frames, selected) {
+            if let Some(full) = self.images.get_full(&id) {
+                let _ = full.use_render_image(window, cx);
+            }
+            if let Some(thumb) = self.images.get_thumb_only(&id) {
+                let _ = thumb.use_render_image(window, cx);
+            }
+        }
+    }
+
     pub(super) fn render_lightbox_slide(
         &self,
         artifact_id: Option<StudioArtifactId>,
         page: Option<(f32, f32)>,
         theme: &Theme,
+        window: &mut Window,
+        cx: &mut gpui::App,
     ) -> AnyElement {
-        let image = artifact_id.and_then(|id| self.images.get(&id).cloned());
+        let (base, overlay) = artifact_id
+            .map(|id| self.display_layers(id, window, cx))
+            .unwrap_or((None, None));
         let frame = if let Some((left, width)) = page {
             div()
                 .absolute()
@@ -913,6 +1085,7 @@ impl StudioPage {
             div()
                 .absolute()
                 .inset_0()
+                .overflow_hidden()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -923,85 +1096,97 @@ impl StudioPage {
             self.lightbox_zoom
         };
         let measured = self.lightbox_stage_width > 1.0 && self.lightbox_stage_height > 1.0;
-        if let Some(image) = image {
-            let picture = img(image).object_fit(ObjectFit::Contain);
-            let picture = if page.is_some() || zoom <= 1.001 {
-                picture.size_full()
+        let zoomed = page.is_none() && zoom > 1.001;
+        let stack = |base: Arc<Image>, overlay: Option<Arc<Image>>| {
+            let mut layer = div().relative().overflow_hidden();
+            layer = if !zoomed {
+                layer.size_full()
             } else if measured {
-                picture
+                layer
                     .flex_none()
                     .w(px(self.lightbox_stage_width * zoom))
                     .h(px(self.lightbox_stage_height * zoom))
-            } else {
-                picture
-                    .flex_none()
-                    .w(gpui::relative(zoom))
-                    .h(gpui::relative(zoom))
-            };
-            let picture = if page.is_none() && self.lightbox_zoom > 1.001 {
-                picture
-                    .relative()
                     .left(self.lightbox_pan.x)
                     .top(self.lightbox_pan.y)
             } else {
-                picture
+                layer
+                    .flex_none()
+                    .w(gpui::relative(zoom))
+                    .h(gpui::relative(zoom))
+                    .left(self.lightbox_pan.x)
+                    .top(self.lightbox_pan.y)
             };
-            frame.child(picture).into_any_element()
-        } else {
-            frame
+            layer
+                .child(contain_image(base).size_full())
+                .when_some(overlay, |layer, overlay| {
+                    layer.child(contain_image(overlay).absolute().inset_0())
+                })
+        };
+        match base {
+            Some(base) => frame.child(stack(base, overlay)).into_any_element(),
+            None => frame
                 .child(
                     div()
                         .text_size(px(12.0))
                         .text_color(theme.text_faint)
                         .child("Loading image…"),
                 )
-                .into_any_element()
+                .into_any_element(),
         }
     }
 
     pub(super) fn render_artifact_page(
         &self,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let id = self.selected_artifact?;
+        self.warm_lightbox_neighbors(window, cx);
         let sequence = self.artifact_sequence();
         let selected_index = sequence
             .iter()
             .position(|candidate| *candidate == id)
             .unwrap_or(0);
-        let details = self.conversation.as_ref().and_then(|view| {
-            view.turns.iter().find_map(|turn| {
-                turn.runs.iter().find_map(|run| {
-                    run.artifacts
-                        .iter()
-                        .find(|artifact| artifact.id == id)
-                        .map(|artifact| {
-                            (
-                                turn.id,
-                                turn.prompt.clone(),
-                                run.model.display_name.clone(),
-                                artifact.mime_type.clone(),
-                                artifact.size_bytes,
-                            )
-                        })
-                })
-            })
+        let details = self.artifact_frame(id).map(|frame| {
+            (
+                frame.turn_id,
+                frame.prompt.clone(),
+                frame.model_display_name.clone(),
+                frame.mime_type.clone(),
+                frame.size_bytes,
+            )
         });
-        let thumbnails = sequence
-            .iter()
-            .enumerate()
+        let filmstrip_viewport = filmstrip_viewport_width(self.lightbox_stage_width);
+        let filmstrip_range =
+            filmstrip_visible_range(selected_index, sequence.len(), filmstrip_viewport);
+        let thumbnails = filmstrip_range
+            .filter_map(|index| {
+                sequence
+                    .get(index)
+                    .copied()
+                    .map(|artifact_id| (index, artifact_id))
+            })
             .map(|(index, artifact_id)| {
-                let thumbnail = self.images.get(artifact_id).cloned();
+                let thumbnail = self.images.get_thumb(&artifact_id);
                 let frame_size = filmstrip_thumb_size(index, selected_index);
+                let origin = filmstrip_thumb_origin(index, selected_index)
+                    + filmstrip_offset(selected_index, filmstrip_viewport);
                 let border = if index == selected_index {
                     theme.text_muted
                 } else {
                     theme.border
                 };
-                div()
+                let frame = div()
                     .id(SharedString::from(format!("studio-thumbnail-{index}")))
+                    .absolute()
+                    .left(px(origin))
+                    .top(px((ARTIFACT_FILMSTRIP_HEIGHT - frame_size) / 2.0))
                     .size(px(frame_size))
+                    .min_w(px(frame_size))
+                    .max_w(px(frame_size))
+                    .min_h(px(frame_size))
+                    .max_h(px(frame_size))
                     .flex_none()
                     .rounded(px(8.0))
                     .overflow_hidden()
@@ -1012,14 +1197,15 @@ impl StudioPage {
                     .hover(|style| style.opacity(0.82))
                     .on_click(cx.listener(move |page, _, _, cx| {
                         page.select_artifact_index(index, cx);
-                    }))
-                    .when_some(thumbnail, |frame, thumbnail| {
-                        frame.child(filmstrip_cover(thumbnail).size_full().rounded(px(7.0)))
-                    })
-                    .into_any_element()
+                    }));
+                match thumbnail {
+                    Some(thumbnail) => frame
+                        .child(cover_image(thumbnail).size_full().rounded(px(7.0)))
+                        .into_any_element(),
+                    None => frame.into_any_element(),
+                }
             })
             .collect::<Vec<_>>();
-        let filmstrip_viewport = filmstrip_viewport_width(self.lightbox_stage_width);
         let filmstrip_x = filmstrip_offset(selected_index, filmstrip_viewport);
         let filmstrip_span = filmstrip_content_width(sequence.len());
         let fade_left = filmstrip_x < -0.5;
@@ -1034,25 +1220,31 @@ impl StudioPage {
             self.lightbox_swipe_x,
             self.lightbox_snap.is_some(),
         ) {
-            slides.push(self.render_lightbox_slide(Some(id), None, theme));
+            slides.push(self.render_lightbox_slide(Some(id), None, theme, window, cx));
         } else {
             if selected_index > 0 {
                 slides.push(self.render_lightbox_slide(
                     Some(sequence[selected_index - 1]),
                     Some((self.lightbox_swipe_x - page_width, page_width)),
                     theme,
+                    window,
+                    cx,
                 ));
             }
             slides.push(self.render_lightbox_slide(
                 Some(id),
                 Some((self.lightbox_swipe_x, page_width)),
                 theme,
+                window,
+                cx,
             ));
             if let Some(next_id) = sequence.get(selected_index + 1).copied() {
                 slides.push(self.render_lightbox_slide(
                     Some(next_id),
                     Some((self.lightbox_swipe_x + page_width, page_width)),
                     theme,
+                    window,
+                    cx,
                 ));
             }
         }
@@ -1190,6 +1382,7 @@ impl StudioPage {
             .size_full()
             .overflow_y_scroll()
             .track_scroll(&self.inspector_scroll)
+            .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
             .flex()
             .flex_col()
             .border_l_1()
@@ -1430,28 +1623,29 @@ impl StudioPage {
                                             .flex_none()
                                             .overflow_hidden()
                                             .relative()
-                                            .child(
-                                                div()
-                                                    .absolute()
-                                                    .top_0()
-                                                    .bottom_0()
-                                                    .left(px(filmstrip_x))
-                                                    .w(px(filmstrip_span.max(1.0)))
-                                                    .flex()
-                                                    .flex_none()
-                                                    .items_center()
-                                                    .gap(px(ARTIFACT_FILMSTRIP_GAP))
-                                                    .children(thumbnails),
-                                            ),
+                                            .children(thumbnails),
                                     )
                                     .fade_left(fade_left)
                                     .fade_right(fade_right),
                                 ),
                         ),
                 )
-                .child(div().w(px(INSPECTOR_WIDTH)).h_full().flex_none().child(
-                    crate::frost::frosted(0.0, crate::frost::MENU_BLUR, inspector),
-                ))
+                .child(
+                    div()
+                        .relative()
+                        .w(px(INSPECTOR_WIDTH))
+                        .h_full()
+                        .flex_none()
+                        .child(crate::frost::frosted(
+                            0.0,
+                            crate::frost::MENU_BLUR,
+                            inspector,
+                        ))
+                        .child(
+                            crate::scrollbar::overlay("studio-inspector", &self.inspector_scroll)
+                                .inset_top(Theme::TITLEBAR_HEIGHT),
+                        ),
+                )
                 .into_any_element(),
         )
     }
@@ -1564,6 +1758,129 @@ mod tests {
     fn filmstrip_viewport_uses_most_of_the_stage() {
         assert!((filmstrip_viewport_width(1000.0) - 940.0).abs() < 0.01);
         assert!((filmstrip_viewport_width(0.0) - 1128.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn gallery_thumbs_shrink_a_large_frame() {
+        let mut raw = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(1200, 800))
+            .write_to(&mut std::io::Cursor::new(&mut raw), image::ImageFormat::Png)
+            .unwrap();
+        let thumb = downsample_gallery_thumb(raw).unwrap();
+        assert!(thumb.bytes.len() < 1200 * 800);
+        assert_eq!(thumb.format, ImageFormat::Jpeg);
+    }
+
+    #[test]
+    fn filmstrip_visible_range_stays_bounded() {
+        let range = filmstrip_visible_range(500, 10_000, 800.0);
+        assert!(range.len() < 40, "range={range:?}");
+        assert!(range.contains(&500));
+        assert_eq!(filmstrip_visible_range(0, 0, 800.0), 0..0);
+    }
+
+    fn test_frame(conversation: StudioConversationId, id: StudioArtifactId) -> ArtifactFrame {
+        ArtifactFrame {
+            id,
+            conversation_id: conversation,
+            turn_id: StudioTurnId::new(),
+            prompt: "prompt".into(),
+            model_display_name: "model".into(),
+            mime_type: "image/png".into(),
+            size_bytes: 1,
+        }
+    }
+
+    #[test]
+    fn viewer_walks_only_the_frames_it_was_given() {
+        let conversation = StudioConversationId::new();
+        let ids: Vec<_> = (0..4).map(|_| StudioArtifactId::new()).collect();
+        let frames: Vec<_> = ids
+            .iter()
+            .copied()
+            .map(|id| test_frame(conversation, id))
+            .collect();
+        assert_eq!(frames.iter().map(|frame| frame.id).collect::<Vec<_>>(), ids);
+        let neighbors = lightbox_neighbor_ids(&frames, ids[1]);
+        assert_eq!(neighbors[0], ids[1]);
+        assert!(neighbors.contains(&ids[0]));
+        assert!(neighbors.contains(&ids[2]));
+        assert!(!neighbors.contains(&StudioArtifactId::new()));
+    }
+
+    #[test]
+    fn conversation_frames_stay_inside_that_conversation() {
+        use chrono::Utc;
+        use std::collections::BTreeMap;
+        let conversation_id = StudioConversationId::new();
+        let other = StudioConversationId::new();
+        let artifact = zeron_proto::StudioArtifactView {
+            id: StudioArtifactId::new(),
+            output_position: 0,
+            media_kind: MediaKind::Image,
+            mime_type: "image/png".into(),
+            size_bytes: 1,
+            width: Some(1),
+            height: Some(1),
+            duration_seconds: None,
+            metadata: serde_json::Value::Null,
+            created_at: Utc::now(),
+        };
+        let view = StudioConversationView {
+            conversation: zeron_proto::StudioConversationSummary {
+                id: conversation_id,
+                title: "one".into(),
+                turn_count: 1,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                archived: false,
+                forked_from_turn_id: None,
+            },
+            turns: vec![zeron_proto::StudioTurnView {
+                id: StudioTurnId::new(),
+                position: 0,
+                prompt: "a fox".into(),
+                source_turn_id: None,
+                batch_id: zeron_studio::StudioBatchId::new(),
+                created_at: Utc::now(),
+                runs: vec![zeron_proto::StudioRunView {
+                    id: zeron_studio::StudioRunId::new(),
+                    position: 0,
+                    provider_id: "venice".into(),
+                    model: zeron_studio::MediaModel {
+                        provider_id: "venice".into(),
+                        id: "flux".into(),
+                        display_name: "Flux".into(),
+                        description: None,
+                        operation: zeron_studio::MediaOperation::TextToImage,
+                        output_kind: MediaKind::Image,
+                        output_mime_types: vec!["image/png".into()],
+                        input_constraints: Vec::new(),
+                        prompt_maximum_chars: None,
+                        negative_prompt_maximum_chars: None,
+                        maximum_output_count: 8,
+                        controls: Vec::new(),
+                        pricing: None,
+                        features: Vec::new(),
+                        manifest_version: "test".into(),
+                        fetched_at: Utc::now(),
+                    },
+                    controls: BTreeMap::new(),
+                    output_count: 1,
+                    display_aspect_ratio: (1, 1),
+                    state: zeron_proto::StudioRunState::Succeeded,
+                    progress: None,
+                    error: None,
+                    quote: None,
+                    artifacts: vec![artifact.clone()],
+                }],
+            }],
+        };
+        let frames = frames_from_conversation(&view);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].conversation_id, conversation_id);
+        assert_ne!(frames[0].conversation_id, other);
+        assert_eq!(frames[0].id, artifact.id);
     }
 
     #[test]

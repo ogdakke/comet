@@ -3520,9 +3520,13 @@ impl Shell {
 
     fn render_studio_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let page = self.ensure_studio_page(cx);
-        let (conversations, selected) = {
+        let (conversations, selected, gallery_selected) = {
             let page = page.read(cx);
-            (page.conversations().to_vec(), page.selected_conversation())
+            (
+                page.conversations().to_vec(),
+                page.selected_conversation(),
+                page.is_gallery(),
+            )
         };
         let now = Utc::now();
         let rows = conversations
@@ -3679,6 +3683,7 @@ impl Shell {
             .collect::<Vec<_>>();
 
         let new_page = page.clone();
+        let gallery_page = page.clone();
         let header = div()
             .flex_none()
             .flex()
@@ -3689,6 +3694,7 @@ impl Shell {
             .pb(px(4.0))
             .child(
                 div()
+                    .id("studio-gallery")
                     .h(px(29.0))
                     .flex_1()
                     .min_w_0()
@@ -3697,12 +3703,37 @@ impl Shell {
                     .gap(px(Theme::SPACE_SM))
                     .rounded(px(8.0))
                     .px(px(Theme::SPACE_SM))
+                    .cursor_pointer()
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text.opacity(0.8))
+                    .bg(if gallery_selected {
+                        crate::theme::glass_selected_bg()
+                    } else {
+                        crate::theme::wash(0.0)
+                    })
+                    .hover(|style| {
+                        style.bg(if gallery_selected {
+                            crate::theme::glass_selected_bg()
+                        } else {
+                            theme.glass_hover()
+                        })
+                    })
+                    .text_color(if gallery_selected {
+                        theme.text
+                    } else {
+                        theme.text.opacity(0.8)
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.dismiss_studio_artifact(cx);
+                        gallery_page.update(cx, |page, cx| page.show_gallery(cx));
+                    }))
                     .child(
                         icon(icons::WIDGET)
                             .size(px(16.0))
-                            .text_color(theme.text_muted),
+                            .text_color(if gallery_selected {
+                                theme.text
+                            } else {
+                                theme.text_muted
+                            }),
                     )
                     .child("Studio"),
             )
