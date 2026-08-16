@@ -214,3 +214,34 @@ async fn claude_thinking_silence_never_settles_the_turn() {
         "the turn must survive silent thinking intact: {events:?}"
     );
 }
+
+/// Codex also has legitimate silent stretches after completed output. The
+/// blanket settle used to manufacture Done mid-turn, after which the real
+/// tail was misclassified as self-continued output and repeatedly parked.
+#[tokio::test]
+async fn codex_thinking_silence_never_settles_the_turn() {
+    init_env();
+    let events = run_and_collect(
+        AcpHarness::codex(),
+        "scenario:quiet-thinking",
+        Duration::from_secs(20),
+    )
+    .await;
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Completed, None)],
+        "{events:?}"
+    );
+    let finished = events
+        .iter()
+        .position(|(_, e)| matches!(e, AgentEvent::TextDelta { text } if text == "finished"))
+        .unwrap_or_else(|| panic!("post-quiet text must fold into the SAME turn: {events:?}"));
+    let done = events
+        .iter()
+        .position(|(_, e)| matches!(e, AgentEvent::Done { .. }))
+        .expect("done asserted above");
+    assert!(
+        finished < done,
+        "the turn must survive silent thinking intact: {events:?}"
+    );
+}
