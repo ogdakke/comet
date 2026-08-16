@@ -163,6 +163,13 @@ pub struct CreateStudioTurnRequest {
     pub source_turn_id: Option<StudioTurnId>,
 }
 
+/// Append another copy of a turn's original model runs under the same prompt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtendStudioTurnRequest {
+    pub turn_id: StudioTurnId,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteStudioBatchRequest {

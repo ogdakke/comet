@@ -55,6 +55,7 @@ pub struct StudioPage {
     pub(super) feed_scroll: gpui::ScrollHandle,
     pub(super) artifact_filmstrip_scroll: gpui::ScrollHandle,
     pub(super) scroll_after_turn_count: Option<usize>,
+    pub(super) scroll_after_extend: Option<zeron_studio::StudioTurnId>,
     pub(super) scroll_task: Option<Task<()>>,
     pub(super) rail_hover: Option<usize>,
     pub(super) source_turn: Option<zeron_studio::StudioTurnId>,
@@ -142,6 +143,7 @@ impl StudioPage {
             feed_scroll: gpui::ScrollHandle::new(),
             artifact_filmstrip_scroll: gpui::ScrollHandle::new(),
             scroll_after_turn_count: None,
+            scroll_after_extend: None,
             scroll_task: None,
             rail_hover: None,
             source_turn: None,
@@ -329,6 +331,7 @@ impl StudioPage {
         self.selected_conversation = Some(id);
         self.conversation = None;
         self.scroll_after_turn_count = None;
+        self.scroll_after_extend = None;
         self.scroll_task = None;
         self.rail_hover = None;
         self.feed_scroll.set_offset(Point::default());
@@ -362,11 +365,19 @@ impl StudioPage {
                         let submitted_turn_arrived = page
                             .scroll_after_turn_count
                             .is_some_and(|before| view.turns.len() > before);
+                        let last_turn_id = view.turns.last().map(|turn| turn.id);
                         page.apply_conversation_summary(view.conversation.clone(), cx);
                         page.conversation = Some(view);
                         page.seed_composer_from_conversation(cx);
                         if first_open || submitted_turn_arrived {
                             page.scroll_after_turn_count = None;
+                            page.feed_scroll.scroll_to_bottom();
+                        } else if page
+                            .scroll_after_extend
+                            .zip(last_turn_id)
+                            .is_some_and(|(wanted, last)| wanted == last)
+                        {
+                            page.scroll_after_extend = None;
                             page.feed_scroll.scroll_to_bottom();
                         }
                         page.start_missing_image_loads(cx);
@@ -710,9 +721,42 @@ impl StudioPage {
         cx.notify();
     }
 
-    pub(super) fn generate_again(&mut self, turn: &StudioTurnView, cx: &mut Context<Self>) {
-        self.use_prompt(turn, cx);
-        self.submit(cx);
+    pub(super) fn generate_more(&mut self, turn: &StudioTurnView, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        if self.busy {
+            return;
+        }
+        let turn_id = turn.id;
+        let is_last = self
+            .conversation
+            .as_ref()
+            .and_then(|view| view.turns.last())
+            .is_some_and(|last| last.id == turn_id);
+        if is_last {
+            self.scroll_after_extend = Some(turn_id);
+            self.feed_scroll.scroll_to_bottom();
+        }
+        self.busy = true;
+        self.action_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::EXTEND_STUDIO_TURN,
+                    serde_json::json!({ "turnId": turn_id }),
+                )
+                .await;
+            this.update(cx, |page, cx| {
+                page.busy = false;
+                if let Err(error) = result {
+                    page.scroll_after_extend = None;
+                    page.error = Some(error.to_string().into());
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     pub(super) fn fork_from(&mut self, turn: &StudioTurnView, cx: &mut Context<Self>) {

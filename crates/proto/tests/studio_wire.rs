@@ -1,9 +1,10 @@
 use zeron_proto::{
-    ListStudioProvidersResponse, ProviderValidationState, QuoteStudioBatchResponse,
-    QuoteStudioRunView, ReadStudioArtifactChunkRequest, SetStudioProviderCredentialRequest,
-    SetStudioProviderPreferencesRequest, StudioProviderConnection,
+    ExtendStudioTurnRequest, ListStudioProvidersResponse, ProviderValidationState,
+    QuoteStudioBatchResponse, QuoteStudioRunView, ReadStudioArtifactChunkRequest,
+    SetStudioProviderCredentialRequest, SetStudioProviderPreferencesRequest,
+    StudioProviderConnection,
 };
-use zeron_studio::{Quote, StudioArtifactId};
+use zeron_studio::{Quote, StudioArtifactId, StudioTurnId};
 
 #[test]
 fn provider_responses_have_no_secret_field() {
@@ -58,6 +59,16 @@ fn artifact_reads_are_authorized_by_id_not_path() {
         Some(42)
     );
     assert!(value.get("path").is_none());
+}
+
+#[test]
+fn extend_turn_uses_camel_case_wire_shape() {
+    let request = ExtendStudioTurnRequest {
+        turn_id: StudioTurnId::new(),
+    };
+    let json = serde_json::to_value(request).unwrap();
+    assert!(json.get("turnId").is_some());
+    assert!(json.get("turn_id").is_none());
 }
 
 #[test]

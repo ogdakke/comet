@@ -51,17 +51,29 @@ fn studio_rail_ticks(turns: &[StudioTurnView]) -> Vec<StudioRailTick> {
         .map(|(turn_ix, turn)| StudioRailTick {
             turn_ix,
             prompt: turn.prompt.clone(),
-            models: turn
-                .runs
-                .iter()
-                .map(|run| (run.model.display_name.clone(), run.output_count))
-                .collect(),
+            models: merge_studio_models(&turn.runs),
             created_at: turn.created_at,
             cost: super::cost::turn_quote(turn)
                 .as_ref()
                 .map(super::cost::format_quote),
         })
         .collect()
+}
+
+/// Collapse repeated generate-more copies of the same model into one rail line.
+fn merge_studio_models(runs: &[StudioRunView]) -> Vec<(String, u32)> {
+    let mut models: Vec<(String, u32)> = Vec::new();
+    for run in runs {
+        if let Some((_, count)) = models
+            .iter_mut()
+            .find(|(name, _)| name == &run.model.display_name)
+        {
+            *count = count.saturating_add(run.output_count);
+        } else {
+            models.push((run.model.display_name.clone(), run.output_count));
+        }
+    }
+    models
 }
 
 /// Compact "model · n" list for the hover card. One model spells out
@@ -155,7 +167,7 @@ pub(super) fn prompt_exceeds_lines(
     prompt_visual_lines_at(prompt, inner_width, char_advance) > max_lines
 }
 
-/// Quiet text action under a prompt bubble (`Use prompt`, `Show more`).
+/// Quiet text action under a prompt bubble or image grid (`Use prompt`, `Generate more`).
 pub(super) fn turn_action(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
@@ -494,7 +506,7 @@ impl StudioPage {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let turn_for_prompt = turn.clone();
-        let turn_for_again = turn.clone();
+        let turn_for_more = turn.clone();
         let turn_for_fork = turn.clone();
         let turn_id = turn.id;
         let expanded = self.expanded_prompts.contains(&turn.id);
@@ -628,16 +640,6 @@ impl StudioPage {
                                 )),
                             )
                             .child(
-                                turn_action(
-                                    format!("studio-generate-again-{turn_ix}"),
-                                    "Generate again",
-                                    theme,
-                                )
-                                .on_click(cx.listener(
-                                    move |page, _, _, cx| page.generate_again(&turn_for_again, cx),
-                                )),
-                            )
-                            .child(
                                 turn_action(format!("studio-fork-{turn_ix}"), "Fork", theme)
                                     .on_click(cx.listener(move |page, _, _, cx| {
                                         page.fork_from(&turn_for_fork, cx)
@@ -666,6 +668,16 @@ impl StudioPage {
                     ),
             )
             .child(grid)
+            .child(
+                turn_action(
+                    format!("studio-generate-more-{turn_ix}"),
+                    "Generate more",
+                    theme,
+                )
+                .on_click(
+                    cx.listener(move |page, _, _, cx| page.generate_more(&turn_for_more, cx)),
+                ),
+            )
             .into_any_element()
     }
 
@@ -907,6 +919,25 @@ mod tests {
         );
         assert_eq!(ticks[1].models, vec![("Flux".into(), 1)]);
         assert!(studio_rail_ticks(&[]).is_empty());
+    }
+
+    #[test]
+    fn studio_rail_ticks_merge_repeated_generate_more_runs() {
+        let now = Utc::now();
+        let turns = vec![test_turn(
+            "a fox in snow",
+            now,
+            vec![
+                test_run("Flux", 4),
+                test_run("Flux", 4),
+                test_run("Kling", 2),
+            ],
+        )];
+        let ticks = studio_rail_ticks(&turns);
+        assert_eq!(
+            ticks[0].models,
+            vec![("Flux".into(), 8), ("Kling".into(), 2)]
+        );
     }
 
     #[test]

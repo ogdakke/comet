@@ -60,13 +60,13 @@ use zeron_doc::{MessagePart, SessionCommandPayload};
 use zeron_proto::{
     ArchiveStudioConversationRequest, ChatConfig, CreateStudioConversationRequest,
     CreateStudioTurnRequest, DeleteStudioArtifactRequest, DeleteStudioConversationRequest,
-    EngineInfo, HarnessId, ListStudioConversationsRequest, ListStudioConversationsResponse,
-    ListStudioModelsRequest, ListStudioModelsResponse, ListStudioProvidersResponse,
-    ProviderValidationState, QuoteStudioBatchRequest, QuoteStudioBatchResponse, QuoteStudioRunView,
-    ReadStudioArtifactChunkRequest, RenameStudioConversationRequest, RetryStudioRunRequest,
-    SetStudioProviderCredentialRequest, SetStudioProviderPreferencesRequest, StudioModelRunSpec,
-    StudioProviderConnection, StudioProviderRequest, ToolCall, WatchStudioConversationRequest,
-    WorkspaceScope,
+    EngineInfo, ExtendStudioTurnRequest, HarnessId, ListStudioConversationsRequest,
+    ListStudioConversationsResponse, ListStudioModelsRequest, ListStudioModelsResponse,
+    ListStudioProvidersResponse, ProviderValidationState, QuoteStudioBatchRequest,
+    QuoteStudioBatchResponse, QuoteStudioRunView, ReadStudioArtifactChunkRequest,
+    RenameStudioConversationRequest, RetryStudioRunRequest, SetStudioProviderCredentialRequest,
+    SetStudioProviderPreferencesRequest, StudioModelRunSpec, StudioProviderConnection,
+    StudioProviderRequest, ToolCall, WatchStudioConversationRequest, WorkspaceScope,
 };
 use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
@@ -1382,6 +1382,35 @@ impl RpcService for EngineRpc {
                 let initial_view = self
                     .studio
                     .conversation_view(request.conversation_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let futures = stored
+                    .into_iter()
+                    .map(|run| {
+                        let store = self.studio.clone();
+                        let providers = self.studio_providers.clone();
+                        let credentials = self.studio_credentials.clone();
+                        execute_studio_run(store, providers, credentials, run)
+                    })
+                    .collect::<Vec<_>>();
+                tokio::spawn(async move {
+                    let _ = futures::future::join_all(futures).await;
+                });
+                RpcReply::value(&initial_view)
+            }
+            methods::EXTEND_STUDIO_TURN => {
+                let request: ExtendStudioTurnRequest = parse_params(params)?;
+                let (_, prompt, specs) = self
+                    .studio
+                    .turn_extend_spec(request.turn_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let prepared = self.prepare_studio_runs(&prompt, specs, true).await?;
+                let (conversation_id, stored) = self
+                    .studio
+                    .extend_turn(request.turn_id, &prepared, &self.engine_info.device_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let initial_view = self
+                    .studio
+                    .conversation_view(conversation_id)
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 let futures = stored
                     .into_iter()

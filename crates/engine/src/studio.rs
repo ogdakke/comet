@@ -16,7 +16,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeron_proto::{
     ListStudioModelsResponse, StudioArtifactChunk, StudioArtifactView, StudioConversationSummary,
-    StudioConversationView, StudioRunState, StudioRunView, StudioTurnView, UNTITLED_STUDIO_TITLE,
+    StudioConversationView, StudioModelRunSpec, StudioRunState, StudioRunView, StudioTurnView,
+    UNTITLED_STUDIO_TITLE,
 };
 use zeron_studio::{
     GenerationRequest, MediaModel, MediaProvider, ProviderArtifact, ProviderId, Quote,
@@ -26,6 +27,8 @@ use zeron_studio::{
 
 const DATABASE_FILE: &str = "studio.sqlite3";
 const SCHEMA_VERSION: i64 = 1;
+const MAX_CREATE_TURN_RUNS: usize = 16;
+const MAX_TURN_RUNS: usize = 64;
 pub(crate) const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const STUDIO_CATALOG_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const ARTIFACT_READ_CHUNK_BYTES: u64 = 192_000;
@@ -276,6 +279,8 @@ pub enum StudioStoreError {
     InvalidValue(String),
     #[error("studio conversation was not found")]
     ConversationNotFound,
+    #[error("studio turn was not found")]
+    TurnNotFound,
     #[error("studio run was not found")]
     RunNotFound,
 }
@@ -499,7 +504,7 @@ impl StudioStore {
                 "prompt must contain 1 to 32000 characters".into(),
             ));
         }
-        if runs.is_empty() || runs.len() > 16 {
+        if runs.is_empty() || runs.len() > MAX_CREATE_TURN_RUNS {
             return Err(StudioStoreError::InvalidValue(
                 "a turn must contain 1 to 16 model runs".into(),
             ));
@@ -537,47 +542,7 @@ impl StudioStore {
             rusqlite::params![batch_id.0.to_string(), turn_id.0.to_string(), now],
         )?;
 
-        let mut stored = Vec::with_capacity(runs.len());
-        for (position, prepared) in runs.iter().enumerate() {
-            let run_id = StudioRunId::new();
-            let attempt_id = StudioAttemptId::new();
-            let idempotency_key = Uuid::new_v4().to_string();
-            let model_json = serde_json::to_string(&prepared.model)
-                .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
-            let settings_json = serde_json::to_string(&prepared.request.controls)
-                .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
-            let request_json = serde_json::to_string(&prepared.request)
-                .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
-            let request_hash = format!("{:x}", Sha256::digest(request_json.as_bytes()));
-            let quote = prepared.quote.clone().or_else(|| {
-                prepared
-                    .model
-                    .estimate_cost(&prepared.request.controls, prepared.request.output_count)
-            });
-            let quote_json = quote
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
-            transaction.execute(
-                "INSERT INTO studio_runs (id, batch_id, position, provider_id, model_id, operation, model_manifest_json, settings_json, owner_device_id, state, quote_json, output_count, display_aspect_width, display_aspect_height, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'queued', ?10, ?11, ?12, ?13, ?14, ?14)",
-                rusqlite::params![run_id.0.to_string(), batch_id.0.to_string(), position as i64, prepared.request.provider_id.as_str(), prepared.request.model_id.as_str(), operation_name(prepared.request.operation), model_json, settings_json, owner_device_id, quote_json, prepared.request.output_count, prepared.request.display_aspect_ratio.0, prepared.request.display_aspect_ratio.1, now],
-            )?;
-            transaction.execute(
-                "INSERT INTO studio_attempts (id, run_id, attempt_number, idempotency_key, request_json, request_wire_hash, state, provider_connection_id, created_at) VALUES (?1, ?2, 1, ?3, ?4, ?5, 'prepared', ?6, ?7)",
-                rusqlite::params![attempt_id.0.to_string(), run_id.0.to_string(), idempotency_key, request_json, request_hash, prepared.request.provider_id.as_str(), now],
-            )?;
-            transaction.execute(
-                "INSERT INTO studio_run_events (run_id, attempt_id, state, created_at) VALUES (?1, ?2, 'prepared', ?3)",
-                rusqlite::params![run_id.0.to_string(), attempt_id.0.to_string(), now],
-            )?;
-            stored.push(StoredStudioRun {
-                run_id,
-                attempt_id,
-                idempotency_key,
-                request: prepared.request.clone(),
-            });
-        }
+        let stored = insert_prepared_runs(&transaction, batch_id, 0, runs, owner_device_id, now)?;
         if let Some(title) = (position == 0).then(|| title_from_prompt(prompt)).flatten() {
             transaction.execute(
                 "UPDATE studio_conversations
@@ -600,6 +565,152 @@ impl StudioStore {
         transaction.commit()?;
         self.notify_change();
         Ok(stored)
+    }
+
+    /// Original model-run specs for a turn: one per distinct first-generation
+    /// snapshot, so "generate more" never doubles already-appended copies.
+    pub fn turn_extend_spec(
+        &self,
+        turn_id: StudioTurnId,
+    ) -> Result<(StudioConversationId, String, Vec<StudioModelRunSpec>), StudioStoreError> {
+        let connection = self.connection()?;
+        let (conversation_id, prompt, archived): (String, String, Option<i64>) = connection
+            .query_row(
+                "SELECT t.conversation_id, t.prompt, c.archived_at
+                 FROM studio_turns t
+                 JOIN studio_conversations c ON c.id = t.conversation_id
+                 WHERE t.id = ?1",
+                [turn_id.0.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StudioStoreError::TurnNotFound,
+                other => other.into(),
+            })?;
+        if archived.is_some() {
+            return Err(StudioStoreError::ConversationNotFound);
+        }
+        let mut statement = connection.prepare(
+            "SELECT a.request_json
+             FROM studio_runs r
+             JOIN studio_batches b ON b.id = r.batch_id
+             JOIN studio_attempts a ON a.run_id = r.id AND a.attempt_number = 1
+             WHERE b.turn_id = ?1
+             ORDER BY r.position",
+        )?;
+        let requests = statement
+            .query_map([turn_id.0.to_string()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut specs = Vec::new();
+        let mut seen = Vec::new();
+        for request_json in requests {
+            let request: GenerationRequest = serde_json::from_str(&request_json)
+                .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
+            let key = (
+                request.provider_id.clone(),
+                request.model_id.clone(),
+                request.controls.clone(),
+                request.output_count,
+                request.display_aspect_ratio,
+            );
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            specs.push(StudioModelRunSpec {
+                provider_id: request.provider_id,
+                model_id: request.model_id,
+                operation: request.operation,
+                output_count: request.output_count,
+                controls: request.controls,
+                inputs: request.inputs,
+                manifest_version: request.manifest_version,
+                display_aspect_ratio: request.display_aspect_ratio,
+            });
+        }
+        if specs.is_empty() {
+            return Err(StudioStoreError::InvalidValue(
+                "turn has no model runs to generate more from".into(),
+            ));
+        }
+        Ok((
+            StudioConversationId(parse_uuid(&conversation_id)?),
+            prompt,
+            specs,
+        ))
+    }
+
+    pub fn extend_turn(
+        &self,
+        turn_id: StudioTurnId,
+        runs: &[PreparedStudioRun],
+        owner_device_id: &str,
+    ) -> Result<(StudioConversationId, Vec<StoredStudioRun>), StudioStoreError> {
+        if runs.is_empty() || runs.len() > MAX_CREATE_TURN_RUNS {
+            return Err(StudioStoreError::InvalidValue(
+                "generate more must add 1 to 16 model runs".into(),
+            ));
+        }
+        if runs.iter().any(|run| !run.request.inputs.is_empty()) {
+            return Err(StudioStoreError::InvalidValue(
+                "studio inputs are not available in the image slice".into(),
+            ));
+        }
+
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let (conversation_id, batch_id, archived): (String, String, Option<i64>) = transaction
+            .query_row(
+                "SELECT t.conversation_id, b.id, c.archived_at
+                 FROM studio_turns t
+                 JOIN studio_batches b ON b.turn_id = t.id
+                 JOIN studio_conversations c ON c.id = t.conversation_id
+                 WHERE t.id = ?1",
+                [turn_id.0.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StudioStoreError::TurnNotFound,
+                other => other.into(),
+            })?;
+        if archived.is_some() {
+            return Err(StudioStoreError::ConversationNotFound);
+        }
+        let current: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM studio_runs WHERE batch_id = ?1",
+            [batch_id.clone()],
+            |row| row.get(0),
+        )?;
+        if current as usize + runs.len() > MAX_TURN_RUNS {
+            return Err(StudioStoreError::InvalidValue(format!(
+                "a turn can contain at most {MAX_TURN_RUNS} model runs"
+            )));
+        }
+        let next_position: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM studio_runs WHERE batch_id = ?1",
+            [batch_id.clone()],
+            |row| row.get(0),
+        )?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let batch_id = StudioBatchId(parse_uuid(&batch_id)?);
+        let stored = insert_prepared_runs(
+            &transaction,
+            batch_id,
+            next_position,
+            runs,
+            owner_device_id,
+            now,
+        )?;
+        if let Some(run) = stored.first() {
+            recompute_batch(&transaction, run.run_id, now)?;
+        }
+        transaction.execute(
+            "UPDATE studio_conversations SET updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![conversation_id.clone(), now],
+        )?;
+        transaction.commit()?;
+        self.notify_change();
+        Ok((StudioConversationId(parse_uuid(&conversation_id)?), stored))
     }
 
     pub fn delete_conversation(&self, id: StudioConversationId) -> Result<(), StudioStoreError> {
@@ -1142,6 +1253,59 @@ impl StudioStore {
                 other => other.into(),
             })
     }
+}
+
+fn insert_prepared_runs(
+    transaction: &rusqlite::Transaction<'_>,
+    batch_id: StudioBatchId,
+    start_position: i64,
+    runs: &[PreparedStudioRun],
+    owner_device_id: &str,
+    now: i64,
+) -> Result<Vec<StoredStudioRun>, StudioStoreError> {
+    let mut stored = Vec::with_capacity(runs.len());
+    for (offset, prepared) in runs.iter().enumerate() {
+        let run_id = StudioRunId::new();
+        let attempt_id = StudioAttemptId::new();
+        let idempotency_key = Uuid::new_v4().to_string();
+        let model_json = serde_json::to_string(&prepared.model)
+            .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
+        let settings_json = serde_json::to_string(&prepared.request.controls)
+            .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
+        let request_json = serde_json::to_string(&prepared.request)
+            .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
+        let request_hash = format!("{:x}", Sha256::digest(request_json.as_bytes()));
+        let quote = prepared.quote.clone().or_else(|| {
+            prepared
+                .model
+                .estimate_cost(&prepared.request.controls, prepared.request.output_count)
+        });
+        let quote_json = quote
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
+        let position = start_position + offset as i64;
+        transaction.execute(
+            "INSERT INTO studio_runs (id, batch_id, position, provider_id, model_id, operation, model_manifest_json, settings_json, owner_device_id, state, quote_json, output_count, display_aspect_width, display_aspect_height, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'queued', ?10, ?11, ?12, ?13, ?14, ?14)",
+            rusqlite::params![run_id.0.to_string(), batch_id.0.to_string(), position, prepared.request.provider_id.as_str(), prepared.request.model_id.as_str(), operation_name(prepared.request.operation), model_json, settings_json, owner_device_id, quote_json, prepared.request.output_count, prepared.request.display_aspect_ratio.0, prepared.request.display_aspect_ratio.1, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO studio_attempts (id, run_id, attempt_number, idempotency_key, request_json, request_wire_hash, state, provider_connection_id, created_at) VALUES (?1, ?2, 1, ?3, ?4, ?5, 'prepared', ?6, ?7)",
+            rusqlite::params![attempt_id.0.to_string(), run_id.0.to_string(), idempotency_key, request_json, request_hash, prepared.request.provider_id.as_str(), now],
+        )?;
+        transaction.execute(
+            "INSERT INTO studio_run_events (run_id, attempt_id, state, created_at) VALUES (?1, ?2, 'prepared', ?3)",
+            rusqlite::params![run_id.0.to_string(), attempt_id.0.to_string(), now],
+        )?;
+        stored.push(StoredStudioRun {
+            run_id,
+            attempt_id,
+            idempotency_key,
+            request: prepared.request.clone(),
+        });
+    }
+    Ok(stored)
 }
 
 fn recompute_batch(

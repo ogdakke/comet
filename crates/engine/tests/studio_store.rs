@@ -272,6 +272,75 @@ fn first_turn_titles_an_untitled_conversation_from_the_prompt() {
 }
 
 #[test]
+fn extend_turn_appends_the_original_model_set_under_the_same_prompt() {
+    let root = tempdir().unwrap();
+    let flux = image_model("fake");
+    let mut kling = image_model("fake");
+    kling.id = "kling".into();
+    kling.display_name = "Kling".into();
+    let store = StudioStore::open(root.path(), 1024).unwrap();
+    let conversation = store.create_conversation("More", None).unwrap();
+    store
+        .create_turn(
+            conversation.id,
+            "a red comet",
+            None,
+            &[
+                prepared_run(&flux, "a red comet"),
+                prepared_run(&kling, "a red comet"),
+            ],
+            "device-a",
+        )
+        .unwrap();
+    let view = store.conversation_view(conversation.id).unwrap();
+    let turn_id = view.turns[0].id;
+    let (_, prompt, specs) = store.turn_extend_spec(turn_id).unwrap();
+    assert_eq!(prompt, "a red comet");
+    assert_eq!(specs.len(), 2);
+
+    store
+        .extend_turn(
+            turn_id,
+            &[
+                prepared_run(&flux, "a red comet"),
+                prepared_run(&kling, "a red comet"),
+            ],
+            "device-a",
+        )
+        .unwrap();
+    let once = store.conversation_view(conversation.id).unwrap();
+    assert_eq!(once.turns.len(), 1);
+    assert_eq!(once.turns[0].prompt, "a red comet");
+    assert_eq!(once.turns[0].runs.len(), 4);
+
+    let (_, _, specs_again) = store.turn_extend_spec(turn_id).unwrap();
+    assert_eq!(
+        specs_again.len(),
+        2,
+        "already-appended copies are not templates"
+    );
+
+    store
+        .extend_turn(
+            turn_id,
+            &[
+                prepared_run(&flux, "a red comet"),
+                prepared_run(&kling, "a red comet"),
+            ],
+            "device-a",
+        )
+        .unwrap();
+    let twice = store.conversation_view(conversation.id).unwrap();
+    assert_eq!(twice.turns.len(), 1);
+    assert_eq!(twice.turns[0].runs.len(), 6);
+    assert!(
+        store
+            .turn_extend_spec(zeron_studio::StudioTurnId::new())
+            .is_err()
+    );
+}
+
+#[test]
 fn first_turn_keeps_a_user_chosen_title() {
     let root = tempdir().unwrap();
     let model = image_model("fake");
@@ -1286,5 +1355,73 @@ async fn submit_reports_the_real_constraint_error_when_settings_no_longer_fit() 
         !error.to_lowercase().contains("manifest"),
         "catalog identity must not leak to the user: {error}"
     );
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn extend_turn_appends_runs_without_a_new_prompt() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![image_model("fake")],
+        FakeSubmissionMode::Complete(Vec::new()),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+    let conversation = create_conversation(&client).await;
+    let created: StudioConversationView = serde_json::from_value(
+        client
+            .call(
+                methods::CREATE_STUDIO_TURN,
+                serde_json::json!({
+                    "conversationId": conversation.id,
+                    "prompt": "a comet above the sea",
+                    "runs": [{
+                        "providerId": "fake",
+                        "modelId": "image-model",
+                        "operation": "text_to_image",
+                        "outputCount": 2,
+                        "controls": {},
+                        "inputs": [],
+                        "manifestVersion": "fixture-v1",
+                        "displayAspectRatio": [1, 1]
+                    }]
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(created.turns.len(), 1);
+    assert_eq!(created.turns[0].runs.len(), 1);
+
+    let extended: StudioConversationView = serde_json::from_value(
+        client
+            .call(
+                methods::EXTEND_STUDIO_TURN,
+                serde_json::json!({ "turnId": created.turns[0].id }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(extended.turns.len(), 1);
+    assert_eq!(extended.turns[0].prompt, "a comet above the sea");
+    assert_eq!(extended.turns[0].runs.len(), 2);
+    assert_eq!(extended.turns[0].runs[0].output_count, 2);
+    assert_eq!(extended.turns[0].runs[1].output_count, 2);
+    assert_eq!(extended.turns[0].runs[1].state, StudioRunState::Queued);
+
+    let again: StudioConversationView = serde_json::from_value(
+        client
+            .call(
+                methods::EXTEND_STUDIO_TURN,
+                serde_json::json!({ "turnId": created.turns[0].id }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(again.turns.len(), 1);
+    assert_eq!(again.turns[0].runs.len(), 3);
     engine.shutdown().await;
 }
