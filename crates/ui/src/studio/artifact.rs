@@ -1627,7 +1627,18 @@ impl StudioPage {
                         .h_full()
                         .relative()
                         .overflow_hidden()
-                        .child(stage)
+                        // Image dissolves through the filmstrip chrome the
+                        // same way the transcript fades under the composer.
+                        // The strip itself is a sibling so it stays opaque.
+                        .child(
+                            crate::edge_fade::edge_faded(
+                                Theme::TRANSCRIPT_FADE_BAND,
+                                false,
+                                true,
+                                stage,
+                            )
+                            .band_bottom(ARTIFACT_FILMSTRIP_HEIGHT),
+                        )
                         .child(
                             div()
                                 .absolute()
