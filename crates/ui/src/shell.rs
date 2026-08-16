@@ -499,6 +499,14 @@ struct RenameChatDialog {
     _events: Subscription,
 }
 
+/// Studio conversation rename dialog — same chrome as session rename.
+struct RenameStudioDialog {
+    conversation_id: zeron_studio::StudioConversationId,
+    input: Entity<ComposerInput>,
+    focus_pending: bool,
+    _events: Subscription,
+}
+
 /// In-app update lifecycle (macOS bundle installs; see `render_update_strip`).
 enum UpdateFlow {
     Idle,
@@ -823,6 +831,10 @@ pub struct Shell {
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
+    /// Studio conversation-row context menu: (conversation id, window position).
+    studio_menu: popover::Popup<(zeron_studio::StudioConversationId, Point<Pixels>)>,
+    rename_studio_dialog: Option<RenameStudioDialog>,
+    delete_studio_confirm: Option<zeron_studio::StudioConversationId>,
     /// Space-row context menu (dropdown rows): (space id, window position).
     space_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_space_dialog: Option<RenameSpaceDialog>,
@@ -1069,6 +1081,9 @@ impl Shell {
             chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,
+            studio_menu: popover::Popup::default(),
+            rename_studio_dialog: None,
+            delete_studio_confirm: None,
             space_menu: popover::Popup::default(),
             rename_space_dialog: None,
             delete_space_confirm: None,
@@ -1801,6 +1816,13 @@ impl Shell {
         }
     }
 
+    fn close_studio_menu(&mut self, cx: &mut Context<Self>) {
+        if self.studio_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.studio_menu);
+            cx.notify();
+        }
+    }
+
     fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         // Recreate per visit: the page's ListHarnesses load re-probes which
         // CLIs are installed, so installing one shows up on the next open.
@@ -1811,6 +1833,7 @@ impl Shell {
         self.nav.push(NavEntry::Settings(section));
         self.close_user_menu(cx);
         self.close_chat_menu(cx);
+        self.close_studio_menu(cx);
         cx.notify();
     }
 
@@ -1828,12 +1851,14 @@ impl Shell {
         }
         self.close_user_menu(cx);
         self.close_chat_menu(cx);
+        self.close_studio_menu(cx);
         cx.notify();
     }
 
     fn close_studio(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Chat;
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
+        self.close_studio_menu(cx);
         cx.notify();
     }
 
@@ -1947,6 +1972,7 @@ impl Shell {
         }
         self.close_user_menu(cx);
         self.close_chat_menu(cx);
+        self.close_studio_menu(cx);
         cx.notify();
     }
 
@@ -2160,6 +2186,83 @@ impl Shell {
             serde_json::json!({ "op": "deleteChat", "chatId": chat_id }),
             cx,
         );
+        cx.notify();
+    }
+
+    fn open_rename_studio(
+        &mut self,
+        conversation_id: zeron_studio::StudioConversationId,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_studio_menu(cx);
+        let current = self
+            .studio_page
+            .as_ref()
+            .and_then(|page| page.read(cx).conversation_title(conversation_id))
+            .unwrap_or_default();
+        let input = cx.new(|cx| ComposerInput::new("Study title", cx));
+        input.update(cx, |input, cx| input.set_text(current, cx));
+        let events = cx.subscribe(&input, |this: &mut Shell, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Submitted) {
+                this.submit_rename_studio(cx);
+            }
+        });
+        self.rename_studio_dialog = Some(RenameStudioDialog {
+            conversation_id,
+            input,
+            focus_pending: true,
+            _events: events,
+        });
+        cx.notify();
+    }
+
+    fn submit_rename_studio(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.rename_studio_dialog.take() else {
+            return;
+        };
+        let title = dialog.input.read(cx).text().trim().to_string();
+        if !title.is_empty()
+            && let Some(page) = self.studio_page.clone()
+        {
+            page.update(cx, |page, cx| {
+                page.rename_conversation(dialog.conversation_id, title, cx)
+            });
+        }
+        cx.notify();
+    }
+
+    fn archive_studio(
+        &mut self,
+        conversation_id: zeron_studio::StudioConversationId,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_studio_menu(cx);
+        if let Some(page) = self.studio_page.clone() {
+            page.update(cx, |page, cx| {
+                page.archive_conversation(conversation_id, cx)
+            });
+        }
+        cx.notify();
+    }
+
+    fn delete_studio_conversation(
+        &mut self,
+        conversation_id: zeron_studio::StudioConversationId,
+        cx: &mut Context<Self>,
+    ) {
+        self.delete_studio_confirm = None;
+        if matches!(
+            self.route,
+            Route::StudioArtifact {
+                conversation_id: open,
+                ..
+            } if open == conversation_id
+        ) {
+            self.dismiss_studio_artifact(cx);
+        }
+        if let Some(page) = self.studio_page.clone() {
+            page.update(cx, |page, cx| page.delete_conversation(conversation_id, cx));
+        }
         cx.notify();
     }
 
@@ -3325,6 +3428,7 @@ impl Shell {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.close_studio_menu(cx);
                     this.chat_menu.open((menu_id.clone(), event.position));
                     cx.notify();
                 }),
@@ -3422,9 +3526,9 @@ impl Shell {
             .map(|conversation| {
                 let is_selected = selected == Some(conversation.id);
                 let select_page = page.clone();
-                let archive_page = page.clone();
                 let select_id = conversation.id;
                 let archive_id = conversation.id;
+                let menu_id = conversation.id;
                 let group: SharedString =
                     format!("studio-conversation-row-{}", conversation.id.0).into();
                 let age: SharedString = format_time_ago(conversation.updated_at, now).into();
@@ -3458,6 +3562,14 @@ impl Shell {
                         this.dismiss_studio_artifact(cx);
                         select_page.update(cx, |page, cx| page.open_conversation(select_id, cx));
                     }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.close_chat_menu(cx);
+                            this.studio_menu.open((menu_id, event.position));
+                            cx.notify();
+                        }),
+                    )
                     .child(
                         div()
                             .w_full()
@@ -3482,7 +3594,7 @@ impl Shell {
                                 div()
                                     .relative()
                                     .h(px(14.0))
-                                    .min_w(px(28.0))
+                                    .min_w(px(56.0))
                                     .flex_none()
                                     .whitespace_nowrap()
                                     .child(
@@ -3507,18 +3619,39 @@ impl Shell {
                                             .inset_0()
                                             .flex()
                                             .justify_end()
+                                            .items_center()
                                             .opacity(0.0)
                                             .group_hover(group.clone(), |style| style.opacity(1.0))
-                                            .on_click(cx.listener(move |_, _, _, cx| {
+                                            .on_click(cx.listener(move |this, _, _, cx| {
                                                 cx.stop_propagation();
-                                                archive_page.update(cx, |page, cx| {
-                                                    page.archive_conversation(archive_id, cx)
-                                                });
+                                                this.archive_studio(archive_id, cx);
                                             }))
                                             .child(
-                                                icon(icons::ARCHIVE_MINIMALISTIC)
-                                                    .size(px(12.0))
-                                                    .text_color(theme.text_muted),
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap(px(4.0))
+                                                    .h(px(18.0))
+                                                    .px(px(4.0))
+                                                    .mr(px(-4.0))
+                                                    .rounded(px(5.0))
+                                                    .bg(crate::theme::wash(0.10))
+                                                    .hover(|style| {
+                                                        style.bg(crate::theme::wash(0.18))
+                                                    })
+                                                    .child(
+                                                        icon(icons::ARCHIVE_MINIMALISTIC)
+                                                            .size(px(11.0))
+                                                            .flex_none()
+                                                            .text_color(theme.text_muted),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(10.0))
+                                                            .text_color(theme.text_muted)
+                                                            .child(SharedString::from("Archive")),
+                                                    ),
                                             ),
                                     ),
                             ),
@@ -4774,6 +4907,164 @@ impl Shell {
                 )
                 .into_any_element();
             overlays.push(popover::modal("delete-chat-dialog", viewport, card));
+        }
+
+        if let Some((conversation_id, position)) = self.studio_menu.get().cloned() {
+            let studio_menu_closing = self.studio_menu.closing_since();
+            let rename_id = conversation_id;
+            let archive_id = conversation_id;
+            let delete_id = conversation_id;
+            let menu = popover::popover_card(&theme)
+                .w(px(170.0))
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.close_studio_menu(cx);
+                }))
+                .flex()
+                .flex_col()
+                .child(
+                    popover::menu_row(
+                        &theme,
+                        false,
+                        format!("studio-menu-rename-{}", conversation_id.0),
+                    )
+                    .id("studio-menu-rename")
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.open_rename_studio(rename_id, cx)),
+                    )
+                    .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
+                    .child(SharedString::from("Rename…")),
+                )
+                .child(
+                    popover::menu_row(
+                        &theme,
+                        false,
+                        format!("studio-menu-archive-{}", conversation_id.0),
+                    )
+                    .id("studio-menu-archive")
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.archive_studio(archive_id, cx)),
+                    )
+                    .child(
+                        icon(icons::ARCHIVE_MINIMALISTIC)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child(SharedString::from("Archive")),
+                )
+                .child(popover::menu_separator())
+                .child(
+                    popover::menu_row(
+                        &theme,
+                        false,
+                        format!("studio-menu-delete-{}", conversation_id.0),
+                    )
+                    .id("studio-menu-delete")
+                    .text_color(theme.danger)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_studio_menu(cx);
+                        this.delete_studio_confirm = Some(delete_id);
+                        cx.notify();
+                    }))
+                    .child(
+                        icon(icons::TRASH_BIN_MINIMALISTIC)
+                            .size(px(16.0))
+                            .text_color(theme.danger),
+                    )
+                    .child(SharedString::from("Delete…")),
+                )
+                .into_any_element();
+            overlays.push(popover::menu_at(
+                "studio-context-menu",
+                position,
+                menu,
+                studio_menu_closing,
+            ));
+        }
+
+        if let Some(dialog) = &mut self.rename_studio_dialog {
+            if std::mem::take(&mut dialog.focus_pending) {
+                window.focus(&dialog.input.focus_handle(cx), cx);
+            }
+            let input = dialog.input.clone();
+            let card = popover::dialog_card(&theme)
+                .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+                    if ev.keystroke.key == "escape" {
+                        this.rename_studio_dialog = None;
+                        cx.notify();
+                    }
+                }))
+                .child(popover::dialog_title(&theme, "Rename study"))
+                .child(
+                    div()
+                        .mt(px(12.0))
+                        .child(popover::dialog_field(input.into_any_element())),
+                )
+                .child(
+                    div()
+                        .mt(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            popover::btn_ghost(&theme, "Cancel", "rename-studio-cancel")
+                                .id("rename-studio-cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.rename_studio_dialog = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            popover::btn_primary(&theme, "Rename")
+                                .id("rename-studio-save")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.submit_rename_studio(cx)),
+                                ),
+                        ),
+                )
+                .into_any_element();
+            overlays.push(popover::modal("rename-studio-dialog", viewport, card));
+        }
+
+        if let Some(conversation_id) = self.delete_studio_confirm {
+            let title = transcript::single_line(
+                &self
+                    .studio_page
+                    .as_ref()
+                    .and_then(|page| page.read(cx).conversation_title(conversation_id))
+                    .unwrap_or_else(|| zeron_proto::UNTITLED_STUDIO_TITLE.into()),
+            );
+            let card = popover::dialog_card(&theme)
+                .child(popover::dialog_title(&theme, "Delete study?"))
+                .child(div().mt(px(6.0)).child(popover::dialog_body(
+                    &theme,
+                    format!("\u{201C}{title}\u{201D} will be permanently deleted. This can\u{2019}t be undone."),
+                )))
+                .child(
+                    div()
+                        .mt(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            popover::btn_ghost(&theme, "Cancel", "delete-studio-cancel")
+                                .id("delete-studio-cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.delete_studio_confirm = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            popover::btn_danger(&theme, "Delete")
+                                .id("delete-studio-confirm")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.delete_studio_conversation(conversation_id, cx)
+                                })),
+                        ),
+                )
+                .into_any_element();
+            overlays.push(popover::modal("delete-studio-dialog", viewport, card));
         }
 
         if let Some(sync) = self.render_sync_overlay(viewport, cx) {

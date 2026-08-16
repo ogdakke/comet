@@ -59,10 +59,10 @@ use tokio::sync::watch;
 use zeron_doc::{MessagePart, SessionCommandPayload};
 use zeron_proto::{
     ArchiveStudioConversationRequest, ChatConfig, CreateStudioConversationRequest,
-    CreateStudioTurnRequest, DeleteStudioArtifactRequest, EngineInfo, HarnessId,
-    ListStudioConversationsRequest, ListStudioConversationsResponse, ListStudioModelsRequest,
-    ListStudioModelsResponse, ListStudioProvidersResponse, ProviderValidationState,
-    QuoteStudioBatchRequest, QuoteStudioBatchResponse, QuoteStudioRunView,
+    CreateStudioTurnRequest, DeleteStudioArtifactRequest, DeleteStudioConversationRequest,
+    EngineInfo, HarnessId, ListStudioConversationsRequest, ListStudioConversationsResponse,
+    ListStudioModelsRequest, ListStudioModelsResponse, ListStudioProvidersResponse,
+    ProviderValidationState, QuoteStudioBatchRequest, QuoteStudioBatchResponse, QuoteStudioRunView,
     ReadStudioArtifactChunkRequest, RenameStudioConversationRequest, RetryStudioRunRequest,
     SetStudioProviderCredentialRequest, SetStudioProviderPreferencesRequest, StudioModelRunSpec,
     StudioProviderConnection, StudioProviderRequest, ToolCall, WatchStudioConversationRequest,
@@ -1312,6 +1312,13 @@ impl RpcService for EngineRpc {
                     .archive_conversation(request.conversation_id, request.archived)
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&conversation)
+            }
+            methods::DELETE_STUDIO_CONVERSATION => {
+                let request: DeleteStudioConversationRequest = parse_params(params)?;
+                self.studio
+                    .delete_conversation(request.conversation_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::WATCH_STUDIO_CONVERSATION => {
                 let request: WatchStudioConversationRequest = parse_params(params)?;

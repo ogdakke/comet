@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeron_proto::{
     ListStudioModelsResponse, StudioArtifactChunk, StudioArtifactView, StudioConversationSummary,
-    StudioConversationView, StudioRunState, StudioRunView, StudioTurnView,
+    StudioConversationView, StudioRunState, StudioRunView, StudioTurnView, UNTITLED_STUDIO_TITLE,
 };
 use zeron_studio::{
     GenerationRequest, MediaModel, MediaProvider, ProviderArtifact, ProviderId, Quote,
@@ -578,13 +578,110 @@ impl StudioStore {
                 request: prepared.request.clone(),
             });
         }
-        transaction.execute(
-            "UPDATE studio_conversations SET updated_at = ?2 WHERE id = ?1",
-            rusqlite::params![conversation_id.0.to_string(), now],
-        )?;
+        if let Some(title) = (position == 0).then(|| title_from_prompt(prompt)).flatten() {
+            transaction.execute(
+                "UPDATE studio_conversations
+                 SET title = CASE WHEN title = ?4 THEN ?2 ELSE title END,
+                     updated_at = ?3
+                 WHERE id = ?1",
+                rusqlite::params![
+                    conversation_id.0.to_string(),
+                    title,
+                    now,
+                    UNTITLED_STUDIO_TITLE
+                ],
+            )?;
+        } else {
+            transaction.execute(
+                "UPDATE studio_conversations SET updated_at = ?2 WHERE id = ?1",
+                rusqlite::params![conversation_id.0.to_string(), now],
+            )?;
+        }
         transaction.commit()?;
         self.notify_change();
         Ok(stored)
+    }
+
+    pub fn delete_conversation(&self, id: StudioConversationId) -> Result<(), StudioStoreError> {
+        let artifacts: Vec<(StudioArtifactId, String)> = {
+            let connection = self.connection()?;
+            let exists: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM studio_conversations WHERE id = ?1)",
+                [id.0.to_string()],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Err(StudioStoreError::ConversationNotFound);
+            }
+            let mut statement = connection.prepare(
+                "SELECT a.id, a.mime_type
+                 FROM studio_artifacts a
+                 JOIN studio_runs r ON r.id = a.run_id
+                 JOIN studio_batches b ON b.id = r.batch_id
+                 JOIN studio_turns t ON t.id = b.turn_id
+                 WHERE t.conversation_id = ?1",
+            )?;
+            let rows = statement
+                .query_map([id.0.to_string()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(|(artifact_id, mime)| {
+                    parse_uuid(&artifact_id).map(|uuid| (StudioArtifactId(uuid), mime))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        {
+            let mut connection = self.connection()?;
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "UPDATE studio_conversations SET forked_from_turn_id = NULL
+                 WHERE forked_from_turn_id IN (
+                     SELECT id FROM studio_turns WHERE conversation_id = ?1
+                 )",
+                [id.0.to_string()],
+            )?;
+            for (artifact_id, _) in &artifacts {
+                transaction.execute(
+                    "DELETE FROM studio_run_inputs WHERE artifact_id = ?1",
+                    [artifact_id.0.to_string()],
+                )?;
+                transaction.execute(
+                    "DELETE FROM studio_artifacts WHERE id = ?1",
+                    [artifact_id.0.to_string()],
+                )?;
+            }
+            let changed = transaction.execute(
+                "DELETE FROM studio_conversations WHERE id = ?1",
+                [id.0.to_string()],
+            )?;
+            if changed == 0 {
+                return Err(StudioStoreError::ConversationNotFound);
+            }
+            transaction.commit()?;
+        }
+
+        for (artifact_id, mime) in artifacts {
+            if let Some(extension) = extension_for_mime(&mime) {
+                match self.artifacts.delete(artifact_id, extension) {
+                    Ok(()) => {}
+                    Err(StudioStoreError::Io(error))
+                        if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            artifact = %artifact_id.0,
+                            error = %error,
+                            "studio conversation delete left an artifact file"
+                        );
+                    }
+                }
+            }
+        }
+
+        self.notify_change();
+        Ok(())
     }
 
     pub fn cache_models(
@@ -1152,6 +1249,21 @@ fn validate_title(title: &str) -> Result<&str, StudioStoreError> {
         ));
     }
     Ok(title)
+}
+
+/// First-prompt fallback title: a handful of words, hard-capped so the
+/// sidebar row stays short.
+fn title_from_prompt(prompt: &str) -> Option<String> {
+    let title: String = prompt
+        .split_whitespace()
+        .take(7)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(48)
+        .collect();
+    let title = title.trim().to_string();
+    (!title.is_empty()).then_some(title)
 }
 
 fn conversation_from_row(

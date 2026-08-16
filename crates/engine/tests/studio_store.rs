@@ -193,6 +193,88 @@ fn create_turn_persists_catalog_cost() {
     assert!((quote.amount - 0.10).abs() < f64::EPSILON);
 }
 
+fn prepared_run(model: &MediaModel, prompt: &str) -> PreparedStudioRun {
+    PreparedStudioRun {
+        model: model.clone(),
+        quote: None,
+        request: GenerationRequest {
+            provider_id: model.provider_id.clone(),
+            model_id: model.id.clone(),
+            operation: model.operation,
+            prompt: prompt.into(),
+            negative_prompt: None,
+            output_count: 1,
+            controls: BTreeMap::new(),
+            inputs: Vec::new(),
+            manifest_version: model.manifest_version.clone(),
+            display_aspect_ratio: (1, 1),
+        },
+    }
+}
+
+#[test]
+fn first_turn_titles_an_untitled_conversation_from_the_prompt() {
+    let root = tempdir().unwrap();
+    let model = image_model("fake");
+    let store = StudioStore::open(root.path(), 1024).unwrap();
+    let conversation = store
+        .create_conversation(zeron_proto::UNTITLED_STUDIO_TITLE, None)
+        .unwrap();
+    store
+        .create_turn(
+            conversation.id,
+            "a red comet over the sea at dusk with extra words",
+            None,
+            &[prepared_run(
+                &model,
+                "a red comet over the sea at dusk with extra words",
+            )],
+            "device-a",
+        )
+        .unwrap();
+    let view = store.conversation_view(conversation.id).unwrap();
+    assert_eq!(view.conversation.title, "a red comet over the sea at");
+}
+
+#[test]
+fn first_turn_keeps_a_user_chosen_title() {
+    let root = tempdir().unwrap();
+    let model = image_model("fake");
+    let store = StudioStore::open(root.path(), 1024).unwrap();
+    let conversation = store.create_conversation("Night studies", None).unwrap();
+    store
+        .create_turn(
+            conversation.id,
+            "a red comet over the sea",
+            None,
+            &[prepared_run(&model, "a red comet over the sea")],
+            "device-a",
+        )
+        .unwrap();
+    let view = store.conversation_view(conversation.id).unwrap();
+    assert_eq!(view.conversation.title, "Night studies");
+}
+
+#[test]
+fn delete_conversation_removes_the_row_and_cascaded_turns() {
+    let root = tempdir().unwrap();
+    let model = image_model("fake");
+    let store = StudioStore::open(root.path(), 1024).unwrap();
+    let conversation = store.create_conversation("Gone", None).unwrap();
+    store
+        .create_turn(
+            conversation.id,
+            "throwaway",
+            None,
+            &[prepared_run(&model, "throwaway")],
+            "device-a",
+        )
+        .unwrap();
+    store.delete_conversation(conversation.id).unwrap();
+    assert!(store.conversation_view(conversation.id).is_err());
+    assert!(store.list_conversations(true).unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn engine_assembly_opens_the_active_profiles_studio() {
     let root = tempdir().unwrap();
@@ -408,6 +490,25 @@ async fn conversation_rpc_round_trips_and_archives_profile_history() {
     .unwrap();
     assert_eq!(all.conversations.len(), 1);
     assert!(all.conversations[0].archived);
+
+    client
+        .call(
+            methods::DELETE_STUDIO_CONVERSATION,
+            serde_json::json!({ "conversationId": created.id }),
+        )
+        .await
+        .unwrap();
+    let after_delete: ListStudioConversationsResponse = serde_json::from_value(
+        client
+            .call(
+                methods::LIST_STUDIO_CONVERSATIONS,
+                serde_json::json!({ "includeArchived": true }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(after_delete.conversations.is_empty());
 
     engine.shutdown().await;
 }

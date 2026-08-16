@@ -81,6 +81,10 @@ pub struct ListStudioModelsResponse {
     pub stale: bool,
 }
 
+/// Default title for a newly created studio conversation. The first prompt
+/// replaces this with a truncated copy of itself.
+pub const UNTITLED_STUDIO_TITLE: &str = "Untitled study";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StudioConversationSummary {
@@ -127,6 +131,12 @@ pub struct RenameStudioConversationRequest {
 pub struct ArchiveStudioConversationRequest {
     pub conversation_id: StudioConversationId,
     pub archived: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteStudioConversationRequest {
+    pub conversation_id: StudioConversationId,
 }
 
 /// One independently configured model card in the composer.

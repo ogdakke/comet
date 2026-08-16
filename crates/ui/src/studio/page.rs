@@ -11,7 +11,7 @@ use gpui::{
 use zeron_proto::{
     ListStudioConversationsResponse, ListStudioModelsResponse, ListStudioProvidersResponse,
     QuoteStudioBatchResponse, StudioConversationSummary, StudioConversationView,
-    StudioProviderConnection, StudioTurnView,
+    StudioProviderConnection, StudioTurnView, UNTITLED_STUDIO_TITLE,
 };
 use zeron_rpc::methods;
 use zeron_studio::{StudioArtifactId, StudioConversationId};
@@ -242,6 +242,53 @@ impl StudioPage {
         self.selected_conversation
     }
 
+    pub fn conversation_title(&self, id: StudioConversationId) -> Option<String> {
+        self.conversations
+            .iter()
+            .find(|item| item.id == id)
+            .map(|item| item.title.clone())
+    }
+
+    fn apply_conversation_summary(
+        &mut self,
+        summary: StudioConversationSummary,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = if summary.archived {
+            let before = self.conversations.len();
+            self.conversations.retain(|item| item.id != summary.id);
+            before != self.conversations.len()
+        } else if let Some(existing) = self
+            .conversations
+            .iter_mut()
+            .find(|item| item.id == summary.id)
+        {
+            if *existing == summary {
+                false
+            } else {
+                *existing = summary.clone();
+                true
+            }
+        } else {
+            self.conversations.push(summary.clone());
+            true
+        };
+        if changed {
+            self.conversations.sort_by(|left, right| {
+                right
+                    .updated_at
+                    .cmp(&left.updated_at)
+                    .then_with(|| right.id.0.cmp(&left.id.0))
+            });
+            cx.emit(StudioEvent::SidebarChanged);
+        }
+        if let Some(view) = self.conversation.as_mut()
+            && view.conversation.id == summary.id
+        {
+            view.conversation = summary;
+        }
+    }
+
     pub fn open_conversation(&mut self, id: StudioConversationId, cx: &mut Context<Self>) {
         let Some(engine) = self.engine(cx) else {
             return;
@@ -286,6 +333,7 @@ impl StudioPage {
                         let submitted_turn_arrived = page
                             .scroll_after_turn_count
                             .is_some_and(|before| view.turns.len() > before);
+                        page.apply_conversation_summary(view.conversation.clone(), cx);
                         page.conversation = Some(view);
                         page.seed_composer_from_conversation(cx);
                         if first_open || submitted_turn_arrived {
@@ -363,7 +411,7 @@ impl StudioPage {
                 .client()
                 .call(
                     methods::CREATE_STUDIO_CONVERSATION,
-                    serde_json::json!({ "title": "Untitled study" }),
+                    serde_json::json!({ "title": UNTITLED_STUDIO_TITLE }),
                 )
                 .await;
             this.update(cx, |page, cx| {
@@ -639,6 +687,75 @@ impl StudioPage {
                         page.conversations.insert(0, conversation.clone());
                         page.open_conversation(conversation.id, cx);
                         page.use_prompt(&snapshot, cx);
+                    }
+                    Err(error) => page.error = Some(error.to_string().into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    pub fn rename_conversation(
+        &mut self,
+        conversation_id: StudioConversationId,
+        title: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        self.action_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::RENAME_STUDIO_CONVERSATION,
+                    serde_json::json!({ "conversationId": conversation_id, "title": title }),
+                )
+                .await;
+            this.update(cx, |page, cx| {
+                match result.and_then(|value| {
+                    serde_json::from_value::<StudioConversationSummary>(value)
+                        .map_err(|error| zeron_rpc::RpcError::Failed(error.to_string()))
+                }) {
+                    Ok(summary) => page.apply_conversation_summary(summary, cx),
+                    Err(error) => page.error = Some(error.to_string().into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    pub fn delete_conversation(
+        &mut self,
+        conversation_id: StudioConversationId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        self.action_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::DELETE_STUDIO_CONVERSATION,
+                    serde_json::json!({ "conversationId": conversation_id }),
+                )
+                .await;
+            this.update(cx, |page, cx| {
+                match result {
+                    Ok(_) => {
+                        page.conversations.retain(|item| item.id != conversation_id);
+                        if page.selected_conversation == Some(conversation_id) {
+                            page.close_artifact(cx);
+                            page.selected_conversation = None;
+                            page.conversation = None;
+                            if let Some(next) = page.conversations.first() {
+                                page.open_conversation(next.id, cx);
+                            }
+                        }
+                        cx.emit(StudioEvent::SidebarChanged);
                     }
                     Err(error) => page.error = Some(error.to_string().into()),
                 }
