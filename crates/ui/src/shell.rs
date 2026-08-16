@@ -3442,23 +3442,35 @@ impl Shell {
                             .w_full()
                             .flex()
                             .items_center()
+                            .gap(px(Theme::SPACE_SM))
                             .child(
                                 div()
                                     .flex_1()
-                                    .text_size(px(11.0))
-                                    .line_height(px(14.0))
-                                    .text_color(theme.text_muted.opacity(0.5))
-                                    .child("Studio"),
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(13.0))
+                                    .line_height(px(17.0))
+                                    .text_color(if is_selected {
+                                        theme.text
+                                    } else {
+                                        theme.text.opacity(0.8)
+                                    })
+                                    .child(SharedString::from(conversation.title)),
                             )
                             .child(
                                 div()
                                     .relative()
                                     .h(px(14.0))
-                                    .min_w(px(18.0))
+                                    .min_w(px(28.0))
+                                    .flex_none()
+                                    .whitespace_nowrap()
                                     .child(
                                         div()
                                             .absolute()
                                             .inset_0()
+                                            .flex()
+                                            .justify_end()
+                                            .whitespace_nowrap()
                                             .text_size(px(10.0))
                                             .text_color(theme.text_muted.opacity(0.5))
                                             .group_hover(group.clone(), |style| style.opacity(0.0))
@@ -3489,19 +3501,6 @@ impl Shell {
                                             ),
                                     ),
                             ),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .truncate()
-                            .text_size(px(13.0))
-                            .line_height(px(17.0))
-                            .text_color(if is_selected {
-                                theme.text
-                            } else {
-                                theme.text.opacity(0.8)
-                            })
-                            .child(SharedString::from(conversation.title)),
                     )
                     .child(
                         div()

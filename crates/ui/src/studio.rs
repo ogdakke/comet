@@ -7,8 +7,8 @@ use std::sync::Arc;
 use base64::Engine as _;
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, Image, ImageFormat,
-    ObjectFit, Pixels, Point, Render, SharedString, Subscription, Task, Window, div, img,
-    prelude::*, px,
+    KeyDownEvent, ObjectFit, Pixels, Point, Render, SharedString, Subscription, Task, Window, div,
+    img, prelude::*, px,
 };
 use zeron_proto::{
     ListStudioConversationsResponse, ListStudioModelsResponse, ListStudioProvidersResponse,
@@ -19,6 +19,7 @@ use zeron_rpc::methods;
 use zeron_studio::{StudioArtifactId, StudioConversationId};
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
+use crate::popover;
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
@@ -161,7 +162,10 @@ pub struct StudioPage {
     selected_conversation: Option<StudioConversationId>,
     conversation: Option<StudioConversationView>,
     prompt: Entity<ComposerInput>,
-    model_picker_open: bool,
+    model_search: Entity<ComposerInput>,
+    model_picker: popover::Popup<()>,
+    model_picker_active: Option<usize>,
+    model_picker_scroll: gpui::ScrollHandle,
     source_turn: Option<zeron_studio::StudioTurnId>,
     images: HashMap<StudioArtifactId, Arc<Image>>,
     loading_images: HashSet<StudioArtifactId>,
@@ -179,17 +183,30 @@ pub struct StudioPage {
     image_tasks: HashMap<StudioArtifactId, Task<()>>,
     _observe: Subscription,
     _prompt_events: Subscription,
+    _model_search_events: Subscription,
 }
 
 impl StudioPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
         let prompt = cx.new(|cx| ComposerInput::new("Describe the image you want to create", cx));
+        let model_search = cx.new(|cx| ComposerInput::new("Search models…", cx));
         let prompt_events = cx.subscribe(&prompt, |page: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => page.submit(cx),
             ComposerInputEvent::Edited => cx.notify(),
             _ => {}
         });
+        let model_search_events =
+            cx.subscribe(&model_search, |page: &mut Self, _, event, cx| match event {
+                ComposerInputEvent::Edited => {
+                    page.model_picker_active =
+                        (!page.filtered_model_indices(cx).is_empty()).then_some(0);
+                    page.model_picker_scroll.set_offset(Point::default());
+                    cx.notify();
+                }
+                ComposerInputEvent::Submitted => page.activate_model_picker_row(cx),
+                _ => {}
+            });
         let mut page = Self {
             state,
             conversations: Vec::new(),
@@ -200,7 +217,10 @@ impl StudioPage {
             selected_conversation: None,
             conversation: None,
             prompt,
-            model_picker_open: false,
+            model_search,
+            model_picker: popover::Popup::default(),
+            model_picker_active: None,
+            model_picker_scroll: gpui::ScrollHandle::new(),
             source_turn: None,
             images: HashMap::new(),
             loading_images: HashSet::new(),
@@ -218,6 +238,7 @@ impl StudioPage {
             image_tasks: HashMap::new(),
             _observe: observe,
             _prompt_events: prompt_events,
+            _model_search_events: model_search_events,
         };
         page.load(cx);
         page
@@ -225,6 +246,109 @@ impl StudioPage {
 
     fn engine(&self, cx: &Context<Self>) -> Option<EngineHandle> {
         self.state.read(cx).engine().cloned()
+    }
+
+    fn close_model_picker(&mut self, cx: &mut Context<Self>) {
+        if self.model_picker.begin_close() {
+            popover::reap_popup(cx, |page: &mut Self| &mut page.model_picker);
+        }
+        cx.notify();
+    }
+
+    fn toggle_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pressed_open = self.model_picker.take_press_was_open();
+        if self.model_picker.is_open() || pressed_open {
+            self.close_model_picker(cx);
+            return;
+        }
+
+        self.model_picker.open(());
+        self.model_search.update(cx, |input, cx| {
+            input.set_placeholder("Search models…", cx);
+            if !input.text().is_empty() {
+                input.set_text("", cx);
+            }
+        });
+        let visible = self.filtered_model_indices(cx);
+        self.model_picker_active = visible
+            .iter()
+            .position(|index| self.selected_models.contains(&self.models[*index].id))
+            .or((!visible.is_empty()).then_some(0));
+        self.model_picker_scroll.set_offset(Point::default());
+        if let Some(active) = self.model_picker_active {
+            self.model_picker_scroll.scroll_to_item(active);
+        }
+        let search_focus = self.model_search.read(cx).focus_handle(cx);
+        window.focus(&search_focus, cx);
+        cx.notify();
+    }
+
+    fn filtered_model_indices(&self, cx: &gpui::App) -> Vec<usize> {
+        let query = self.model_search.read(cx).text();
+        let labels = self
+            .models
+            .iter()
+            .map(|model| model.display_name.as_str())
+            .collect::<Vec<_>>();
+        popover::filter_indices(query, &labels)
+    }
+
+    fn activate_model_picker_row(&mut self, cx: &mut Context<Self>) {
+        if !self.model_picker.is_open() {
+            return;
+        }
+        let visible = self.filtered_model_indices(cx);
+        let Some(model_index) = self
+            .model_picker_active
+            .and_then(|active| visible.get(active))
+            .copied()
+        else {
+            return;
+        };
+        let id = self.models[model_index].id.clone();
+        if !self.selected_models.remove(&id) {
+            self.selected_models.insert(id);
+        }
+        cx.notify();
+    }
+
+    fn on_model_picker_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.model_picker.is_open() {
+            return;
+        }
+        let key = popover::classify_key(
+            event.keystroke.key.as_str(),
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+        );
+        match key {
+            popover::MenuKey::Escape => self.close_model_picker(cx),
+            popover::MenuKey::Up | popover::MenuKey::Down => {
+                let count = self.filtered_model_indices(cx).len();
+                let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
+                self.model_picker_active =
+                    popover::menu_step(self.model_picker_active, count, delta);
+                if let Some(active) = self.model_picker_active {
+                    self.model_picker_scroll.scroll_to_item(active);
+                }
+                cx.notify();
+            }
+            popover::MenuKey::Enter
+                if !self
+                    .model_search
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window) =>
+            {
+                self.activate_model_picker_row(cx)
+            }
+            _ => {}
+        }
     }
 
     pub fn load(&mut self, cx: &mut Context<Self>) {
@@ -970,16 +1094,46 @@ impl StudioPage {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let available =
-            (f32::from(window.viewport_size().width) - 256.0 - 240.0 - 64.0).clamp(240.0, 1600.0);
-        let columns = grid_columns(available);
-        let gap = if available < 520.0 { 12.0 } else { 16.0 };
-        let tile_width = (available - gap * (columns.saturating_sub(1) as f32)) / columns as f32;
         let turns = self
             .conversation
             .clone()
             .map(|view| view.turns)
             .unwrap_or_default();
+        if turns.is_empty() {
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .child(crate::motion::fade_in(
+                    "new-studio-canvas",
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .child(
+                            crate::icons::icon(crate::icons::ZERON_LOGO)
+                                .w(px(41.9))
+                                .h(px(48.0))
+                                .text_color(theme.text.opacity(0.2)),
+                        )
+                        .child(
+                            div()
+                                .mt(px(12.0))
+                                .text_size(px(14.0))
+                                .text_color(theme.text_muted.opacity(0.6))
+                                .child("Describe an image below to begin"),
+                        ),
+                ))
+                .into_any_element();
+        }
+
+        let available =
+            (f32::from(window.viewport_size().width) - 256.0 - 240.0 - 64.0).clamp(240.0, 1600.0);
+        let columns = grid_columns(available);
+        let gap = if available < 520.0 { 12.0 } else { 16.0 };
+        let tile_width = (available - gap * (columns.saturating_sub(1) as f32)) / columns as f32;
         let mut feed = div()
             .w_full()
             .max_w(px(1600.0))
@@ -1096,17 +1250,6 @@ impl StudioPage {
                             })),
                     )
                     .child(grid),
-            );
-        }
-        if turns.is_empty() {
-            feed = feed.child(
-                div()
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(theme.text_faint)
-                    .child("Describe an image below to begin"),
             );
         }
         feed.into_any_element()
@@ -1255,12 +1398,13 @@ impl StudioPage {
                                             }))
                                             .child("−"),
                                     )
-                                    .child(div().text_color(theme.text_muted).child(
-                                        SharedString::from(format!(
-                                            "{output_count} variation{}",
-                                            if output_count == 1 { "" } else { "s" }
-                                        )),
-                                    ))
+                                    .child(
+                                        div()
+                                            .min_w(px(16.0))
+                                            .text_center()
+                                            .text_color(theme.text_muted)
+                                            .child(SharedString::from(output_count.to_string())),
+                                    )
                                     .child(
                                         div()
                                             .id(SharedString::from(format!(
@@ -1390,28 +1534,31 @@ impl StudioPage {
             })
             .collect::<Vec<_>>();
 
-        let picker_rows = self
-            .models
-            .clone()
-            .into_iter()
-            .map(|model| {
+        let visible_model_indices = self.filtered_model_indices(cx);
+        let picker_rows = visible_model_indices
+            .iter()
+            .map(|model_index| self.models[*model_index].clone())
+            .enumerate()
+            .map(|(visible_index, model)| {
                 let selected = self.selected_models.contains(&model.id);
+                let active = self.model_picker_active == Some(visible_index);
                 let id = model.id.clone();
-                div()
+                let mut row = div()
                     .id(SharedString::from(format!("studio-model-{}", id.as_str())))
-                    .h(px(38.0))
-                    .px(px(10.0))
+                    .h(px(40.0))
+                    .flex_none()
+                    .px(px(8.0))
                     .flex()
                     .items_center()
                     .gap(px(8.0))
-                    .rounded(px(7.0))
+                    .rounded(px(8.0))
                     .cursor_pointer()
-                    .bg(if selected {
-                        crate::theme::wash(0.10)
-                    } else {
-                        crate::theme::wash(0.0)
-                    })
-                    .hover(|style| style.bg(crate::theme::wash(0.08)))
+                    .on_hover(cx.listener(move |page, hovered: &bool, _, cx| {
+                        if *hovered && page.model_picker_active != Some(visible_index) {
+                            page.model_picker_active = Some(visible_index);
+                            cx.notify();
+                        }
+                    }))
                     .on_click(cx.listener(move |page, _, _, cx| {
                         if !page.selected_models.remove(&id) {
                             page.selected_models.insert(id.clone());
@@ -1433,26 +1580,82 @@ impl StudioPage {
                                 .size(px(12.0))
                                 .text_color(theme.text_muted),
                         )
-                    })
+                    });
+                if selected {
+                    row = row
+                        .bg(crate::theme::card_selected_bg())
+                        .shadow(crate::theme::card_selected_shadows());
+                } else if active {
+                    row = row.bg(crate::theme::ink(0.05));
+                } else {
+                    row = row.hover(|style| style.bg(crate::theme::ink(0.05)));
+                }
+                row
             })
             .collect::<Vec<_>>();
 
-        let picker = self.model_picker_open.then(|| {
-            div()
+        let picker = self.model_picker.get().map(|_| {
+            let empty = picker_rows.is_empty();
+            let search_row = div()
+                .flex_none()
+                .h(px(46.0))
+                .px(px(10.0))
+                .border_b_1()
+                .border_color(crate::theme::hairline(0.08))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    crate::icons::icon(crate::icons::MAGNIFER)
+                        .size(px(14.0))
+                        .flex_none()
+                        .text_color(theme.text_muted.opacity(0.7)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(13.0))
+                        .child(self.model_search.clone()),
+                );
+            let card = popover::popover_card_flush(theme)
                 .id("studio-model-picker")
-                .absolute()
-                .left_0()
-                .bottom(px(34.0))
-                .w(px(300.0))
-                .max_h(px(300.0))
-                .overflow_y_scroll()
-                .rounded(px(12.0))
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.glass_overlay())
-                .p(px(6.0))
-                .when(!theme.is_glass(), |picker| picker.shadow_lg())
-                .children(picker_rows)
+                .w(px(320.0))
+                .on_mouse_down_out(cx.listener(|page, _, _, cx| page.close_model_picker(cx)))
+                .on_key_down(cx.listener(|page, event: &KeyDownEvent, window, cx| {
+                    page.on_model_picker_key_down(event, window, cx)
+                }))
+                .child(search_row)
+                .child(
+                    div()
+                        .id("studio-model-list")
+                        .max_h(px(300.0))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.model_picker_scroll)
+                        .p(px(6.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .when(empty, |list| {
+                            list.child(
+                                div()
+                                    .h(px(72.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.text_muted)
+                                    .child("No models found"),
+                            )
+                        })
+                        .children(picker_rows),
+                )
+                .into_any_element();
+            popover::anchored_menu_above(
+                "studio-model-menu",
+                card,
+                self.model_picker.closing_since(),
+            )
         });
 
         let blocked = self.busy
@@ -1512,9 +1715,14 @@ impl StudioPage {
                                     .rounded(px(7.0))
                                     .cursor_pointer()
                                     .hover(|style| style.bg(crate::theme::wash(0.08)))
-                                    .on_click(cx.listener(|page, _, _, cx| {
-                                        page.model_picker_open = !page.model_picker_open;
-                                        cx.notify();
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(|page, _, _, _| {
+                                            page.model_picker.note_trigger_press()
+                                        }),
+                                    )
+                                    .on_click(cx.listener(|page, _, window, cx| {
+                                        page.toggle_model_picker(window, cx)
                                     }))
                                     .child(
                                         crate::icons::icon(crate::icons::WIDGET)
@@ -1976,6 +2184,10 @@ impl Render for StudioPage {
                 )
                 .into_any_element()
         } else {
+            let has_turns = self
+                .conversation
+                .as_ref()
+                .is_some_and(|view| !view.turns.is_empty());
             div()
                 .relative()
                 .flex_1()
@@ -1987,8 +2199,7 @@ impl Render for StudioPage {
                         .id("studio-feed-scroll")
                         .size_full()
                         .overflow_y_scroll()
-                        .px(px(24.0))
-                        .pt(px(22.0))
+                        .when(has_turns, |feed| feed.px(px(24.0)).pt(px(22.0)))
                         .child(self.render_feed(window, &theme, cx)),
                 )
                 .child(self.render_composer(&theme, cx))
