@@ -1890,11 +1890,14 @@ impl StudioPage {
             .map(|(index, artifact_id)| {
                 let thumbnail = self.images.get(artifact_id).cloned();
                 let artifact_id = *artifact_id;
+                let frame_size = if index == selected_index { 58.0 } else { 50.0 };
                 div()
                     .id(SharedString::from(format!("studio-thumbnail-{index}")))
-                    .w(px(if index == selected_index { 58.0 } else { 50.0 }))
-                    .h(px(if index == selected_index { 58.0 } else { 50.0 }))
+                    .size(px(frame_size))
                     .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .rounded(px(8.0))
                     .overflow_hidden()
                     .border_1()
@@ -1920,10 +1923,17 @@ impl StudioPage {
                     }))
                     .when_some(thumbnail, |thumb, thumbnail| {
                         thumb.child(
-                            img(thumbnail)
-                                .size_full()
+                            div()
+                                .size(px(frame_size - 2.0))
+                                .flex_none()
                                 .rounded(px(7.0))
-                                .object_fit(ObjectFit::Cover),
+                                .overflow_hidden()
+                                .child(
+                                    img(thumbnail)
+                                        .size_full()
+                                        .rounded(px(7.0))
+                                        .object_fit(ObjectFit::Cover),
+                                ),
                         )
                     })
             })
