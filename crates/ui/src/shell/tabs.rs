@@ -351,7 +351,11 @@ impl Shell {
             .child(div().flex_1());
 
         let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
+        // BlockMouse: tiles scroll under this glass strip. Without it the
+        // hit-test continues through, so a window-move that starts on the
+        // bar and ends over an image fires the tile's on_click.
         self.titlebar_drag_region("studio-titlebar", bar, cx)
+            .occlude()
             .into_any_element()
     }
 }
