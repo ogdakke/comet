@@ -1,6 +1,7 @@
 //! Studio conversation page: load, submit, and the feed/lightbox outlet.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ops::Range;
 use std::time::Instant;
 
 use gpui::{
@@ -13,7 +14,7 @@ use zeron_proto::{
     StudioProviderConnection, StudioTurnView, UNTITLED_STUDIO_TITLE,
 };
 use zeron_rpc::methods;
-use zeron_studio::{MediaKind, StudioArtifactId, StudioConversationId};
+use zeron_studio::{StudioArtifactId, StudioConversationId};
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover;
@@ -26,7 +27,7 @@ use super::draft::{
     DraftRunConfig, apply_remembered_drafts, apply_remembered_selection, apply_turn_models,
     draft_aspect, select_first_model,
 };
-use super::feed::{STUDIO_COMPOSER_CLEARANCE, STUDIO_RAIL_GUTTER, conversation_image_count};
+use super::feed::{FeedLayoutSig, conversation_image_count, new_feed_list};
 use super::gallery::new_gallery_list;
 use super::images::StudioImages;
 
@@ -52,7 +53,11 @@ pub struct StudioPage {
     pub(super) model_picker_focus: FocusHandle,
     pub(super) model_picker_favorites: bool,
     pub(super) model_picker_filters: BTreeSet<zeron_studio::ModelFeature>,
-    pub(super) feed_scroll: gpui::ScrollHandle,
+    pub(super) feed_list: gpui::ListState,
+    pub(super) feed_width: f32,
+    pub(super) feed_columns: usize,
+    pub(super) feed_visible_rows: Range<usize>,
+    pub(super) feed_layout_sig: Option<FeedLayoutSig>,
     pub(super) scroll_after_turn_count: Option<usize>,
     pub(super) scroll_after_extend: Option<zeron_studio::StudioTurnId>,
     pub(super) scroll_task: Option<Task<()>>,
@@ -151,7 +156,11 @@ impl StudioPage {
             model_picker_focus: cx.focus_handle(),
             model_picker_favorites: false,
             model_picker_filters: BTreeSet::new(),
-            feed_scroll: gpui::ScrollHandle::new(),
+            feed_list: new_feed_list(cx),
+            feed_width: 0.0,
+            feed_columns: 0,
+            feed_visible_rows: 0..0,
+            feed_layout_sig: None,
             scroll_after_turn_count: None,
             scroll_after_extend: None,
             scroll_task: None,
@@ -358,7 +367,7 @@ impl StudioPage {
         self.scroll_after_extend = None;
         self.scroll_task = None;
         self.rail_hover = None;
-        self.feed_scroll.set_offset(Point::default());
+        self.reset_feed_list();
         cx.emit(StudioEvent::SidebarChanged);
         self.watch_task = Some(cx.spawn(async move |this, cx| {
             let stream = engine
@@ -393,18 +402,19 @@ impl StudioPage {
                         page.apply_conversation_summary(view.conversation.clone(), cx);
                         page.conversation = Some(view);
                         page.seed_composer_from_conversation(cx);
+                        page.sync_feed_list();
                         if first_open || submitted_turn_arrived {
                             page.scroll_after_turn_count = None;
-                            page.feed_scroll.scroll_to_bottom();
+                            page.feed_scroll_to_end();
                         } else if page
                             .scroll_after_extend
                             .zip(last_turn_id)
                             .is_some_and(|(wanted, last)| wanted == last)
                         {
                             page.scroll_after_extend = None;
-                            page.feed_scroll.scroll_to_bottom();
+                            page.feed_scroll_to_end();
                         }
-                        page.start_missing_image_loads(cx);
+                        page.request_visible_feed_images(cx);
                         cx.notify();
                     })
                     .is_err()
@@ -439,31 +449,7 @@ impl StudioPage {
             }
         }
         self.sync_gallery_list(self.gallery_width.max(1.0));
-    }
-
-    pub(super) fn conversation_has_image(&self, id: StudioArtifactId) -> bool {
-        self.conversation
-            .iter()
-            .flat_map(|view| &view.turns)
-            .flat_map(|turn| &turn.runs)
-            .flat_map(|run| &run.artifacts)
-            .any(|artifact| artifact.id == id && artifact.media_kind == MediaKind::Image)
-    }
-
-    pub(super) fn start_missing_image_loads(&mut self, cx: &mut Context<Self>) {
-        let ids = self
-            .conversation
-            .iter()
-            .flat_map(|view| &view.turns)
-            .flat_map(|turn| &turn.runs)
-            .flat_map(|run| &run.artifacts)
-            .filter(|artifact| artifact.media_kind == MediaKind::Image)
-            .map(|artifact| artifact.id)
-            .collect::<Vec<_>>();
-        self.image_protect = ids.iter().copied().collect();
-        self.image_protect
-            .extend(self.loading_images.iter().copied());
-        self.request_images(ids, true, cx);
+        self.sync_feed_list();
     }
 
     pub fn new_conversation(&mut self, cx: &mut Context<Self>) {
@@ -540,7 +526,7 @@ impl StudioPage {
                 .as_ref()
                 .map_or(0, |view| view.turns.len()),
         );
-        self.feed_scroll.scroll_to_bottom();
+        self.feed_scroll_to_end();
         self.busy = true;
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
@@ -715,6 +701,9 @@ impl StudioPage {
         if !self.expanded_prompts.remove(&turn_id) {
             self.expanded_prompts.insert(turn_id);
         }
+        if let Some(ix) = self.feed_turns().iter().position(|turn| turn.id == turn_id) {
+            self.feed_list.remeasure_items(ix..ix + 1);
+        }
         cx.notify();
     }
 
@@ -761,7 +750,7 @@ impl StudioPage {
             .is_some_and(|last| last.id == turn_id);
         if is_last {
             self.scroll_after_extend = Some(turn_id);
-            self.feed_scroll.scroll_to_bottom();
+            self.feed_scroll_to_end();
         }
         self.busy = true;
         self.action_task = Some(cx.spawn(async move |this, cx| {
@@ -1036,55 +1025,13 @@ impl Render for StudioPage {
         } else if self.selected_conversation.is_none() {
             self.render_gallery(window, &theme, cx)
         } else {
-            let has_turns = self
-                .conversation
-                .as_ref()
-                .is_some_and(|view| !view.turns.is_empty());
-            let show_rail = has_turns && self.rail_should_show(self.feed_container_width(window));
-            let left_pad = if show_rail {
-                24.0 + STUDIO_RAIL_GUTTER
-            } else {
-                24.0
-            };
-            let rail = self.render_studio_rail(window, &theme, cx);
-            // Top fade into the glass titlebar — same primitive as the chat
-            // transcript. Lightbox is a different branch and stays unfaded.
-            let feed = crate::edge_fade::edge_faded(
-                Theme::TRANSCRIPT_FADE_BAND,
-                true,
-                false,
-                div()
-                    .id("studio-feed-scroll")
-                    .size_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.feed_scroll)
-                    .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
-                    .when(has_turns, |feed| {
-                        feed.pt(px(Theme::TITLEBAR_HEIGHT + Theme::TRANSCRIPT_FADE_BAND))
-                            .pl(px(left_pad))
-                            .pr(px(24.0))
-                            .pb(px(STUDIO_COMPOSER_CLEARANCE))
-                            .flex()
-                            .flex_col()
-                            .gap(px(28.0))
-                    })
-                    .children(self.render_feed(window, &theme, show_rail, cx)),
-            )
-            .inset_top(Theme::TITLEBAR_HEIGHT)
-            .band_top(Theme::TRANSCRIPT_FADE_BAND);
             div()
                 .relative()
                 .flex_1()
                 .min_w_0()
                 .h_full()
                 .overflow_hidden()
-                .child(feed)
-                .child(rail)
-                .child(
-                    crate::scrollbar::overlay("studio-feed", &self.feed_scroll)
-                        .inset_top(Theme::TITLEBAR_HEIGHT)
-                        .inset_bottom(STUDIO_COMPOSER_CLEARANCE),
-                )
+                .child(self.render_conversation_feed(window, &theme, cx))
                 .child(self.render_composer(&theme, cx))
                 .into_any_element()
         };

@@ -80,7 +80,7 @@ impl StudioPage {
             self.watch_task = None;
             self.composer_seeded_for = None;
             self.expanded_prompts.clear();
-            self.feed_scroll.set_offset(gpui::Point::default());
+            self.reset_feed_list();
             cx.emit(StudioEvent::SidebarChanged);
         }
         cx.notify();
@@ -211,6 +211,19 @@ impl StudioPage {
         self.gallery.iter().find(|item| item.id == id)
     }
 
+    fn sync_gallery_visible_rows(&mut self) {
+        let rows = gallery_row_count(self.gallery.len(), self.gallery_list_columns.max(1));
+        if rows == 0 {
+            self.gallery_visible_rows = 0..0;
+            return;
+        }
+        let top = self.gallery_list.logical_scroll_top();
+        let viewport_h = f32::from(self.gallery_list.viewport_bounds().size.height);
+        let row_h = self.gallery_row_px.max(1.0);
+        let span = ((viewport_h + f32::from(top.offset_in_item)) / row_h).ceil() as usize;
+        self.gallery_visible_rows = top.item_ix.min(rows)..(top.item_ix + span.max(1)).min(rows);
+    }
+
     fn gallery_ids_around_visible(&self, extra_rows: usize) -> Vec<StudioArtifactId> {
         let columns = self.gallery_list_columns.max(1);
         let rows = if self.gallery_visible_rows.end > self.gallery_visible_rows.start {
@@ -252,7 +265,7 @@ impl StudioPage {
             return;
         }
         if self.selected_conversation.is_some() {
-            self.start_missing_image_loads(cx);
+            self.request_visible_feed_images(cx);
             return;
         }
         let visible = self.gallery_ids_around_visible(0);
@@ -301,7 +314,7 @@ impl StudioPage {
                 let keep_full = this
                     .update(cx, |page, _| {
                         full || page.gallery_ids_around_visible(0).contains(&id)
-                            || page.conversation_has_image(id)
+                            || page.visible_feed_has_image(id)
                             || page.selected_artifact.is_some_and(|selected| {
                                 super::artifact::lightbox_neighbor_ids(
                                     &page.lightbox_frames,
@@ -661,11 +674,10 @@ impl StudioPage {
                         let width = f32::from(bounds.size.width);
                         let changed = measure_entity
                             .update(cx, |page, _| {
-                                if (page.gallery_width - width).abs() <= 0.5 {
+                                if width < 64.0 || (page.gallery_width - width).abs() <= 0.5 {
                                     return false;
                                 }
                                 page.gallery_width = width;
-                                page.sync_gallery_list(width);
                                 true
                             })
                             .unwrap_or(false);
@@ -696,6 +708,7 @@ impl StudioPage {
                         .on_scrub(move |_, cx| {
                             scrub
                                 .update(cx, |page: &mut StudioPage, cx| {
+                                    page.sync_gallery_visible_rows();
                                     page.request_visible_gallery_images(cx);
                                     cx.notify();
                                 })

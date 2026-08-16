@@ -44,8 +44,9 @@ pub struct ScrollMetrics {
     pub viewport: Bounds<Pixels>,
 }
 
-/// Anything the overlay can drive. Studio uses a [`ScrollHandle`]; the agent
-/// chat uses a virtualized [`ListState`].
+/// Anything the overlay can drive. The studio gallery/feed and the agent
+/// transcript use a virtualized [`ListState`]; a few overlays still wrap a
+/// [`ScrollHandle`].
 #[derive(Clone)]
 pub enum ScrollSource {
     Handle(ScrollHandle),

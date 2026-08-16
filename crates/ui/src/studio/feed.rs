@@ -1,9 +1,18 @@
-//! Conversation feed: tiles, turns, and the tick rail.
+//! Conversation feed: virtualized turns, tiles, and the tick rail.
+//!
+//! One [`gpui::ListState`] item per turn — the same variable-height list the
+//! agent transcript uses — so long conversations keep measured heights and only
+//! paint the visible window plus overdraw. Image fetches follow the gallery:
+//! visible turns load full frames, neighbors prefetch thumbs.
 
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
-use gpui::{AnyElement, Context, Point, SharedString, Window, div, prelude::*, px};
+use gpui::{
+    AnyElement, Context, ListAlignment, ListOffset, ListScrollEvent, ListState, SharedString,
+    Window, canvas, div, list, prelude::*, px,
+};
 use zeron_proto::{StudioRunState, StudioRunView, StudioTurnView};
 use zeron_studio::{MediaKind, StudioArtifactId};
 
@@ -26,6 +35,16 @@ pub(super) const STUDIO_COMPOSER_CLEARANCE: f32 = 256.0;
 /// Extra left inset so the tick rail (16px + 20px hover bar) does not cover
 /// the prompt header. Matches the chat transcript's wide-gutter band.
 pub(super) const STUDIO_RAIL_GUTTER: f32 = 28.0;
+/// Space between successive turns. Previously the flex gap of the
+/// unvirtualized column; now the non-last row's bottom pad.
+const FEED_TURN_GAP: f32 = 28.0;
+/// Paint / measure window past the viewport — same order as the gallery so a
+/// fling reveals the next turn already decoded.
+const FEED_OVERDRAW_PX: f32 = 1600.0;
+/// Turns above and below the visible range that prefetch thumbs.
+const FEED_PREFETCH_TURNS: usize = 2;
+/// Horizontal inset matching the previous overflow-scroll padding.
+const FEED_PAD_X: f32 = 24.0;
 /// Collapsed prompt bubble: three rows of chat-bubble type, then Show more.
 const PROMPT_COLLAPSED_LINES: usize = 3;
 const PROMPT_LINE_HEIGHT: f32 = 22.0;
@@ -118,6 +137,97 @@ pub(super) fn conversation_image_count(turns: &[StudioTurnView]) -> u32 {
         .count() as u32
 }
 
+/// Height-affecting identity of the feed. Remeasure only when this changes
+/// so progress ticks do not reset the virtualizer.
+#[derive(Clone, PartialEq)]
+pub(super) struct FeedLayoutSig {
+    tile_q: u32,
+    columns: usize,
+    turns: Vec<TurnLayoutSig>,
+}
+
+#[derive(Clone, PartialEq)]
+struct TurnLayoutSig {
+    id: zeron_studio::StudioTurnId,
+    expanded: bool,
+    slots: Vec<(u16, u16, u16)>,
+}
+
+pub(super) fn new_feed_list(cx: &mut Context<StudioPage>) -> ListState {
+    let list = ListState::new(0, ListAlignment::Top, px(FEED_OVERDRAW_PX)).measure_all();
+    let weak = cx.weak_entity();
+    list.set_scroll_handler(move |event: &ListScrollEvent, _, cx| {
+        weak.update(cx, |page: &mut StudioPage, cx| {
+            page.feed_visible_rows = event.visible_range.clone();
+            page.request_visible_feed_images(cx);
+            cx.notify();
+        })
+        .ok();
+    });
+    list
+}
+
+fn remeasure_changed_feed_rows(list: &ListState, old: Option<&FeedLayoutSig>, new: &FeedLayoutSig) {
+    let Some(old) = old else {
+        list.remeasure_items(0..new.turns.len());
+        return;
+    };
+    let shared = old.turns.len().min(new.turns.len());
+    if old.columns != new.columns || old.tile_q != new.tile_q {
+        list.remeasure_items(0..shared);
+        return;
+    }
+    for i in 0..shared {
+        if old.turns[i] != new.turns[i] {
+            list.remeasure_items(i..i + 1);
+        }
+    }
+}
+
+/// Image ids on `turns[range]`. Non-image artifacts and holes are skipped.
+pub(super) fn feed_image_ids(
+    turns: &[StudioTurnView],
+    range: Range<usize>,
+) -> Vec<StudioArtifactId> {
+    let end = range.end.min(turns.len());
+    let start = range.start.min(end);
+    turns[start..end]
+        .iter()
+        .flat_map(|turn| &turn.runs)
+        .flat_map(|run| &run.artifacts)
+        .filter(|artifact| artifact.media_kind == MediaKind::Image)
+        .map(|artifact| artifact.id)
+        .collect()
+}
+
+/// Visible range if the list has reported one; otherwise the tail — opening a
+/// conversation lands on the latest turn, so prefetching from 0 would decode
+/// the wrong images on the first frame.
+pub(super) fn feed_visible_or_tail(visible: Range<usize>, turn_count: usize) -> Range<usize> {
+    if visible.end > visible.start {
+        visible.start.min(turn_count)..visible.end.min(turn_count)
+    } else {
+        turn_count.saturating_sub(3)..turn_count
+    }
+}
+
+/// Visible `[start, end)` from the list's current top item. `top_item >=
+/// item_count` is `scroll_to_end`'s past-the-last anchor — treat it as the
+/// tail. `span` is how many measured items still intersect the viewport.
+pub(super) fn feed_visible_from_top(
+    top_item: usize,
+    item_count: usize,
+    span: usize,
+) -> Range<usize> {
+    if item_count == 0 {
+        return 0..0;
+    }
+    if top_item >= item_count {
+        return item_count.saturating_sub(span.max(1))..item_count;
+    }
+    top_item..(top_item + span.max(1)).min(item_count)
+}
+
 pub fn grid_columns(content_width: f32) -> usize {
     if content_width < 520.0 {
         1
@@ -130,8 +240,42 @@ pub fn grid_columns(content_width: f32) -> usize {
     }
 }
 
+/// Slack around the 520 / 900 / 1240 cuts so a 1px measure wobble cannot
+/// flip 2↔3↔4 columns while the window edge is being dragged.
+const COLUMN_SLACK: f32 = 32.0;
+/// Remeasure the virtualizer only when tile width moves by this much.
+const TILE_QUANT: f32 = 8.0;
+
+fn column_enter_width(columns: usize) -> f32 {
+    match columns {
+        2 => 520.0,
+        3 => 900.0,
+        4 => 1240.0,
+        _ => 0.0,
+    }
+}
+
+pub(super) fn grid_columns_sticky(content_width: f32, current: usize) -> usize {
+    let desired = grid_columns(content_width);
+    if current == 0 || desired == current {
+        return desired;
+    }
+    if desired > current {
+        if content_width >= column_enter_width(desired) + COLUMN_SLACK {
+            desired
+        } else {
+            current
+        }
+    } else if content_width + COLUMN_SLACK < column_enter_width(current) {
+        desired
+    } else {
+        current
+    }
+}
+
 /// Visual rows a prompt would occupy at `inner_width` (bubble minus padding).
 /// Newlines always take a row, including blank ones.
+#[cfg(test)]
 fn prompt_visual_lines(prompt: &str, inner_width: f32) -> usize {
     prompt_visual_lines_at(prompt, inner_width, PROMPT_AVG_CHAR_ADVANCE)
 }
@@ -360,24 +504,183 @@ impl StudioPage {
     }
 
     pub(super) fn feed_container_width(&self, window: &Window) -> f32 {
-        let measured = f32::from(self.feed_scroll.bounds().size.width);
-        if measured > 0.0 {
-            measured
+        // Never read ListState here: `render_feed_row` runs while the list
+        // holds a mutable borrow, and `viewport_bounds()` would panic.
+        if self.feed_width > 1.0 {
+            self.feed_width
         } else {
             (f32::from(window.viewport_size().width) - crate::settings::SIDEBAR_DEFAULT).max(0.0)
         }
     }
 
-    /// Smooth-scroll the feed so `turn_ix` sits at the viewport top — same
-    /// 500ms ease-in-out timeline as the chat MessageRail.
-    pub(super) fn scroll_to_turn(&mut self, turn_ix: usize, cx: &mut Context<Self>) {
-        if motion::reduced_motion(cx) {
-            self.feed_scroll.scroll_to_top_of_item(turn_ix);
-            cx.notify();
+    pub(super) fn reset_feed_list(&mut self) {
+        self.feed_list.reset(0);
+        self.feed_visible_rows = 0..0;
+        self.feed_layout_sig = None;
+        self.feed_columns = 0;
+        self.scroll_task = None;
+    }
+
+    pub(super) fn feed_scroll_to_end(&self) {
+        self.feed_list.scroll_to_end();
+    }
+
+    fn feed_content_width(&self, window: &Window) -> f32 {
+        let rail_gutter = if self.rail_should_show(self.feed_container_width(window)) {
+            STUDIO_RAIL_GUTTER
+        } else {
+            0.0
+        };
+        (self.feed_container_width(window) - FEED_PAD_X * 2.0 - rail_gutter).clamp(240.0, 1600.0)
+    }
+
+    fn feed_grid_metrics(&self, window: &Window) -> (f32, f32, f32) {
+        let available = self.feed_content_width(window);
+        let columns = grid_columns_sticky(available, self.feed_columns);
+        let gap = if available < 520.0 { 12.0 } else { 16.0 };
+        let tile_width =
+            (available - gap * (columns.saturating_sub(1) as f32)) / columns.max(1) as f32;
+        (tile_width, gap, available)
+    }
+
+    fn compute_feed_layout_sig(&self) -> FeedLayoutSig {
+        let width = self.feed_width.max(1.0);
+        let rail_gutter = if self.rail_should_show(width) {
+            STUDIO_RAIL_GUTTER
+        } else {
+            0.0
+        };
+        let available = (width - FEED_PAD_X * 2.0 - rail_gutter).clamp(240.0, 1600.0);
+        let columns = grid_columns_sticky(available, self.feed_columns);
+        let gap = if available < 520.0 { 12.0 } else { 16.0 };
+        let tile = (available - gap * (columns.saturating_sub(1) as f32)) / columns.max(1) as f32;
+        FeedLayoutSig {
+            tile_q: (tile / TILE_QUANT).round() as u32,
+            columns,
+            turns: self
+                .feed_turns()
+                .iter()
+                .map(|turn| TurnLayoutSig {
+                    id: turn.id,
+                    expanded: self.expanded_prompts.contains(&turn.id),
+                    slots: turn
+                        .runs
+                        .iter()
+                        .map(|run| {
+                            let (aw, ah) = run.display_aspect_ratio;
+                            (
+                                aw.min(u16::MAX as u32) as u16,
+                                ah.min(u16::MAX as u32) as u16,
+                                feed_output_slots(run).len() as u16,
+                            )
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
+    pub(super) fn sync_feed_list(&mut self) {
+        let count = self.feed_turns().len();
+        let sig = self.compute_feed_layout_sig();
+        self.feed_columns = sig.columns;
+        let old_count = self.feed_list.item_count();
+        let old_sig = self.feed_layout_sig.replace(sig.clone());
+
+        if count == 0 {
+            if old_count != 0 {
+                self.feed_list.reset(0);
+            }
             return;
         }
-        if self.feed_scroll.bounds_for_item(turn_ix).is_none() {
-            self.feed_scroll.scroll_to_top_of_item(turn_ix);
+
+        if old_count == 0 {
+            self.feed_list.splice(0..0, count);
+            self.feed_list.clone().measure_all();
+            return;
+        }
+
+        if count != old_count {
+            if count > old_count {
+                self.feed_list
+                    .splice(old_count..old_count, count - old_count);
+            } else {
+                self.feed_list.splice(count..old_count, 0);
+            }
+            remeasure_changed_feed_rows(&self.feed_list, old_sig.as_ref(), &sig);
+            self.feed_list.clone().measure_all();
+            return;
+        }
+
+        if old_sig.as_ref() != Some(&sig) {
+            remeasure_changed_feed_rows(&self.feed_list, old_sig.as_ref(), &sig);
+        }
+    }
+
+    pub(super) fn feed_ids_around_visible(&self, extra: usize) -> Vec<StudioArtifactId> {
+        let turns = self.feed_turns();
+        let visible = feed_visible_or_tail(self.feed_visible_rows.clone(), turns.len());
+        let start = visible.start.saturating_sub(extra);
+        let end = visible.end.saturating_add(extra).min(turns.len());
+        feed_image_ids(turns, start..end)
+    }
+
+    /// The list's scroll handler is wheel/touch only. Scrollbar
+    /// `set_offset_from_scrollbar` never updates `feed_visible_rows`, so a
+    /// thumb scrub has to read the current top item back out of the list.
+    pub(super) fn sync_feed_visible_rows(&mut self) {
+        let list = &self.feed_list;
+        let count = list.item_count();
+        let top = list.logical_scroll_top().item_ix;
+        let viewport_bottom = f32::from(list.viewport_bounds().bottom());
+        let mut span = 0;
+        if top < count && viewport_bottom > 0.0 {
+            span = 1;
+            let mut ix = top + 1;
+            while ix < count {
+                match list.bounds_for_item(ix) {
+                    Some(bounds) if f32::from(bounds.top()) < viewport_bottom => {
+                        span += 1;
+                        ix += 1;
+                    }
+                    _ => break,
+                }
+            }
+        }
+        self.feed_visible_rows = feed_visible_from_top(top, count, span);
+    }
+
+    pub(super) fn visible_feed_has_image(&self, id: StudioArtifactId) -> bool {
+        self.feed_ids_around_visible(FEED_PREFETCH_TURNS)
+            .contains(&id)
+    }
+
+    pub(super) fn request_visible_feed_images(&mut self, cx: &mut Context<Self>) {
+        // Do not read ListState here. The wheel handler runs while the list
+        // holds a mutable borrow — `item_count()` would panic.
+        let visible = self.feed_ids_around_visible(0);
+        let mut thumbs = Vec::new();
+        for id in self.feed_ids_around_visible(FEED_PREFETCH_TURNS) {
+            if !visible.contains(&id) {
+                thumbs.push(id);
+            }
+        }
+        self.image_protect = visible.iter().chain(thumbs.iter()).copied().collect();
+        self.image_protect
+            .extend(self.loading_images.iter().copied());
+        self.request_images(visible, true, cx);
+        self.request_images(thumbs, false, cx);
+    }
+
+    /// Smooth-scroll the feed so `turn_ix` sits at the viewport top — same
+    /// 500ms ease-in-out timeline as the chat MessageRail. Item-space while
+    /// the target is unmeasured; pixel-exact once `bounds_for_item` lands.
+    pub(super) fn scroll_to_turn(&mut self, turn_ix: usize, cx: &mut Context<Self>) {
+        if motion::reduced_motion(cx) {
+            self.feed_list.scroll_to(ListOffset {
+                item_ix: turn_ix,
+                offset_in_item: px(0.0),
+            });
             cx.notify();
             return;
         }
@@ -385,6 +688,7 @@ impl StudioPage {
             let started = Instant::now();
             let total = motion::SCROLL_GLIDE.total().mul_f32(motion::speed_scale());
             let mut timeline = rail::GlideTimeline::new();
+            let mut height_ema: Option<f32> = None;
             let frames = (total.as_millis() / 16) as usize + 90;
             for _ in 0..frames {
                 cx.background_executor()
@@ -394,26 +698,83 @@ impl StudioPage {
                 let eased = motion::SCROLL_GLIDE.curve.eval(raw);
                 let frac = timeline.step(eased);
                 let done = this.update(cx, |page, cx| {
+                    let list = page.feed_list.clone();
                     if raw >= 1.0 {
-                        page.feed_scroll.scroll_to_top_of_item(turn_ix);
+                        list.scroll_to(ListOffset {
+                            item_ix: turn_ix,
+                            offset_in_item: px(0.0),
+                        });
                         cx.notify();
                         return true;
                     }
-                    let here = f32::from(page.feed_scroll.offset().y);
-                    let target = page
-                        .feed_scroll
-                        .bounds_for_item(turn_ix)
-                        .map(|bounds| {
-                            let raw_target =
-                                f32::from(page.feed_scroll.bounds().top() - bounds.top());
-                            let max_y = f32::from(page.feed_scroll.max_offset().y);
-                            raw_target.clamp(-max_y, 0.0)
-                        })
-                        .unwrap_or(here);
-                    page.feed_scroll.set_offset(Point {
-                        x: px(0.0),
-                        y: px(here + frac * (target - here)),
-                    });
+                    let viewport = f32::from(list.viewport_bounds().size.height);
+                    let top = list.logical_scroll_top();
+                    let top_height = list
+                        .bounds_for_item(top.item_ix)
+                        .map(|b| f32::from(b.size.height).max(1.0));
+                    if viewport > 0.0 {
+                        let bottom = f32::from(list.viewport_bounds().bottom());
+                        let mut ix = top.item_ix;
+                        let mut count = 0.0f32;
+                        while let Some(b) = list.bounds_for_item(ix) {
+                            if f32::from(b.top()) >= bottom {
+                                break;
+                            }
+                            count += 1.0;
+                            ix += 1;
+                        }
+                        if count > 0.0 {
+                            let mean = viewport / count;
+                            let ema = height_ema.get_or_insert(mean);
+                            *ema += 0.5 * (mean - *ema);
+                        }
+                    }
+                    if height_ema.is_none() {
+                        height_ema = top_height;
+                    }
+                    let here = top.item_ix as f32
+                        + top_height
+                            .map(|h| (f32::from(top.offset_in_item) / h).clamp(0.0, 1.0))
+                            .unwrap_or(0.0);
+                    if turn_ix < top.item_ix {
+                        let next = here - frac * (here - turn_ix as f32);
+                        let step_px = (here - next) * height_ema.unwrap_or(0.0);
+                        if step_px > 0.0 && step_px <= FEED_OVERDRAW_PX * 0.8 {
+                            list.scroll_by(px(-step_px));
+                            cx.notify();
+                            return false;
+                        }
+                        let ix = (next.floor().max(0.0) as usize).min(top.item_ix);
+                        let within = next - ix as f32;
+                        let offset = if ix == top.item_ix {
+                            top_height
+                                .map(|h| (within * h).min(f32::from(top.offset_in_item)))
+                                .unwrap_or(0.0)
+                        } else {
+                            within * height_ema.unwrap_or(0.0)
+                        };
+                        list.scroll_to(ListOffset {
+                            item_ix: ix,
+                            offset_in_item: px(offset),
+                        });
+                        cx.notify();
+                        return false;
+                    }
+                    match list.bounds_for_item(turn_ix) {
+                        Some(bounds) => {
+                            let delta = f32::from(bounds.top() - list.viewport_bounds().top());
+                            list.scroll_by(px(frac * delta));
+                        }
+                        None => {
+                            let next = here + frac * (turn_ix as f32 - here);
+                            let ix = (next.floor().max(0.0) as usize).min(turn_ix);
+                            let within = next - ix as f32;
+                            list.scroll_to(ListOffset {
+                                item_ix: ix,
+                                offset_in_item: px(within * height_ema.unwrap_or(0.0)),
+                            });
+                        }
+                    }
                     cx.notify();
                     false
                 });
@@ -423,74 +784,166 @@ impl StudioPage {
                 }
             }
             this.update(cx, |page, cx| {
-                page.feed_scroll.scroll_to_top_of_item(turn_ix);
+                page.feed_list.scroll_to(ListOffset {
+                    item_ix: turn_ix,
+                    offset_in_item: px(0.0),
+                });
                 cx.notify();
             })
             .ok();
         }));
     }
 
-    pub(super) fn render_feed(
+    pub(super) fn render_conversation_feed(
         &mut self,
         window: &mut Window,
         theme: &Theme,
-        show_rail: bool,
         cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
-        let turns = self
-            .conversation
-            .clone()
-            .map(|view| view.turns)
-            .unwrap_or_default();
-        if turns.is_empty() {
-            return vec![
-                div()
-                    .size_full()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .child(crate::motion::fade_in(
-                        "new-studio-canvas",
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .child(
-                                crate::icons::icon(crate::icons::ZERON_LOGO)
-                                    .w(px(41.9))
-                                    .h(px(48.0))
-                                    .text_color(theme.text.opacity(0.2)),
-                            )
-                            .child(
-                                div()
-                                    .mt(px(12.0))
-                                    .text_size(px(14.0))
-                                    .text_color(theme.text_muted.opacity(0.6))
-                                    .child("Describe an image below to begin"),
-                            ),
-                    ))
-                    .into_any_element(),
-            ];
+    ) -> AnyElement {
+        let has_turns = !self.feed_turns().is_empty();
+        self.sync_feed_list();
+        if has_turns {
+            // Render is outside the list's layout borrow.
+            self.sync_feed_visible_rows();
+            self.request_visible_feed_images(cx);
         }
-
-        let rail_gutter = if show_rail { STUDIO_RAIL_GUTTER } else { 0.0 };
-        let available = (f32::from(window.viewport_size().width)
-            - crate::settings::SIDEBAR_DEFAULT
-            - 240.0
-            - 64.0
-            - rail_gutter)
-            .clamp(240.0, 1600.0);
-        let columns = grid_columns(available);
-        let gap = if available < 520.0 { 12.0 } else { 16.0 };
-        let tile_width = (available - gap * (columns.saturating_sub(1) as f32)) / columns as f32;
-        turns
-            .iter()
-            .enumerate()
-            .map(|(turn_ix, turn)| {
-                self.render_turn(turn_ix, turn, tile_width, gap, available, theme, window, cx)
+        let rail = self.render_studio_rail(window, theme, cx);
+        let measure_entity = cx.weak_entity();
+        let body = if has_turns {
+            let list_element = list(self.feed_list.clone(), cx.processor(Self::render_feed_row))
+                .flex_1()
+                .size_full()
+                .with_sizing_behavior(gpui::ListSizingBehavior::Auto);
+            div()
+                .id("studio-feed-scroll")
+                .size_full()
+                .pt(px(Theme::TITLEBAR_HEIGHT + Theme::TRANSCRIPT_FADE_BAND))
+                .child(list_element)
+                .into_any_element()
+        } else {
+            div()
+                .id("studio-feed-scroll")
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .child(crate::motion::fade_in(
+                    "new-studio-canvas",
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .child(
+                            crate::icons::icon(crate::icons::ZERON_LOGO)
+                                .w(px(41.9))
+                                .h(px(48.0))
+                                .text_color(theme.text.opacity(0.2)),
+                        )
+                        .child(
+                            div()
+                                .mt(px(12.0))
+                                .text_size(px(14.0))
+                                .text_color(theme.text_muted.opacity(0.6))
+                                .child("Describe an image below to begin"),
+                        ),
+                ))
+                .into_any_element()
+        };
+        let feed = crate::edge_fade::edge_faded(Theme::TRANSCRIPT_FADE_BAND, true, false, body)
+            .inset_top(Theme::TITLEBAR_HEIGHT)
+            .band_top(Theme::TRANSCRIPT_FADE_BAND);
+        let scrub = cx.weak_entity();
+        div()
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .overflow_hidden()
+            .child(
+                canvas(
+                    move |bounds, window, cx| {
+                        let width = f32::from(bounds.size.width);
+                        // Absolute children layout after the in-flow list, which
+                        // still holds ListState. Only stash the width; remesure
+                        // on the next render. Ignore collapsed/zero passes so
+                        // we do not flip between "window fallback" and the pane.
+                        let changed = measure_entity
+                            .update(cx, |page, _| {
+                                if width < 64.0 || (page.feed_width - width).abs() <= 0.5 {
+                                    return false;
+                                }
+                                page.feed_width = width;
+                                true
+                            })
+                            .unwrap_or(false);
+                        if changed {
+                            window.request_animation_frame();
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .child(feed)
+            .child(rail)
+            .when(has_turns, |el| {
+                el.child(
+                    crate::scrollbar::overlay("studio-feed", &self.feed_list)
+                        .inset_top(Theme::TITLEBAR_HEIGHT)
+                        .on_scrub(move |_, cx| {
+                            scrub
+                                .update(cx, |page: &mut StudioPage, cx| {
+                                    page.sync_feed_visible_rows();
+                                    page.request_visible_feed_images(cx);
+                                    cx.notify();
+                                })
+                                .ok();
+                        }),
+                )
             })
-            .collect()
+            .into_any_element()
+    }
+
+    fn render_feed_row(
+        &mut self,
+        turn_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(turn) = self.feed_turns().get(turn_ix).cloned() else {
+            return gpui::Empty.into_any_element();
+        };
+        let theme = Theme::of(cx).clone();
+        let (tile_width, gap, content_width) = self.feed_grid_metrics(window);
+        let last = turn_ix + 1 == self.feed_turns().len();
+        let show_rail = self.rail_should_show(self.feed_container_width(window));
+        let left_pad = if show_rail {
+            FEED_PAD_X + STUDIO_RAIL_GUTTER
+        } else {
+            FEED_PAD_X
+        };
+        div()
+            .w_full()
+            .pl(px(left_pad))
+            .pr(px(FEED_PAD_X))
+            .pb(px(if last {
+                STUDIO_COMPOSER_CLEARANCE
+            } else {
+                FEED_TURN_GAP
+            }))
+            .child(self.render_turn(
+                turn_ix,
+                &turn,
+                tile_width,
+                gap,
+                content_width,
+                &theme,
+                window,
+                cx,
+            ))
+            .into_any_element()
     }
 
     pub(super) fn render_turn(
@@ -697,10 +1150,10 @@ impl StudioPage {
             return gpui::Empty.into_any_element();
         }
         let tick_rows: Vec<usize> = ticks.iter().map(|tick| tick.turn_ix).collect();
-        let top_row = self.feed_scroll.top_item();
+        let top_row = self.feed_list.logical_scroll_top().item_ix;
         let active = rail::active_tick(&tick_rows, top_row);
         let hover = self.rail_hover;
-        let viewport_h = f32::from(self.feed_scroll.bounds().size.height);
+        let viewport_h = f32::from(self.feed_list.viewport_bounds().size.height);
         let capacity = rail::rail_slots(if viewport_h > 0.0 { viewport_h } else { 600.0 });
         let buckets = rail::tick_buckets(ticks.len(), capacity);
         let active_bucket = active.and_then(|ix| rail::bucket_of(&buckets, ix));
@@ -828,6 +1281,21 @@ mod tests {
         assert_eq!(grid_columns(900.0), 3);
         assert_eq!(grid_columns(1239.0), 3);
         assert_eq!(grid_columns(1240.0), 4);
+    }
+
+    #[test]
+    fn grid_columns_sticky_ignores_wobble_around_cuts() {
+        assert_eq!(grid_columns_sticky(900.0, 2), 2);
+        assert_eq!(grid_columns_sticky(931.0, 2), 2);
+        assert_eq!(grid_columns_sticky(932.0, 2), 3);
+        assert_eq!(grid_columns_sticky(899.0, 3), 3);
+        assert_eq!(grid_columns_sticky(868.0, 3), 3);
+        assert_eq!(grid_columns_sticky(867.0, 3), 2);
+        assert_eq!(grid_columns_sticky(1240.0, 3), 3);
+        assert_eq!(grid_columns_sticky(1272.0, 3), 4);
+        assert_eq!(grid_columns_sticky(1208.0, 4), 4);
+        assert_eq!(grid_columns_sticky(1207.0, 4), 3);
+        assert_eq!(grid_columns_sticky(900.0, 0), 3);
     }
     fn test_model(display_name: &str) -> zeron_studio::MediaModel {
         zeron_studio::MediaModel {
@@ -1036,6 +1504,48 @@ mod tests {
         run.state = StudioRunState::Failed;
         run.output_count = 1;
         assert_eq!(feed_output_slots(&run), vec![(0, None)]);
+    }
+
+    #[test]
+    fn feed_visible_or_tail_prefers_reported_range_else_latest_turns() {
+        assert_eq!(feed_visible_or_tail(0..0, 10), 7..10);
+        assert_eq!(feed_visible_or_tail(0..0, 2), 0..2);
+        assert_eq!(feed_visible_or_tail(0..0, 0), 0..0);
+        assert_eq!(feed_visible_or_tail(3..6, 10), 3..6);
+        assert_eq!(feed_visible_or_tail(8..20, 10), 8..10);
+    }
+
+    #[test]
+    fn feed_visible_from_top_covers_scrollbar_jumps() {
+        assert_eq!(feed_visible_from_top(0, 0, 2), 0..0);
+        assert_eq!(feed_visible_from_top(3, 10, 2), 3..5);
+        assert_eq!(feed_visible_from_top(9, 10, 3), 9..10);
+        // scroll_to_end anchors past the last item.
+        assert_eq!(feed_visible_from_top(10, 10, 3), 7..10);
+        assert_eq!(feed_visible_from_top(0, 4, 0), 0..1);
+    }
+
+    #[test]
+    fn feed_image_ids_collect_only_images_in_range() {
+        let now = Utc::now();
+        let mut first = test_run("Flux", 2);
+        first.artifacts = vec![test_artifact(0), test_artifact(1)];
+        let mut second = test_run("Flux", 1);
+        second.artifacts = vec![test_artifact(0)];
+        let mut video = test_artifact(0);
+        video.media_kind = zeron_studio::MediaKind::Video;
+        let mut third = test_run("Kling", 1);
+        third.artifacts = vec![video];
+        let turns = vec![
+            test_turn("one", now, vec![first]),
+            test_turn("two", now, vec![second]),
+            test_turn("three", now, vec![third]),
+        ];
+        assert_eq!(feed_image_ids(&turns, 0..1).len(), 2);
+        assert_eq!(feed_image_ids(&turns, 1..2).len(), 1);
+        assert!(feed_image_ids(&turns, 2..3).is_empty());
+        assert_eq!(feed_image_ids(&turns, 0..3).len(), 3);
+        assert!(feed_image_ids(&turns, 9..12).is_empty());
     }
 
     #[test]
