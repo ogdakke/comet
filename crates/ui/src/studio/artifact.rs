@@ -1369,8 +1369,8 @@ impl StudioPage {
             )
             .children(slides);
 
-        let back_button = div()
-            .id("studio-artifact-back")
+        let close_button = div()
+            .id("studio-artifact-close")
             .size(px(24.0))
             .flex_none()
             .flex()
@@ -1386,7 +1386,7 @@ impl StudioPage {
                 cx.notify();
             }))
             .child(
-                crate::icons::icon(crate::icons::ARROW_LEFT)
+                crate::icons::icon(crate::icons::CLOSE)
                     .size(px(14.0))
                     .text_color(theme.text_muted.opacity(0.7)),
             );
@@ -1426,6 +1426,13 @@ impl StudioPage {
                     .text_color(theme.text_muted),
             );
 
+        // Same flush glass column as the chat changes pane: translucent
+        // `bg` over the window frost, no extra menu blur or overlay tint.
+        let inspector_bg = if theme.is_glass() {
+            theme.bg.opacity(0.4)
+        } else {
+            theme.bg
+        };
         let inspector = div()
             .id("studio-artifact-inspector")
             .size_full()
@@ -1436,7 +1443,7 @@ impl StudioPage {
             .flex_col()
             .border_l_1()
             .border_color(theme.border)
-            .bg(theme.glass_overlay())
+            .bg(inspector_bg)
             .px(px(INSPECTOR_PAD_X))
             .pt(px(Theme::TITLEBAR_HEIGHT + 18.0))
             .pb(px(16.0))
@@ -1625,11 +1632,11 @@ impl StudioPage {
                             div()
                                 .absolute()
                                 .top(px(Theme::TITLEBAR_TOP_PAD))
-                                .left(px(16.0))
+                                .right(px(16.0))
                                 .h(px(Theme::TITLEBAR_HEIGHT))
                                 .flex()
                                 .items_center()
-                                .child(back_button),
+                                .child(close_button),
                         )
                         .child(
                             div()
@@ -1689,11 +1696,7 @@ impl StudioPage {
                         .w(px(INSPECTOR_WIDTH))
                         .h_full()
                         .flex_none()
-                        .child(crate::frost::frosted(
-                            0.0,
-                            crate::frost::MENU_BLUR,
-                            inspector,
-                        ))
+                        .child(inspector)
                         .child(
                             crate::scrollbar::overlay("studio-inspector", &self.inspector_scroll)
                                 .inset_top(Theme::TITLEBAR_HEIGHT),
