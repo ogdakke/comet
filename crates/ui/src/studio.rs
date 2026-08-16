@@ -1981,14 +1981,14 @@ impl StudioPage {
 
         let back_button = div()
             .id("studio-artifact-back")
-            .size(px(28.0))
+            .size(px(24.0))
             .flex_none()
             .flex()
             .items_center()
             .justify_center()
             .rounded(px(6.0))
             .cursor_pointer()
-            .hover(|style| style.bg(crate::theme::wash(0.11)))
+            .hover(|style| style.bg(crate::theme::wash(0.14)))
             .on_click(cx.listener(|page, _, _, cx| {
                 page.selected_artifact = None;
                 cx.emit(StudioEvent::CloseArtifact);
@@ -1996,8 +1996,8 @@ impl StudioPage {
             }))
             .child(
                 crate::icons::icon(crate::icons::ARROW_LEFT)
-                    .size(px(16.0))
-                    .text_color(theme.text_muted),
+                    .size(px(14.0))
+                    .text_color(theme.text_muted.opacity(0.7)),
             );
 
         let previous = div()
@@ -2063,14 +2063,14 @@ impl StudioPage {
                             .child(
                                 div()
                                     .id("studio-copy-prompt")
-                                    .size(px(28.0))
+                                    .size(px(24.0))
                                     .flex_none()
                                     .flex()
                                     .items_center()
                                     .justify_center()
                                     .rounded(px(6.0))
                                     .cursor_pointer()
-                                    .hover(|style| style.bg(crate::theme::wash(0.11)))
+                                    .hover(|style| style.bg(crate::theme::wash(0.14)))
                                     .on_click(move |_, _, cx| {
                                         cx.write_to_clipboard(ClipboardItem::new_string(
                                             copy_prompt.clone(),
@@ -2079,7 +2079,7 @@ impl StudioPage {
                                     .child(
                                         crate::icons::icon(crate::icons::COPY)
                                             .size(px(14.0))
-                                            .text_color(theme.text_muted),
+                                            .text_color(theme.text_muted.opacity(0.7)),
                                     ),
                             ),
                     )
