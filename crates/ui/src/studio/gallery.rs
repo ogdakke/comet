@@ -951,7 +951,9 @@ impl StudioPage {
                 theme.text.opacity(0.88)
             })
             .when(selected, |check| check.bg(theme.text))
-            .occlude()
+            // BlockMouse (`.occlude()`) ends the hit test, so a wheel over
+            // the check never reaches the virtualized list underneath.
+            .block_mouse_except_scroll()
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |page, _, _, cx| {
