@@ -166,6 +166,7 @@ pub struct StudioPage {
     model_picker: popover::Popup<()>,
     model_picker_active: Option<usize>,
     model_picker_scroll: gpui::ScrollHandle,
+    model_picker_focus: FocusHandle,
     source_turn: Option<zeron_studio::StudioTurnId>,
     images: HashMap<StudioArtifactId, Arc<Image>>,
     loading_images: HashSet<StudioArtifactId>,
@@ -199,8 +200,7 @@ impl StudioPage {
         let model_search_events =
             cx.subscribe(&model_search, |page: &mut Self, _, event, cx| match event {
                 ComposerInputEvent::Edited => {
-                    page.model_picker_active =
-                        (!page.filtered_model_indices(cx).is_empty()).then_some(0);
+                    page.model_picker_active = None;
                     page.model_picker_scroll.set_offset(Point::default());
                     cx.notify();
                 }
@@ -221,6 +221,7 @@ impl StudioPage {
             model_picker: popover::Popup::default(),
             model_picker_active: None,
             model_picker_scroll: gpui::ScrollHandle::new(),
+            model_picker_focus: cx.focus_handle(),
             source_turn: None,
             images: HashMap::new(),
             loading_images: HashSet::new(),
@@ -269,15 +270,8 @@ impl StudioPage {
                 input.set_text("", cx);
             }
         });
-        let visible = self.filtered_model_indices(cx);
-        self.model_picker_active = visible
-            .iter()
-            .position(|index| self.selected_models.contains(&self.models[*index].id))
-            .or((!visible.is_empty()).then_some(0));
+        self.model_picker_active = None;
         self.model_picker_scroll.set_offset(Point::default());
-        if let Some(active) = self.model_picker_active {
-            self.model_picker_scroll.scroll_to_item(active);
-        }
         let search_focus = self.model_search.read(cx).focus_handle(cx);
         window.focus(&search_focus, cx);
         cx.notify();
@@ -298,11 +292,7 @@ impl StudioPage {
             return;
         }
         let visible = self.filtered_model_indices(cx);
-        let Some(model_index) = self
-            .model_picker_active
-            .and_then(|active| visible.get(active))
-            .copied()
-        else {
+        let Some(model_index) = visible.get(self.model_picker_active.unwrap_or(0)).copied() else {
             return;
         };
         let id = self.models[model_index].id.clone();
@@ -315,7 +305,7 @@ impl StudioPage {
     fn on_model_picker_key_down(
         &mut self,
         event: &KeyDownEvent,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !self.model_picker.is_open() {
@@ -326,26 +316,80 @@ impl StudioPage {
             event.keystroke.modifiers.platform,
             event.keystroke.modifiers.control,
         );
+        let search_focus = self.model_search.read(cx).focus_handle(cx);
+        let search_focused = search_focus.is_focused(window);
+        let list_focused = self.model_picker_focus.is_focused(window);
         match key {
-            popover::MenuKey::Escape => self.close_model_picker(cx),
+            popover::MenuKey::Escape => {
+                self.close_model_picker(cx);
+                cx.stop_propagation();
+            }
             popover::MenuKey::Up | popover::MenuKey::Down => {
                 let count = self.filtered_model_indices(cx).len();
-                let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
-                self.model_picker_active =
-                    popover::menu_step(self.model_picker_active, count, delta);
+                if search_focused && key == popover::MenuKey::Down {
+                    self.model_picker_active = (count > 0).then_some(0);
+                    if count > 0 {
+                        window.focus(&self.model_picker_focus, cx);
+                    }
+                } else if list_focused
+                    && key == popover::MenuKey::Up
+                    && self.model_picker_active == Some(0)
+                {
+                    self.model_picker_active = None;
+                    window.focus(&search_focus, cx);
+                } else if list_focused {
+                    let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
+                    self.model_picker_active =
+                        popover::menu_step(self.model_picker_active, count, delta);
+                } else {
+                    return;
+                }
                 if let Some(active) = self.model_picker_active {
                     self.model_picker_scroll.scroll_to_item(active);
                 }
                 cx.notify();
+                cx.stop_propagation();
             }
-            popover::MenuKey::Enter
-                if !self
-                    .model_search
-                    .read(cx)
-                    .focus_handle(cx)
-                    .is_focused(window) =>
-            {
-                self.activate_model_picker_row(cx)
+            popover::MenuKey::Enter if list_focused => {
+                self.activate_model_picker_row(cx);
+                cx.stop_propagation();
+            }
+            _ if list_focused => {
+                let modifiers = &event.keystroke.modifiers;
+                if modifiers.platform || modifiers.control || modifiers.alt {
+                    return;
+                }
+                let typed = event
+                    .keystroke
+                    .key_char
+                    .as_deref()
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        let key = event.keystroke.key.as_str();
+                        if key == "space" {
+                            Some(" ".to_owned())
+                        } else if key.chars().count() == 1 {
+                            Some(key.to_owned())
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(typed) = typed {
+                    let query = self.model_search.read(cx).text().to_owned();
+                    window.focus(&search_focus, cx);
+                    self.model_search.update(cx, |input, cx| {
+                        input.set_text(format!("{query}{typed}"), cx)
+                    });
+                    cx.stop_propagation();
+                } else if event.keystroke.key == "backspace" {
+                    let mut query = self.model_search.read(cx).text().to_owned();
+                    query.pop();
+                    window.focus(&search_focus, cx);
+                    self.model_search
+                        .update(cx, |input, cx| input.set_text(query, cx));
+                    cx.stop_propagation();
+                }
             }
             _ => {}
         }
@@ -1621,6 +1665,7 @@ impl StudioPage {
             let card = popover::popover_card_flush(theme)
                 .id("studio-model-picker")
                 .w(px(320.0))
+                .track_focus(&self.model_picker_focus)
                 .on_mouse_down_out(cx.listener(|page, _, _, cx| page.close_model_picker(cx)))
                 .on_key_down(cx.listener(|page, event: &KeyDownEvent, window, cx| {
                     page.on_model_picker_key_down(event, window, cx)
