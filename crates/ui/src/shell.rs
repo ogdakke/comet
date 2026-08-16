@@ -824,6 +824,7 @@ pub struct Shell {
     providers_page: Option<Entity<ProvidersPage>>,
     studio_page: Option<Entity<StudioPage>>,
     studio_sub: Option<Subscription>,
+    studio_observe: Option<Subscription>,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
@@ -1076,6 +1077,7 @@ impl Shell {
             providers_page: None,
             studio_page: None,
             studio_sub: None,
+            studio_observe: None,
             shortcuts_sub: None,
             notifications_sub: None,
             chat_menu: popover::Popup::default(),
@@ -1913,6 +1915,7 @@ impl Shell {
                 }
             }
         }));
+        self.studio_observe = Some(cx.observe(&page, |_, _, cx| cx.notify()));
         self.studio_page = Some(page.clone());
         page
     }
@@ -2896,7 +2899,8 @@ impl Shell {
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         match self.route {
             Route::Chat => self.render_session_title_bar(cx),
-            Route::Studio | Route::StudioArtifact { .. } | Route::Settings(_) => {
+            Route::Studio => self.render_studio_title_bar(cx),
+            Route::StudioArtifact { .. } | Route::Settings(_) => {
                 let inner = div()
                     .size_full()
                     .flex()

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, TimeZone, Utc};
 use gpui::{AnyElement, Context, ObjectFit, Point, SharedString, Window, div, img, prelude::*, px};
 use zeron_proto::{StudioRunState, StudioRunView, StudioTurnView};
-use zeron_studio::StudioArtifactId;
+use zeron_studio::{MediaKind, StudioArtifactId};
 
 use crate::icons;
 use crate::motion;
@@ -92,6 +92,17 @@ where
     } else {
         format!("{relative} · {absolute}")
     }
+}
+
+/// Images that still exist on the conversation — requested-but-missing
+/// slots and non-image artifacts do not count.
+pub(super) fn conversation_image_count(turns: &[StudioTurnView]) -> u32 {
+    turns
+        .iter()
+        .flat_map(|turn| &turn.runs)
+        .flat_map(|run| &run.artifacts)
+        .filter(|artifact| artifact.media_kind == MediaKind::Image)
+        .count() as u32
 }
 
 pub fn grid_columns(content_width: f32) -> usize {
@@ -881,6 +892,28 @@ mod tests {
         let chat_inner = transcript::MAX_CONTENT_WIDTH * 0.8 - PROMPT_BUBBLE_PAD_X * 2.0;
         assert!(!prompt_exceeds_collapsed_lines("cute dog", chat_inner));
         assert_eq!(prompt_visual_lines("cute dog", chat_inner), 1);
+    }
+
+    #[test]
+    fn conversation_image_count_is_artifacts_not_turns_or_slots() {
+        let now = Utc::now();
+        assert_eq!(conversation_image_count(&[]), 0);
+
+        let empty_turn = test_turn("prompt", now, vec![test_run("Flux", 4)]);
+        assert_eq!(conversation_image_count(&[empty_turn]), 0);
+
+        let mut run = test_run("Flux", 4);
+        run.artifacts = vec![test_artifact(0), test_artifact(2)];
+        let mut other = test_run("Kling", 1);
+        other.artifacts = vec![test_artifact(0)];
+        let mut video = test_artifact(1);
+        video.media_kind = zeron_studio::MediaKind::Video;
+        other.artifacts.push(video);
+        let turns = vec![
+            test_turn("first", now, vec![run]),
+            test_turn("second", now, vec![other]),
+        ];
+        assert_eq!(conversation_image_count(&turns), 3);
     }
 
     #[test]

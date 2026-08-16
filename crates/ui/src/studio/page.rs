@@ -28,7 +28,7 @@ use super::draft::{
     DraftRunConfig, apply_remembered_drafts, apply_remembered_selection, apply_turn_models,
     draft_aspect, select_first_model,
 };
-use super::feed::{STUDIO_COMPOSER_CLEARANCE, STUDIO_RAIL_GUTTER};
+use super::feed::{STUDIO_COMPOSER_CLEARANCE, STUDIO_RAIL_GUTTER, conversation_image_count};
 
 pub struct StudioPage {
     pub(super) state: Entity<AppState>,
@@ -254,6 +254,20 @@ impl StudioPage {
             .iter()
             .find(|item| item.id == id)
             .map(|item| item.title.clone())
+    }
+
+    /// Title of the open conversation, for the window titlebar.
+    pub fn selected_title(&self) -> Option<String> {
+        self.selected_conversation
+            .and_then(|id| self.conversation_title(id))
+    }
+
+    /// Images currently on the open conversation. `None` until the view
+    /// arrives, so the titlebar does not flash "0 images" on a switch.
+    pub fn selected_image_count(&self) -> Option<u32> {
+        self.conversation
+            .as_ref()
+            .map(|view| conversation_image_count(&view.turns))
     }
 
     fn apply_conversation_summary(
