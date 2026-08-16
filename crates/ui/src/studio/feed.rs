@@ -36,6 +36,10 @@ pub(super) const STUDIO_COMPOSER_CLEARANCE: f32 = 296.0;
 /// Extra left inset so the tick rail (16px + 20px hover bar) does not cover
 /// the prompt header. Matches the chat transcript's wide-gutter band.
 pub(super) const STUDIO_RAIL_GUTTER: f32 = 28.0;
+/// Bottom of the unobstructed reading band. The composer floats 18px above
+/// the viewport and is ~191px tall; ticks should ignore that covered strip
+/// when deciding which turn you are looking at.
+const STUDIO_READING_BOTTOM_INSET: f32 = 220.0;
 /// Space between successive turns. Previously the flex gap of the
 /// unvirtualized column; now the non-last row's bottom pad.
 const FEED_TURN_GAP: f32 = 28.0;
@@ -62,6 +66,63 @@ struct StudioRailTick {
     models: Vec<(String, u32)>,
     created_at: DateTime<Utc>,
     cost: Option<String>,
+}
+
+/// Measured turn interval in the same coordinate space as the list viewport.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TurnSpan {
+    top: f32,
+    bottom: f32,
+}
+
+impl TurnSpan {
+    fn overlap(self, band_top: f32, band_bottom: f32) -> f32 {
+        (self.bottom.min(band_bottom) - self.top.max(band_top)).max(0.0)
+    }
+}
+
+/// The most plausible Studio rail tick for the current scroll position.
+///
+/// Studio turns are tall — image grids plus a 296px last-row composer pad —
+/// so the viewport-top row is often still the previous turn while you are
+/// looking at the next one, and even when you are pinned to the end.
+///
+/// 1. Empty → `None`.
+/// 2. Pinned to the end → last tick.
+/// 3. Otherwise the turn with the largest intersection with the reading
+///    band (viewport minus the floating composer). Exact ties go to the
+///    later turn, so a 50/50 split prefers what you just scrolled into.
+/// 4. If nothing intersects the band, the last turn whose top is at or
+///    above the band top; before any turn reaches it, the first.
+fn studio_active_tick(
+    spans: &[TurnSpan],
+    reading_top: f32,
+    reading_bottom: f32,
+    at_end: bool,
+) -> Option<usize> {
+    if spans.is_empty() {
+        return None;
+    }
+    if at_end {
+        return Some(spans.len() - 1);
+    }
+    let band_bottom = reading_bottom.max(reading_top);
+    let mut best: Option<(usize, f32)> = None;
+    for (ix, span) in spans.iter().enumerate() {
+        let overlap = span.overlap(reading_top, band_bottom);
+        match best {
+            Some((_, best_overlap)) if overlap < best_overlap => {}
+            _ if overlap > 0.0 => best = Some((ix, overlap)),
+            _ => {}
+        }
+    }
+    if let Some((ix, _)) = best {
+        return Some(ix);
+    }
+    match spans.iter().rposition(|span| span.top <= reading_top) {
+        Some(ix) => Some(ix),
+        None => Some(0),
+    }
 }
 
 fn studio_rail_ticks(turns: &[StudioTurnView]) -> Vec<StudioRailTick> {
@@ -1280,6 +1341,11 @@ impl StudioPage {
 
     /// Left-edge tick rail for the conversation feed — same chrome as the
     /// chat MessageRail, with a Studio-specific hover card.
+    ///
+    /// Active tick is the turn that occupies the most of the unobstructed
+    /// reading band, not the viewport-top row: Studio turns are tall, so a
+    /// sliver of the previous turn at the clip top must not keep its tick
+    /// lit. Pinned-to-end always highlights the last tick.
     pub(super) fn render_studio_rail(
         &mut self,
         window: &Window,
@@ -1293,9 +1359,49 @@ impl StudioPage {
         if ticks.len() < 2 {
             return gpui::Empty.into_any_element();
         }
-        let tick_rows: Vec<usize> = ticks.iter().map(|tick| tick.turn_ix).collect();
-        let top_row = self.feed_list.logical_scroll_top().item_ix;
-        let active = rail::active_tick(&tick_rows, top_row);
+        let n = ticks.len();
+        let list = &self.feed_list;
+        let top_row = list.logical_scroll_top().item_ix;
+        let viewport = list.viewport_bounds();
+        let vp_bottom = f32::from(viewport.bottom());
+        // `is_scrolled_to_end` is the usual pin; also treat a last row whose
+        // bottom has reached the clip as pinned — wheel/scrollbar can sit a
+        // pixel short of the official end while the last turn is fully in
+        // view and a previous turn still owns the clip top.
+        let last_flush = list
+            .bounds_for_item(n - 1)
+            .is_some_and(|bounds| f32::from(bounds.bottom()) <= vp_bottom + 8.0);
+        let at_end = list.is_scrolled_to_end() == Some(true) || top_row >= n || last_flush;
+        let reading_top = f32::from(viewport.top());
+        let reading_bottom = (vp_bottom - STUDIO_READING_BOTTOM_INSET).max(reading_top + 1.0);
+        let mut spans = Vec::with_capacity(n);
+        let mut measured = true;
+        for i in 0..n {
+            match list.bounds_for_item(i) {
+                Some(bounds) => {
+                    let top = f32::from(bounds.top());
+                    let mut bottom = f32::from(bounds.bottom());
+                    // Last row includes the composer runway — score the
+                    // prompt + images, not the empty pad behind the card.
+                    if i + 1 == n {
+                        bottom = (bottom - STUDIO_COMPOSER_CLEARANCE).max(top);
+                    }
+                    spans.push(TurnSpan { top, bottom });
+                }
+                None => {
+                    measured = false;
+                    break;
+                }
+            }
+        }
+        let active = if measured {
+            studio_active_tick(&spans, reading_top, reading_bottom, at_end)
+        } else if at_end {
+            Some(n - 1)
+        } else {
+            let tick_rows: Vec<usize> = ticks.iter().map(|tick| tick.turn_ix).collect();
+            rail::active_tick(&tick_rows, top_row)
+        };
         let hover = self.rail_hover;
         let viewport_h = f32::from(self.feed_list.viewport_bounds().size.height);
         let capacity = rail::rail_slots(if viewport_h > 0.0 { viewport_h } else { 600.0 });
@@ -1508,6 +1614,66 @@ mod tests {
             runs,
             created_at,
         }
+    }
+
+    fn span(top: f32, bottom: f32) -> TurnSpan {
+        TurnSpan { top, bottom }
+    }
+
+    #[test]
+    fn studio_active_tick_empty_is_none() {
+        assert_eq!(studio_active_tick(&[], 0.0, 800.0, false), None);
+        assert_eq!(studio_active_tick(&[], 0.0, 800.0, true), None);
+    }
+
+    #[test]
+    fn studio_active_tick_at_end_is_always_last() {
+        // Previous turn still owns the clip top (the screenshot case): a
+        // 7-image turn peeks into the reading band, but the list is pinned
+        // to the bottom so the last tick must light.
+        let spans = [span(-1600.0, 180.0), span(180.0, 700.0)];
+        assert_eq!(studio_active_tick(&spans, 0.0, 680.0, true), Some(1));
+        let three = [span(0.0, 400.0), span(400.0, 800.0), span(800.0, 1100.0)];
+        assert_eq!(studio_active_tick(&three, 200.0, 880.0, true), Some(2));
+    }
+
+    #[test]
+    fn studio_active_tick_picks_the_turn_that_fills_the_reading_band() {
+        // Leftover sliver of the previous turn at the top — last turn fills
+        // the band, so it is the plausible tick even before `at_end`.
+        let spans = [span(-400.0, 180.0), span(180.0, 800.0)];
+        assert_eq!(studio_active_tick(&spans, 0.0, 680.0, false), Some(1));
+
+        // Still mostly the first turn.
+        let early = [span(-100.0, 500.0), span(500.0, 1000.0)];
+        assert_eq!(studio_active_tick(&early, 0.0, 680.0, false), Some(0));
+
+        // Crossed over: second turn now occupies more of the band.
+        let crossed = [span(-400.0, 250.0), span(250.0, 900.0)];
+        assert_eq!(studio_active_tick(&crossed, 0.0, 680.0, false), Some(1));
+    }
+
+    #[test]
+    fn studio_active_tick_tie_prefers_the_later_turn() {
+        let spans = [span(0.0, 340.0), span(340.0, 680.0)];
+        assert_eq!(studio_active_tick(&spans, 0.0, 680.0, false), Some(1));
+    }
+
+    #[test]
+    fn studio_active_tick_middle_of_three() {
+        let spans = [span(-300.0, 100.0), span(100.0, 600.0), span(600.0, 1100.0)];
+        assert_eq!(studio_active_tick(&spans, 0.0, 680.0, false), Some(1));
+    }
+
+    #[test]
+    fn studio_active_tick_falls_back_when_nothing_intersects() {
+        // Everything still below the band (short first turn, reading line
+        // sits in the title-adjacent pad) → first tick.
+        let below = [span(800.0, 1200.0), span(1200.0, 1600.0)];
+        assert_eq!(studio_active_tick(&below, 0.0, 680.0, false), Some(0));
+        // Everything already above the band, not marked at-end → last.
+        let above = [span(-2000.0, -1200.0), span(-1200.0, -200.0)];
+        assert_eq!(studio_active_tick(&above, 0.0, 680.0, false), Some(1));
     }
 
     #[test]
