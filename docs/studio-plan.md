@@ -333,21 +333,18 @@ Skeleton states remain visually quiet:
 - failed: static surface with the run error/retry affordance;
 - succeeded: overlap the decoded image and skeleton, then reveal the image without changing layout.
 
-The currently pinned GPUI fork does not expose a public API for attaching an arbitrary fragment
-shader to a normal element. Its `runtime_shaders` feature recompiles GPUI's built-in Metal shader
-library during development; it is not an application shader plug-in system. GPUI's public scene is a
-fixed set of quads, paths, sprites/images, and surfaces.
+GPUI still cannot compile app-supplied shader source. The pinned fork now has an `EffectQuad`
+primitive and `Window::paint_effect_quad` for a small audited catalog (`StarShimmer`, `SoftNoise`,
+`ProgressWash`) implemented in Metal, WGSL, and HLSL. Application code selects an effect through
+`zeron-ui::shader` (`shader(Effect::StarShimmer { seed, speed })`) and cannot inject fragment
+source at runtime. `runtime_shaders` remains a Metal-only rebuild of GPUI's own library.
 
-The initial implementation uses ordinary GPUI painting only: a clipped neutral tile with a soft
-diagonal gradient translating across it, followed by a 220ms opacity crossfade once the real image is
-fully decoded. The shimmer is paint-only, never changes layout, animates only while its tile is
-visible and pending, and stops requesting frames immediately on completion. Reduced motion renders a
-static neutral tile and an immediate image or very short crossfade.
-
-A custom `EffectQuad` / `EffectSprite` renderer primitive and shader-based image dissolve are optional
-future polish, not an MVP dependency. If pursued later, implement a small fixed set of audited effects
-with equivalent Metal and WGSL behavior rather than compiling arbitrary user/provider shader source
-at runtime.
+Studio tiles use that catalog: queued is `SoftNoise`, running/downloading is `StarShimmer` with a
+per-tile seed, and downloading can overlay a progress wash when the run reports one. The effect is
+paint-only, never changes layout, requests display-refresh frames only while a pending tile is
+mounted, and parks immediately on completion. Reduced motion freezes time at 0. Succeeded tiles
+still overlap the decoded image with a 220ms opacity crossfade. A shader-based image dissolve
+(`EffectSprite`) remains optional later polish.
 
 ### Image lightbox route
 
@@ -476,8 +473,8 @@ completed MP4 locally.
    and structured diagnostic export.
 3. Add retention controls, cache cleanup, disk-space preflight, accessibility, reduced-motion, and
    large-gallery virtualization.
-4. Optionally evaluate a cross-renderer `EffectQuad` / `EffectSprite` primitive for shader-based
-   loading and image transitions after profiling the ordinary GPUI implementation.
+4. `EffectQuad` (StarShimmer / SoftNoise / ProgressWash) is implemented. Optionally add
+   `EffectSprite` for a shader-based image dissolve after profiling the current opacity crossfade.
 5. Design opt-in metadata sync and remote artifact transport separately; do not overload registry
    rows or attachment relay RPCs.
 

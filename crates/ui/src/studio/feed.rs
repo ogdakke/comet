@@ -11,6 +11,7 @@ use crate::icons;
 use crate::motion;
 use crate::popover;
 use crate::rail;
+use crate::shader::{Effect, shader};
 use crate::state::format_time_ago;
 use crate::theme::Theme;
 use crate::transcript::{self, format_timestamp};
@@ -183,6 +184,16 @@ fn feed_output_slots(run: &StudioRunView) -> Vec<(usize, Option<StudioArtifactId
     }
 }
 
+fn lattice_seed(turn_ix: usize, run_ix: usize, output_ix: usize) -> u32 {
+    let mut x = (turn_ix as u32).wrapping_mul(0x9E37_79B9)
+        ^ (run_ix as u32).wrapping_mul(0x85EB_CA6B)
+        ^ (output_ix as u32).wrapping_mul(0xC2B2_AE35);
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7FEB_352D);
+    x ^= x >> 15;
+    x
+}
+
 impl StudioPage {
     pub(super) fn render_tile(
         &self,
@@ -193,6 +204,7 @@ impl StudioPage {
         aspect: (u32, u32),
         state: StudioRunState,
         artifact_id: Option<StudioArtifactId>,
+        progress: Option<f32>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -244,43 +256,36 @@ impl StudioPage {
                 ))
                 .into_any_element();
         }
-        let label = match state {
-            StudioRunState::Failed => "Generation failed",
-            StudioRunState::Queued => "Queued",
-            StudioRunState::Running => "Generating",
-            StudioRunState::Downloading => "Downloading",
-            _ => "Loading image",
-        };
         let pending = matches!(
             state,
             StudioRunState::Queued | StudioRunState::Running | StudioRunState::Downloading
         );
-        let shimmer = if pending && !crate::motion::reduced_motion(cx) {
-            let phase = crate::motion::staggered_phase(
-                crate::motion::pulse_delta(&crate::motion::ZERON_PULSE, cx.entity_id(), cx),
-                turn_ix * 7 + run_ix * 3 + output_ix,
-                0.07,
-            );
-            Some(
-                div()
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .left(px((phase * 1.45 - 0.4) * width))
-                    .w(px(width * 0.32))
-                    .bg(gpui::white().opacity(0.035)),
-            )
-        } else {
-            None
-        };
+        let seed = lattice_seed(turn_ix, run_ix, output_ix);
+        let fill = pending.then(|| {
+            let effect = match state {
+                StudioRunState::Queued => Effect::SoftNoise { seed, amount: 0.7 },
+                StudioRunState::Downloading => Effect::StarShimmer { seed, speed: 1.0 },
+                _ => Effect::StarShimmer { seed, speed: 1.0 },
+            };
+            shader(effect)
+                .progress(progress.filter(|_| state == StudioRunState::Downloading))
+                .absolute()
+                .top_0()
+                .left_0()
+                .w(px(width))
+                .h(px(height))
+                .rounded(px(10.0))
+        });
         base.relative()
             .flex()
             .items_center()
             .justify_center()
             .text_size(px(11.0))
             .text_color(theme.text_faint)
-            .when_some(shimmer, |tile, shimmer| tile.child(shimmer))
-            .child(label)
+            .when_some(fill, |tile, fill| tile.child(fill))
+            .when(state == StudioRunState::Failed, |tile| {
+                tile.child("Generation failed")
+            })
             .into_any_element()
     }
 
@@ -461,6 +466,7 @@ impl StudioPage {
                     run.display_aspect_ratio,
                     run.state,
                     artifact,
+                    run.progress,
                     theme,
                     cx,
                 ));
