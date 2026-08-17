@@ -144,6 +144,23 @@ fn input_max_scroll(content_height: f32, viewport_height: f32) -> f32 {
     (content_height - viewport_height).max(0.0)
 }
 
+/// Height the input element should occupy.
+///
+/// A parent-assigned height is the viewport: the field fills that box and
+/// scrolls internally once content is taller. Unconstrained fields (search,
+/// rename) still grow with content up to `unconstrained_max` so a paste
+/// cannot expand them without bound.
+fn input_element_height(
+    content_height: f32,
+    available_height: Option<f32>,
+    unconstrained_max: f32,
+) -> f32 {
+    match available_height {
+        Some(available) => available.max(0.0),
+        None => content_height.min(unconstrained_max).max(0.0),
+    }
+}
+
 /// Apply GPUI's wheel delta to a top-origin input offset. Positive deltas mean
 /// scrolling toward the start, matching gpui's built-in list/div behavior.
 fn input_scroll_offset(
@@ -2824,7 +2841,18 @@ impl gpui::Element for ComposerTextElement {
                 let content_height = input.update(cx, |input, cx| {
                     input.layout_text(width, &text_style, window, cx)
                 });
-                size(width, px(content_height.min(max_content)))
+                let available_height = match available.height {
+                    gpui::AvailableSpace::Definite(height) => Some(f32::from(height)),
+                    _ => None,
+                };
+                size(
+                    width,
+                    px(input_element_height(
+                        content_height,
+                        available_height,
+                        max_content,
+                    )),
+                )
             });
         (layout_id, ())
     }
@@ -3149,14 +3177,22 @@ impl Render for ComposerInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .w_full()
+            // Fill a parent-assigned height so any capped composer (agent,
+            // studio, a future image-edit field) becomes the scroll viewport.
+            // `min_h_0` lets a flex parent shrink us below content height;
+            // unconstrained parents still size to the measured text.
+            .h_full()
+            .min_h_0()
+            .overflow_hidden()
             .text_size(px(INPUT_TEXT_SIZE))
             .line_height(px(INPUT_LINE_HEIGHT))
             .text_color(text_color)
             .font_family(theme.font_sans.clone())
             .child(ComposerTextElement {
                 input: cx.entity(),
-                // Internal scrolling once content exceeds the 260px textarea
-                // box minus its `pt-4 pb-1` padding.
+                // Fallback cap when the parent does not assign a height
+                // (search / rename). Capped composers pass a definite
+                // height and ignore this.
                 max_content_height: TEXTAREA_MAX - TEXTAREA_PAD_V,
             })
     }
@@ -4003,6 +4039,8 @@ impl Composer {
     fn render_input_with_completion(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         div()
             .relative()
+            .h_full()
+            .min_h_0()
             .child(self.input.clone())
             .children(self.render_file_mention_popup(theme, cx))
             .children(self.render_slash_popup(theme, cx))
@@ -5582,6 +5620,7 @@ impl Render for Composer {
                         .h(px(
                             (base_height - PILL_BORDER_V - ACTIONS_ROW_HEIGHT).max(0.0)
                         ))
+                        .min_h_0()
                         .px(px(16.0))
                         .pt(px(text_pt))
                         .pb(px(4.0))
@@ -5639,6 +5678,8 @@ impl Render for Composer {
                             div()
                                 .flex_1()
                                 .min_w_0()
+                                .h_full()
+                                .min_h_0()
                                 .pl(px(16.0))
                                 .pr(px(8.0))
                                 .relative()
@@ -6084,6 +6125,27 @@ mod tests {
         );
         // Zero lines still measures one.
         assert_eq!(input_content_height(0), INPUT_LINE_HEIGHT);
+    }
+
+    #[test]
+    fn input_fills_a_parent_assigned_height() {
+        // A capped composer (studio's 208px box, the agent textarea, a
+        // future image-edit field) assigns a definite height. The input
+        // occupies that viewport even when the text is shorter, so clicks
+        // and drag-autoscroll use the visible box rather than the text.
+        assert_eq!(input_element_height(50.0, Some(208.0), 240.0), 208.0);
+        assert_eq!(input_element_height(400.0, Some(208.0), 240.0), 208.0);
+        // The unconstrained fallback must not override a parent assignment —
+        // a 400px editor should scroll at 400, not the historical 240 cap.
+        assert_eq!(input_element_height(800.0, Some(400.0), 240.0), 400.0);
+        assert_eq!(input_element_height(50.0, Some(0.0), 240.0), 0.0);
+    }
+
+    #[test]
+    fn unconstrained_input_grows_with_content_up_to_the_cap() {
+        assert_eq!(input_element_height(50.0, None, 240.0), 50.0);
+        assert_eq!(input_element_height(400.0, None, 240.0), 240.0);
+        assert_eq!(input_element_height(0.0, None, 240.0), 0.0);
     }
 
     #[test]
