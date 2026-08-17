@@ -1,8 +1,9 @@
 //! Blanket dropped-reply settle (`ZERON_ACP_QUIET_SETTLE_MS`), tested with
-//! the GROK spec so no adapter-specific evidence (Claude's cost frame,
-//! `noRunningTurn` steering reasons) is in play — this is the path every ACP
-//! agent gets. Own test binary: the env knob is process-global, and every
-//! test here shares the one value.
+//! the PI spec so no adapter-specific evidence (Claude's cost frame,
+//! `noRunningTurn` steering reasons) is in play — this is the path every
+//! non-exempt ACP agent gets. Claude, Codex, and Grok ignore the blanket
+//! settle. Own test binary: the env knob is process-global, and every test
+//! here shares the one value.
 
 use std::path::PathBuf;
 use std::sync::Once;
@@ -118,7 +119,7 @@ async fn generic_dropped_reply_settles_off_the_quiet_window() {
     init_env();
     let started = std::time::Instant::now();
     let events = run_and_collect(
-        AcpHarness::grok(),
+        AcpHarness::pi(),
         "scenario:quiet-starve",
         Duration::from_secs(20),
     )
@@ -150,7 +151,7 @@ async fn generic_dropped_reply_settles_off_the_quiet_window() {
 async fn open_tool_call_holds_the_quiet_settle_off() {
     init_env();
     let events = run_and_collect(
-        AcpHarness::grok(),
+        AcpHarness::pi(),
         "scenario:quiet-tool-guard",
         Duration::from_secs(20),
     )
@@ -223,6 +224,37 @@ async fn codex_thinking_silence_never_settles_the_turn() {
     init_env();
     let events = run_and_collect(
         AcpHarness::codex(),
+        "scenario:quiet-thinking",
+        Duration::from_secs(20),
+    )
+    .await;
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Completed, None)],
+        "{events:?}"
+    );
+    let finished = events
+        .iter()
+        .position(|(_, e)| matches!(e, AgentEvent::TextDelta { text } if text == "finished"))
+        .unwrap_or_else(|| panic!("post-quiet text must fold into the SAME turn: {events:?}"));
+    let done = events
+        .iter()
+        .position(|(_, e)| matches!(e, AgentEvent::Done { .. }))
+        .expect("done asserted above");
+    assert!(
+        finished < done,
+        "the turn must survive silent thinking intact: {events:?}"
+    );
+}
+
+/// Grok has the same silent-reasoning shape as Claude/Codex. The blanket
+/// settle used to manufacture Done mid-turn, after which the real tail was
+/// misclassified as self-continued output and repeatedly parked.
+#[tokio::test]
+async fn grok_thinking_silence_never_settles_the_turn() {
+    init_env();
+    let events = run_and_collect(
+        AcpHarness::grok(),
         "scenario:quiet-thinking",
         Duration::from_secs(20),
     )

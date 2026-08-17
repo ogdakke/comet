@@ -5,8 +5,9 @@
 //!   SURVEY_RUNS=3 cargo test -p zeron-harness --test real_quiet_survey -- --ignored --nocapture
 //!
 //! No env knob is set here — this binary runs the DEFAULTS the app ships:
-//! Claude exempt from the blanket settle, every other adapter on the 30s
-//! window. For each installed+authenticated agent CLI it reports, per run:
+//! Claude, Codex, and Grok exempt from the blanket settle, every other
+//! adapter on the 30s window. For each installed+authenticated agent CLI it
+//! reports, per run:
 //! the Done count, content events after the first Done (orphan signature),
 //! and the maximum inter-event silent gap — the safety margin against the
 //! window. Uninstalled/unauthenticated agents are skipped by name.
