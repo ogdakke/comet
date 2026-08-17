@@ -15,7 +15,7 @@ use crate::theme::{Theme, hairline};
 
 use super::StudioEvent;
 use super::artifact::{
-    StudioPaint, cover_image, downsample_feed_display, downsample_gallery_thumb,
+    StudioPaint, cover_layers, downsample_feed_display, downsample_gallery_thumb,
     read_artifact_bytes, read_preview_bytes, write_artifact_file,
 };
 use super::page::StudioPage;
@@ -340,13 +340,44 @@ impl StudioPage {
         })
     }
 
+    pub(super) fn artifact_pixel_size(&self, id: StudioArtifactId) -> Option<(u32, u32)> {
+        let nonzero = |width: Option<u32>, height: Option<u32>| match (width, height) {
+            (Some(width), Some(height)) if width > 0 && height > 0 => Some((width, height)),
+            _ => None,
+        };
+        if let Some(item) = self.gallery.iter().find(|item| item.id == id) {
+            if let Some(size) = nonzero(item.width, item.height) {
+                return Some(size);
+            }
+        }
+        if let Some(frame) = self.lightbox_frames.iter().find(|frame| frame.id == id) {
+            if let Some(size) = nonzero(frame.width, frame.height) {
+                return Some(size);
+            }
+        }
+        self.conversation.as_ref().and_then(|view| {
+            view.turns
+                .iter()
+                .flat_map(|turn| &turn.runs)
+                .find_map(|run| {
+                    run.artifacts
+                        .iter()
+                        .find(|artifact| artifact.id == id)
+                        .and_then(|artifact| {
+                            nonzero(artifact.width, artifact.height).or_else(|| {
+                                let (width, height) = run.display_aspect_ratio;
+                                (width > 0 && height > 0).then_some((width, height))
+                            })
+                        })
+                })
+        })
+    }
+
     pub(super) fn warm_placeholders(&mut self, ids: impl IntoIterator<Item = StudioArtifactId>) {
         for id in ids {
-            if self.images.get_placeholder(&id).is_some() {
-                continue;
-            }
             if let Some(hash) = self.thumbhash_for(id).map(str::to_owned) {
-                self.images.ensure_placeholder(id, &hash);
+                self.images
+                    .ensure_placeholder(id, &hash, self.artifact_pixel_size(id));
             }
         }
     }
@@ -1172,13 +1203,12 @@ impl StudioPage {
         );
         match image {
             Some(image) => frame
-                .child(cover_image(image).size_full().rounded(px(10.0)))
-                .when_some(full, |frame, thumb| {
-                    frame.child(crate::motion::fade_quick(
-                        SharedString::from(format!("studio-thumb-ready-{}", id.0)),
-                        cover_image(thumb).absolute().inset_0().rounded(px(10.0)),
-                    ))
-                })
+                .child(cover_layers(
+                    image,
+                    full,
+                    px(10.0),
+                    Some(SharedString::from(format!("studio-thumb-ready-{}", id.0))),
+                ))
                 .child(checkbox)
                 .into_any_element(),
             None => frame.child(checkbox).into_any_element(),

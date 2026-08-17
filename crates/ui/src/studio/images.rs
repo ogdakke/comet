@@ -38,12 +38,17 @@ struct CachedImage {
     last_used: u64,
 }
 
+struct PlaceholderImage {
+    image: Arc<Image>,
+    aspect: Option<(u32, u32)>,
+}
+
 #[derive(Default)]
 pub(super) struct StudioImages {
     thumbs: HashMap<StudioArtifactId, CachedImage>,
     displays: HashMap<StudioArtifactId, CachedImage>,
     full: HashMap<StudioArtifactId, CachedImage>,
-    placeholders: HashMap<StudioArtifactId, Arc<Image>>,
+    placeholders: HashMap<StudioArtifactId, PlaceholderImage>,
     tick: u64,
     thumb_bytes: usize,
     display_bytes: usize,
@@ -51,16 +56,45 @@ pub(super) struct StudioImages {
     pending_free: Vec<Arc<Image>>,
 }
 
-pub(super) fn image_from_thumbhash(thumbhash: &str) -> Option<Arc<Image>> {
+/// ThumbHash stores aspect as a 3-bit luminance grid. A 2:3 photo encodes as
+/// 5:7 and decodes to 23×32 — wider than the real frame — so a contained
+/// placeholder peeks out as blurred side bars. 9:16 already lands on 18×32.
+/// Stretch the decode onto the artifact's aspect so Contain lines up.
+const PLACEHOLDER_LONG_EDGE: u32 = 32;
+
+pub(super) fn placeholder_dimensions(width: u32, height: u32) -> (u32, u32) {
+    if width == 0 || height == 0 {
+        return (PLACEHOLDER_LONG_EDGE, PLACEHOLDER_LONG_EDGE);
+    }
+    if width >= height {
+        let h =
+            ((PLACEHOLDER_LONG_EDGE as f32 * height as f32 / width as f32).round() as u32).max(1);
+        (PLACEHOLDER_LONG_EDGE, h)
+    } else {
+        let w =
+            ((PLACEHOLDER_LONG_EDGE as f32 * width as f32 / height as f32).round() as u32).max(1);
+        (w, PLACEHOLDER_LONG_EDGE)
+    }
+}
+
+pub(super) fn image_from_thumbhash(
+    thumbhash: &str,
+    aspect: Option<(u32, u32)>,
+) -> Option<Arc<Image>> {
     let hash = base64::engine::general_purpose::STANDARD
         .decode(thumbhash)
         .ok()?;
     let (width, height, rgba) = thumbhash::thumb_hash_to_rgba(&hash).ok()?;
     let buffer = image::RgbaImage::from_raw(width as u32, height as u32, rgba)?;
+    let mut image = image::DynamicImage::ImageRgba8(buffer);
+    if let Some((aw, ah)) = aspect.filter(|(w, h)| *w > 0 && *h > 0) {
+        let (tw, th) = placeholder_dimensions(aw, ah);
+        if tw != image.width() || th != image.height() {
+            image = image.resize_exact(tw, th, image::imageops::FilterType::Triangle);
+        }
+    }
     let mut encoded = Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(buffer)
-        .write_to(&mut encoded, image::ImageFormat::Png)
-        .ok()?;
+    image.write_to(&mut encoded, image::ImageFormat::Png).ok()?;
     Some(Arc::new(Image::from_bytes(
         ImageFormat::Png,
         encoded.into_inner(),
@@ -100,15 +134,26 @@ impl StudioImages {
     }
 
     pub(super) fn get_placeholder(&self, id: &StudioArtifactId) -> Option<Arc<Image>> {
-        self.placeholders.get(id).cloned()
+        self.placeholders.get(id).map(|entry| entry.image.clone())
     }
 
-    pub(super) fn ensure_placeholder(&mut self, id: StudioArtifactId, thumbhash: &str) {
-        if self.placeholders.contains_key(&id) {
-            return;
+    pub(super) fn ensure_placeholder(
+        &mut self,
+        id: StudioArtifactId,
+        thumbhash: &str,
+        aspect: Option<(u32, u32)>,
+    ) {
+        let aspect = aspect.filter(|(width, height)| *width > 0 && *height > 0);
+        if let Some(existing) = self.placeholders.get(&id) {
+            // Keep a first decode with no aspect; replace it once the photo
+            // size is known so a 5:7 2:3 smear cannot stick for the session.
+            if aspect.is_none() || existing.aspect == aspect {
+                return;
+            }
         }
-        if let Some(image) = image_from_thumbhash(thumbhash) {
-            self.placeholders.insert(id, image);
+        if let Some(image) = image_from_thumbhash(thumbhash, aspect) {
+            self.placeholders
+                .insert(id, PlaceholderImage { image, aspect });
         }
     }
 
@@ -293,7 +338,7 @@ mod tests {
         let rgba = vec![128u8; 16 * 16 * 4];
         let hash = thumbhash::rgba_to_thumb_hash(16, 16, &rgba);
         let encoded = base64::engine::general_purpose::STANDARD.encode(hash);
-        images.ensure_placeholder(keep, &encoded);
+        images.ensure_placeholder(keep, &encoded, Some((16, 16)));
         assert!(images.get_placeholder(&keep).is_some());
         for n in 1..=THUMB_CACHE_MAX as u128 + 8 {
             images.insert_thumb(id(n), dummy(8));
@@ -323,5 +368,60 @@ mod tests {
         images.insert_full(id, dummy(1024));
         assert!(!images.contains_display(&id));
         assert!(images.get_display(&id).is_none());
+    }
+
+    fn thumbhash_of(width: u32, height: u32) -> String {
+        let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+        for y in 0..height {
+            for x in 0..width {
+                rgba.extend_from_slice(&[(40 + x) as u8, (80 + y) as u8, 120, 255]);
+            }
+        }
+        let hash = thumbhash::rgba_to_thumb_hash(width as usize, height as usize, &rgba);
+        base64::engine::general_purpose::STANDARD.encode(hash)
+    }
+
+    fn decoded_size(image: &Arc<Image>) -> (u32, u32) {
+        let decoded = image::load_from_memory(&image.bytes).unwrap();
+        (decoded.width(), decoded.height())
+    }
+
+    #[test]
+    fn thumbhash_2_3_is_wider_than_the_photo_until_corrected() {
+        let hash = thumbhash_of(64, 96);
+        let raw = image_from_thumbhash(&hash, None).unwrap();
+        let (width, height) = decoded_size(&raw);
+        assert_eq!((width, height), (23, 32));
+        assert!((width as f32 / height as f32) - (2.0 / 3.0) > 0.04);
+
+        let fixed = image_from_thumbhash(&hash, Some((64, 96))).unwrap();
+        assert_eq!(decoded_size(&fixed), placeholder_dimensions(2, 3));
+        assert_eq!(decoded_size(&fixed), (21, 32));
+    }
+
+    #[test]
+    fn thumbhash_9_16_already_matches_the_photo() {
+        let hash = thumbhash_of(45, 80);
+        let raw = image_from_thumbhash(&hash, None).unwrap();
+        assert_eq!(decoded_size(&raw), (18, 32));
+        let fixed = image_from_thumbhash(&hash, Some((45, 80))).unwrap();
+        assert_eq!(decoded_size(&fixed), (18, 32));
+    }
+
+    #[test]
+    fn ensure_placeholder_replaces_a_2_3_hash_once_aspect_is_known() {
+        let mut images = StudioImages::default();
+        let keep = id(1);
+        let hash = thumbhash_of(64, 96);
+        images.ensure_placeholder(keep, &hash, None);
+        assert_eq!(
+            decoded_size(&images.get_placeholder(&keep).unwrap()),
+            (23, 32)
+        );
+        images.ensure_placeholder(keep, &hash, Some((64, 96)));
+        assert_eq!(
+            decoded_size(&images.get_placeholder(&keep).unwrap()),
+            (21, 32)
+        );
     }
 }

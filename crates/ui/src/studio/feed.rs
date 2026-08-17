@@ -28,7 +28,7 @@ use crate::state::format_time_ago;
 use crate::theme::Theme;
 use crate::transcript::{self, format_timestamp};
 
-use super::artifact::{StudioPaint, contain_image};
+use super::artifact::{StudioPaint, contain_layers};
 use super::page::StudioPage;
 
 /// Scroll runway below the final Studio turn. The composer floats 18px above
@@ -688,16 +688,12 @@ impl StudioPage {
                     }))
                     .child(crate::motion::fade_quick(
                         SharedString::from(format!("studio-image-reveal-{}", id.0)),
-                        div()
-                            .size_full()
-                            .relative()
-                            .child(contain_image(image).size_full().rounded(px(10.0)))
-                            .when_some(full, |layer, thumb| {
-                                layer.child(crate::motion::fade_quick(
-                                    SharedString::from(format!("studio-thumb-ready-{}", id.0)),
-                                    contain_image(thumb).absolute().inset_0().rounded(px(10.0)),
-                                ))
-                            }),
+                        div().size_full().child(contain_layers(
+                            image,
+                            full,
+                            px(10.0),
+                            Some(SharedString::from(format!("studio-thumb-ready-{}", id.0))),
+                        )),
                     ))
                     .when_some(self.artifact_focus_ring(id, theme), |tile, ring| {
                         tile.child(ring)

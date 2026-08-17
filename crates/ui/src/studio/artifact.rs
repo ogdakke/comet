@@ -250,6 +250,65 @@ pub(super) fn contain_image(image: Arc<Image>) -> FittedImage {
     fitted_image(image, ObjectFit::Contain)
 }
 
+/// Placeholder + sharp overlay for every Studio surface: gallery tiles,
+/// thread tiles, filmstrip thumbs, and the lightbox. Fit is the only
+/// layout difference — Cover in a square, Contain in a photo-sized box.
+pub(super) fn cover_layers(
+    base: Arc<Image>,
+    overlay: Option<Arc<Image>>,
+    radius: impl Into<Pixels>,
+    fade: Option<SharedString>,
+) -> AnyElement {
+    layered_image(base, overlay, ObjectFit::Cover, radius.into(), fade)
+}
+
+pub(super) fn contain_layers(
+    base: Arc<Image>,
+    overlay: Option<Arc<Image>>,
+    radius: impl Into<Pixels>,
+    fade: Option<SharedString>,
+) -> AnyElement {
+    layered_image(base, overlay, ObjectFit::Contain, radius.into(), fade)
+}
+
+fn layered_image(
+    base: Arc<Image>,
+    overlay: Option<Arc<Image>>,
+    fit: ObjectFit,
+    radius: Pixels,
+    fade: Option<SharedString>,
+) -> AnyElement {
+    let paint = |image: Arc<Image>| {
+        let layer = match fit {
+            ObjectFit::Cover => cover_image(image),
+            _ => contain_image(image),
+        }
+        .size_full();
+        if f32::from(radius) > 0.0 {
+            layer.rounded(radius)
+        } else {
+            layer
+        }
+    };
+    // Tiles need the clip so Cover/rounded corners don't spill. The lightbox
+    // must not: overflow_hidden here hard-clips the photo above the filmstrip
+    // and kills the dissolve under that chrome.
+    let mut stack = div().size_full().relative();
+    if f32::from(radius) > 0.0 {
+        stack = stack.overflow_hidden().rounded(radius);
+    }
+    stack
+        .child(paint(base))
+        .when_some(overlay, |stack, overlay| {
+            let layer = paint(overlay).absolute().inset_0();
+            match fade {
+                Some(id) => stack.child(motion::fade_quick(id, layer)),
+                None => stack.child(layer),
+            }
+        })
+        .into_any_element()
+}
+
 fn fitted_image(image: Arc<Image>, fit: ObjectFit) -> FittedImage {
     FittedImage {
         image,
@@ -531,6 +590,20 @@ fn lightbox_pan_range(stage: f32, zoom: f32) -> f32 {
         0.0
     } else {
         stage.max(1.0) * zoom / 2.0
+    }
+}
+
+/// Size of a photo after ObjectFit::Contain into the stage.
+fn lightbox_contain_size(stage_w: f32, stage_h: f32, image_w: f32, image_h: f32) -> (f32, f32) {
+    if stage_w <= 1.0 || stage_h <= 1.0 || image_w <= 0.0 || image_h <= 0.0 {
+        return (stage_w.max(0.0), stage_h.max(0.0));
+    }
+    let stage_aspect = stage_w / stage_h;
+    let image_aspect = image_w / image_h;
+    if image_aspect > stage_aspect {
+        (stage_w, stage_w / image_aspect)
+    } else {
+        (stage_h * image_aspect, stage_h)
     }
 }
 
@@ -1054,19 +1127,25 @@ impl StudioPage {
 
     fn lightbox_image_pixel_size(&self, window: &mut Window, cx: &mut App) -> Option<(u32, u32)> {
         let id = self.lightbox_display_artifact_id()?;
-        if let Some(frame) = self.artifact_frame(id)
-            && let (Some(width), Some(height)) = (frame.width, frame.height)
-            && width > 0
-            && height > 0
-        {
-            return Some((width, height));
+        self.photo_pixel_size(id, window, cx)
+    }
+
+    /// Real photo size for a slide. Never the ThumbHash decode — that is 5:7
+    /// for a 2:3 image and would recreate the side-bar halo.
+    fn photo_pixel_size(
+        &self,
+        id: StudioArtifactId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<(u32, u32)> {
+        if let Some(size) = self.artifact_pixel_size(id) {
+            return Some(size);
         }
         let image = self
             .images
             .get_full(&id)
             .or_else(|| self.images.get_display(&id))
-            .or_else(|| self.images.get_thumb(&id))
-            .or_else(|| self.images.get_placeholder(&id))?;
+            .or_else(|| self.images.get_thumb_only(&id))?;
         let data = image.use_render_image(window, cx)?;
         if data.frame_count() == 0 {
             return None;
@@ -1683,10 +1762,42 @@ impl StudioPage {
         let transformed = page.is_none()
             && (self.lightbox_zoom_spring.is_some()
                 || lightbox_viewer_transformed(zoom, self.lightbox_pan));
+        let image_size = artifact_id.and_then(|id| self.photo_pixel_size(id, window, cx));
         let stack = |base: Arc<Image>, overlay: Option<Arc<Image>>| {
-            let mut layer = div().relative().overflow_hidden();
+            // Once the sharp frame has a GPU tile, drop the ThumbHash. A 2:3
+            // hash decodes as 5:7; stacked in the full stage it shows as
+            // blurred side bars. Size a placeholder-only slide to the photo
+            // box (no overflow_hidden — that clip cuts the filmstrip fade).
+            let placeholder_only = overlay.is_none();
+            let paint = overlay.unwrap_or(base);
+            let mut layer = div().relative();
             let zoom = zoom.max(0.01);
-            layer = if !transformed {
+            layer = if placeholder_only && measured {
+                if let Some((image_w, image_h)) = image_size {
+                    let (width, height) = lightbox_contain_size(
+                        self.lightbox_stage_width,
+                        self.lightbox_stage_height,
+                        image_w as f32,
+                        image_h as f32,
+                    );
+                    let scale = if transformed { zoom } else { 1.0 };
+                    let layer = layer.flex_none().w(px(width * scale)).h(px(height * scale));
+                    if transformed {
+                        layer.left(self.lightbox_pan.x).top(self.lightbox_pan.y)
+                    } else {
+                        layer
+                    }
+                } else if !transformed {
+                    layer.size_full()
+                } else {
+                    layer
+                        .flex_none()
+                        .w(px(self.lightbox_stage_width * zoom))
+                        .h(px(self.lightbox_stage_height * zoom))
+                        .left(self.lightbox_pan.x)
+                        .top(self.lightbox_pan.y)
+                }
+            } else if !transformed {
                 layer.size_full()
             } else if measured {
                 layer
@@ -1703,11 +1814,7 @@ impl StudioPage {
                     .left(self.lightbox_pan.x)
                     .top(self.lightbox_pan.y)
             };
-            layer
-                .child(contain_image(base).size_full())
-                .when_some(overlay, |layer, overlay| {
-                    layer.child(contain_image(overlay).absolute().inset_0())
-                })
+            layer.child(contain_layers(paint, None, px(0.0), None))
         };
         match base {
             Some(base) => frame.child(stack(base, overlay)).into_any_element(),
@@ -1802,16 +1909,15 @@ impl StudioPage {
                 };
                 match thumbnail {
                     Some(thumbnail) => frame
-                        .child(cover_image(thumbnail).size_full().rounded(px(7.0)))
-                        .when_some(sharp, |frame, thumb| {
-                            frame.child(crate::motion::fade_quick(
-                                SharedString::from(format!(
-                                    "studio-filmstrip-ready-{}",
-                                    artifact_id.0
-                                )),
-                                cover_image(thumb).absolute().inset_0().rounded(px(7.0)),
-                            ))
-                        })
+                        .child(cover_layers(
+                            thumbnail,
+                            sharp,
+                            px(7.0),
+                            Some(SharedString::from(format!(
+                                "studio-filmstrip-ready-{}",
+                                artifact_id.0
+                            ))),
+                        ))
                         .into_any_element(),
                     None => frame.into_any_element(),
                 }
@@ -2717,6 +2823,21 @@ mod tests {
             std::fs::read(destination).expect("saved artifact"),
             b"image bytes"
         );
+    }
+
+    #[test]
+    fn contained_2_3_box_is_narrower_than_the_thumbhash_smear() {
+        let (width, height) = lightbox_contain_size(1200.0, 800.0, 2.0, 3.0);
+        assert!((height - 800.0).abs() < 0.01);
+        assert!((width - 800.0 * 2.0 / 3.0).abs() < 0.01);
+        let (thumb_w, _) = lightbox_contain_size(1200.0, 800.0, 5.0, 7.0);
+        assert!(
+            thumb_w - width > 20.0,
+            "5:7 thumbhash {thumb_w} should outrun a 2:3 photo {width}"
+        );
+        let (nine_sixteen, _) = lightbox_contain_size(1200.0, 800.0, 9.0, 16.0);
+        let (decoded_nine_sixteen, _) = lightbox_contain_size(1200.0, 800.0, 18.0, 32.0);
+        assert!((nine_sixteen - decoded_nine_sixteen).abs() < 0.01);
     }
 
     #[test]
