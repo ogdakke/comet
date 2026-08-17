@@ -154,6 +154,101 @@ fn arg_from_title(title: &str) -> Option<String> {
     }
 }
 
+fn raw_has(raw: Option<&Value>, key: &str) -> bool {
+    match raw.and_then(|r| r.get(key)) {
+        None | Some(Value::Null) => false,
+        Some(_) => true,
+    }
+}
+
+/// `path` / `file_path` / `filePath` on rawInput, else the first location.
+fn input_path(update: &Value, raw_str: impl Fn(&str) -> Option<String>) -> Option<String> {
+    raw_str("path")
+        .or_else(|| raw_str("file_path"))
+        .or_else(|| raw_str("filePath"))
+        .or_else(|| first_location(update))
+}
+
+/// Pi `edit` sends `{path, edits:[{oldText,newText}]}`; others use a single
+/// old/new pair. Either is enough to type the call as an edit.
+fn is_edit_input(raw: Option<&Value>) -> bool {
+    let Some(raw) = raw else {
+        return false;
+    };
+    if raw
+        .get("edits")
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty())
+    {
+        return true;
+    }
+    let has_old = raw
+        .get("oldText")
+        .or_else(|| raw.get("old_string"))
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty());
+    let has_new = raw
+        .get("newText")
+        .or_else(|| raw.get("new_string"))
+        .and_then(Value::as_str)
+        .is_some();
+    has_old && has_new
+}
+
+/// Recover a typed call from `rawInput` when ACP `kind` is missing or
+/// `"other"`. `pi-acp` repeats args on `tool_call_update` without `kind` /
+/// `title`; treating that as unknown names the chip "other" and clobbers the
+/// opening `Read`/`Edit`.
+fn infer_from_raw_input(
+    update: &Value,
+    raw: Option<&Value>,
+    raw_str: impl Fn(&str) -> Option<String>,
+) -> Option<ToolCall> {
+    if let Some(command) = raw_str("command").or_else(|| raw_str("cmd")) {
+        return Some(ToolCall::Exec { command });
+    }
+    let path = input_path(update, &raw_str);
+    if let Some(path) = path.clone().filter(|_| is_edit_input(raw)) {
+        return Some(ToolCall::EditFile {
+            path,
+            old_string: None,
+            new_string: None,
+        });
+    }
+    if let Some(path) = path.clone().filter(|_| {
+        raw.and_then(|r| r.get("content"))
+            .and_then(Value::as_str)
+            .is_some()
+            && !raw_has(raw, "offset")
+            && !raw_has(raw, "limit")
+            && !is_edit_input(raw)
+    }) {
+        return Some(ToolCall::WriteFile {
+            path,
+            content: None,
+        });
+    }
+    if let Some(url) = raw_str("url") {
+        return Some(ToolCall::WebFetch { url, prompt: None });
+    }
+    if let Some(query) = raw_str("searchTerm") {
+        return Some(ToolCall::WebSearch { query });
+    }
+    if let Some(pattern) = raw_str("pattern")
+        .or_else(|| raw_str("globPattern"))
+        .or_else(|| raw_str("query"))
+    {
+        return Some(ToolCall::Search {
+            pattern,
+            path: raw_str("path"),
+        });
+    }
+    if let Some(pattern) = raw_str("glob") {
+        return Some(ToolCall::Glob { pattern });
+    }
+    path.map(|path| ToolCall::ReadFile { path })
+}
+
 /// Reduce an ACP tool call (kind + title + rawInput + locations + diff
 /// content) to the typed [`ToolCall`] zeron renders. Best-effort: agents vary
 /// in how much structure they put in `rawInput`, so every arm has a fallback.
@@ -172,6 +267,7 @@ fn typed_call(update: &Value) -> ToolCall {
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
     };
+    let path = input_path(update, &raw_str);
     match kind {
         "execute" => ToolCall::Exec {
             command: raw_str("command")
@@ -180,12 +276,7 @@ fn typed_call(update: &Value) -> ToolCall {
                 .unwrap_or_default(),
         },
         "read" => ToolCall::ReadFile {
-            path: raw_str("path")
-                .or_else(|| raw_str("file_path"))
-                .or_else(|| raw_str("filePath"))
-                .or_else(|| first_location(update))
-                .or_else(|| arg_from_title(&title))
-                .unwrap_or_default(),
+            path: path.or_else(|| arg_from_title(&title)).unwrap_or_default(),
         },
         "edit" | "delete" | "move" => {
             // A diff pins down the file and shape; otherwise fall back to the
@@ -204,11 +295,7 @@ fn typed_call(update: &Value) -> ToolCall {
                     }
                 }
             } else {
-                match raw_str("path")
-                    .or_else(|| raw_str("file_path"))
-                    .or_else(|| raw_str("filePath"))
-                    .or_else(|| first_location(update))
-                {
+                match path {
                     Some(path) if kind == "edit" => ToolCall::EditFile {
                         path,
                         old_string: None,
@@ -275,10 +362,17 @@ fn typed_call(update: &Value) -> ToolCall {
                 }),
             input: raw.cloned(),
         },
-        _ => ToolCall::Unknown {
-            name: if title.is_empty() { kind.into() } else { title },
+        _ => infer_from_raw_input(update, raw, raw_str).unwrap_or_else(|| ToolCall::Unknown {
+            // Never surface ACP's catch-all kind as the chip name.
+            name: if title.is_empty() || title.eq_ignore_ascii_case("other") {
+                raw_str("_toolName")
+                    .filter(|n| !n.eq_ignore_ascii_case("other"))
+                    .unwrap_or_default()
+            } else {
+                title
+            },
             input: raw.cloned(),
-        },
+        }),
     }
 }
 
@@ -840,6 +934,102 @@ mod tests {
                         "description": "Look up multitask docs",
                         "prompt": "find the reminder",
                     })),
+                },
+            }]
+        );
+    }
+
+    /// pi-acp repeats `rawInput` on `tool_call_update` without `kind`/`title`.
+    /// Those updates used to type as `Unknown { name: "other" }` and clobber
+    /// the opening Read/Edit chip.
+    #[test]
+    fn pi_kindless_read_raw_input_maps_to_read_file() {
+        let update = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t1",
+            "status": "in_progress",
+            "rawInput": {
+                "path": "crates/ui/src/popover.rs",
+                "offset": 1,
+                "limit": 460,
+            },
+        });
+        assert_eq!(
+            map_update(&update),
+            vec![AgentEvent::ToolCall {
+                id: "t1".into(),
+                call: ToolCall::ReadFile {
+                    path: "crates/ui/src/popover.rs".into(),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn pi_kindless_edit_raw_input_maps_to_edit_file() {
+        let update = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t2",
+            "rawInput": {
+                "path": "crates/ui/src/composer.rs",
+                "edits": [{
+                    "oldText": "slash_task: None,",
+                    "newText": "slash_task: None,\n            slash_scroll: gpui::ScrollHandle::new(),",
+                }],
+            },
+        });
+        assert_eq!(
+            map_update(&update),
+            vec![AgentEvent::ToolCall {
+                id: "t2".into(),
+                call: ToolCall::EditFile {
+                    path: "crates/ui/src/composer.rs".into(),
+                    old_string: None,
+                    new_string: None,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn kind_other_with_read_args_maps_to_read_file() {
+        let update = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "t3",
+            "title": "read",
+            "kind": "other",
+            "rawInput": {
+                "path": "crates/ui/src/pickers.rs",
+                "offset": 1680,
+                "limit": 190,
+            },
+        });
+        assert_eq!(
+            map_update(&update),
+            vec![AgentEvent::ToolCall {
+                id: "t3".into(),
+                call: ToolCall::ReadFile {
+                    path: "crates/ui/src/pickers.rs".into(),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn kind_other_without_inferable_args_does_not_name_chip_other() {
+        let update = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t4",
+            "kind": "other",
+            "rawInput": { "method": "notify" },
+        });
+        assert_eq!(
+            map_update(&update),
+            vec![AgentEvent::ToolCall {
+                id: "t4".into(),
+                call: ToolCall::Unknown {
+                    name: String::new(),
+                    input: Some(json!({ "method": "notify" })),
                 },
             }]
         );
