@@ -128,6 +128,30 @@ pub fn caret_visible(ms_since_activity: u64) -> bool {
     (ms_since_activity / CARET_BLINK_MS) % 2 == 0
 }
 
+/// Snap a layout coordinate onto the device-pixel grid.
+///
+/// Caret blink `notify`s the input, which dirties every ancestor, so GPUI
+/// rebuilds the window and Taffy re-solves flex. The text well's origin then
+/// drifts by a fraction of a CSS pixel (~½ device px on retina). Painting
+/// glyphs at that raw origin makes the placeholder bob up and down with the
+/// caret. Rounding in *device* space (not CSS px) maps 67.4 and 67.6 at 2×
+/// onto the same physical pixel.
+fn snap_to_device_px(value: Pixels, scale: f32) -> Pixels {
+    if scale <= 0.0 {
+        return value;
+    }
+    px((f32::from(value) * scale).round() / scale)
+}
+
+/// Content-local paint origin for the shaped lines and the caret. Shared by
+/// prepaint and paint so the bar cannot drift off the placeholder.
+fn input_content_origin(bounds: Bounds<Pixels>, scroll: f32, scale: f32) -> Point<Pixels> {
+    point(
+        snap_to_device_px(bounds.left(), scale),
+        snap_to_device_px(bounds.top() - px(scroll), scale),
+    )
+}
+
 /// Auto-grow: content height for a wrapped-line count.
 pub fn input_content_height(wrapped_lines: usize) -> f32 {
     wrapped_lines.max(1) as f32 * INPUT_LINE_HEIGHT
@@ -2901,6 +2925,13 @@ impl ComposerInput {
     /// Keep the cursor visible when content exceeds the element height.
     fn clamp_scroll(&mut self, element_height: f32) -> bool {
         let previous = self.scroll_top;
+        // The empty field shapes the placeholder as its display line. Following
+        // that line's caret can introduce a sub-pixel scroll that, combined
+        // with blink relayout, bobs the hint up and down.
+        if self.display_is_placeholder {
+            self.scroll_top = 0.0;
+            return previous != 0.0;
+        }
         if self.follow_cursor {
             if let Some(cursor) = self.point_for_index(self.cursor_offset()) {
                 self.scroll_top = input_scroll_offset_for_cursor(
@@ -3196,8 +3227,7 @@ impl gpui::Element for ComposerTextElement {
             }
         });
         let input = self.input.read(cx);
-        let scroll = px(input.scroll_top);
-        let origin = point(bounds.left(), bounds.top() - scroll);
+        let origin = input_content_origin(bounds, input.scroll_top, window.scale_factor());
         let selection_color = Theme::of(cx).selection;
         let caret_color = Theme::of(cx).caret;
         // The inline-code recipe: chips wash violet like `code` spans do.
@@ -3392,11 +3422,12 @@ impl gpui::Element for ComposerTextElement {
             for quad in prepaint.selection_quads.drain(..) {
                 window.paint_quad(quad);
             }
-            let mut y = bounds.top() - px(scroll);
+            let origin = input_content_origin(bounds, scroll, window.scale_factor());
+            let mut y = origin.y;
             for line in &lines {
                 let height = line.size(line_height).height;
                 let _ = line.paint(
-                    point(bounds.left(), y),
+                    point(origin.x, y),
                     line_height,
                     gpui::TextAlign::Left,
                     Some(bounds),
@@ -6469,6 +6500,21 @@ mod tests {
         assert!(!caret_visible(CARET_BLINK_MS));
         assert!(!caret_visible(2 * CARET_BLINK_MS - 1));
         assert!(caret_visible(2 * CARET_BLINK_MS));
+    }
+
+    #[test]
+    fn device_pixel_snap_collapses_retina_half_pixel_drift() {
+        // Blink relayout on a 2× display typically drifts the well by ~0.2 CSS
+        // px. Those two origins must paint on the same physical pixel or the
+        // placeholder bobs with the caret.
+        assert_eq!(
+            snap_to_device_px(px(67.4), 2.0),
+            snap_to_device_px(px(67.6), 2.0)
+        );
+        assert_eq!(f32::from(snap_to_device_px(px(67.4), 2.0)), 67.5);
+        assert_eq!(snap_to_device_px(px(20.0), 1.0), px(20.0));
+        assert_eq!(snap_to_device_px(px(20.4), 1.0), px(20.0));
+        assert_eq!(snap_to_device_px(px(20.6), 1.0), px(21.0));
     }
 
     #[test]
