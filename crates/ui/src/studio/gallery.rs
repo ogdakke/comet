@@ -23,6 +23,8 @@ use super::page::StudioPage;
 const GALLERY_PAD: f32 = 20.0;
 const GALLERY_GAP: f32 = 10.0;
 const GALLERY_MIN_TILE: f32 = 248.0;
+/// Breathing room above a revealed row so it sits below the titlebar fade.
+const GALLERY_REVEAL_TOP_PAD: f32 = 24.0;
 const GALLERY_CHECK: f32 = 20.0;
 // Image decoding is CPU-heavy. A large fan-out makes scrolling contend with
 // the render thread even though the list itself is virtualized.
@@ -65,20 +67,27 @@ pub(super) fn select_index_range(count: usize, from: usize, to: usize) -> Range<
 }
 
 /// If `row` is outside the last known gallery viewport, the list row to
-/// scroll to so that tile becomes visible. `None` means stay put — including
-/// when the viewport is unknown, so a close without cycling does not jump.
+/// put at the top of the grid. `None` means stay put — including when the
+/// viewport is unknown, so a close without cycling does not jump.
 pub(super) fn gallery_scroll_row_for_reveal(visible: Range<usize>, row: usize) -> Option<usize> {
-    if visible.end <= visible.start {
-        return None;
-    }
-    if visible.contains(&row) {
-        return None;
-    }
-    if row >= visible.end {
-        let span = visible.end - visible.start;
-        Some(row.saturating_sub(span.saturating_sub(1)))
+    if visible.end <= visible.start || visible.contains(&row) {
+        None
     } else {
         Some(row)
+    }
+}
+
+fn gallery_reveal_list_offset(row: usize, row_height: f32) -> ListOffset {
+    if row == 0 || row_height <= GALLERY_REVEAL_TOP_PAD {
+        ListOffset {
+            item_ix: row,
+            offset_in_item: px(0.0),
+        }
+    } else {
+        ListOffset {
+            item_ix: row - 1,
+            offset_in_item: px(row_height - GALLERY_REVEAL_TOP_PAD),
+        }
     }
 }
 
@@ -148,10 +157,8 @@ impl StudioPage {
         else {
             return;
         };
-        self.gallery_list.scroll_to(ListOffset {
-            item_ix: target,
-            offset_in_item: px(0.0),
-        });
+        self.gallery_list
+            .scroll_to(gallery_reveal_list_offset(target, self.gallery_row_px));
         let span = (self.gallery_visible_rows.end - self.gallery_visible_rows.start).max(1);
         self.gallery_visible_rows = target..(target + span);
     }
@@ -1262,8 +1269,18 @@ mod tests {
         assert_eq!(gallery_scroll_row_for_reveal(4..8, 7), None);
         assert_eq!(gallery_scroll_row_for_reveal(0..0, 12), None);
         assert_eq!(gallery_scroll_row_for_reveal(4..8, 2), Some(2));
-        assert_eq!(gallery_scroll_row_for_reveal(4..8, 12), Some(9));
+        assert_eq!(gallery_scroll_row_for_reveal(4..8, 12), Some(12));
         assert_eq!(gallery_scroll_row_for_reveal(0..1, 0), None);
         assert_eq!(gallery_scroll_row_for_reveal(0..1, 3), Some(3));
+    }
+
+    #[test]
+    fn gallery_reveal_leaves_a_top_pad() {
+        let offset = gallery_reveal_list_offset(3, 258.0);
+        assert_eq!(offset.item_ix, 2);
+        assert!((f32::from(offset.offset_in_item) - (258.0 - GALLERY_REVEAL_TOP_PAD)).abs() < 0.01);
+        let first = gallery_reveal_list_offset(0, 258.0);
+        assert_eq!(first.item_ix, 0);
+        assert_eq!(f32::from(first.offset_in_item), 0.0);
     }
 }
