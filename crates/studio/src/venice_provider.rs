@@ -57,8 +57,20 @@ impl VeniceMediaProvider {
     }
 
     async fn models(&self, secret: &Secret) -> ProviderResult<Vec<crate::MediaModel>> {
+        self.models_of_type(secret, "image").await
+    }
+
+    async fn models_of_type(
+        &self,
+        secret: &Secret,
+        media_type: &str,
+    ) -> ProviderResult<Vec<crate::MediaModel>> {
         let response = self
-            .authenticated(reqwest::Method::GET, "/models?type=image", secret)
+            .authenticated(
+                reqwest::Method::GET,
+                &format!("/models?type={media_type}"),
+                secret,
+            )
             .send()
             .await
             .map_err(network_error)?;
@@ -67,6 +79,20 @@ impl VeniceMediaProvider {
         normalize_model_catalog(&bytes, chrono::Utc::now()).map_err(|error| {
             ProviderError::new(ProviderErrorKind::MalformedResponse, error.to_string())
         })
+    }
+
+    async fn merged_models(&self, secret: &Secret) -> ProviderResult<Vec<crate::MediaModel>> {
+        let image = self.models_of_type(secret, "image").await;
+        let upscale = self.models_of_type(secret, "upscale").await;
+        match (image, upscale) {
+            (Ok(mut image), Ok(upscale)) => {
+                image.extend(upscale);
+                Ok(image)
+            }
+            (Ok(image), Err(_)) => Ok(image),
+            (Err(_), Ok(upscale)) => Ok(upscale),
+            (Err(error), Err(_)) => Err(error),
+        }
     }
 
     async fn billing_balance(&self, secret: &Secret) -> ProviderResult<AccountBalance> {
@@ -79,85 +105,12 @@ impl VeniceMediaProvider {
         let bytes = read_limited(response, MAX_ERROR_BYTES).await?;
         usd_account_balance(&bytes)
     }
-}
 
-#[async_trait]
-impl MediaProvider for VeniceMediaProvider {
-    fn id(&self) -> ProviderId {
-        VENICE_PROVIDER_ID.into()
-    }
-
-    fn submission_capabilities(&self) -> SubmissionCapabilities {
-        SubmissionCapabilities {
-            accepts_idempotency_key: false,
-            can_reconcile: false,
-            supports_cancellation: false,
-        }
-    }
-
-    async fn validate_credentials(&self, secret: &Secret) -> ProviderResult<ProviderAccount> {
-        self.models(secret).await?;
-        Ok(ProviderAccount {
-            id: ProviderAccountId::new(VENICE_PROVIDER_ID),
-            label: "Venice AI".into(),
-        })
-    }
-
-    async fn list_models(&self, secret: &Secret) -> ProviderResult<Vec<crate::MediaModel>> {
-        self.models(secret).await
-    }
-
-    async fn quote(
+    async fn submit_text_to_image(
         &self,
         secret: &Secret,
         request: &GenerationRequest,
-    ) -> ProviderResult<Option<Quote>> {
-        if !matches!(
-            request.operation,
-            MediaOperation::TextToVideo
-                | MediaOperation::ImageToVideo
-                | MediaOperation::ReferenceToVideo
-                | MediaOperation::VideoToVideo
-        ) {
-            return Ok(None);
-        }
-        let payload = video_quote_payload(request)?;
-        let response = self
-            .authenticated(reqwest::Method::POST, "/video/quote", secret)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(network_error)?;
-        let response = require_success(response).await?;
-        let bytes = read_limited(response, MAX_ERROR_BYTES).await?;
-        let quoted: VideoQuoteResponse = serde_json::from_slice(&bytes).map_err(|error| {
-            ProviderError::new(ProviderErrorKind::MalformedResponse, error.to_string())
-        })?;
-        if !quoted.quote.is_finite() || quoted.quote < 0.0 {
-            return Err(ProviderError::new(
-                ProviderErrorKind::MalformedResponse,
-                "Venice returned a non-finite video quote",
-            ));
-        }
-        Ok(Some(Quote::provider("USD", quoted.quote)))
-    }
-
-    async fn balance(&self, secret: &Secret) -> ProviderResult<Option<AccountBalance>> {
-        self.billing_balance(secret).await.map(Some)
-    }
-
-    async fn submit(
-        &self,
-        secret: &Secret,
-        request: &GenerationRequest,
-        _context: &SubmitContext,
     ) -> ProviderResult<Submission> {
-        if request.operation != crate::MediaOperation::TextToImage || !request.inputs.is_empty() {
-            return Err(ProviderError::new(
-                ProviderErrorKind::Unsupported,
-                "this Venice adapter slice supports text-to-image without inputs",
-            ));
-        }
         let binary = request.output_count == 1;
         let payload = image_payload(request, binary)?;
         let response = self
@@ -166,16 +119,7 @@ impl MediaProvider for VeniceMediaProvider {
             .send()
             .await
             .map_err(network_error)?;
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
+        let content_type = response_content_type(&response);
         let moderation = ModerationFlags::from_headers(response.headers());
         let response = require_success(response).await?;
         let bytes = read_limited(response, MAX_IMAGE_RESPONSE_BYTES).await?;
@@ -224,6 +168,128 @@ impl MediaProvider for VeniceMediaProvider {
                 .collect::<ProviderResult<Vec<_>>>()?
         };
         Ok(Submission::Completed { artifacts })
+    }
+
+    async fn submit_upscale(
+        &self,
+        secret: &Secret,
+        request: &GenerationRequest,
+        context: &SubmitContext,
+    ) -> ProviderResult<Submission> {
+        let payload = upscale_payload(request, context)?;
+        let response = self
+            .authenticated(reqwest::Method::POST, "/image/upscale", secret)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(network_error)?;
+        let content_type = response_content_type(&response);
+        let moderation = ModerationFlags::from_headers(response.headers());
+        let response = require_success(response).await?;
+        let bytes = read_limited(response, MAX_IMAGE_RESPONSE_BYTES).await?;
+        if !content_type.starts_with("image/") {
+            return Err(ProviderError::new(
+                ProviderErrorKind::MalformedResponse,
+                format!("Venice returned {content_type} for an upscale request"),
+            ));
+        }
+        let artifact = image_artifact(bytes, moderation.metadata(None))?;
+        if artifact.mime_type != "image/png" {
+            return Err(ProviderError::new(
+                ProviderErrorKind::MalformedResponse,
+                format!(
+                    "Venice upscale returned {}, expected image/png",
+                    artifact.mime_type
+                ),
+            ));
+        }
+        Ok(Submission::Completed {
+            artifacts: vec![artifact],
+        })
+    }
+}
+
+#[async_trait]
+impl MediaProvider for VeniceMediaProvider {
+    fn id(&self) -> ProviderId {
+        VENICE_PROVIDER_ID.into()
+    }
+
+    fn submission_capabilities(&self) -> SubmissionCapabilities {
+        SubmissionCapabilities {
+            accepts_idempotency_key: false,
+            can_reconcile: false,
+            supports_cancellation: false,
+        }
+    }
+
+    async fn validate_credentials(&self, secret: &Secret) -> ProviderResult<ProviderAccount> {
+        self.models(secret).await?;
+        Ok(ProviderAccount {
+            id: ProviderAccountId::new(VENICE_PROVIDER_ID),
+            label: "Venice AI".into(),
+        })
+    }
+
+    async fn list_models(&self, secret: &Secret) -> ProviderResult<Vec<crate::MediaModel>> {
+        self.merged_models(secret).await
+    }
+
+    async fn quote(
+        &self,
+        secret: &Secret,
+        request: &GenerationRequest,
+    ) -> ProviderResult<Option<Quote>> {
+        if !matches!(
+            request.operation,
+            MediaOperation::TextToVideo
+                | MediaOperation::ImageToVideo
+                | MediaOperation::ReferenceToVideo
+                | MediaOperation::VideoToVideo
+        ) {
+            return Ok(None);
+        }
+        let payload = video_quote_payload(request)?;
+        let response = self
+            .authenticated(reqwest::Method::POST, "/video/quote", secret)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(network_error)?;
+        let response = require_success(response).await?;
+        let bytes = read_limited(response, MAX_ERROR_BYTES).await?;
+        let quoted: VideoQuoteResponse = serde_json::from_slice(&bytes).map_err(|error| {
+            ProviderError::new(ProviderErrorKind::MalformedResponse, error.to_string())
+        })?;
+        if !quoted.quote.is_finite() || quoted.quote < 0.0 {
+            return Err(ProviderError::new(
+                ProviderErrorKind::MalformedResponse,
+                "Venice returned a non-finite video quote",
+            ));
+        }
+        Ok(Some(Quote::provider("USD", quoted.quote)))
+    }
+
+    async fn balance(&self, secret: &Secret) -> ProviderResult<Option<AccountBalance>> {
+        self.billing_balance(secret).await.map(Some)
+    }
+
+    async fn submit(
+        &self,
+        secret: &Secret,
+        request: &GenerationRequest,
+        _context: &SubmitContext,
+    ) -> ProviderResult<Submission> {
+        match request.operation {
+            crate::MediaOperation::TextToImage if request.inputs.is_empty() => {
+                self.submit_text_to_image(secret, request).await
+            }
+            crate::MediaOperation::Upscale => self.submit_upscale(secret, request, _context).await,
+            _ => Err(ProviderError::new(
+                ProviderErrorKind::Unsupported,
+                "this Venice adapter slice supports text-to-image without inputs and image upscale",
+            )),
+        }
     }
 
     async fn reconcile(
@@ -351,6 +417,124 @@ fn image_payload(request: &GenerationRequest, binary: bool) -> ProviderResult<se
         payload.insert(id.as_str().into(), wire);
     }
     Ok(payload.into())
+}
+
+const UPSCALE_MIN_PIXELS: u64 = 65_536;
+const UPSCALE_MAX_OUTPUT_PIXELS: u64 = 16_777_216;
+const UPSCALE_MAX_INPUT_BYTES: u64 = 25 * 1024 * 1024;
+
+fn upscale_payload(
+    request: &GenerationRequest,
+    context: &SubmitContext,
+) -> ProviderResult<serde_json::Value> {
+    if request.output_count != 1 {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "Venice upscale returns exactly one image",
+        ));
+    }
+    let source = context
+        .inputs
+        .iter()
+        .find(|input| input.role.as_str() == "source" && input.ordinal == 0)
+        .ok_or_else(|| {
+            ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                "Venice upscale requires one source image",
+            )
+        })?;
+    let bytes = std::fs::read(&source.path).map_err(|error| {
+        ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            format!("could not read upscale source: {error}"),
+        )
+    })?;
+    if bytes.len() as u64 > UPSCALE_MAX_INPUT_BYTES {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "upscale source exceeds Venice's 25MB limit",
+        ));
+    }
+    let scale = upscale_scale(request)?;
+    enforce_upscale_pixel_limits(&bytes, scale)?;
+    let mut payload = serde_json::Map::from_iter([(
+        "image".into(),
+        serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(bytes)),
+    )]);
+    payload.insert("scale".into(), scale.into());
+    for (id, value) in &request.controls {
+        match (id.as_str(), value) {
+            ("scale", ControlValue::Integer { .. }) => {}
+            ("creativity", ControlValue::Number { value }) => {
+                payload.insert("creativity".into(), (*value).into());
+            }
+            (unknown, _) => {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    format!("unsupported Venice upscale control {unknown}"),
+                ));
+            }
+        }
+    }
+    Ok(payload.into())
+}
+
+fn upscale_scale(request: &GenerationRequest) -> ProviderResult<i64> {
+    match request.controls.get(&crate::ControlId::from("scale")) {
+        Some(ControlValue::Integer { value }) if *value == 2 || *value == 4 => Ok(*value),
+        Some(_) => Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "Venice upscale scale must be 2 or 4",
+        )),
+        None => Ok(2),
+    }
+}
+
+fn enforce_upscale_pixel_limits(bytes: &[u8], scale: i64) -> ProviderResult<()> {
+    let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|error| {
+            ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                format!("could not inspect upscale source: {error}"),
+            )
+        })?
+        .into_dimensions()
+        .map_err(|error| {
+            ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                format!("could not read upscale source dimensions: {error}"),
+            )
+        })?;
+    let area = u64::from(width).saturating_mul(u64::from(height));
+    if area < UPSCALE_MIN_PIXELS {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            format!("upscale source must be at least {UPSCALE_MIN_PIXELS} pixels"),
+        ));
+    }
+    let scale = u64::try_from(scale).unwrap_or(0);
+    let output = area.saturating_mul(scale.saturating_mul(scale));
+    if output > UPSCALE_MAX_OUTPUT_PIXELS {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "upscale output would exceed Venice's 16777216 pixel limit",
+        ));
+    }
+    Ok(())
+}
+
+fn response_content_type(response: &Response) -> String {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
 }
 
 const PERSISTABLE_IMAGE_MIMES: &[&str] = &["image/webp", "image/png", "image/jpeg"];
@@ -795,6 +979,217 @@ mod tests {
         assert_eq!(quoted.source, crate::QuoteSource::Provider);
         assert_eq!(quoted.currency, "USD");
         assert!((quoted.amount - 0.085).abs() < f64::EPSILON);
+        server.await.unwrap();
+    }
+
+    fn upscale_request() -> GenerationRequest {
+        GenerationRequest {
+            provider_id: VENICE_PROVIDER_ID.into(),
+            model_id: "upscaler".into(),
+            operation: crate::MediaOperation::Upscale,
+            prompt: String::new(),
+            negative_prompt: None,
+            output_count: 1,
+            controls: BTreeMap::from([
+                ("scale".into(), ControlValue::Integer { value: 2 }),
+                ("creativity".into(), ControlValue::Number { value: 0.01 }),
+            ]),
+            inputs: Vec::new(),
+            manifest_version: "v1".into(),
+            display_aspect_ratio: (1, 1),
+        }
+    }
+
+    fn solid_png(width: u32, height: u32) -> Vec<u8> {
+        let mut raw = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            width,
+            height,
+            image::Rgb([40, 120, 200]),
+        ))
+        .write_to(&mut std::io::Cursor::new(&mut raw), image::ImageFormat::Png)
+        .unwrap();
+        raw
+    }
+
+    fn source_input(bytes: &[u8]) -> (std::path::PathBuf, crate::ResolvedInput) {
+        let path = std::env::temp_dir().join(format!("zeron-upscale-{}.png", uuid::Uuid::new_v4()));
+        std::fs::write(&path, bytes).unwrap();
+        let input = crate::ResolvedInput {
+            role: crate::InputRole::from("source"),
+            ordinal: 0,
+            path: path.clone(),
+            mime_type: "image/png".into(),
+            content_hash: "hash".into(),
+            size_bytes: bytes.len() as u64,
+        };
+        (path, input)
+    }
+
+    #[test]
+    fn upscale_payload_sends_image_scale_and_creativity() {
+        let png = solid_png(256, 256);
+        let (path, input) = source_input(&png);
+        let context = SubmitContext {
+            idempotency_key: "key".into(),
+            inputs: vec![input],
+        };
+        let value = upscale_payload(&upscale_request(), &context).unwrap();
+        assert_eq!(value["scale"], 2);
+        assert_eq!(value["creativity"], 0.01);
+        assert!(value.get("model").is_none());
+        assert!(value.get("prompt").is_none());
+        assert!(value.get("safe_mode").is_none());
+        let encoded = value["image"].as_str().unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap(),
+            png
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn upscale_payload_requires_a_source_input() {
+        let context = SubmitContext {
+            idempotency_key: "key".into(),
+            inputs: Vec::new(),
+        };
+        assert_eq!(
+            upscale_payload(&upscale_request(), &context)
+                .unwrap_err()
+                .kind,
+            ProviderErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn upscale_rejects_unknown_controls() {
+        let png = solid_png(256, 256);
+        let (path, input) = source_input(&png);
+        let mut request = upscale_request();
+        request
+            .controls
+            .insert("mystery".into(), ControlValue::Boolean { value: true });
+        let context = SubmitContext {
+            idempotency_key: "key".into(),
+            inputs: vec![input],
+        };
+        assert_eq!(
+            upscale_payload(&request, &context).unwrap_err().kind,
+            ProviderErrorKind::InvalidRequest
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn upscale_rejects_sources_below_the_pixel_floor() {
+        let (path, input) = source_input(&solid_png(64, 64));
+        let context = SubmitContext {
+            idempotency_key: "key".into(),
+            inputs: vec![input],
+        };
+        assert_eq!(
+            upscale_payload(&upscale_request(), &context)
+                .unwrap_err()
+                .kind,
+            ProviderErrorKind::InvalidRequest
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn upscale_submit_returns_a_png() {
+        let png = solid_png(256, 256);
+        let (path, input) = source_input(&png);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = solid_png(512, 512);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut incoming = vec![0_u8; 65536];
+            let _ = stream.read(&mut incoming).await;
+            let incoming = String::from_utf8_lossy(&incoming);
+            assert!(incoming.contains("POST /image/upscale"));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+        });
+        let provider = VeniceMediaProvider::with_base_url(format!("http://{addr}"));
+        let submission = provider
+            .submit(
+                &Secret::new("token"),
+                &upscale_request(),
+                &SubmitContext {
+                    idempotency_key: "key".into(),
+                    inputs: vec![input],
+                },
+            )
+            .await
+            .unwrap();
+        let Submission::Completed { artifacts } = submission else {
+            panic!("expected completed upscale");
+        };
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].mime_type, "image/png");
+        server.await.unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn list_models_fetches_image_and_upscale_catalogs() {
+        let image = include_bytes!("../tests/fixtures/venice/image-model.json");
+        let upscale = include_bytes!("../tests/fixtures/venice/upscale-model.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_server = seen.clone();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut incoming = vec![0_u8; 4096];
+                let n = stream.read(&mut incoming).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&incoming[..n]);
+                let media_type = if request.contains("type=upscale") {
+                    "upscale"
+                } else {
+                    "image"
+                };
+                seen_server.lock().unwrap().push(media_type.to_owned());
+                let body: &[u8] = if media_type == "upscale" {
+                    upscale
+                } else {
+                    image
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+            }
+        });
+        let provider = VeniceMediaProvider::with_base_url(format!("http://{addr}"));
+        let models = provider.list_models(&Secret::new("token")).await.unwrap();
+        let mut types: Vec<_> = seen.lock().unwrap().clone();
+        types.sort();
+        assert_eq!(types, ["image", "upscale"]);
+        assert!(
+            models
+                .iter()
+                .any(|model| model.operation == crate::MediaOperation::TextToImage)
+        );
+        assert!(
+            models
+                .iter()
+                .any(|model| model.operation == crate::MediaOperation::Upscale)
+        );
         server.await.unwrap();
     }
 }

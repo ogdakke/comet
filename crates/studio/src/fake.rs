@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use crate::{
     AccountBalance, CancelResult, GenerationRequest, MediaModel, MediaProvider, PollResult,
     ProviderAccount, ProviderAccountId, ProviderArtifact, ProviderError, ProviderErrorKind,
-    ProviderId, ProviderResult, Quote, RemoteAttempt, RemoteJob, Secret, Submission,
+    ProviderId, ProviderResult, Quote, RemoteAttempt, RemoteJob, ResolvedInput, Secret, Submission,
     SubmissionCapabilities, SubmitContext,
 };
 
@@ -39,6 +39,7 @@ struct State {
     next_job: u64,
     jobs: HashMap<String, FakeJob>,
     submissions: HashMap<String, Submission>,
+    last_submit_inputs: Vec<ResolvedInput>,
 }
 
 /// A deliberately small configurable fake. It requires the secret `valid` by default.
@@ -68,6 +69,7 @@ impl FakeMediaProvider {
                 next_job: 1,
                 jobs: HashMap::new(),
                 submissions: HashMap::new(),
+                last_submit_inputs: Vec::new(),
             }),
         }
     }
@@ -78,6 +80,14 @@ impl FakeMediaProvider {
 
     pub fn list_call_count(&self) -> usize {
         self.list_calls.load(Ordering::SeqCst)
+    }
+
+    pub fn last_submit_inputs(&self) -> Vec<ResolvedInput> {
+        self.state
+            .lock()
+            .expect("fake provider lock poisoned")
+            .last_submit_inputs
+            .clone()
     }
 
     pub fn with_accepted_secret(mut self, secret: impl Into<String>) -> Self {
@@ -161,6 +171,7 @@ impl MediaProvider for FakeMediaProvider {
     ) -> ProviderResult<Submission> {
         self.authenticate(secret)?;
         let mut state = self.state.lock().expect("fake provider lock poisoned");
+        state.last_submit_inputs = context.inputs.clone();
         if let Some(submission) = state.submissions.get(&context.idempotency_key) {
             return Ok(submission.clone());
         }

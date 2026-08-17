@@ -54,6 +54,7 @@ struct CatalogModel {
 struct ModelSpec {
     name: Option<String>,
     description: Option<String>,
+    #[serde(default)]
     constraints: serde_json::Value,
     pricing: Option<serde_json::Value>,
     #[serde(default, rename = "supportsOptimizePromptThinking")]
@@ -125,7 +126,7 @@ pub fn normalize_model_catalog(
     Ok(response
         .data
         .into_iter()
-        .filter(|model| matches!(model.media_type.as_str(), "image" | "video"))
+        .filter(|model| matches!(model.media_type.as_str(), "image" | "video" | "upscale"))
         .filter_map(|model| normalize_model(model, fetched_at).ok())
         .collect())
 }
@@ -137,6 +138,7 @@ fn normalize_model(
     match model.media_type.as_str() {
         "image" => normalize_image(model, fetched_at),
         "video" => normalize_video(model, fetched_at),
+        "upscale" => normalize_upscale(model, fetched_at),
         _ => unreachable!("caller filters non-media model types"),
     }
 }
@@ -264,6 +266,87 @@ fn normalize_image(
         maximum_output_count: 4,
         controls,
         pricing: pricing_metadata(model.model_spec.pricing.as_ref()),
+        features,
+        manifest_version: String::new(),
+        fetched_at,
+    })
+}
+
+const UPSCALE_MAX_INPUT_BYTES: u64 = 25 * 1024 * 1024;
+
+fn normalize_upscale(
+    model: CatalogModel,
+    fetched_at: DateTime<Utc>,
+) -> Result<MediaModel, VeniceCatalogError> {
+    if model.id.trim().is_empty() {
+        return Err(VeniceCatalogError::MissingField {
+            model_id: model.id,
+            field: "id",
+        });
+    }
+    let features = model_features(&model.model_spec);
+    let mut input = input_constraint("source", &["image/jpeg", "image/png", "image/webp"]);
+    input.mime.maximum_bytes = Some(UPSCALE_MAX_INPUT_BYTES);
+
+    let scale_choices = [2_i64, 4];
+    let controls = vec![
+        ModelControl {
+            id: ControlId::from("scale"),
+            label: "Scale".to_owned(),
+            description: Some(
+                "Upscale factor. 4x may be reduced so the output stays within Venice size limits."
+                    .to_owned(),
+            ),
+            kind: ControlKind::Integer,
+            required: true,
+            default: Some(ControlValue::Integer { value: 2 }),
+            minimum: Some(2.0),
+            maximum: Some(4.0),
+            step: Some(2.0),
+            choices: scale_choices
+                .iter()
+                .map(|value| ControlChoice {
+                    value: ControlValue::Integer { value: *value },
+                    label: format!("{value}x"),
+                })
+                .collect(),
+            visible_when: Vec::new(),
+        },
+        ModelControl {
+            id: ControlId::from("creativity"),
+            label: "Creativity".to_owned(),
+            description: Some(
+                "How much detail the upscaler invents. Lower stays closer to the source."
+                    .to_owned(),
+            ),
+            kind: ControlKind::Number,
+            required: false,
+            default: Some(ControlValue::Number { value: 0.01 }),
+            minimum: Some(0.0),
+            maximum: Some(0.02),
+            step: Some(0.001),
+            choices: Vec::new(),
+            visible_when: Vec::new(),
+        },
+    ];
+
+    finish_manifest(MediaModel {
+        provider_id: ProviderId::from(VENICE_PROVIDER_ID),
+        id: ModelId::new(model.id),
+        display_name: model
+            .model_spec
+            .name
+            .unwrap_or_else(|| "Venice upscaler".to_owned()),
+        description: model.model_spec.description,
+        operation: MediaOperation::Upscale,
+        output_kind: MediaKind::Image,
+        output_mime_types: vec!["image/png".to_owned()],
+        input_constraints: vec![input],
+        prompt_maximum_chars: None,
+        negative_prompt_maximum_chars: None,
+        maximum_output_count: 1,
+        controls,
+        pricing: upscale_pricing_metadata(model.model_spec.pricing.as_ref()),
         features,
         manifest_version: String::new(),
         fetched_at,
@@ -589,6 +672,52 @@ fn input_constraint(role: &'static str, mime_types: &[&str]) -> InputConstraint 
             maximum_height: None,
         },
     }
+}
+
+fn upscale_pricing_metadata(pricing: Option<&serde_json::Value>) -> Option<PricingMetadata> {
+    let pricing = pricing?;
+    let mut entries = Vec::new();
+    let Some(upscale) = pricing.get("upscale").and_then(|value| value.as_object()) else {
+        return None;
+    };
+    for (scale, price) in upscale {
+        let Some(amount) = usd_amount(price) else {
+            continue;
+        };
+        let Some(factor) = parse_upscale_factor(scale) else {
+            continue;
+        };
+        entries.push(PricingEntry {
+            when: [(
+                ControlId::from("scale"),
+                ControlValue::Integer { value: factor },
+            )]
+            .into_iter()
+            .collect(),
+            amount,
+        });
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    Some(PricingMetadata {
+        currency: "USD".to_owned(),
+        unit: PricingUnit::PerRequest,
+        unit_label: String::new(),
+        amount: None,
+        entries,
+        detail: None,
+    })
+}
+
+fn parse_upscale_factor(value: &str) -> Option<i64> {
+    value
+        .trim()
+        .trim_end_matches('x')
+        .trim_end_matches('X')
+        .parse()
+        .ok()
+        .filter(|value| *value == 2 || *value == 4)
 }
 
 fn pricing_metadata(pricing: Option<&serde_json::Value>) -> Option<PricingMetadata> {

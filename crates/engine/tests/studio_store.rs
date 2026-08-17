@@ -17,9 +17,9 @@ use zeron_proto::{
 use zeron_rpc::{memory_client, methods};
 use zeron_studio::{
     AccountBalance, ControlKind, ControlValue, FakeMediaProvider, FakeSubmissionMode,
-    GenerationRequest, MediaKind, MediaModel, MediaOperation, ModelControl, PricingMetadata,
-    PricingUnit, ProviderArtifact, ProviderError, ProviderErrorKind, ProviderId, Quote,
-    QuoteSource, Secret, StudioArtifactId,
+    GenerationRequest, InputConstraint, MediaKind, MediaModel, MediaOperation, MimeConstraint,
+    ModelControl, PricingMetadata, PricingUnit, ProviderArtifact, ProviderError, ProviderErrorKind,
+    ProviderId, Quote, QuoteSource, Secret, StudioArtifactId,
 };
 
 #[derive(Default)]
@@ -1980,5 +1980,368 @@ async fn gallery_lists_images_across_conversations_newest_first() {
     .await
     .unwrap();
     assert_eq!(after.artifacts[0].prompt, "older comet");
+    engine.shutdown().await;
+}
+
+fn upscale_model(provider_id: &str) -> MediaModel {
+    MediaModel {
+        provider_id: provider_id.into(),
+        id: "upscaler".into(),
+        display_name: "Upscaler".into(),
+        description: None,
+        operation: MediaOperation::Upscale,
+        output_kind: MediaKind::Image,
+        output_mime_types: vec!["image/png".into()],
+        input_constraints: vec![InputConstraint {
+            role: "source".into(),
+            minimum_count: 1,
+            maximum_count: 1,
+            mime: MimeConstraint {
+                accepted: vec!["image/png".into(), "image/jpeg".into(), "image/webp".into()],
+                maximum_bytes: Some(25 * 1024 * 1024),
+                maximum_width: None,
+                maximum_height: None,
+            },
+        }],
+        prompt_maximum_chars: None,
+        negative_prompt_maximum_chars: None,
+        maximum_output_count: 1,
+        controls: vec![ModelControl {
+            id: "scale".into(),
+            label: "Scale".into(),
+            description: None,
+            kind: ControlKind::Integer,
+            required: true,
+            default: Some(ControlValue::Integer { value: 2 }),
+            minimum: Some(2.0),
+            maximum: Some(4.0),
+            step: Some(2.0),
+            choices: vec![],
+            visible_when: Vec::new(),
+        }],
+        pricing: None,
+        features: Vec::new(),
+        manifest_version: "fixture-v1".into(),
+        fetched_at: chrono::Utc::now(),
+    }
+}
+
+async fn wait_for_success(
+    updates: &mut tokio::sync::mpsc::Receiver<serde_json::Value>,
+    turns: usize,
+) -> StudioConversationView {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let view: StudioConversationView =
+                serde_json::from_value(updates.recv().await.unwrap()).unwrap();
+            if view.turns.len() >= turns
+                && view
+                    .turns
+                    .last()
+                    .and_then(|turn| turn.runs.last())
+                    .is_some_and(|run| run.state == StudioRunState::Succeeded)
+            {
+                break view;
+            }
+        }
+    })
+    .await
+    .expect("run did not succeed")
+}
+
+#[tokio::test]
+async fn upscale_turn_uses_an_existing_artifact_and_empty_prompt() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![image_model("fake"), upscale_model("fake")],
+        FakeSubmissionMode::Complete(vec![png_artifact()]),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider.clone()).await;
+    let conversation = create_conversation(&client).await;
+    let mut updates = client
+        .subscribe(
+            methods::WATCH_STUDIO_CONVERSATION,
+            serde_json::json!({ "conversationId": conversation.id }),
+        )
+        .await
+        .unwrap();
+    let _empty: StudioConversationView =
+        serde_json::from_value(updates.recv().await.unwrap()).unwrap();
+
+    client
+        .call(
+            methods::CREATE_STUDIO_TURN,
+            serde_json::json!({
+                "conversationId": conversation.id,
+                "prompt": "a comet",
+                "runs": [{
+                    "providerId": "fake",
+                    "modelId": "image-model",
+                    "operation": "text_to_image",
+                    "outputCount": 1,
+                    "controls": {},
+                    "inputs": [],
+                    "manifestVersion": "fixture-v1",
+                    "displayAspectRatio": [1, 1]
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+    let generated = wait_for_success(&mut updates, 1).await;
+    let source = &generated.turns[0].runs[0].artifacts[0];
+    assert!(!source.content_hash.is_empty());
+
+    let upscaled: StudioConversationView = serde_json::from_value(
+        client
+            .call(
+                methods::CREATE_STUDIO_TURN,
+                serde_json::json!({
+                    "conversationId": conversation.id,
+                    "prompt": "",
+                    "runs": [{
+                        "providerId": "fake",
+                        "modelId": "upscaler",
+                        "operation": "upscale",
+                        "outputCount": 1,
+                        "controls": { "scale": { "type": "integer", "value": 2 } },
+                        "inputs": [{
+                            "role": "source",
+                            "ordinal": 0,
+                            "source": { "source": "artifact", "artifact_id": source.id },
+                            "content_hash": ""
+                        }],
+                        "manifestVersion": "fixture-v1",
+                        "displayAspectRatio": [1, 1]
+                    }]
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(upscaled.turns[1].prompt, "");
+    assert_eq!(upscaled.turns[1].runs[0].inputs.len(), 1);
+    assert_eq!(
+        upscaled.turns[1].runs[0].inputs[0].content_hash,
+        source.content_hash
+    );
+    wait_for_success(&mut updates, 2).await;
+
+    let input_count: i64 = engine
+        .studio
+        .connection()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM studio_run_inputs", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(input_count, 1);
+    assert!(!provider.last_submit_inputs().is_empty());
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn empty_prompt_is_still_rejected_for_text_to_image() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![image_model("fake")],
+        FakeSubmissionMode::Complete(vec![png_artifact()]),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+    let conversation = create_conversation(&client).await;
+    let error = client
+        .call(
+            methods::CREATE_STUDIO_TURN,
+            serde_json::json!({
+                "conversationId": conversation.id,
+                "prompt": "   ",
+                "runs": [{
+                    "providerId": "fake",
+                    "modelId": "image-model",
+                    "operation": "text_to_image",
+                    "outputCount": 1,
+                    "controls": {},
+                    "inputs": [],
+                    "manifestVersion": "fixture-v1",
+                    "displayAspectRatio": [1, 1]
+                }]
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("prompt"));
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn video_and_edit_submits_are_still_blocked() {
+    let root = tempdir().unwrap();
+    let mut video = image_model("fake");
+    video.id = "video-model".into();
+    video.operation = MediaOperation::TextToVideo;
+    video.output_kind = MediaKind::Video;
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![video],
+        FakeSubmissionMode::Complete(Vec::new()),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+    let conversation = create_conversation(&client).await;
+    let error = client
+        .call(
+            methods::CREATE_STUDIO_TURN,
+            serde_json::json!({
+                "conversationId": conversation.id,
+                "prompt": "a comet",
+                "runs": [{
+                    "providerId": "fake",
+                    "modelId": "video-model",
+                    "operation": "text_to_video",
+                    "outputCount": 1,
+                    "controls": {},
+                    "inputs": [],
+                    "manifestVersion": "fixture-v1",
+                    "displayAspectRatio": [1, 1]
+                }]
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("text-to-image and upscale"));
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn upscale_rejects_hash_mismatch_deleted_artifact_and_asset_source() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![image_model("fake"), upscale_model("fake")],
+        FakeSubmissionMode::Complete(vec![png_artifact()]),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+    let conversation = create_conversation(&client).await;
+    let mut updates = client
+        .subscribe(
+            methods::WATCH_STUDIO_CONVERSATION,
+            serde_json::json!({ "conversationId": conversation.id }),
+        )
+        .await
+        .unwrap();
+    let _empty: StudioConversationView =
+        serde_json::from_value(updates.recv().await.unwrap()).unwrap();
+    client
+        .call(
+            methods::CREATE_STUDIO_TURN,
+            serde_json::json!({
+                "conversationId": conversation.id,
+                "prompt": "a comet",
+                "runs": [{
+                    "providerId": "fake",
+                    "modelId": "image-model",
+                    "operation": "text_to_image",
+                    "outputCount": 1,
+                    "controls": {},
+                    "inputs": [],
+                    "manifestVersion": "fixture-v1",
+                    "displayAspectRatio": [1, 1]
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+    let generated = wait_for_success(&mut updates, 1).await;
+    let source = &generated.turns[0].runs[0].artifacts[0];
+
+    let mismatch = client
+        .call(
+            methods::CREATE_STUDIO_TURN,
+            serde_json::json!({
+                "conversationId": conversation.id,
+                "prompt": "",
+                "runs": [{
+                    "providerId": "fake",
+                    "modelId": "upscaler",
+                    "operation": "upscale",
+                    "outputCount": 1,
+                    "controls": { "scale": { "type": "integer", "value": 2 } },
+                    "inputs": [{
+                        "role": "source",
+                        "ordinal": 0,
+                        "source": { "source": "artifact", "artifact_id": source.id },
+                        "content_hash": "not-the-hash"
+                    }],
+                    "manifestVersion": "fixture-v1",
+                    "displayAspectRatio": [1, 1]
+                }]
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(mismatch.to_string().contains("hash"));
+
+    let asset = client
+        .call(
+            methods::CREATE_STUDIO_TURN,
+            serde_json::json!({
+                "conversationId": conversation.id,
+                "prompt": "",
+                "runs": [{
+                    "providerId": "fake",
+                    "modelId": "upscaler",
+                    "operation": "upscale",
+                    "outputCount": 1,
+                    "controls": { "scale": { "type": "integer", "value": 2 } },
+                    "inputs": [{
+                        "role": "source",
+                        "ordinal": 0,
+                        "source": { "source": "asset", "asset_id": StudioArtifactId::new() },
+                        "content_hash": "abc"
+                    }],
+                    "manifestVersion": "fixture-v1",
+                    "displayAspectRatio": [1, 1]
+                }]
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(asset.to_string().contains("asset"));
+
+    client
+        .call(
+            methods::DELETE_STUDIO_ARTIFACT,
+            serde_json::json!({ "artifactId": source.id }),
+        )
+        .await
+        .unwrap();
+    let deleted = client
+        .call(
+            methods::CREATE_STUDIO_TURN,
+            serde_json::json!({
+                "conversationId": conversation.id,
+                "prompt": "",
+                "runs": [{
+                    "providerId": "fake",
+                    "modelId": "upscaler",
+                    "operation": "upscale",
+                    "outputCount": 1,
+                    "controls": { "scale": { "type": "integer", "value": 2 } },
+                    "inputs": [{
+                        "role": "source",
+                        "ordinal": 0,
+                        "source": { "source": "artifact", "artifact_id": source.id },
+                        "content_hash": ""
+                    }],
+                    "manifestVersion": "fixture-v1",
+                    "displayAspectRatio": [1, 1]
+                }]
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(deleted.to_string().contains("not found") || deleted.to_string().contains("artifact"));
     engine.shutdown().await;
 }

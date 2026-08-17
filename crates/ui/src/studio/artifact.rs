@@ -2148,6 +2148,7 @@ mod tests {
             metadata: serde_json::Value::Null,
             created_at: Utc::now(),
             thumbhash: None,
+            content_hash: String::new(),
         };
         let view = StudioConversationView {
             conversation: zeron_proto::StudioConversationSummary {
@@ -2197,6 +2198,7 @@ mod tests {
                     progress: None,
                     error: None,
                     quote: None,
+                    inputs: Vec::new(),
                     artifacts: vec![artifact.clone()],
                 }],
             }],

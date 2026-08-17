@@ -1707,6 +1707,7 @@ mod tests {
             metadata: serde_json::Value::Null,
             created_at: Utc::now(),
             thumbhash: None,
+            content_hash: String::new(),
         }
     }
 
@@ -1723,6 +1724,7 @@ mod tests {
             progress: None,
             error: None,
             quote: None,
+            inputs: Vec::new(),
             artifacts: Vec::new(),
         }
     }

@@ -166,3 +166,24 @@ fn gallery_items_use_camel_case_wire_shape() {
     );
     assert!(json["artifacts"][0].get("conversation_id").is_none());
 }
+
+#[test]
+fn artifact_view_exposes_content_hash() {
+    let artifact = zeron_proto::StudioArtifactView {
+        id: StudioArtifactId::new(),
+        output_position: 0,
+        media_kind: MediaKind::Image,
+        mime_type: "image/png".into(),
+        size_bytes: 12,
+        width: Some(64),
+        height: Some(64),
+        duration_seconds: None,
+        metadata: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+        thumbhash: None,
+        content_hash: "abc123".into(),
+    };
+    let json = serde_json::to_value(artifact).unwrap();
+    assert_eq!(json["contentHash"], "abc123");
+    assert!(json.get("content_hash").is_none());
+}

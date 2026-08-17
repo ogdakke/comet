@@ -254,6 +254,10 @@ pub struct StudioArtifactView {
     /// preview has been derived; tiles paint this if the JPEG is not in RAM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbhash: Option<String>,
+    /// SHA-256 of the artifact bytes. Clients send this back when using the
+    /// image as a generation input.
+    #[serde(default)]
+    pub content_hash: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -271,6 +275,8 @@ pub struct StudioRunView {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quote: Option<Quote>,
+    #[serde(default)]
+    pub inputs: Vec<GenerationInput>,
     pub artifacts: Vec<StudioArtifactView>,
 }
 

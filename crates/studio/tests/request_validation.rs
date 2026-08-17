@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 
 use chrono::Utc;
 use zeron_studio::{
-    ControlId, ControlKind, ControlValidationError, ControlValue, GenerationRequest, MediaKind,
-    MediaModel, MediaOperation, ModelControl, RequestValidationError,
+    ControlId, ControlKind, ControlValidationError, ControlValue, GenerationInput,
+    GenerationInputSource, GenerationRequest, InputConstraint, MediaKind, MediaModel,
+    MediaOperation, MimeConstraint, ModelControl, RequestValidationError, StudioArtifactId,
 };
 
 fn model() -> MediaModel {
@@ -108,5 +109,106 @@ fn rejects_out_of_range_values_against_the_current_manifest() {
         Err(RequestValidationError::Control(
             ControlValidationError::AboveMaximum { .. }
         ))
+    ));
+}
+
+fn upscale_model() -> MediaModel {
+    MediaModel {
+        provider_id: "fake".into(),
+        id: "upscaler".into(),
+        display_name: "Upscaler".to_owned(),
+        description: None,
+        operation: MediaOperation::Upscale,
+        output_kind: MediaKind::Image,
+        output_mime_types: vec!["image/png".to_owned()],
+        input_constraints: vec![InputConstraint {
+            role: "source".into(),
+            minimum_count: 1,
+            maximum_count: 1,
+            mime: MimeConstraint {
+                accepted: vec!["image/png".to_owned()],
+                maximum_bytes: Some(25 * 1024 * 1024),
+                maximum_width: None,
+                maximum_height: None,
+            },
+        }],
+        prompt_maximum_chars: None,
+        negative_prompt_maximum_chars: None,
+        maximum_output_count: 1,
+        controls: Vec::new(),
+        pricing: None,
+        features: Vec::new(),
+        manifest_version: "fixture-v1".to_owned(),
+        fetched_at: Utc::now(),
+    }
+}
+
+fn source_input() -> GenerationInput {
+    GenerationInput {
+        role: "source".into(),
+        ordinal: 0,
+        source: GenerationInputSource::Artifact {
+            artifact_id: StudioArtifactId::new(),
+        },
+        content_hash: "abc".to_owned(),
+    }
+}
+
+fn upscale_request() -> GenerationRequest {
+    GenerationRequest {
+        provider_id: "fake".into(),
+        model_id: "upscaler".into(),
+        operation: MediaOperation::Upscale,
+        prompt: String::new(),
+        negative_prompt: None,
+        output_count: 1,
+        controls: BTreeMap::new(),
+        inputs: vec![source_input()],
+        manifest_version: "fixture-v1".to_owned(),
+        display_aspect_ratio: (1, 1),
+    }
+}
+
+#[test]
+fn upscale_accepts_an_empty_prompt_and_one_source() {
+    upscale_request()
+        .validate_against(&upscale_model())
+        .unwrap();
+}
+
+#[test]
+fn upscale_rejects_a_missing_source() {
+    let mut request = upscale_request();
+    request.inputs.clear();
+    assert!(matches!(
+        request.validate_against(&upscale_model()),
+        Err(RequestValidationError::InvalidInputCount { .. })
+    ));
+}
+
+#[test]
+fn upscale_rejects_an_extra_role() {
+    let mut request = upscale_request();
+    request.inputs.push(GenerationInput {
+        role: "mask".into(),
+        ordinal: 0,
+        source: GenerationInputSource::Artifact {
+            artifact_id: StudioArtifactId::new(),
+        },
+        content_hash: "def".to_owned(),
+    });
+    assert!(matches!(
+        request.validate_against(&upscale_model()),
+        Err(RequestValidationError::UnsupportedInputRole { .. })
+    ));
+}
+
+#[test]
+fn upscale_rejects_more_than_one_output() {
+    let mut request = upscale_request();
+    request.output_count = 2;
+    assert!(matches!(
+        request.validate_against(&upscale_model()),
+        Err(RequestValidationError::InvalidOutputCount { .. })
     ));
 }

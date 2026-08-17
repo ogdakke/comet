@@ -9,6 +9,7 @@ use zeron_studio::{
 const IMAGE: &[u8] = include_bytes!("fixtures/venice/image-model.json");
 const TEXT_TO_VIDEO: &[u8] = include_bytes!("fixtures/venice/text-to-video-model.json");
 const IMAGE_TO_VIDEO: &[u8] = include_bytes!("fixtures/venice/image-to-video-model.json");
+const UPSCALE: &[u8] = include_bytes!("fixtures/venice/upscale-model.json");
 
 fn fetched_at() -> chrono::DateTime<Utc> {
     Utc.timestamp_opt(1_777_000_000, 0).unwrap()
@@ -70,6 +71,38 @@ fn real_catalog_fixtures_render_as_provider_neutral_controls() {
             .iter()
             .all(|control| control.id.as_str() != "aspect_ratio")
     );
+
+    let upscale = normalize_model_catalog(UPSCALE, fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(upscale.operation, MediaOperation::Upscale);
+    assert_eq!(upscale.output_kind, zeron_studio::MediaKind::Image);
+    assert_eq!(upscale.output_mime_types, vec!["image/png".to_owned()]);
+    assert_eq!(upscale.maximum_output_count, 1);
+    assert_eq!(upscale.prompt_maximum_chars, None);
+    assert_eq!(upscale.features, vec![ModelFeature::Private]);
+    assert_eq!(upscale.input_constraints.len(), 1);
+    assert_eq!(upscale.input_constraints[0].role.as_str(), "source");
+    assert_eq!(
+        upscale.input_constraints[0].mime.maximum_bytes,
+        Some(25 * 1024 * 1024)
+    );
+    assert_control(&upscale, "scale", ControlKind::Integer, 2);
+    assert_control(&upscale, "creativity", ControlKind::Number, 0);
+    assert!(
+        upscale
+            .controls
+            .iter()
+            .all(|control| control.id.as_str() != "steps"
+                && control.id.as_str() != "aspect_ratio"
+                && control.id.as_str() != "safe_mode")
+    );
+    let scale = upscale
+        .controls
+        .iter()
+        .find(|control| control.id == ControlId::from("scale"))
+        .unwrap();
+    assert_eq!(scale.default, Some(ControlValue::Integer { value: 2 }));
 }
 
 #[test]
@@ -404,6 +437,62 @@ fn flat_generation_price_is_normalized() {
         .remove(0);
     let quote = model.estimate_cost(&BTreeMap::new(), 3).unwrap();
     assert!((quote.amount - 0.03).abs() < f64::EPSILON);
+}
+
+#[test]
+fn upscale_catalog_quotes_scale_not_the_generation_price() {
+    let model = normalize_model_catalog(UPSCALE, fetched_at())
+        .unwrap()
+        .remove(0);
+    let pricing = model
+        .pricing
+        .as_ref()
+        .expect("upscale fixture advertises pricing");
+    assert_eq!(pricing.unit, PricingUnit::PerRequest);
+    assert!(pricing.amount.is_none());
+    assert!(
+        pricing
+            .entries
+            .iter()
+            .all(|entry| entry.when.contains_key(&ControlId::from("scale")))
+    );
+
+    let two = model
+        .estimate_cost(
+            &BTreeMap::from([(ControlId::from("scale"), ControlValue::Integer { value: 2 })]),
+            1,
+        )
+        .unwrap();
+    assert_eq!(two.source, QuoteSource::Catalog);
+    assert!((two.amount - 0.02).abs() < f64::EPSILON);
+
+    let four = model
+        .estimate_cost(
+            &BTreeMap::from([(ControlId::from("scale"), ControlValue::Integer { value: 4 })]),
+            1,
+        )
+        .unwrap();
+    assert!((four.amount - 0.08).abs() < f64::EPSILON);
+
+    let defaulted = model.estimate_cost(&BTreeMap::new(), 1).unwrap();
+    assert!(
+        (defaulted.amount - 0.02).abs() < f64::EPSILON,
+        "catalog default scale is 2x"
+    );
+}
+
+#[test]
+fn a_broken_upscale_row_does_not_fail_the_catalog() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(UPSCALE).unwrap();
+    let good = fixture["data"][0].clone();
+    let mut broken = good.clone();
+    broken["id"] = "".into();
+    fixture["data"] = serde_json::json!([broken, good]);
+
+    let models =
+        normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at()).unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].id.as_str(), "upscaler");
 }
 
 #[test]

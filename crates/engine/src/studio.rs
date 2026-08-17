@@ -20,9 +20,10 @@ use zeron_proto::{
     StudioModelRunSpec, StudioRunState, StudioRunView, StudioTurnView, UNTITLED_STUDIO_TITLE,
 };
 use zeron_studio::{
-    GenerationRequest, MediaModel, MediaProvider, ProviderArtifact, ProviderId, Quote,
+    GenerationInput, GenerationInputSource, GenerationRequest, InputRole, MediaKind, MediaModel,
+    MediaOperation, MediaProvider, ProviderArtifact, ProviderId, Quote, ResolvedInput,
     StudioArtifactId, StudioAttemptId, StudioBatchId, StudioConversationId, StudioRunId,
-    StudioTurnId, SubmissionCapabilities,
+    StudioTurnId, SubmissionCapabilities, sniff_media_mime,
 };
 
 use crate::venice_import::{ImportReport, ImportedStudioHistory};
@@ -593,7 +594,7 @@ impl StudioStore {
         owner_device_id: &str,
     ) -> Result<Vec<StoredStudioRun>, StudioStoreError> {
         let prompt = prompt.trim();
-        if prompt.is_empty() || prompt.chars().count() > 32_000 {
+        if prompt.chars().count() > 32_000 {
             return Err(StudioStoreError::InvalidValue(
                 "prompt must contain 1 to 32000 characters".into(),
             ));
@@ -603,9 +604,13 @@ impl StudioStore {
                 "a turn must contain 1 to 16 model runs".into(),
             ));
         }
-        if runs.iter().any(|run| !run.request.inputs.is_empty()) {
+        if prompt.is_empty()
+            && !runs
+                .iter()
+                .all(|run| run.request.operation == MediaOperation::Upscale)
+        {
             return Err(StudioStoreError::InvalidValue(
-                "studio inputs are not available in the image slice".into(),
+                "prompt must contain 1 to 32000 characters".into(),
             ));
         }
 
@@ -992,12 +997,6 @@ impl StudioStore {
                 "generate more must add 1 to 16 model runs".into(),
             ));
         }
-        if runs.iter().any(|run| !run.request.inputs.is_empty()) {
-            return Err(StudioStoreError::InvalidValue(
-                "studio inputs are not available in the image slice".into(),
-            ));
-        }
-
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         let (conversation_id, batch_id, archived): (String, String, Option<i64>) = transaction
@@ -1416,7 +1415,7 @@ impl StudioStore {
         ))
     }
 
-    fn run_model(&self, run_id: StudioRunId) -> Result<MediaModel, StudioStoreError> {
+    pub(crate) fn run_model(&self, run_id: StudioRunId) -> Result<MediaModel, StudioStoreError> {
         let json: String = self
             .connection()?
             .query_row(
@@ -1596,6 +1595,150 @@ impl StudioStore {
         Ok(())
     }
 
+    /// Stamp and verify artifact-backed inputs. User-uploaded assets are not
+    /// accepted until ImportStudioAsset exists.
+    pub fn bind_generation_inputs(
+        &self,
+        request: &mut GenerationRequest,
+    ) -> Result<(), StudioStoreError> {
+        for input in &mut request.inputs {
+            match &input.source {
+                GenerationInputSource::Asset { .. } => {
+                    return Err(StudioStoreError::InvalidValue(
+                        "studio asset inputs are not available yet".into(),
+                    ));
+                }
+                GenerationInputSource::Artifact { artifact_id } => {
+                    let (kind, stored_hash, width, height) =
+                        self.artifact_input_row(*artifact_id)?;
+                    if kind != MediaKind::Image {
+                        return Err(StudioStoreError::InvalidValue(
+                            "upscale source must be an image artifact".into(),
+                        ));
+                    }
+                    if input.content_hash.is_empty() {
+                        input.content_hash = stored_hash;
+                    } else if input.content_hash != stored_hash {
+                        return Err(StudioStoreError::InvalidValue(
+                            "studio input content hash does not match the artifact".into(),
+                        ));
+                    }
+                    if request.operation == MediaOperation::Upscale
+                        && let (Some(width), Some(height)) = (width, height)
+                        && width > 0
+                        && height > 0
+                    {
+                        request.display_aspect_ratio = (width, height);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn resolve_generation_inputs(
+        &self,
+        request: &GenerationRequest,
+        model: &MediaModel,
+    ) -> Result<Vec<ResolvedInput>, StudioStoreError> {
+        let mut resolved = Vec::with_capacity(request.inputs.len());
+        for input in &request.inputs {
+            let artifact_id = match &input.source {
+                GenerationInputSource::Asset { .. } => {
+                    return Err(StudioStoreError::InvalidValue(
+                        "studio asset inputs are not available yet".into(),
+                    ));
+                }
+                GenerationInputSource::Artifact { artifact_id } => *artifact_id,
+            };
+            let (kind, stored_hash, _, _) = self.artifact_input_row(artifact_id)?;
+            if kind != MediaKind::Image {
+                return Err(StudioStoreError::InvalidValue(
+                    "generation input must be an image artifact".into(),
+                ));
+            }
+            let (path, _, _) = self.artifacts.locate(artifact_id)?;
+            let mut file = File::open(&path)?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            let hash = format!("{:x}", Sha256::digest(&bytes));
+            if hash != stored_hash || hash != input.content_hash {
+                return Err(StudioStoreError::InvalidValue(
+                    "studio input content hash does not match the stored file".into(),
+                ));
+            }
+            let mime_type = sniff_media_mime(&bytes).ok_or_else(|| {
+                StudioStoreError::InvalidValue("studio input is not a supported image".into())
+            })?;
+            let constraint = model
+                .input_constraints
+                .iter()
+                .find(|constraint| constraint.role == input.role);
+            if let Some(constraint) = constraint {
+                if !constraint
+                    .mime
+                    .accepted
+                    .iter()
+                    .any(|accepted| accepted == mime_type)
+                {
+                    return Err(StudioStoreError::InvalidValue(format!(
+                        "studio input MIME {mime_type} is not accepted for role {}",
+                        input.role.as_str()
+                    )));
+                }
+                if constraint
+                    .mime
+                    .maximum_bytes
+                    .is_some_and(|maximum| bytes.len() as u64 > maximum)
+                {
+                    return Err(StudioStoreError::InvalidValue(
+                        "studio input exceeds the model size limit".into(),
+                    ));
+                }
+            }
+            resolved.push(ResolvedInput {
+                role: input.role.clone(),
+                ordinal: input.ordinal,
+                path,
+                mime_type: mime_type.to_owned(),
+                content_hash: hash,
+                size_bytes: bytes.len() as u64,
+            });
+        }
+        Ok(resolved)
+    }
+
+    fn artifact_input_row(
+        &self,
+        artifact_id: StudioArtifactId,
+    ) -> Result<(MediaKind, String, Option<u32>, Option<u32>), StudioStoreError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT media_kind, content_hash, width, height FROM studio_artifacts
+                 WHERE id = ?1 AND deleted_at IS NULL",
+                [artifact_id.0.to_string()],
+                |row| {
+                    let kind = match row.get::<_, String>(0)?.as_str() {
+                        "image" => MediaKind::Image,
+                        "video" => MediaKind::Video,
+                        _ => {
+                            return Err(rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Text,
+                                Box::new(StudioStoreError::InvalidArtifact),
+                            ));
+                        }
+                    };
+                    Ok((kind, row.get(1)?, row.get(2)?, row.get(3)?))
+                },
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StudioStoreError::ArtifactNotFound,
+                other => other.into(),
+            })
+    }
+
     pub fn conversation_view(
         &self,
         id: StudioConversationId,
@@ -1657,10 +1800,16 @@ impl StudioStore {
             ) in run_rows
             {
                 let mut artifacts_statement = connection.prepare(
-                    "SELECT id, output_position, media_kind, mime_type, size_bytes, width, height, duration_seconds, metadata_json, created_at, thumbhash FROM studio_artifacts WHERE run_id = ?1 AND deleted_at IS NULL ORDER BY output_position",
+                    "SELECT id, output_position, media_kind, mime_type, size_bytes, width, height, duration_seconds, metadata_json, created_at, thumbhash, content_hash FROM studio_artifacts WHERE run_id = ?1 AND deleted_at IS NULL ORDER BY output_position",
                 )?;
                 let artifacts = artifacts_statement
                     .query_map([run_id.clone()], artifact_from_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut inputs_statement = connection.prepare(
+                    "SELECT role, ordinal, asset_id, artifact_id, content_hash FROM studio_run_inputs WHERE run_id = ?1 ORDER BY ordinal, role",
+                )?;
+                let inputs = inputs_statement
+                    .query_map([run_id.clone()], run_input_from_row)?
                     .collect::<Result<Vec<_>, _>>()?;
                 let model: MediaModel = serde_json::from_str(&model_json)
                     .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
@@ -1691,6 +1840,7 @@ impl StudioStore {
                     progress,
                     error,
                     quote,
+                    inputs,
                     artifacts,
                 });
             }
@@ -1777,6 +1927,25 @@ fn insert_prepared_runs(
             "INSERT INTO studio_run_events (run_id, attempt_id, state, created_at) VALUES (?1, ?2, 'prepared', ?3)",
             rusqlite::params![run_id.0.to_string(), attempt_id.0.to_string(), now],
         )?;
+        for input in &prepared.request.inputs {
+            let (asset_id, artifact_id) = match &input.source {
+                GenerationInputSource::Asset { asset_id } => (Some(asset_id.0.to_string()), None),
+                GenerationInputSource::Artifact { artifact_id } => {
+                    (None, Some(artifact_id.0.to_string()))
+                }
+            };
+            transaction.execute(
+                "INSERT INTO studio_run_inputs (run_id, role, ordinal, asset_id, artifact_id, content_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    run_id.0.to_string(),
+                    input.role.as_str(),
+                    input.ordinal as i64,
+                    asset_id,
+                    artifact_id,
+                    input.content_hash
+                ],
+            )?;
+        }
         stored.push(StoredStudioRun {
             run_id,
             attempt_id,
@@ -1914,6 +2083,35 @@ fn artifact_from_row(row: &rusqlite::Row<'_>) -> Result<StudioArtifactView, rusq
         created_at: chrono::DateTime::from_timestamp_millis(created_at)
             .ok_or(rusqlite::Error::InvalidQuery)?,
         thumbhash: row.get(10)?,
+        content_hash: row.get(11)?,
+    })
+}
+
+fn run_input_from_row(row: &rusqlite::Row<'_>) -> Result<GenerationInput, rusqlite::Error> {
+    use rusqlite::types::Type;
+    let parse_uuid = |index, value: String| {
+        Uuid::parse_str(&value).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(error))
+        })
+    };
+    let role: String = row.get(0)?;
+    let ordinal: u32 = row.get(1)?;
+    let asset_id: Option<String> = row.get(2)?;
+    let artifact_id: Option<String> = row.get(3)?;
+    let source = match (asset_id, artifact_id) {
+        (Some(asset_id), None) => GenerationInputSource::Asset {
+            asset_id: zeron_studio::StudioAssetId(parse_uuid(2, asset_id)?),
+        },
+        (None, Some(artifact_id)) => GenerationInputSource::Artifact {
+            artifact_id: StudioArtifactId(parse_uuid(3, artifact_id)?),
+        },
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    Ok(GenerationInput {
+        role: InputRole::new(role),
+        ordinal,
+        source,
+        content_hash: row.get(4)?,
     })
 }
 

@@ -1,0 +1,35 @@
+{
+  "data": [
+    {
+      "created": 1744453050,
+      "id": "upscaler",
+      "model_spec": {
+        "pricing": {
+          "generation": {
+            "usd": 0.01,
+            "diem": 0.01
+          },
+          "upscale": {
+            "2x": {
+              "usd": 0.02,
+              "diem": 0.02
+            },
+            "4x": {
+              "usd": 0.08,
+              "diem": 0.08
+            }
+          }
+        },
+        "name": "Upscaler",
+        "offline": false,
+        "privacy": "private",
+        "traits": []
+      },
+      "object": "model",
+      "owned_by": "venice.ai",
+      "type": "upscale"
+    }
+  ],
+  "object": "list",
+  "type": "upscale"
+}

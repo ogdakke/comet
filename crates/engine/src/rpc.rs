@@ -533,9 +533,16 @@ impl EngineRpc {
             std::collections::BTreeMap::<zeron_studio::ProviderId, ListStudioModelsResponse>::new();
         let mut prepared = Vec::with_capacity(specs.len());
         for spec in specs {
-            if submit && !matches!(spec.operation, zeron_studio::MediaOperation::TextToImage) {
+            if submit
+                && !matches!(
+                    spec.operation,
+                    zeron_studio::MediaOperation::TextToImage
+                        | zeron_studio::MediaOperation::Upscale
+                )
+            {
                 return Err(RpcError::Failed(
-                    "only text-to-image runs are available in the current Studio slice".into(),
+                    "only text-to-image and upscale runs are available in the current Studio slice"
+                        .into(),
                 ));
             }
             let catalog = match catalogs.get(&spec.provider_id) {
@@ -573,6 +580,9 @@ impl EngineRpc {
                 manifest_version: spec.manifest_version,
                 display_aspect_ratio: spec.display_aspect_ratio,
             };
+            self.studio
+                .bind_generation_inputs(&mut generation)
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
             generation.drop_unknown_controls(&model);
             generation
                 .bind_to(&model)
@@ -2270,7 +2280,9 @@ fn apply_venice_safe_mode_for_submit(
     credentials: &StudioCredentials,
     mut request: zeron_studio::GenerationRequest,
 ) -> zeron_studio::GenerationRequest {
-    if request.provider_id.as_str() != zeron_studio::venice::VENICE_PROVIDER_ID {
+    if request.provider_id.as_str() != zeron_studio::venice::VENICE_PROVIDER_ID
+        || request.operation != zeron_studio::MediaOperation::TextToImage
+    {
         return request;
     }
     if let Ok(Some(connection)) = credentials.connection(&request.provider_id) {
@@ -2312,9 +2324,23 @@ async fn execute_studio_run(
     store
         .mark_submitting(&run)
         .map_err(|error| error.to_string())?;
+    let model = match store.run_model(run.run_id) {
+        Ok(model) => model,
+        Err(error) => {
+            let message = error.to_string();
+            return fail_studio_run(&store, &run, &message, false);
+        }
+    };
+    let inputs = match store.resolve_generation_inputs(&run.request, &model) {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            let message = error.to_string();
+            return fail_studio_run(&store, &run, &message, false);
+        }
+    };
     let context = zeron_studio::SubmitContext {
         idempotency_key: run.idempotency_key.clone(),
-        inputs: Vec::new(),
+        inputs,
     };
     let request = apply_venice_safe_mode_for_submit(&credentials, run.request.clone());
     match provider.submit(&secret, &request, &context).await {
