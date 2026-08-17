@@ -1434,12 +1434,15 @@ impl Render for StudioPage {
         let body = if let Some(page) = self.render_artifact_page(&theme, window, cx) {
             page
         } else if self.providers.iter().all(|provider| !provider.configured) {
+            // Parent is not a flex container, so `flex_1` cannot fill it.
+            // `size_full` + titlebar pad center the CTA in the visible canvas.
             div()
-                .flex_1()
+                .size_full()
+                .pt(px(Theme::TITLEBAR_HEIGHT))
                 .flex()
+                .flex_col()
                 .items_center()
                 .justify_center()
-                .flex_col()
                 .gap(px(8.0))
                 .child(
                     div()
