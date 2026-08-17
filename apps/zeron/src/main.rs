@@ -4,6 +4,7 @@
 
 mod auth_cli;
 mod daemon;
+mod defaults;
 mod update_cli;
 
 use clap::{Parser, Subcommand};
@@ -114,6 +115,11 @@ fn main() -> anyhow::Result<()> {
     // wedge report ("stale until restart") with zero diagnostics even though
     // the engine logs the exact failure line. One file per launch, previous
     // launch kept as `.old`.
+    let runtime_defaults = if long_running {
+        Some(engine_config_from_env())
+    } else {
+        None
+    };
     let log_file = if long_running {
         let mode = if cli.command.is_some() {
             "headless"
@@ -140,6 +146,9 @@ fn main() -> anyhow::Result<()> {
                 .init(),
             None => registry.init(),
         }
+    }
+    if let Some(config) = &runtime_defaults {
+        defaults::log_isolation(&config.data_dir, config.ipc_port);
     }
 
     match cli.command {
@@ -185,11 +194,11 @@ fn main() -> anyhow::Result<()> {
             zeron_ui::run_app(zeron_ui::UiConfig {
                 data_dir: std::env::var_os("ZERON_DATA_DIR")
                     .map(std::path::PathBuf::from)
-                    .unwrap_or_else(dirs_data_dir),
+                    .unwrap_or_else(defaults::data_dir),
                 ipc_port: std::env::var("ZERON_IPC_PORT")
                     .ok()
                     .and_then(|p| p.parse().ok())
-                    .unwrap_or(27654),
+                    .unwrap_or_else(defaults::ipc_port),
                 edge_url: edge_url_from_env(),
                 workos_client_id: workos_client_id_from_env(&edge_token),
                 edge_token,
@@ -210,12 +219,12 @@ fn engine_config_from_env() -> zeron_engine::EngineConfig {
     zeron_engine::EngineConfig {
         data_dir: std::env::var_os("ZERON_DATA_DIR")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(dirs_data_dir),
+            .unwrap_or_else(defaults::data_dir),
         edge_url: edge_url_from_env(),
         ipc_port: std::env::var("ZERON_IPC_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
-            .unwrap_or(27654),
+            .unwrap_or_else(defaults::ipc_port),
         default_harness: harness_from_env(),
         // WorkOS mode: the signed-in session's org wins; ZERON_ORG_ID (dev
         // default "dev-org") scopes the workspace room otherwise.
@@ -239,20 +248,6 @@ fn harness_from_env() -> zeron_engine::HarnessId {
         Ok("pi") => zeron_engine::HarnessId::Pi,
         _ => zeron_engine::HarnessId::ClaudeCode,
     }
-}
-
-fn dirs_data_dir() -> std::path::PathBuf {
-    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME not set"));
-    let dir = home.join(".zeron");
-    // One-shot 0.2.0 migration: adopt the pre-rename data dir (sign-in,
-    // device identity, prefs) instead of starting fresh.
-    if !dir.exists() {
-        let old = home.join(".comet-native");
-        if old.exists() && std::fs::rename(&old, &dir).is_ok() {
-            eprintln!("migrated data dir {} -> {}", old.display(), dir.display());
-        }
-    }
-    dir
 }
 
 /// `zeron sync`: dial the running engine's IPC and print per-room sync state.
@@ -394,7 +389,7 @@ async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
 fn open_log_file(mode: &str) -> Option<std::fs::File> {
     let dir = std::env::var_os("ZERON_DATA_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(dirs_data_dir)
+        .unwrap_or_else(defaults::data_dir)
         .join("logs");
     open_log_file_in(&dir, mode)
 }

@@ -173,6 +173,15 @@ pub enum InstallKind {
     Unmanaged,
 }
 
+impl InstallKind {
+    /// Packaged / installer-managed binaries share `~/.zeron` and the
+    /// production IPC port. Source builds do not, so `cargo run` cannot
+    /// attach to — or become — the installed app's engine.
+    pub fn uses_production_runtime(&self) -> bool {
+        !matches!(self, Self::Unmanaged)
+    }
+}
+
 pub fn detect_install() -> InstallKind {
     let Ok(exe) = std::env::current_exe() else {
         return InstallKind::Unmanaged;
@@ -749,6 +758,27 @@ mod tests {
                 Some(Path::new("/home/u"))
             ),
             InstallKind::Unmanaged
+        );
+        assert!(
+            detect_install_from(
+                Path::new("/Applications/Zeron.app/Contents/MacOS/zeron"),
+                Some(Path::new("/Users/u")),
+            )
+            .uses_production_runtime()
+        );
+        assert!(
+            detect_install_from(
+                Path::new("/home/u/.zeron/app/0.1.1/zeron"),
+                Some(Path::new("/home/u")),
+            )
+            .uses_production_runtime()
+        );
+        assert!(
+            !detect_install_from(
+                Path::new("/src/target/debug/zeron"),
+                Some(Path::new("/home/u"))
+            )
+            .uses_production_runtime()
         );
     }
 

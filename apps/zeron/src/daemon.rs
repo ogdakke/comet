@@ -69,6 +69,14 @@ pub fn install(data_dir: &Path) -> anyhow::Result<()> {
     } else {
         bail!("zeron daemon is only supported on macOS (launchd) and Linux (systemd)");
     }
+    if !zeron_update::detect_install().uses_production_runtime() {
+        println!(
+            "Note: unpackaged binary — this service uses {} and will not share \
+             an engine with the installed app (~/.zeron, port {}).",
+            data_dir.display(),
+            crate::defaults::PACKAGED_IPC_PORT
+        );
+    }
     println!(
         "Without a saved account the engine stays local-only; sign-in and restart are optional for sync."
     );

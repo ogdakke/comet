@@ -166,6 +166,7 @@ pub async fn status(config: EngineConfig) -> anyhow::Result<()> {
         .unwrap_or(next_scope);
     let account = account_status(scope, &auth.state());
     println!("Data dir: {}", config.data_dir.display());
+    println!("Install:  {}", install_kind_label());
     println!("Edge:     {}", config.edge_url);
     println!("Mode:     {}", account.mode);
     println!("Auth:     {}", account.auth);
@@ -204,6 +205,14 @@ async fn live_engine_scope(ipc_port: u16) -> Option<WorkspaceScope> {
     serde_json::from_value::<zeron_engine::EngineInfo>(value)
         .ok()
         .map(|info| info.workspace_scope)
+}
+
+fn install_kind_label() -> &'static str {
+    match crate::defaults::install_kind() {
+        zeron_update::InstallKind::MacApp { .. } => "Zeron.app",
+        zeron_update::InstallKind::Managed { .. } => "managed (~/.zeron/app)",
+        zeron_update::InstallKind::Unmanaged => "source build (isolated from the installed app)",
+    }
 }
 
 /// The same exclusive data-dir lock the engine holds for its lifetime: taken for

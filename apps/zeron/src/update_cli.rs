@@ -51,7 +51,7 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
             );
             let data_dir = std::env::var_os("ZERON_DATA_DIR")
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(super::dirs_data_dir);
+                .unwrap_or_else(super::defaults::data_dir);
             let staged = zeron_update::stage_mac_app(edge_url, &manifest, &data_dir).await?;
             zeron_update::apply_mac_app(&staged, &bundle)?;
             println!("updated {} — relaunch Zeron to finish.", bundle.display());
