@@ -3885,15 +3885,13 @@ impl Shell {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.show_studio_gallery(cx);
                     }))
-                    .child(
-                        icon(icons::GALLERY_WIDE)
-                            .size(px(16.0))
-                            .text_color(if gallery_selected {
-                                theme.text
-                            } else {
-                                theme.text_muted
-                            }),
-                    )
+                    .child(icon(icons::GALLERY_WIDE).size(px(16.0)).text_color(
+                        if gallery_selected {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        },
+                    ))
                     .child("Studio"),
             )
             .child(
