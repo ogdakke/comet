@@ -1217,7 +1217,9 @@ impl StudioPage {
             self.request_visible_feed_images(cx);
             let vp = self.feed_list.viewport_bounds();
             let top = f32::from(vp.top());
-            let bottom = f32::from(vp.bottom()) - STUDIO_READING_BOTTOM_INSET;
+            // Same as the transcript: measure from the window bottom, not the
+            // composer. The 220px reading inset is for rail ticks only.
+            let bottom = f32::from(vp.bottom());
             let entity = cx.weak_entity();
             render::bind_selection_scroll(top, bottom, move |delta, cx| {
                 entity

@@ -4089,7 +4089,9 @@ impl Render for Transcript {
         {
             let vp = self.list.viewport_bounds();
             let top = f32::from(vp.top()) + Theme::TITLEBAR_HEIGHT;
-            let bottom = f32::from(vp.bottom()) - self.bottom_clearance;
+            // Band bottom is the window edge — not the composer. Subtracting
+            // `bottom_clearance` put the down-scroll zone ~200px too high.
+            let bottom = f32::from(vp.bottom());
             let entity = cx.weak_entity();
             render::bind_selection_scroll(top, bottom, move |delta, cx| {
                 entity
