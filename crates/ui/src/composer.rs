@@ -162,6 +162,14 @@ fn input_element_height(
     }
 }
 
+/// Scroll viewport when layout reported a taller box than the owner capped.
+fn input_viewport_height(bounds_height: f32, viewport_max: Option<f32>) -> f32 {
+    match viewport_max {
+        Some(max) => bounds_height.min(max).max(0.0),
+        None => bounds_height.max(0.0),
+    }
+}
+
 /// Byte range of the hard line containing `ix` (text between `\n`).
 fn input_line_range(text: &str, ix: usize) -> Range<usize> {
     let mut ix = ix.min(text.len());
@@ -1351,6 +1359,11 @@ pub struct ComposerInput {
     /// narrow compact width and then using that exaggerated wrapped height
     /// as the expanded target for one frame.
     soft_wrap: bool,
+    /// Visible-box cap from the owner (studio's 208px text well, a future
+    /// image-edit field, …). When the parent does not assign a definite
+    /// height, the element sizes to `min(content, this)` so overflow
+    /// becomes internal scroll instead of being clipped by the card.
+    viewport_max: Option<f32>,
     /// Caret blink anchor: reset on every keystroke/caret move so the caret is
     /// solid while typing and blinks at [`CARET_BLINK_MS`] when idle.
     blink_anchor: Instant,
@@ -1426,6 +1439,7 @@ impl ComposerInput {
             layout_epoch: 0,
             display_is_placeholder: true,
             soft_wrap: true,
+            viewport_max: None,
             blink_anchor: Instant::now(),
             blink_task: None,
             undo_stack: Vec::new(),
@@ -1600,6 +1614,13 @@ impl ComposerInput {
 
     pub fn set_soft_wrap(&mut self, soft_wrap: bool) {
         self.soft_wrap = soft_wrap;
+    }
+
+    /// Cap the painted viewport so a parent shorter than the default
+    /// textarea max still scrolls. Pass the inner height of the text well
+    /// (padding already subtracted). `None` restores the default cap.
+    pub fn set_viewport_max(&mut self, max: Option<f32>) {
+        self.viewport_max = max.filter(|height| *height > 0.0);
     }
 
     pub fn set_placeholder(
@@ -2428,13 +2449,25 @@ impl ComposerInput {
         .detach();
     }
 
+    /// Visible height used for scroll math. Prefers the owner's viewport
+    /// cap when layout still reported the full text height (studio's card
+    /// is shorter than the agent textarea max).
+    fn viewport_height(&self) -> f32 {
+        let bounds_h = self
+            .last_bounds
+            .map(|bounds| f32::from(bounds.size.height))
+            .unwrap_or(0.0);
+        input_viewport_height(bounds_h, self.viewport_max)
+    }
+
     fn drag_selection_position(&self, position: Point<Pixels>) -> Point<Pixels> {
         let Some(bounds) = self.last_bounds else {
             return position;
         };
+        let bottom = bounds.top() + px(self.viewport_height());
         point(
             position.x.clamp(bounds.left(), bounds.right() - px(0.5)),
-            position.y.clamp(bounds.top(), bounds.bottom() - px(0.5)),
+            position.y.clamp(bounds.top(), bottom - px(0.5)),
         )
     }
 
@@ -2445,7 +2478,7 @@ impl ComposerInput {
         input_drag_scroll_delta(
             f32::from(position.y),
             f32::from(bounds.top()),
-            f32::from(bounds.bottom()),
+            f32::from(bounds.top()) + self.viewport_height(),
             f32::from(self.line_height),
         )
     }
@@ -2454,7 +2487,7 @@ impl ComposerInput {
         if !self.is_selecting || self.drag_generation != generation {
             return false;
         }
-        let (Some(position), Some(bounds)) = (self.drag_position, self.last_bounds) else {
+        let (Some(position), Some(_)) = (self.drag_position, self.last_bounds) else {
             self.drag_autoscroll_active = false;
             return false;
         };
@@ -2465,7 +2498,7 @@ impl ComposerInput {
         }
         let next = (self.scroll_top + delta).clamp(
             0.0,
-            input_max_scroll(self.content_height, f32::from(bounds.size.height)),
+            input_max_scroll(self.content_height, self.viewport_height()),
         );
         if next == self.scroll_top {
             self.drag_autoscroll_active = false;
@@ -2486,15 +2519,15 @@ impl ComposerInput {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(bounds) = self.last_bounds else {
+        if self.last_bounds.is_none() {
             return;
-        };
+        }
         let delta_y = f32::from(event.delta.pixel_delta(self.line_height).y);
         let next = input_scroll_offset(
             self.scroll_top,
             delta_y,
             self.content_height,
-            f32::from(bounds.size.height),
+            self.viewport_height(),
         );
         if next == self.scroll_top {
             return;
@@ -2905,6 +2938,11 @@ impl gpui::Element for ComposerTextElement {
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut style = Style::default();
         style.size.width = relative(1.0).into();
+        // Fill a definite parent so last_bounds is the visible box, not the
+        // full text. min-height 0 lets a flex parent shrink us below
+        // min-content (otherwise the card clips and wheel-scroll is a no-op).
+        style.size.height = relative(1.0).into();
+        style.min_size.height = px(0.0).into();
         let input = self.input.clone();
         let text_style = window.text_style();
         let max_content = self.max_content_height;
@@ -2917,15 +2955,15 @@ impl gpui::Element for ComposerTextElement {
                 let content_height = input.update(cx, |input, cx| {
                     input.layout_text(width, &text_style, window, cx)
                 });
-                let available_height = match available.height {
+                let assigned_height = known.height.map(f32::from).or(match available.height {
                     gpui::AvailableSpace::Definite(height) => Some(f32::from(height)),
                     _ => None,
-                };
+                });
                 size(
                     width,
                     px(input_element_height(
                         content_height,
-                        available_height,
+                        assigned_height,
                         max_content,
                     )),
                 )
@@ -2943,8 +2981,8 @@ impl gpui::Element for ComposerTextElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         self.input.update(cx, |input, cx| {
-            let scrolled = input.clamp_scroll(f32::from(bounds.size.height));
             input.last_bounds = Some(bounds);
+            let scrolled = input.clamp_scroll(input.viewport_height());
             if scrolled {
                 cx.emit(ComposerInputEvent::ViewportChanged);
             }
@@ -3266,10 +3304,9 @@ impl Render for ComposerInput {
             .font_family(theme.font_sans.clone())
             .child(ComposerTextElement {
                 input: cx.entity(),
-                // Fallback cap when the parent does not assign a height
-                // (search / rename). Capped composers pass a definite
-                // height and ignore this.
-                max_content_height: TEXTAREA_MAX - TEXTAREA_PAD_V,
+                // Owner-supplied viewport (studio, image-edit) or the
+                // historical 240px textarea cap for unconstrained fields.
+                max_content_height: self.viewport_max.unwrap_or(TEXTAREA_MAX - TEXTAREA_PAD_V),
             })
     }
 }
@@ -6215,6 +6252,16 @@ mod tests {
         // a 400px editor should scroll at 400, not the historical 240 cap.
         assert_eq!(input_element_height(800.0, Some(400.0), 240.0), 400.0);
         assert_eq!(input_element_height(50.0, Some(0.0), 240.0), 0.0);
+    }
+
+    #[test]
+    fn owner_viewport_cap_wins_over_a_taller_layout_box() {
+        // Studio's card is ~208px; layout may still report the 240px agent
+        // cap. Scroll math must use the smaller visible well.
+        assert_eq!(input_viewport_height(240.0, Some(208.0)), 208.0);
+        assert_eq!(input_viewport_height(180.0, Some(208.0)), 180.0);
+        assert_eq!(input_viewport_height(240.0, None), 240.0);
+        assert_eq!(input_viewport_height(0.0, Some(208.0)), 0.0);
     }
 
     #[test]

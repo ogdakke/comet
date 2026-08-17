@@ -991,10 +991,15 @@ impl StudioPage {
             self.prompt_expanded
         };
         self.prompt_expanded = prompt_expanded;
-        self.prompt
-            .update(cx, |input, _| input.set_soft_wrap(prompt_expanded));
-
         let prompt_height = (content_height + 12.0).clamp(32.0, 220.0);
+        // Inner well after `py(6)` — this is the scroll viewport once the
+        // card stops growing. Without it the input sizes to content (or the
+        // agent 240px cap) and the card just clips.
+        let prompt_viewport = (prompt_height - 12.0).max(0.0);
+        self.prompt.update(cx, |input, _| {
+            input.set_soft_wrap(prompt_expanded);
+            input.set_viewport_max(Some(prompt_viewport));
+        });
         let body_target = if prompt_expanded {
             prompt_height + 36.0
         } else {
@@ -1039,11 +1044,20 @@ impl StudioPage {
                     .h(px(prompt_height))
                     .px(px(8.0))
                     .py(px(6.0))
-                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
                     .when(!prompt_expanded, |input| {
                         input.pr(px(COMPACT_ACTIONS_INSET))
                     })
-                    .child(self.prompt.clone()),
+                    .child(
+                        div()
+                            .id("studio-prompt")
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .overflow_hidden()
+                            .child(self.prompt.clone()),
+                    ),
             )
             .child(
                 div()
