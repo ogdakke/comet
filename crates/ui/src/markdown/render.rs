@@ -711,14 +711,16 @@ fn flat_text_element(
             // Register this element into the frame's document-ordered
             // registry (paint order IS document order), then the frame's
             // mouse listeners.
+            let clip = window.content_mask().bounds;
             REGISTRY.with(|r| {
                 r.borrow_mut().push(RegEntry {
                     key: sel_key.clone(),
                     text: flat_text.clone(),
                     layout: layout.clone(),
+                    clip,
                 })
             });
-            register_selection_listeners(window, &sel_key, &flat_text, &layout);
+            register_selection_listeners(window, &sel_key, &flat_text, &layout, clip);
         },
     )
     .absolute()
@@ -759,14 +761,51 @@ pub(crate) fn paint_text_selection(
             ));
         }
     }
+    let clip = window.content_mask().bounds;
     REGISTRY.with(|r| {
         r.borrow_mut().push(RegEntry {
             key: key.clone(),
             text: text.clone(),
             layout: layout.clone(),
+            clip,
         })
     });
-    register_selection_listeners(window, key, text, layout);
+    register_selection_listeners(window, key, text, layout, clip);
+}
+
+/// Selectable plain text for surfaces that are not markdown (Studio prompt
+/// bubbles). Same registry / wash / mouse path as the chat user bubble, so a
+/// drag highlights, spans into neighboring prompts, and Cmd+C copies.
+pub(crate) fn selectable_plain_text(
+    key: impl Into<std::sync::Arc<str>>,
+    text: SharedString,
+    theme: &Theme,
+) -> AnyElement {
+    let run = TextRun {
+        len: text.len(),
+        font: font(theme.font_sans.clone()),
+        color: theme.text,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let styled = StyledText::new(text.clone()).with_runs(vec![run]);
+    let layout = styled.layout().clone();
+    let sel_key: std::sync::Arc<str> = key.into();
+    let sel_theme = theme.clone();
+    let underlay = canvas(
+        |_, _, _| (),
+        move |_, _, window, _| {
+            paint_text_selection(window, &sel_key, &text, &layout, &sel_theme);
+        },
+    )
+    .absolute()
+    .size_full();
+    div()
+        .relative()
+        .child(underlay)
+        .child(styled)
+        .into_any_element()
 }
 
 /// One painted text element, registered per frame in document order — the
@@ -776,6 +815,9 @@ struct RegEntry {
     key: std::sync::Arc<str>,
     text: SharedString,
     layout: gpui::TextLayout,
+    /// Overflow clip at paint time (collapsed Studio prompts, list viewport).
+    /// Hit-testing uses this so a clipped bubble cannot steal clicks below it.
+    clip: Bounds<gpui::Pixels>,
 }
 
 thread_local! {
@@ -803,7 +845,10 @@ fn registry_point(position: gpui::Point<gpui::Pixels>) -> Option<(usize, usize)>
         let reg = r.borrow();
         let mut best: Option<(usize, f32)> = None;
         for (ei, entry) in reg.iter().enumerate() {
-            let b = entry.layout.bounds();
+            let b = entry.layout.bounds().intersect(&entry.clip);
+            if b.is_empty() {
+                continue;
+            }
             let dy = if position.y < b.top() {
                 f32::from(b.top() - position.y)
             } else if position.y > b.bottom() {
@@ -851,15 +896,17 @@ fn register_selection_listeners(
     key: &std::sync::Arc<str>,
     text: &SharedString,
     layout: &gpui::TextLayout,
+    clip: Bounds<gpui::Pixels>,
 ) {
     use gpui::{DispatchPhase, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
     {
-        let (key, text, layout) = (key.clone(), text.clone(), layout.clone());
+        let (key, text, layout, clip) = (key.clone(), text.clone(), layout.clone(), clip);
         window.on_mouse_event(move |e: &MouseDownEvent, phase, window, _cx| {
             if phase != DispatchPhase::Bubble || e.button != MouseButton::Left {
                 return;
             }
-            if layout.bounds().contains(&e.position) {
+            let hit = layout.bounds().intersect(&clip);
+            if !hit.is_empty() && hit.contains(&e.position) {
                 let ix = match layout.index_for_position(e.position) {
                     Ok(ix) | Err(ix) => ix,
                 };

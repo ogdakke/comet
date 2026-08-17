@@ -12,13 +12,14 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
 use gpui::{
-    AnyElement, Context, ListAlignment, ListOffset, ListScrollEvent, ListState, SharedString,
-    Window, canvas, div, list, prelude::*, px,
+    AnyElement, Context, CursorStyle, ListAlignment, ListOffset, ListScrollEvent, ListState,
+    SharedString, Window, canvas, div, list, prelude::*, px,
 };
 use zeron_proto::{StudioRunState, StudioRunView, StudioTurnView};
 use zeron_studio::{MediaKind, StudioArtifactId};
 
 use crate::icons;
+use crate::markdown::render;
 use crate::motion;
 use crate::popover;
 use crate::rail;
@@ -1217,6 +1218,7 @@ impl StudioPage {
             .min_w_0()
             .h_full()
             .overflow_hidden()
+            .child(render::selection_frame_reset())
             .child(
                 canvas(
                     move |bounds, window, cx| {
@@ -1367,6 +1369,8 @@ impl StudioPage {
                 page.toggle_prompt_expanded(turn_id, cx);
             }))
         });
+        let prompt_key: std::sync::Arc<str> = format!("studio-prompt-{}", turn_id.0).into();
+        let prompt_text = SharedString::from(turn.prompt.clone());
         div()
             .id(SharedString::from(format!("studio-turn-{turn_ix}")))
             .w_full()
@@ -1401,18 +1405,29 @@ impl StudioPage {
                                 .line_height(px(PROMPT_LINE_HEIGHT))
                                 .text_color(theme.text)
                                 .when(!clampable, |el| {
-                                    el.child(SharedString::from(turn.prompt.clone()))
+                                    el.cursor(CursorStyle::IBeam).child(
+                                        render::selectable_plain_text(
+                                            prompt_key.clone(),
+                                            prompt_text.clone(),
+                                            theme,
+                                        ),
+                                    )
                                 })
                                 .when(clampable, |el| {
                                     el.child(
                                         div()
                                             .w_full()
+                                            .cursor(CursorStyle::IBeam)
                                             .when(collapsed, |box_| {
                                                 box_.max_h(px(PROMPT_LINE_HEIGHT
                                                     * PROMPT_COLLAPSED_LINES as f32))
                                                     .overflow_hidden()
                                             })
-                                            .child(SharedString::from(turn.prompt.clone())),
+                                            .child(render::selectable_plain_text(
+                                                prompt_key,
+                                                prompt_text,
+                                                theme,
+                                            )),
                                     )
                                     .children(show_more)
                                 }),
