@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, Context, Element, GlobalElementId, Image, ImageFormat,
-    InspectorElementId, IntoElement, LayoutId, ObjectFit, PinchEvent, Pixels, Point, Refineable,
-    ScrollWheelEvent, SharedString, Style, StyleRefinement, Styled, TouchPhase, Window, canvas,
-    div, prelude::*, px,
+    AnyElement, App, Bounds, ClipboardItem, Context, DevicePixels, Element, GlobalElementId, Image,
+    ImageFormat, InspectorElementId, IntoElement, LayoutId, ObjectFit, PinchEvent, Pixels, Point,
+    Refineable, ScrollWheelEvent, SharedString, Style, StyleRefinement, Styled, TouchPhase, Window,
+    canvas, div, point, prelude::*, px, size,
 };
 use zeron_proto::{StudioConversationView, StudioGalleryItem};
 use zeron_rpc::methods;
@@ -67,6 +67,8 @@ pub(super) struct ArtifactFrame {
     pub model_display_name: String,
     pub mime_type: String,
     pub size_bytes: u64,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 pub(super) fn frames_from_gallery(items: &[StudioGalleryItem]) -> Vec<ArtifactFrame> {
@@ -80,6 +82,8 @@ pub(super) fn frames_from_gallery(items: &[StudioGalleryItem]) -> Vec<ArtifactFr
             model_display_name: item.model_display_name.clone(),
             mime_type: item.mime_type.clone(),
             size_bytes: item.size_bytes,
+            width: item.width,
+            height: item.height,
         })
         .collect()
 }
@@ -100,6 +104,8 @@ pub(super) fn frames_from_conversation(view: &StudioConversationView) -> Vec<Art
                         model_display_name: run.model.display_name.clone(),
                         mime_type: artifact.mime_type.clone(),
                         size_bytes: artifact.size_bytes,
+                        width: artifact.width,
+                        height: artifact.height,
                     })
             })
         })
@@ -425,6 +431,47 @@ fn lightbox_pan_range(stage: f32, zoom: f32) -> f32 {
     } else {
         stage.max(1.0) * zoom / 2.0
     }
+}
+
+/// Contained-image box inside the stage, including zoom, pan, and swipe.
+fn lightbox_image_paint_bounds(
+    stage: Bounds<Pixels>,
+    image_width: u32,
+    image_height: u32,
+    zoom: f32,
+    pan: Point<Pixels>,
+    swipe_x: f32,
+) -> Bounds<Pixels> {
+    let zoom = zoom.max(1.0);
+    let zoomed_size = size(stage.size.width * zoom, stage.size.height * zoom);
+    let zoomed = Bounds {
+        origin: point(
+            stage.origin.x + (stage.size.width - zoomed_size.width) / 2.0 + pan.x + px(swipe_x),
+            stage.origin.y + (stage.size.height - zoomed_size.height) / 2.0 + pan.y,
+        ),
+        size: zoomed_size,
+    };
+    ObjectFit::Contain.get_bounds(
+        zoomed,
+        size(
+            DevicePixels::from(image_width),
+            DevicePixels::from(image_height),
+        ),
+    )
+}
+
+fn lightbox_click_hits_empty(
+    stage: Bounds<Pixels>,
+    image: Option<(u32, u32)>,
+    zoom: f32,
+    pan: Point<Pixels>,
+    swipe_x: f32,
+    click: Point<Pixels>,
+) -> bool {
+    let Some((width, height)) = image.filter(|(width, height)| *width > 0 && *height > 0) else {
+        return true;
+    };
+    !lightbox_image_paint_bounds(stage, width, height, zoom, pan, swipe_x).contains(&click)
 }
 
 fn snap_offset_at(from: f32, to: f32, elapsed: f32, duration: f32) -> f32 {
@@ -826,6 +873,69 @@ impl StudioPage {
             self.request_visible_gallery_images(cx);
             cx.notify();
         }
+    }
+
+    /// Close via chrome, empty-space click, or Escape. Emits so the shell
+    /// pops the artifact route; [`close_artifact`] then clears viewer state.
+    pub(super) fn request_close_artifact(&mut self, cx: &mut Context<Self>) {
+        if self.selected_artifact.take().is_some() {
+            cx.emit(StudioEvent::CloseArtifact);
+            cx.notify();
+        }
+    }
+
+    fn lightbox_stage_bounds(&self) -> Bounds<Pixels> {
+        Bounds {
+            origin: self.lightbox_stage_origin,
+            size: size(
+                px(self.lightbox_stage_width),
+                px(self.lightbox_stage_height),
+            ),
+        }
+    }
+
+    fn lightbox_image_pixel_size(&self, window: &mut Window, cx: &mut App) -> Option<(u32, u32)> {
+        let id = self.selected_artifact?;
+        if let Some(frame) = self.artifact_frame(id)
+            && let (Some(width), Some(height)) = (frame.width, frame.height)
+            && width > 0
+            && height > 0
+        {
+            return Some((width, height));
+        }
+        let image = self
+            .images
+            .get_full(&id)
+            .or_else(|| self.images.get_display(&id))
+            .or_else(|| self.images.get_thumb(&id))
+            .or_else(|| self.images.get_placeholder(&id))?;
+        let data = image.use_render_image(window, cx)?;
+        if data.frame_count() == 0 {
+            return None;
+        }
+        let size = data.size(0);
+        let width = u32::from(size.width);
+        let height = u32::from(size.height);
+        (width > 0 && height > 0).then_some((width, height))
+    }
+
+    fn lightbox_click_is_empty(
+        &self,
+        click: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        if self.lightbox_stage_width <= 1.0 || self.lightbox_stage_height <= 1.0 {
+            return true;
+        }
+        lightbox_click_hits_empty(
+            self.lightbox_stage_bounds(),
+            self.lightbox_image_pixel_size(window, cx),
+            self.lightbox_zoom,
+            self.lightbox_pan,
+            self.lightbox_swipe_x,
+            click,
+        )
     }
 
     pub(super) fn lightbox_page_width(&self) -> f32 {
@@ -1444,13 +1554,21 @@ impl StudioPage {
                 gpui::MouseButton::Left,
                 cx.listener(|page, _, _, cx| page.end_lightbox_pan(cx)),
             )
-            .on_click(cx.listener(|page, event: &gpui::ClickEvent, _, cx| {
-                if event.click_count() == 2 {
+            .on_click(cx.listener(|page, event: &gpui::ClickEvent, window, cx| {
+                if event.click_count() >= 2 {
                     if page.lightbox_zoom > 1.0 {
                         page.fit_lightbox(cx);
                     } else {
                         page.adjust_lightbox_zoom(2.0, cx);
                     }
+                    return;
+                }
+                if event.click_count() == 1
+                    && event.standard_click()
+                    && !event.is_keyboard()
+                    && page.lightbox_click_is_empty(event.position(), window, cx)
+                {
+                    page.request_close_artifact(cx);
                 }
             }))
             .child(
@@ -1460,6 +1578,7 @@ impl StudioPage {
                         let height = f32::from(bounds.size.height);
                         let changed = measure_entity
                             .update(cx, |page, _| {
+                                page.lightbox_stage_origin = bounds.origin;
                                 if !lightbox_stage_size_changed(
                                     page.lightbox_stage_width,
                                     page.lightbox_stage_height,
@@ -1500,9 +1619,7 @@ impl StudioPage {
             .cursor_pointer()
             .hover(|style| style.bg(crate::theme::wash(0.14)))
             .on_click(cx.listener(|page, _, _, cx| {
-                page.selected_artifact = None;
-                cx.emit(StudioEvent::CloseArtifact);
-                cx.notify();
+                page.request_close_artifact(cx);
             }))
             .child(
                 crate::icons::icon(crate::icons::CLOSE)
@@ -1727,11 +1844,7 @@ impl StudioPage {
                         return;
                     }
                     match event.keystroke.key.as_str() {
-                        "escape" => {
-                            page.selected_artifact = None;
-                            cx.emit(StudioEvent::CloseArtifact);
-                            cx.notify();
-                        }
+                        "escape" => page.request_close_artifact(cx),
                         "left" => page.navigate_artifact(-1, cx),
                         "right" => page.navigate_artifact(1, cx),
                         "home" => page.select_artifact_edge(false, cx),
@@ -1993,6 +2106,8 @@ mod tests {
             model_display_name: "model".into(),
             mime_type: "image/png".into(),
             size_bytes: 1,
+            width: Some(1),
+            height: Some(1),
         }
     }
 
@@ -2118,5 +2233,77 @@ mod tests {
             std::fs::read(destination).expect("saved artifact"),
             b"image bytes"
         );
+    }
+
+    #[test]
+    fn empty_space_is_the_letterbox_around_the_contained_image() {
+        let stage = Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(px(1000.0), px(800.0)),
+        };
+        let pan = Point::default();
+        let painted = lightbox_image_paint_bounds(stage, 2000, 1000, 1.0, pan, 0.0);
+        assert!((f32::from(painted.size.width) - 1000.0).abs() < 0.5);
+        assert!((f32::from(painted.size.height) - 500.0).abs() < 0.5);
+        assert!(lightbox_click_hits_empty(
+            stage,
+            Some((2000, 1000)),
+            1.0,
+            pan,
+            0.0,
+            point(px(500.0), px(50.0)),
+        ));
+        assert!(!lightbox_click_hits_empty(
+            stage,
+            Some((2000, 1000)),
+            1.0,
+            pan,
+            0.0,
+            point(px(500.0), px(400.0)),
+        ));
+        assert!(lightbox_click_hits_empty(
+            stage,
+            None,
+            1.0,
+            pan,
+            0.0,
+            point(px(500.0), px(400.0)),
+        ));
+    }
+
+    #[test]
+    fn empty_space_follows_zoom_and_swipe() {
+        let stage = Bounds {
+            origin: point(px(100.0), px(40.0)),
+            size: size(px(1000.0), px(800.0)),
+        };
+        let pan = Point::default();
+        // Zoomed 2×: the contained 1000×500 box becomes 2000×1000, centered
+        // on the stage, so the original letterbox is now inside the image.
+        assert!(!lightbox_click_hits_empty(
+            stage,
+            Some((2000, 1000)),
+            2.0,
+            pan,
+            0.0,
+            point(px(600.0), px(90.0)),
+        ));
+        // Mid-swipe the current frame sits `swipe_x` to the side.
+        assert!(lightbox_click_hits_empty(
+            stage,
+            Some((2000, 1000)),
+            1.0,
+            pan,
+            -400.0,
+            point(px(900.0), px(440.0)),
+        ));
+        assert!(!lightbox_click_hits_empty(
+            stage,
+            Some((2000, 1000)),
+            1.0,
+            pan,
+            -400.0,
+            point(px(200.0), px(440.0)),
+        ));
     }
 }
