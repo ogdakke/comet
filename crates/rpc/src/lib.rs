@@ -147,6 +147,7 @@ pub mod methods {
     pub const RENAME_STUDIO_CONVERSATION: &str = "RenameStudioConversation";
     pub const ARCHIVE_STUDIO_CONVERSATION: &str = "ArchiveStudioConversation";
     pub const DELETE_STUDIO_CONVERSATION: &str = "DeleteStudioConversation";
+    pub const MARK_STUDIO_CONVERSATION_SEEN: &str = "MarkStudioConversationSeen";
     pub const WATCH_STUDIO_CONVERSATION: &str = "WatchStudioConversation";
     pub const CREATE_STUDIO_TURN: &str = "CreateStudioTurn";
     pub const EXTEND_STUDIO_TURN: &str = "ExtendStudioTurn";

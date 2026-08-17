@@ -28,7 +28,7 @@ use zeron_studio::{
 use crate::venice_import::{ImportReport, ImportedStudioHistory};
 
 const DATABASE_FILE: &str = "studio.sqlite3";
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const MAX_CREATE_TURN_RUNS: usize = 16;
 const MAX_TURN_RUNS: usize = 64;
 pub(crate) const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
@@ -43,6 +43,18 @@ EXISTS (\
     JOIN studio_runs active_run ON active_run.batch_id = active_batch.id \
     WHERE active_turn.conversation_id = c.id \
       AND active_run.state NOT IN ('succeeded', 'failed', 'cancelled')\
+), \
+(\
+    c.last_seen_at IS NOT NULL \
+    AND EXISTS (\
+        SELECT 1 \
+        FROM studio_turns settled_turn \
+        JOIN studio_batches settled_batch ON settled_batch.turn_id = settled_turn.id \
+        JOIN studio_runs settled_run ON settled_run.batch_id = settled_batch.id \
+        WHERE settled_turn.conversation_id = c.id \
+          AND settled_run.state IN ('succeeded', 'failed', 'cancelled') \
+          AND settled_run.updated_at > c.last_seen_at\
+    )\
 )";
 const ARTIFACT_FORMATS: &[(&str, &str)] = &[
     ("webp", "image/webp"),
@@ -64,7 +76,8 @@ CREATE TABLE IF NOT EXISTS studio_conversations (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     archived_at INTEGER,
-    forked_from_turn_id TEXT REFERENCES studio_turns(id)
+    forked_from_turn_id TEXT REFERENCES studio_turns(id),
+    last_seen_at INTEGER
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS studio_turns (
@@ -200,7 +213,7 @@ CREATE TABLE IF NOT EXISTS studio_run_events (
     created_at INTEGER NOT NULL
 ) STRICT;
 
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 COMMIT;
 "#;
 
@@ -208,6 +221,14 @@ const SCHEMA_V2: &str = r#"
 BEGIN IMMEDIATE;
 ALTER TABLE studio_artifacts ADD COLUMN thumbhash TEXT;
 PRAGMA user_version = 2;
+COMMIT;
+"#;
+
+const SCHEMA_V3: &str = r#"
+BEGIN IMMEDIATE;
+ALTER TABLE studio_conversations ADD COLUMN last_seen_at INTEGER;
+UPDATE studio_conversations SET last_seen_at = updated_at WHERE last_seen_at IS NULL;
+PRAGMA user_version = 3;
 COMMIT;
 "#;
 
@@ -345,8 +366,13 @@ impl StudioStore {
         }
         if version == 0 {
             connection.execute_batch(SCHEMA_V1)?;
-        } else if version == 1 {
-            connection.execute_batch(SCHEMA_V2)?;
+        } else {
+            if version < 2 {
+                connection.execute_batch(SCHEMA_V2)?;
+            }
+            if version < 3 {
+                connection.execute_batch(SCHEMA_V3)?;
+            }
         }
 
         let (changes, _) = tokio::sync::watch::channel(0);
@@ -445,7 +471,7 @@ impl StudioStore {
         let id = StudioConversationId::new();
         let now = chrono::Utc::now().timestamp_millis();
         self.connection()?.execute(
-            "INSERT INTO studio_conversations (id, title, created_at, updated_at, forked_from_turn_id) VALUES (?1, ?2, ?3, ?3, ?4)",
+            "INSERT INTO studio_conversations (id, title, created_at, updated_at, last_seen_at, forked_from_turn_id) VALUES (?1, ?2, ?3, ?3, ?3, ?4)",
             rusqlite::params![
                 id.0.to_string(),
                 title,
@@ -524,6 +550,35 @@ impl StudioStore {
         )?;
         if changed == 0 {
             return Err(StudioStoreError::ConversationNotFound);
+        }
+        self.notify_change();
+        self.conversation(id)
+    }
+
+    pub fn mark_conversation_seen(
+        &self,
+        id: StudioConversationId,
+    ) -> Result<StudioConversationSummary, StudioStoreError> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let changed = self.connection()?.execute(
+            "UPDATE studio_conversations SET last_seen_at = ?2
+             WHERE id = ?1
+               AND (
+                    last_seen_at IS NULL
+                    OR EXISTS (
+                        SELECT 1
+                        FROM studio_turns t
+                        JOIN studio_batches b ON b.turn_id = t.id
+                        JOIN studio_runs r ON r.batch_id = b.id
+                        WHERE t.conversation_id = studio_conversations.id
+                          AND r.state IN ('succeeded', 'failed', 'cancelled')
+                          AND r.updated_at > studio_conversations.last_seen_at
+                    )
+               )",
+            rusqlite::params![id.0.to_string(), now],
+        )?;
+        if changed == 0 {
+            return self.conversation(id);
         }
         self.notify_change();
         self.conversation(id)
@@ -680,7 +735,7 @@ impl StudioStore {
             let mut connection = self.connection()?;
             let transaction = connection.transaction()?;
             transaction.execute(
-                "INSERT INTO studio_conversations (id, title, created_at, updated_at, forked_from_turn_id) VALUES (?1, ?2, ?3, ?4, NULL)",
+                "INSERT INTO studio_conversations (id, title, created_at, updated_at, last_seen_at, forked_from_turn_id) VALUES (?1, ?2, ?3, ?4, ?4, NULL)",
                 rusqlite::params![
                     conversation.id.0.to_string(),
                     title,
@@ -1922,6 +1977,7 @@ fn conversation_from_row(
             .map(|value| parse_uuid(6, value).map(StudioTurnId))
             .transpose()?,
         creating: row.get(7)?,
+        done: row.get(8)?,
     })
 }
 

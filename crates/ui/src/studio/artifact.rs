@@ -1965,6 +1965,7 @@ mod tests {
                 archived: false,
                 forked_from_turn_id: None,
                 creating: false,
+                done: false,
             },
             turns: vec![zeron_proto::StudioTurnView {
                 id: StudioTurnId::new(),

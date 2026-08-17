@@ -119,6 +119,7 @@ fn conversation_summary_defaults_creating_to_false() {
     });
     let summary: StudioConversationSummary = serde_json::from_value(json).unwrap();
     assert!(!summary.creating);
+    assert!(!summary.done);
 }
 
 #[test]

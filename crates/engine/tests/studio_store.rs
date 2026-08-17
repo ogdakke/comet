@@ -106,7 +106,7 @@ fn studio_catalog_is_profile_scoped_and_migrated() {
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
 }
 
 #[test]
@@ -377,6 +377,12 @@ fn schema_v1_gains_a_thumbhash_column() {
     connection
         .execute_batch(
             r#"
+            CREATE TABLE studio_conversations (
+                id TEXT PRIMARY KEY NOT NULL,
+                title TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
             CREATE TABLE studio_artifacts (
                 id TEXT PRIMARY KEY NOT NULL,
                 run_id TEXT NOT NULL,
@@ -402,7 +408,7 @@ fn schema_v1_gains_a_thumbhash_column() {
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let has_thumbhash: i64 = store
         .connection()
         .unwrap()
@@ -413,6 +419,57 @@ fn schema_v1_gains_a_thumbhash_column() {
         )
         .unwrap();
     assert_eq!(has_thumbhash, 1);
+    let has_last_seen: i64 = store
+        .connection()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('studio_conversations') WHERE name = 'last_seen_at'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(has_last_seen, 1);
+}
+
+#[test]
+fn schema_v2_gains_a_last_seen_column() {
+    let root = tempdir().unwrap();
+    let studio = root.path().join("studio");
+    std::fs::create_dir_all(&studio).unwrap();
+    let connection = rusqlite::Connection::open(studio.join("studio.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE studio_conversations (
+                id TEXT PRIMARY KEY NOT NULL,
+                title TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            INSERT INTO studio_conversations (id, title, created_at, updated_at)
+            VALUES ('c', 'old thread', 1, 50);
+            PRAGMA user_version = 2;
+            "#,
+        )
+        .unwrap();
+    drop(connection);
+    let store = StudioStore::open(root.path(), 1024).unwrap();
+    let version: i64 = store
+        .connection()
+        .unwrap()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 3);
+    let last_seen: i64 = store
+        .connection()
+        .unwrap()
+        .query_row(
+            "SELECT last_seen_at FROM studio_conversations WHERE id = 'c'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(last_seen, 50);
 }
 
 #[test]
@@ -1423,6 +1480,22 @@ async fn conversation_summary_marks_in_flight_runs_as_creating() {
     .unwrap();
     assert_eq!(listed.conversations.len(), 1);
     assert!(!listed.conversations[0].creating);
+    assert!(
+        listed.conversations[0].done,
+        "a settled generation the user has not opened is Done"
+    );
+
+    let seen: StudioConversationSummary = serde_json::from_value(
+        client
+            .call(
+                methods::MARK_STUDIO_CONVERSATION_SEEN,
+                serde_json::json!({ "conversationId": conversation.id }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!seen.done);
     engine.shutdown().await;
 }
 

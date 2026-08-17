@@ -101,6 +101,9 @@ pub struct StudioConversationSummary {
     /// True while at least one run is still queued, generating, or downloading.
     #[serde(default)]
     pub creating: bool,
+    /// Finished a run the user has not opened since — the green "Done" badge.
+    #[serde(default)]
+    pub done: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +144,12 @@ pub struct ArchiveStudioConversationRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteStudioConversationRequest {
+    pub conversation_id: StudioConversationId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkStudioConversationSeenRequest {
     pub conversation_id: StudioConversationId,
 }
 

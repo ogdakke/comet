@@ -399,7 +399,10 @@ impl StudioPage {
         if let Some(view) = self.conversation.as_mut()
             && view.conversation.id == summary.id
         {
-            view.conversation = summary;
+            view.conversation = summary.clone();
+        }
+        if self.selected_conversation == Some(summary.id) && summary.done {
+            self.mark_conversation_seen(summary.id, cx);
         }
     }
 
@@ -421,6 +424,60 @@ impl StudioPage {
             view.conversation = summary.clone();
         }
         cx.emit(StudioEvent::SidebarChanged);
+        if let Some(id) = self.selected_conversation
+            && self
+                .conversations
+                .iter()
+                .any(|item| item.id == id && item.done)
+        {
+            self.mark_conversation_seen(id, cx);
+        }
+    }
+
+    pub fn selected_unseen(&self) -> Option<StudioConversationId> {
+        let id = self.selected_conversation?;
+        self.conversations
+            .iter()
+            .find(|item| item.id == id && item.done)
+            .map(|item| item.id)
+    }
+
+    pub fn mark_conversation_seen(&mut self, id: StudioConversationId, cx: &mut Context<Self>) {
+        let Some(item) = self.conversations.iter_mut().find(|item| item.id == id) else {
+            return;
+        };
+        if !item.done {
+            return;
+        }
+        item.done = false;
+        if let Some(view) = self.conversation.as_mut()
+            && view.conversation.id == id
+        {
+            view.conversation.done = false;
+        }
+        cx.emit(StudioEvent::SidebarChanged);
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::MARK_STUDIO_CONVERSATION_SEEN,
+                    serde_json::json!({ "conversationId": id }),
+                )
+                .await;
+            this.update(cx, |page, cx| {
+                if let Ok(value) = result
+                    && let Ok(summary) = serde_json::from_value::<StudioConversationSummary>(value)
+                {
+                    page.apply_conversation_summary(summary, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn watch_conversations(&mut self, cx: &mut Context<Self>) {
@@ -484,6 +541,7 @@ impl StudioPage {
         self.rail_hover = None;
         self.reset_feed_list();
         cx.emit(StudioEvent::SidebarChanged);
+        self.mark_conversation_seen(id, cx);
         self.watch_task = Some(cx.spawn(async move |this, cx| {
             let stream = engine
                 .client()

@@ -62,8 +62,8 @@ use zeron_proto::{
     CreateStudioTurnRequest, DeleteStudioArtifactRequest, DeleteStudioConversationRequest,
     EngineInfo, ExtendStudioTurnRequest, HarnessId, ListStudioArtifactsResponse,
     ListStudioConversationsRequest, ListStudioConversationsResponse, ListStudioModelsRequest,
-    ListStudioModelsResponse, ListStudioProvidersResponse, ProviderValidationState,
-    QuoteStudioBatchRequest, QuoteStudioBatchResponse, QuoteStudioRunView,
+    ListStudioModelsResponse, ListStudioProvidersResponse, MarkStudioConversationSeenRequest,
+    ProviderValidationState, QuoteStudioBatchRequest, QuoteStudioBatchResponse, QuoteStudioRunView,
     ReadStudioArtifactChunkRequest, RenameStudioConversationRequest, RetryStudioRunRequest,
     SetStudioProviderCredentialRequest, SetStudioProviderPreferencesRequest, StudioModelRunSpec,
     StudioProviderBalanceResponse, StudioProviderConnection, StudioProviderRequest, ToolCall,
@@ -1369,6 +1369,14 @@ impl RpcService for EngineRpc {
                     .delete_conversation(request.conversation_id)
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::MARK_STUDIO_CONVERSATION_SEEN => {
+                let request: MarkStudioConversationSeenRequest = parse_params(params)?;
+                let conversation = self
+                    .studio
+                    .mark_conversation_seen(request.conversation_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&conversation)
             }
             methods::WATCH_STUDIO_CONVERSATION => {
                 let request: WatchStudioConversationRequest = parse_params(params)?;

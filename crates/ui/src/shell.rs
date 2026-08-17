@@ -1955,6 +1955,8 @@ impl Shell {
             page.update(cx, |page, cx| {
                 if page.selected_conversation() != Some(conversation_id) {
                     page.open_conversation(conversation_id, cx);
+                } else {
+                    page.mark_conversation_seen(conversation_id, cx);
                 }
                 if let Some(artifact_id) = focus_artifact {
                     page.reveal_artifact_in_thread(artifact_id, cx);
@@ -3649,8 +3651,11 @@ impl Shell {
                 let age: SharedString = format_time_ago(conversation.updated_at, now).into();
                 let count = conversation.turn_count;
                 let creating = conversation.creating;
+                let done = conversation.done;
                 let creating_color =
                     spaces::status_dot_color(zeron_proto::ChatIndicator::Working, theme);
+                let done_color =
+                    spaces::status_dot_color(zeron_proto::ChatIndicator::Completed, theme);
                 div()
                     .id(SharedString::from(format!(
                         "studio-conversation-{}",
@@ -3742,6 +3747,26 @@ impl Shell {
                                                             .font_weight(gpui::FontWeight::MEDIUM)
                                                             .text_color(creating_color)
                                                             .child(SharedString::from("Creating")),
+                                                    )
+                                                    .into_any_element()
+                                            } else if done {
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap(px(4.0))
+                                                    .child(
+                                                        icon(icons::CHECK)
+                                                            .size(px(11.0))
+                                                            .flex_none()
+                                                            .text_color(done_color),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(10.0))
+                                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                                            .text_color(done_color)
+                                                            .child(SharedString::from("Done")),
                                                     )
                                                     .into_any_element()
                                             } else {
@@ -7179,6 +7204,11 @@ impl Render for Shell {
                     if let Some(chat_id) = unseen_selected {
                         self.state
                             .update(cx, |s, cx| s.mark_chat_seen(&chat_id, cx));
+                    }
+                    if let Some(page) = self.studio_page.clone()
+                        && let Some(id) = page.read(cx).selected_unseen()
+                    {
+                        page.update(cx, |page, cx| page.mark_conversation_seen(id, cx));
                     }
                 }
                 // Capture knob: `ZERON_OPEN_DIALOG=model` pops the combined
