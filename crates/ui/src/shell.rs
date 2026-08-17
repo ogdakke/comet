@@ -3231,7 +3231,7 @@ impl Shell {
             SettingsSection::Devices => icons::MONITOR,
             SettingsSection::Harnesses => icons::WIDGET,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
-            SettingsSection::Providers => icons::KEY_MINIMALISTIC,
+            SettingsSection::Providers => icons::GALLERY_MINIMALISTIC,
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Notifications => icons::BELL,
             SettingsSection::Shortcuts => icons::KEYBOARD,
@@ -3824,7 +3824,7 @@ impl Shell {
                             .text_size(px(11.0))
                             .line_height(px(14.0))
                             .text_color(theme.text_muted.opacity(0.5))
-                            .child(icon(icons::WIDGET).size(px(11.0)))
+                            .child(icon(icons::GALLERY_WIDE).size(px(11.0)))
                             .child(SharedString::from(format!(
                                 "{count} generation{}",
                                 if count == 1 { "" } else { "s" }
@@ -3886,7 +3886,7 @@ impl Shell {
                         this.show_studio_gallery(cx);
                     }))
                     .child(
-                        icon(icons::WIDGET)
+                        icon(icons::GALLERY_WIDE)
                             .size(px(16.0))
                             .text_color(if gallery_selected {
                                 theme.text
@@ -4186,7 +4186,7 @@ impl Shell {
                         .hover(|style| style.bg(theme.glass_hover()))
                         .on_click(cx.listener(|this, _, _, cx| this.open_studio(cx)))
                         .child(
-                            icon(icons::WIDGET)
+                            icon(icons::GALLERY_WIDE)
                                 .size(px(15.0))
                                 .text_color(theme.text_muted),
                         )

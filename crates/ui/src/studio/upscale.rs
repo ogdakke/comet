@@ -163,7 +163,7 @@ impl StudioPage {
                 }))
             })
             .child(
-                crate::icons::icon(crate::icons::SETTINGS_MINIMALISTIC)
+                crate::icons::icon(crate::icons::TUNING)
                     .size(px(15.0))
                     .text_color(theme.text_muted),
             );

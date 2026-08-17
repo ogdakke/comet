@@ -106,6 +106,9 @@ icon_assets![
     (GLOBAL, "global"),
     (CHECKLIST, "checklist"),
     (WIDGET, "widget"),
+    (GALLERY_WIDE, "gallery-wide"),
+    (GALLERY_MINIMALISTIC, "gallery-minimalistic"),
+    (PALETTE, "palette"),
     (WIFI_OFF, "wifi-off"),
     (CLOSE_CIRCLE, "close-circle"),
     // Hand-drawn info glyph in the Solar Linear style (like the terminal/
@@ -125,6 +128,7 @@ icon_assets![
     (STOP, "stop"),
     (CHECK, "check"),
     (COPY, "copy"),
+    // Solar Mirror Left (Linear) — before/after compare affordance.
     (COMPARE, "compare"),
     // Hand-drawn star pair in the Solar Linear style (like the terminal/
     // plus/return ports) — outline for the favorite affordance, bold for the

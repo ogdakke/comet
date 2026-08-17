@@ -873,7 +873,7 @@ impl StudioPage {
                         .flex_col()
                         .items_center()
                         .child(
-                            crate::icons::icon(crate::icons::WIDGET)
+                            crate::icons::icon(crate::icons::GALLERY_WIDE)
                                 .w(px(28.0))
                                 .h(px(28.0))
                                 .text_color(theme.text.opacity(0.2)),

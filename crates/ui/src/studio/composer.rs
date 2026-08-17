@@ -1089,7 +1089,7 @@ impl StudioPage {
                                         page.toggle_model_picker(window, cx)
                                     }))
                                     .child(
-                                        crate::icons::icon(crate::icons::WIDGET)
+                                        crate::icons::icon(crate::icons::PALETTE)
                                             .size(px(13.0))
                                             .text_color(theme.text_muted),
                                     )

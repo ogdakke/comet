@@ -323,7 +323,7 @@ impl Shell {
                         .items_center()
                         .gap(px(6.0))
                         .child(
-                            icon(icons::WIDGET)
+                            icon(icons::GALLERY_WIDE)
                                 .size(px(14.0))
                                 .flex_none()
                                 .text_color(theme.text_muted),
