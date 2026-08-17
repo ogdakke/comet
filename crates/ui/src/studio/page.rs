@@ -87,6 +87,9 @@ pub struct StudioPage {
     pub(super) source_turn: Option<zeron_studio::StudioTurnId>,
     /// Turns whose prompt bubble is fully expanded past the 3-line clamp.
     pub(super) expanded_prompts: HashSet<zeron_studio::StudioTurnId>,
+    /// Prompt copy that is showing the check flash.
+    pub(super) copied_prompt: Option<zeron_studio::StudioTurnId>,
+    pub(super) copied_prompt_clear: Option<Task<()>>,
     /// Turns whose inspector prompt is fully expanded past the 10-line clamp.
     pub(super) expanded_inspector_prompts: HashSet<zeron_studio::StudioTurnId>,
     pub(super) inspector_scroll: gpui::ScrollHandle,
@@ -220,6 +223,8 @@ impl StudioPage {
             rail_hover: None,
             source_turn: None,
             expanded_prompts: HashSet::new(),
+            copied_prompt: None,
+            copied_prompt_clear: None,
             expanded_inspector_prompts: HashSet::new(),
             inspector_scroll: gpui::ScrollHandle::new(),
             images: StudioImages::default(),

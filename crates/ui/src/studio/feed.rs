@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
 use gpui::{
-    AnyElement, ClipboardItem, Context, CursorStyle, ListAlignment, ListOffset, ListScrollEvent,
-    ListState, SharedString, Window, canvas, div, list, prelude::*, px,
+    AnyElement, ClipboardItem, Context, ListAlignment, ListOffset, ListScrollEvent, ListState,
+    SharedString, Window, canvas, div, list, prelude::*, px,
 };
 use zeron_proto::{StudioRunState, StudioRunView, StudioTurnView};
 use zeron_studio::{MediaKind, StudioArtifactId};
@@ -529,10 +529,11 @@ pub(super) fn turn_action(
         .child(label.into())
 }
 
-/// Tiny copy glyph beside Fork — writes the turn's prompt to the clipboard.
+/// Tiny copy glyph beside Fork — writes the turn's prompt to the clipboard
+/// and flashes a check for ~1.2s (same as the transcript reply copy).
 fn copy_prompt_action(
     id: impl Into<SharedString>,
-    prompt: String,
+    copied: bool,
     theme: &Theme,
 ) -> gpui::Stateful<gpui::Div> {
     let id = id.into();
@@ -546,11 +547,8 @@ fn copy_prompt_action(
         .justify_center()
         .cursor_pointer()
         .on_hover(motion::hover_listener(SharedString::from(fade.clone())))
-        .on_click(move |_, _, cx| {
-            cx.write_to_clipboard(ClipboardItem::new_string(prompt.clone()));
-        })
         .child(
-            icons::icon(icons::COPY)
+            icons::icon(if copied { icons::CHECK } else { icons::COPY })
                 .size(px(11.0))
                 .text_color(motion::hover_blend(
                     &fade,
@@ -795,13 +793,30 @@ impl StudioPage {
         self.feed_list.scroll_to_end();
     }
 
+    fn copy_prompt(
+        &mut self,
+        turn_id: zeron_studio::StudioTurnId,
+        prompt: String,
+        cx: &mut Context<Self>,
+    ) {
+        cx.write_to_clipboard(ClipboardItem::new_string(prompt));
+        self.copied_prompt = Some(turn_id);
+        self.copied_prompt_clear = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1200))
+                .await;
+            this.update(cx, |page, cx| {
+                page.copied_prompt = None;
+                page.copied_prompt_clear = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
     fn apply_selection_scroll(&mut self, delta: f32, cx: &mut Context<Self>) -> bool {
-        let before = self.feed_list.logical_scroll_top();
-        self.feed_list.scroll_by(px(delta));
-        let after = self.feed_list.logical_scroll_top();
-        let moved = before.item_ix != after.item_ix
-            || (f32::from(before.offset_in_item) - f32::from(after.offset_in_item)).abs() > 0.25;
-        if !moved {
+        if !render::scroll_list_by(&self.feed_list, delta) {
             return false;
         }
         self.sync_feed_visible_rows();
@@ -1463,19 +1478,16 @@ impl StudioPage {
                                 .line_height(px(PROMPT_LINE_HEIGHT))
                                 .text_color(theme.text)
                                 .when(!clampable, |el| {
-                                    el.cursor(CursorStyle::IBeam).child(
-                                        render::selectable_plain_text(
-                                            prompt_key.clone(),
-                                            prompt_text.clone(),
-                                            theme,
-                                        ),
-                                    )
+                                    el.child(render::selectable_plain_text(
+                                        prompt_key.clone(),
+                                        prompt_text.clone(),
+                                        theme,
+                                    ))
                                 })
                                 .when(clampable, |el| {
                                     el.child(
                                         div()
                                             .w_full()
-                                            .cursor(CursorStyle::IBeam)
                                             .when(collapsed, |box_| {
                                                 box_.max_h(px(PROMPT_LINE_HEIGHT
                                                     * PROMPT_COLLAPSED_LINES as f32))
@@ -1535,15 +1547,26 @@ impl StudioPage {
                                             "Fork",
                                             theme,
                                         )
-                                        .on_click(cx.listener(move |page, _, _, cx| {
-                                            page.fork_from(&turn_for_fork, cx)
-                                        })),
+                                        .on_click(
+                                            cx.listener(move |page, _, _, cx| {
+                                                page.fork_from(&turn_for_fork, cx)
+                                            }),
+                                        ),
                                     )
-                                    .child(copy_prompt_action(
-                                        format!("studio-copy-prompt-{turn_ix}"),
-                                        turn.prompt.clone(),
-                                        theme,
-                                    )),
+                                    .child(
+                                        copy_prompt_action(
+                                            format!("studio-copy-prompt-{turn_ix}"),
+                                            self.copied_prompt == Some(turn.id),
+                                            theme,
+                                        )
+                                        .on_click({
+                                            let prompt = turn.prompt.clone();
+                                            let id = turn.id;
+                                            cx.listener(move |page, _, _, cx| {
+                                                page.copy_prompt(id, prompt.clone(), cx);
+                                            })
+                                        }),
+                                    ),
                             )
                             .children(retry_runs.into_iter().map(|(run_id, retry_anyway)| {
                                 let fade = format!("studio-retry-{}", run_id.0);

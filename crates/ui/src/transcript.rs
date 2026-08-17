@@ -1679,12 +1679,10 @@ impl Transcript {
                 anchor.held = false;
             }
         }
-        let before = self.list.logical_scroll_top();
-        self.list.scroll_by(px(delta));
-        let after = self.list.logical_scroll_top();
-        let moved = before.item_ix != after.item_ix
-            || (f32::from(before.offset_in_item) - f32::from(after.offset_in_item)).abs() > 0.25;
-        if !moved {
+        // Pixel-space scroll: `scroll_by` from a glued bottom-aligned end
+        // (item_ix == count) is still past the viewport and the next layout
+        // snaps back to the end.
+        if !render::scroll_list_by(&self.list, delta) {
             return false;
         }
         let distance = self.distance_from_bottom();
@@ -4993,12 +4991,12 @@ mod tests {
             Some("one\n\ntwo")
         );
         assert!(rows[..rows.len() - 1].iter().all(|r| r.timestamp.is_none()));
-        assert!(rows[..rows.len() - 1]
-            .iter()
-            .all(|r| r.copy_text.is_none()));
-        assert!(rows_for_entry(&user, true, &mut parse)[0]
-            .copy_text
-            .is_none());
+        assert!(rows[..rows.len() - 1].iter().all(|r| r.copy_text.is_none()));
+        assert!(
+            rows_for_entry(&user, true, &mut parse)[0]
+                .copy_text
+                .is_none()
+        );
 
         // …but never mid-stream (chat-view.tsx: no hover under a moving reply).
         let live = assistant(
@@ -5025,9 +5023,7 @@ mod tests {
             rows.last().unwrap().copy_text.as_deref(),
             Some("hello\n\nworld")
         );
-        assert!(rows[..rows.len() - 1]
-            .iter()
-            .all(|r| r.copy_text.is_none()));
+        assert!(rows[..rows.len() - 1].iter().all(|r| r.copy_text.is_none()));
     }
 
     #[test]

@@ -854,6 +854,21 @@ pub fn bind_selection_scroll(
     });
 }
 
+/// Scroll a virtualized list by `delta` px in scrollbar space (negative =
+/// toward earlier content). Uses the pixel offset, not `scroll_by`, so a
+/// bottom-aligned list that is glued to the end actually moves.
+pub fn scroll_list_by(list: &gpui::ListState, delta: f32) -> bool {
+    let cur_y = f32::from(list.scroll_px_offset_for_scrollbar().y);
+    let max = f32::from(list.max_offset_for_scrollbar().y).max(0.0);
+    let old_top = (-cur_y).clamp(0.0, max);
+    let new_top = (old_top + delta).clamp(0.0, max);
+    if (new_top - old_top).abs() < 0.25 {
+        return false;
+    }
+    list.set_offset_from_scrollbar(point(px(0.0), px(-new_top)));
+    true
+}
+
 fn apply_selection_autoscroll(window: &mut Window, cx: &mut gpui::App) -> bool {
     if !super::selection::is_dragging() {
         return false;
@@ -866,13 +881,14 @@ fn apply_selection_autoscroll(window: &mut Window, cx: &mut gpui::App) -> bool {
     if delta.abs() < 0.5 {
         return false;
     }
+    super::selection::set_extending_up(delta < 0.0);
     if !(host.scroll)(delta, cx) {
         return false;
     }
-    if let Some((key, anchor_ix)) = super::selection::drag_owner()
+    if super::selection::is_dragging()
         && let Some(head) = registry_point(pos)
     {
-        let _ = resolve_drag(&key, anchor_ix, head);
+        let _ = resolve_current_drag(head);
     }
     window.refresh();
     true
@@ -897,7 +913,13 @@ fn schedule_selection_autoscroll(window: &mut Window) {
 pub fn selection_frame_reset() -> impl IntoElement {
     canvas(
         |_, _, _| (),
-        |_, _, _, _| REGISTRY.with(|r| r.borrow_mut().clear()),
+        |_, _, window, _| {
+            REGISTRY.with(|r| r.borrow_mut().clear());
+            // Window-level drag listeners live here (once per frame), not on
+            // each text element: the original click target can scroll out of
+            // the virtualized window, and its listeners would vanish with it.
+            register_drag_listeners(window);
+        },
     )
     .absolute()
     .w(px(0.0))
@@ -938,26 +960,64 @@ fn registry_point(position: gpui::Point<gpui::Pixels>) -> Option<(usize, usize)>
     })
 }
 
-/// Resolve the anchor + head into document-ordered spans over the frame's
-/// registry and store them; true if the selection changed.
-fn resolve_drag(anchor_key: &str, anchor_ix: usize, head: (usize, usize)) -> bool {
+/// Resolve the live drag against the current-frame registry and merge any
+/// spans that have scrolled out of view.
+fn resolve_current_drag(head: (usize, usize)) -> bool {
+    let Some((anchor_key, anchor_range, gran)) = super::selection::drag_owner() else {
+        return false;
+    };
     REGISTRY.with(|r| {
         let reg = r.borrow();
-        let Some(anchor_ei) = reg.iter().position(|e| e.key.as_ref() == anchor_key) else {
-            return false; // anchor scrolled out of the frame — keep spans
-        };
+        if reg.is_empty() {
+            return false;
+        }
+        let head_ei = head.0.min(reg.len() - 1);
+        let head_range = super::selection::snap_unit(&reg[head_ei].text, head.1, gran);
         let elements: Vec<(&str, &str)> = reg
             .iter()
             .map(|e| (e.key.as_ref(), e.text.as_ref()))
             .collect();
-        let spans = super::selection::resolve_spans(&elements, (anchor_ei, anchor_ix), head);
-        super::selection::update_spans(spans)
+        let live = if let Some(anchor_ei) = reg.iter().position(|e| e.key.as_ref() == anchor_key) {
+            super::selection::set_extending_up(
+                (head_ei, head_range.start) < (anchor_ei, anchor_range.start),
+            );
+            super::selection::resolve_span_ranges(
+                &elements,
+                (anchor_ei, anchor_range),
+                (head_ei, head_range),
+            )
+        } else if super::selection::extending_up().unwrap_or(true) {
+            // Anchor is below the viewport: select from the head through the
+            // last visible element (everything on screen toward the start).
+            super::selection::resolve_span_ranges(
+                &elements,
+                (head_ei, head_range),
+                (reg.len() - 1, 0..reg[reg.len() - 1].text.len()),
+            )
+        } else {
+            // Anchor is above the viewport: select from the first visible
+            // element through the head.
+            super::selection::resolve_span_ranges(
+                &elements,
+                (0, 0..reg[0].text.len()),
+                (head_ei, head_range),
+            )
+        };
+        let visible_keys: Vec<String> = reg.iter().map(|e| e.key.to_string()).collect();
+        let first_full = live
+            .first()
+            .is_some_and(|span| span.key == reg[0].key.as_ref() && span.range.start == 0);
+        let last = reg.len() - 1;
+        let last_full = live.last().is_some_and(|span| {
+            span.key == reg[last].key.as_ref() && span.range.end == reg[last].text.len()
+        });
+        let scroll_up = super::selection::extending_up().unwrap_or(true);
+        super::selection::commit_live_spans(live, &visible_keys, first_full, last_full, scroll_up)
     })
 }
 
-/// Register this frame's window-level mouse listeners for one text element's
-/// selection (Zed-markdown mechanics: window-level so a drag keeps tracking
-/// outside the element's bounds; frame-scoped, so paint re-registers).
+/// Mouse-down for one painted text element. Drag move/up live on the
+/// frame reset so they survive the element virtualizing out.
 fn register_selection_listeners(
     window: &mut Window,
     key: &std::sync::Arc<str>,
@@ -965,7 +1025,7 @@ fn register_selection_listeners(
     layout: &gpui::TextLayout,
     clip: Bounds<gpui::Pixels>,
 ) {
-    use gpui::{DispatchPhase, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
+    use gpui::{DispatchPhase, MouseButton, MouseDownEvent};
     {
         let (key, text, layout, clip) = (key.clone(), text.clone(), layout.clone(), clip);
         window.on_mouse_event(move |e: &MouseDownEvent, phase, window, _cx| {
@@ -983,7 +1043,7 @@ fn register_selection_listeners(
                         super::selection::begin_with_span(&key, &text, range);
                     }
                     n if n >= 3 => {
-                        super::selection::begin_with_span(&key, &text, 0..text.len());
+                        super::selection::begin_paragraph(&key, &text);
                     }
                     _ => super::selection::begin(&key, ix),
                 }
@@ -993,39 +1053,37 @@ fn register_selection_listeners(
             }
         });
     }
-    {
-        let key = key.clone();
-        window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
-            if phase != DispatchPhase::Bubble || !e.dragging() {
-                return;
-            }
-            // Only the anchor element's listener drives the drag.
-            let Some(anchor_ix) = super::selection::drag_anchor(&key) else {
-                return;
-            };
-            if let Some(head) = registry_point(e.position)
-                && resolve_drag(&key, anchor_ix, head)
-            {
-                window.refresh();
-            }
-            if apply_selection_autoscroll(window, cx) {
-                schedule_selection_autoscroll(window);
-            }
-        });
-    }
-    {
-        let key = key.clone();
-        window.on_mouse_event(move |_: &MouseUpEvent, phase, _window, _cx| {
-            if phase != DispatchPhase::Bubble {
-                return;
-            }
-            if let Some(_text) = super::selection::end_drag(&key) {
-                // X11 middle-click paste parity (Zed does the same).
-                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-                _cx.write_to_primary(gpui::ClipboardItem::new_string(_text));
-            }
-        });
-    }
+}
+
+/// Window-level drag tracking — registered once per frame from the reset
+/// canvas so a drag keeps going after its original element virtualizes out.
+fn register_drag_listeners(window: &mut Window) {
+    use gpui::{DispatchPhase, MouseMoveEvent, MouseUpEvent};
+    window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
+        if phase != DispatchPhase::Bubble || !e.dragging() {
+            return;
+        }
+        if !super::selection::is_dragging() {
+            return;
+        }
+        if let Some(head) = registry_point(e.position)
+            && resolve_current_drag(head)
+        {
+            window.refresh();
+        }
+        if apply_selection_autoscroll(window, cx) {
+            schedule_selection_autoscroll(window);
+        }
+    });
+    window.on_mouse_event(move |_: &MouseUpEvent, phase, _window, _cx| {
+        if phase != DispatchPhase::Bubble {
+            return;
+        }
+        if let Some(_text) = super::selection::end_any_drag() {
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            _cx.write_to_primary(gpui::ClipboardItem::new_string(_text));
+        }
+    });
 }
 
 /// The wash boxes for one byte range: one box per visual line the range
