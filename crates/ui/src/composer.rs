@@ -6078,11 +6078,16 @@ impl Render for Composer {
                         .flex_row()
                         .items_center()
                         .child(
+                            // One line, not the 47px row. `h_full` here
+                            // stretched the field and painted the
+                            // placeholder at the top; omitting a height
+                            // collapsed the `h_full`/`min_h_0` chain to 0.
+                            // `items_center` on the row then sits this box
+                            // on the same 12px inset as `py-3`.
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .h_full()
-                                .min_h_0()
+                                .h(px(INPUT_LINE_HEIGHT))
                                 .pl(px(16.0))
                                 .pr(px(8.0))
                                 .relative()
@@ -6574,6 +6579,19 @@ mod tests {
         assert_eq!(input_element_height(50.0, None, 240.0), 50.0);
         assert_eq!(input_element_height(400.0, None, 240.0), 240.0);
         assert_eq!(input_element_height(0.0, None, 240.0), 0.0);
+    }
+
+    #[test]
+    fn compact_chat_well_is_one_line_not_the_pill() {
+        // Compact centers a 22.75px well inside the 47px row. Filling the
+        // row top-aligns the placeholder; giving the well no height
+        // collapses the h_full/min_h_0 chain to an unusable 0.
+        assert_eq!(INPUT_LINE_HEIGHT, 22.75);
+        assert!(INPUT_LINE_HEIGHT < COMPACT_TOTAL_HEIGHT - PILL_BORDER_V);
+        assert_eq!(
+            input_element_height(INPUT_LINE_HEIGHT, Some(INPUT_LINE_HEIGHT), 240.0),
+            INPUT_LINE_HEIGHT
+        );
     }
 
     #[test]
