@@ -44,6 +44,13 @@ const ARTIFACT_FILMSTRIP_HEIGHT: f32 = 78.0;
 const ARTIFACT_FILMSTRIP_WIDTH_FRACTION: f32 = 0.94;
 const ARTIFACT_FILMSTRIP_FADE: f32 = 28.0;
 const ARTIFACT_ZOOM_MAX: f32 = 24.0;
+/// Hard floor on the rubber-banded display zoom so the image cannot collapse.
+const ARTIFACT_ZOOM_MIN: f32 = 0.55;
+/// If macOS never sends Ended, settle the undershoot spring after this idle.
+const ARTIFACT_ZOOM_IDLE: Duration = Duration::from_millis(160);
+/// Slightly underdamped snap back to fit. ζ ≈ 0.84 at these values.
+const ARTIFACT_ZOOM_SPRING_STIFFNESS: f32 = 320.0;
+const ARTIFACT_ZOOM_SPRING_DAMPING: f32 = 30.0;
 /// Full-size frames kept around the current filmstrip index.
 const LIGHTBOX_PREFETCH: usize = 6;
 const INSPECTOR_WIDTH: f32 = 320.0;
@@ -332,6 +339,17 @@ pub(super) struct LightboxSnap {
     started: Instant,
 }
 
+/// Spring that returns undershoot zoom and leftover pan to fit-to-stage.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct LightboxZoomSpring {
+    zoom_vel: f32,
+    pan_x_vel: f32,
+    pan_y_vel: f32,
+    last_tick: Instant,
+    /// `1` when fitting from above so the image cannot shrink past rest.
+    zoom_floor: f32,
+}
+
 fn stepped_artifact_index(index: usize, len: usize, delta: isize, wraps: bool) -> usize {
     if len == 0 {
         return 0;
@@ -358,6 +376,74 @@ fn rubber_band(offset: f32, dimension: f32) -> f32 {
     let x = offset.abs();
     let limited = (1.0 - (1.0 / ((x * ARTIFACT_RUBBER_COEFF / dimension) + 1.0))) * dimension;
     limited.copysign(offset)
+}
+
+/// Inverse of [`rubber_band`].
+fn unrubber_band(offset: f32, dimension: f32) -> f32 {
+    let dimension = dimension.max(1.0);
+    let y = offset.abs().min(dimension - 0.001);
+    let x = y * dimension / (ARTIFACT_RUBBER_COEFF * (dimension - y));
+    x.copysign(offset)
+}
+
+/// Displayed zoom → linear zoom, unbanding anything below fit.
+fn logical_lightbox_zoom(displayed: f32) -> f32 {
+    if displayed >= 1.0 {
+        displayed
+    } else {
+        1.0 - unrubber_band(1.0 - displayed, 1.0)
+    }
+}
+
+/// Linear zoom → displayed zoom, rubber-banding anything below fit.
+fn display_lightbox_zoom(logical: f32) -> f32 {
+    if logical >= 1.0 {
+        logical.min(ARTIFACT_ZOOM_MAX)
+    } else {
+        (1.0 - rubber_band(1.0 - logical, 1.0)).max(ARTIFACT_ZOOM_MIN)
+    }
+}
+
+fn apply_lightbox_zoom_factor(displayed: f32, factor: f32) -> f32 {
+    let factor = if factor.is_finite() && factor > 0.0 {
+        factor
+    } else {
+        1.0
+    };
+    display_lightbox_zoom(logical_lightbox_zoom(displayed.max(0.01)) * factor)
+}
+
+/// Keep `focus` (window coords) glued to the same screen point as zoom changes.
+fn zoom_pan_around(
+    zoom: f32,
+    pan: Point<f32>,
+    next_zoom: f32,
+    focus: Point<f32>,
+    stage_center: Point<f32>,
+) -> Point<f32> {
+    let old = zoom.max(0.01);
+    let ratio = next_zoom / old;
+    point(
+        pan.x * ratio + (focus.x - stage_center.x) * (1.0 - ratio),
+        pan.y * ratio + (focus.y - stage_center.y) * (1.0 - ratio),
+    )
+}
+
+fn spring_toward(
+    pos: f32,
+    vel: f32,
+    target: f32,
+    dt: f32,
+    stiffness: f32,
+    damping: f32,
+) -> (f32, f32) {
+    let accel = stiffness * (target - pos) - damping * vel;
+    let vel = vel + accel * dt;
+    (pos + vel * dt, vel)
+}
+
+fn lightbox_viewer_transformed(zoom: f32, pan: Point<Pixels>) -> bool {
+    (zoom - 1.0).abs() > 0.001 || f32::from(pan.x).abs() > 0.5 || f32::from(pan.y).abs() > 0.5
 }
 
 /// Page to settle on: 0 stays, −width next, +width previous.
@@ -442,7 +528,7 @@ fn lightbox_image_paint_bounds(
     pan: Point<Pixels>,
     swipe_x: f32,
 ) -> Bounds<Pixels> {
-    let zoom = zoom.max(1.0);
+    let zoom = zoom.max(0.01);
     let zoomed_size = size(stage.size.width * zoom, stage.size.height * zoom);
     let zoomed = Bounds {
         origin: point(
@@ -738,8 +824,24 @@ impl StudioPage {
         self.lightbox_swipe_last_tick = None;
     }
 
+    fn reset_lightbox_zoom_motion(&mut self) {
+        self.lightbox_zoom_spring = None;
+        self.lightbox_zoom_last_tick = None;
+    }
+
+    fn snap_lightbox_to_fit(&mut self) {
+        self.lightbox_zoom = 1.0;
+        self.lightbox_pan = Point::default();
+        self.reset_lightbox_zoom_motion();
+    }
+
     pub(super) fn lightbox_motion_pending(&self) -> bool {
-        self.lightbox_snap.is_some()
+        self.lightbox_zoom_spring.is_some()
+            || (self.lightbox_zoom_should_settle()
+                && self
+                    .lightbox_zoom_last_tick
+                    .is_some_and(|last| last.elapsed() >= ARTIFACT_ZOOM_IDLE))
+            || self.lightbox_snap.is_some()
             || (self.lightbox_swipe_x.abs() > 0.5
                 && self
                     .lightbox_swipe_last_tick
@@ -747,8 +849,7 @@ impl StudioPage {
     }
 
     pub(super) fn reset_lightbox_viewer(&mut self) {
-        self.lightbox_zoom = 1.0;
-        self.lightbox_pan = Point::default();
+        self.snap_lightbox_to_fit();
         self.lightbox_drag = None;
         self.reset_lightbox_swipe();
         self.lightbox_swipe_locked = false;
@@ -761,8 +862,7 @@ impl StudioPage {
         };
         let changed = self.selected_artifact != Some(artifact_id);
         self.selected_artifact = Some(artifact_id);
-        self.lightbox_zoom = 1.0;
-        self.lightbox_pan = Point::default();
+        self.snap_lightbox_to_fit();
         self.lightbox_drag = None;
         if changed {
             self.inspector_scroll.set_offset(Point::default());
@@ -960,6 +1060,9 @@ impl StudioPage {
     }
 
     fn clamp_lightbox_pan(&mut self) {
+        if self.lightbox_zoom <= 1.001 {
+            return;
+        }
         let (limit_x, limit_y) = self.lightbox_pan_limits();
         self.lightbox_pan.x = px(f32::from(self.lightbox_pan.x).clamp(-limit_x, limit_x));
         self.lightbox_pan.y = px(f32::from(self.lightbox_pan.y).clamp(-limit_y, limit_y));
@@ -973,9 +1076,46 @@ impl StudioPage {
         )
     }
 
-    pub(super) fn adjust_lightbox_zoom(&mut self, factor: f32, cx: &mut Context<Self>) {
-        self.lightbox_zoom = (self.lightbox_zoom * factor).clamp(1.0, ARTIFACT_ZOOM_MAX);
-        if self.lightbox_zoom > 1.001 {
+    fn lightbox_stage_center(&self) -> Point<f32> {
+        let (width, height) = self.lightbox_stage_size();
+        point(
+            f32::from(self.lightbox_stage_origin.x) + width / 2.0,
+            f32::from(self.lightbox_stage_origin.y) + height / 2.0,
+        )
+    }
+
+    fn lightbox_viewer_is_transformed(&self) -> bool {
+        self.lightbox_zoom_spring.is_some()
+            || lightbox_viewer_transformed(self.lightbox_zoom, self.lightbox_pan)
+    }
+
+    fn lightbox_zoom_should_settle(&self) -> bool {
+        self.lightbox_zoom < 1.001
+            && lightbox_viewer_transformed(self.lightbox_zoom, self.lightbox_pan)
+    }
+
+    pub(super) fn adjust_lightbox_zoom(
+        &mut self,
+        factor: f32,
+        focus: Option<Point<Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.lightbox_zoom_spring = None;
+        self.lightbox_zoom_last_tick = Some(Instant::now());
+        let previous = self.lightbox_zoom.max(0.01);
+        let next = apply_lightbox_zoom_factor(previous, factor);
+        if let Some(focus) = focus {
+            let pan = zoom_pan_around(
+                previous,
+                point(f32::from(self.lightbox_pan.x), f32::from(self.lightbox_pan.y)),
+                next,
+                point(f32::from(focus.x), f32::from(focus.y)),
+                self.lightbox_stage_center(),
+            );
+            self.lightbox_pan = point(px(pan.x), px(pan.y));
+        }
+        self.lightbox_zoom = next;
+        if self.lightbox_viewer_is_transformed() {
             self.reset_lightbox_swipe();
         }
         self.clamp_lightbox_pan();
@@ -983,13 +1123,106 @@ impl StudioPage {
     }
 
     pub(super) fn fit_lightbox(&mut self, cx: &mut Context<Self>) {
-        self.lightbox_zoom = 1.0;
-        self.lightbox_pan = Point::default();
+        self.start_lightbox_zoom_spring(cx);
+    }
+
+    fn settle_lightbox_zoom(&mut self, cx: &mut Context<Self>) {
+        if self.lightbox_zoom_should_settle() {
+            self.start_lightbox_zoom_spring(cx);
+        }
+    }
+
+    fn start_lightbox_zoom_spring(&mut self, cx: &mut Context<Self>) {
+        self.lightbox_zoom_last_tick = None;
+        if !lightbox_viewer_transformed(self.lightbox_zoom, self.lightbox_pan) {
+            self.snap_lightbox_to_fit();
+            return;
+        }
+        if crate::motion::reduced_motion(cx) {
+            self.snap_lightbox_to_fit();
+            cx.notify();
+            return;
+        }
+        if self.lightbox_zoom_spring.is_none() {
+            self.lightbox_zoom_spring = Some(LightboxZoomSpring {
+                zoom_vel: 0.0,
+                pan_x_vel: 0.0,
+                pan_y_vel: 0.0,
+                last_tick: Instant::now(),
+                zoom_floor: if self.lightbox_zoom >= 1.0 {
+                    1.0
+                } else {
+                    ARTIFACT_ZOOM_MIN
+                },
+            });
+        }
+        cx.notify();
+    }
+
+    fn step_lightbox_zoom_spring(&mut self, cx: &mut Context<Self>) {
+        let Some(mut spring) = self.lightbox_zoom_spring else {
+            return;
+        };
+        let dt = spring
+            .last_tick
+            .elapsed()
+            .as_secs_f32()
+            .clamp(1.0 / 240.0, 1.0 / 20.0)
+            / motion::speed_scale();
+        spring.last_tick = Instant::now();
+        let (mut zoom, mut zoom_vel) = spring_toward(
+            self.lightbox_zoom,
+            spring.zoom_vel,
+            1.0,
+            dt,
+            ARTIFACT_ZOOM_SPRING_STIFFNESS,
+            ARTIFACT_ZOOM_SPRING_DAMPING,
+        );
+        let (pan_x, pan_x_vel) = spring_toward(
+            f32::from(self.lightbox_pan.x),
+            spring.pan_x_vel,
+            0.0,
+            dt,
+            ARTIFACT_ZOOM_SPRING_STIFFNESS,
+            ARTIFACT_ZOOM_SPRING_DAMPING,
+        );
+        let (pan_y, pan_y_vel) = spring_toward(
+            f32::from(self.lightbox_pan.y),
+            spring.pan_y_vel,
+            0.0,
+            dt,
+            ARTIFACT_ZOOM_SPRING_STIFFNESS,
+            ARTIFACT_ZOOM_SPRING_DAMPING,
+        );
+        let settled = (zoom - 1.0).abs() < 0.0015
+            && zoom_vel.abs() < 0.08
+            && pan_x.abs() < 0.5
+            && pan_y.abs() < 0.5
+            && pan_x_vel.abs() < 8.0
+            && pan_y_vel.abs() < 8.0;
+        if settled {
+            self.snap_lightbox_to_fit();
+            cx.notify();
+            return;
+        }
+        if zoom < spring.zoom_floor {
+            zoom = spring.zoom_floor;
+            zoom_vel = 0.0;
+        } else {
+            zoom = zoom.max(ARTIFACT_ZOOM_MIN);
+        }
+        self.lightbox_zoom = zoom;
+        self.lightbox_pan = point(px(pan_x), px(pan_y));
+        spring.zoom_vel = zoom_vel;
+        spring.pan_x_vel = pan_x_vel;
+        spring.pan_y_vel = pan_y_vel;
+        self.lightbox_zoom_spring = Some(spring);
         cx.notify();
     }
 
     pub(super) fn begin_lightbox_pan(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        if self.lightbox_zoom > 1.0 {
+        if self.lightbox_viewer_is_transformed() {
+            self.lightbox_zoom_spring = None;
             self.lightbox_drag = Some(position);
             cx.notify();
         }
@@ -1009,11 +1242,18 @@ impl StudioPage {
 
     pub(super) fn end_lightbox_pan(&mut self, cx: &mut Context<Self>) {
         if self.lightbox_drag.take().is_some() {
-            cx.notify();
+            if self.lightbox_zoom_should_settle() {
+                self.settle_lightbox_zoom(cx);
+            } else {
+                cx.notify();
+            }
         }
     }
 
     pub(super) fn finish_lightbox_snap_immediate(&mut self, cx: &mut Context<Self>) {
+        if self.lightbox_zoom_spring.is_some() || self.lightbox_zoom_should_settle() {
+            self.snap_lightbox_to_fit();
+        }
         let target = self.lightbox_snap.map(|snap| snap.to).unwrap_or(0.0);
         self.commit_lightbox_snap_target(target, cx);
     }
@@ -1036,6 +1276,18 @@ impl StudioPage {
     }
 
     pub(super) fn step_lightbox_motion(&mut self, cx: &mut Context<Self>) {
+        if self.lightbox_zoom_spring.is_some() {
+            self.step_lightbox_zoom_spring(cx);
+            return;
+        }
+        if self.lightbox_zoom_should_settle()
+            && self
+                .lightbox_zoom_last_tick
+                .is_some_and(|last| last.elapsed() >= ARTIFACT_ZOOM_IDLE)
+        {
+            self.settle_lightbox_zoom(cx);
+            return;
+        }
         if self.lightbox_snap.is_some() {
             let snap = self.lightbox_snap.unwrap();
             let duration = ARTIFACT_SNAP_DURATION.as_secs_f32() * motion::speed_scale();
@@ -1102,10 +1354,10 @@ impl StudioPage {
                 horizontal
             };
             if movement.abs() > f32::EPSILON {
-                self.adjust_lightbox_zoom((movement * 0.01).exp(), cx);
-                if self.lightbox_zoom <= 1.001 {
-                    self.fit_lightbox(cx);
-                }
+                self.adjust_lightbox_zoom((movement * 0.01).exp(), Some(event.position), cx);
+            }
+            if matches!(event.touch_phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+                self.settle_lightbox_zoom(cx);
             }
             cx.stop_propagation();
             return;
@@ -1126,8 +1378,15 @@ impl StudioPage {
             cx.stop_propagation();
             return;
         }
-        if self.lightbox_zoom > 1.001 {
-            self.pan_lightbox(horizontal, vertical, cx);
+        if self.lightbox_viewer_is_transformed() {
+            if matches!(event.touch_phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+                self.settle_lightbox_zoom(cx);
+            } else {
+                self.pan_lightbox(horizontal, vertical, cx);
+                if self.lightbox_zoom_should_settle() {
+                    self.lightbox_zoom_last_tick = Some(Instant::now());
+                }
+            }
             cx.stop_propagation();
             return;
         }
@@ -1172,6 +1431,7 @@ impl StudioPage {
     }
 
     fn pan_lightbox(&mut self, dx: f32, dy: f32, cx: &mut Context<Self>) {
+        self.lightbox_zoom_spring = None;
         self.lightbox_pan.x = px(f32::from(self.lightbox_pan.x) + dx);
         self.lightbox_pan.y = px(f32::from(self.lightbox_pan.y) + dy);
         self.clamp_lightbox_pan();
@@ -1179,11 +1439,14 @@ impl StudioPage {
     }
 
     pub(super) fn on_lightbox_pinch(&mut self, event: &PinchEvent, cx: &mut Context<Self>) {
-        self.adjust_lightbox_zoom((1.0 + event.delta).max(0.05), cx);
-        if matches!(event.phase, TouchPhase::Ended | TouchPhase::Cancelled)
-            && self.lightbox_zoom <= 1.01
-        {
-            self.fit_lightbox(cx);
+        if matches!(event.phase, TouchPhase::Started) {
+            self.lightbox_zoom_spring = None;
+        }
+        if event.delta.abs() > f32::EPSILON {
+            self.adjust_lightbox_zoom((1.0 + event.delta).max(0.05), Some(event.position), cx);
+        }
+        if matches!(event.phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+            self.settle_lightbox_zoom(cx);
         }
         cx.stop_propagation();
     }
@@ -1356,10 +1619,13 @@ impl StudioPage {
             self.lightbox_zoom
         };
         let measured = self.lightbox_stage_width > 1.0 && self.lightbox_stage_height > 1.0;
-        let zoomed = page.is_none() && zoom > 1.001;
+        let transformed = page.is_none()
+            && (self.lightbox_zoom_spring.is_some()
+                || lightbox_viewer_transformed(zoom, self.lightbox_pan));
         let stack = |base: Arc<Image>, overlay: Option<Arc<Image>>| {
             let mut layer = div().relative().overflow_hidden();
-            layer = if !zoomed {
+            let zoom = zoom.max(0.01);
+            layer = if !transformed {
                 layer.size_full()
             } else if measured {
                 layer
@@ -1491,7 +1757,7 @@ impl StudioPage {
         let fade_left = filmstrip_x < -0.5;
         let fade_right = filmstrip_x + filmstrip_span > filmstrip_viewport + 0.5;
 
-        let zoomed = self.lightbox_zoom > 1.001;
+        let zoomed = self.lightbox_viewer_is_transformed();
         let page_width = self.lightbox_stage_width;
         let mut slides = Vec::new();
         if !lightbox_uses_paging_slides(
@@ -1558,10 +1824,10 @@ impl StudioPage {
             )
             .on_click(cx.listener(|page, event: &gpui::ClickEvent, window, cx| {
                 if event.click_count() >= 2 {
-                    if page.lightbox_zoom > 1.0 {
+                    if page.lightbox_zoom > 1.001 || page.lightbox_zoom < 0.999 {
                         page.fit_lightbox(cx);
                     } else {
-                        page.adjust_lightbox_zoom(2.0, cx);
+                        page.adjust_lightbox_zoom(2.0, Some(event.position()), cx);
                     }
                     return;
                 }
@@ -2000,6 +2266,87 @@ mod tests {
         assert_eq!(lightbox_pan_range(900.0, 1.0), 0.0);
         assert!((lightbox_pan_range(900.0, 2.0) - 900.0).abs() < 0.01);
         assert!((lightbox_pan_range(1400.0, 3.0) - 2100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn zoom_around_a_point_keeps_that_screen_point_still() {
+        let center = point(500.0, 400.0);
+        let focus = point(700.0, 400.0);
+        let pan = zoom_pan_around(1.0, point(0.0, 0.0), 2.0, focus, center);
+        assert!((pan.x + 200.0).abs() < 0.01);
+        assert!(pan.y.abs() < 0.01);
+        let back = zoom_pan_around(2.0, pan, 1.0, focus, center);
+        assert!(back.x.abs() < 0.01);
+        assert!(back.y.abs() < 0.01);
+    }
+
+    #[test]
+    fn zoom_out_past_fit_rubber_bands() {
+        let linear = 0.8;
+        let displayed = apply_lightbox_zoom_factor(1.0, linear);
+        assert!(
+            displayed > linear && displayed < 1.0,
+            "displayed={displayed}"
+        );
+        let further = apply_lightbox_zoom_factor(displayed, linear);
+        assert!(
+            further < displayed && (displayed - further) < (1.0 - displayed),
+            "first={} second={}",
+            1.0 - displayed,
+            displayed - further
+        );
+        for logical in [0.95, 0.8, 0.6, 0.4] {
+            let shown = display_lightbox_zoom(logical);
+            let recovered = logical_lightbox_zoom(shown);
+            assert!(
+                (recovered - logical).abs() < 0.01,
+                "logical={logical} shown={shown} recovered={recovered}"
+            );
+        }
+    }
+
+    #[test]
+    fn zoom_spring_settles_on_fit() {
+        let mut zoom = 0.82;
+        let mut vel = 0.0;
+        for _ in 0..240 {
+            (zoom, vel) = spring_toward(
+                zoom,
+                vel,
+                1.0,
+                1.0 / 60.0,
+                ARTIFACT_ZOOM_SPRING_STIFFNESS,
+                ARTIFACT_ZOOM_SPRING_DAMPING,
+            );
+        }
+        assert!((zoom - 1.0).abs() < 0.01, "zoom={zoom}");
+        assert!(vel.abs() < 0.05, "vel={vel}");
+    }
+
+    #[test]
+    fn undershoot_zoom_still_paints_the_contained_image() {
+        let stage = Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(px(1000.0), px(800.0)),
+        };
+        let painted = lightbox_image_paint_bounds(
+            stage,
+            2000,
+            1000,
+            0.8,
+            point(px(-40.0), px(10.0)),
+            0.0,
+        );
+        assert!((f32::from(painted.size.width) - 800.0).abs() < 0.5);
+        assert!((f32::from(painted.size.height) - 400.0).abs() < 0.5);
+        assert!(!lightbox_click_hits_empty(
+            stage,
+            Some((2000, 1000)),
+            0.8,
+            point(px(-40.0), px(10.0)),
+            0.0,
+            point(px(460.0), px(410.0)),
+        ));
     }
 
     #[test]
