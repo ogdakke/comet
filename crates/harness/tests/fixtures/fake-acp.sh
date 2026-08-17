@@ -332,8 +332,9 @@ case "$promptline" in
 
 *scenario:quiet-thinking*)
   # The 2026-08-13 false settle: every tool RESOLVED, then a long silent
-  # thinking stretch (claude-agent-acp / grok / codex-acp forward little
-  # or no thinking traffic), then the turn continues and ends normally.
+  # thinking stretch (claude-agent-acp / grok / codex-acp / pi-acp
+  # forward little or no thinking traffic), then the turn continues and
+  # ends normally.
   # This is exactly the "looks finished" state the blanket settle keys on;
   # exempt agents must hold through it — a false settle here orphans the
   # real turn (its response lands on a closed channel; the session
