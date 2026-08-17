@@ -3330,6 +3330,9 @@ pub struct Composer {
     mention: FileMentionState,
     slash_task: Option<Task<()>>,
     slash: SlashState,
+    /// Scroll position for the slash-command list. Keyboard navigation keeps
+    /// the active row visible, just like the picker menus.
+    slash_scroll: gpui::ScrollHandle,
     /// Advertised commands per harness (one `ListCommands` per harness per
     /// composer lifetime; the engine caches discovery on its side too).
     slash_cache: HashMap<HarnessId, Vec<SlashCommand>>,
@@ -3455,6 +3458,7 @@ impl Composer {
             mention: FileMentionState::default(),
             slash_task: None,
             slash: SlashState::default(),
+            slash_scroll: gpui::ScrollHandle::new(),
             slash_cache: HashMap::new(),
             current_key,
             sending: false,
@@ -4110,6 +4114,9 @@ impl Composer {
         let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
         self.slash.filtered = crate::popover::filter_indices(&query, &names);
         self.slash.active = (!self.slash.filtered.is_empty()).then_some(0);
+        if let Some(active) = self.slash.active {
+            self.slash_scroll.scroll_to_item(active);
+        }
         self.sync_mention_controls(cx);
         cx.notify();
     }
@@ -4117,6 +4124,12 @@ impl Composer {
     fn move_slash(&mut self, delta: isize, cx: &mut Context<Self>) {
         self.slash.active =
             crate::popover::menu_step(self.slash.active, self.slash.filtered.len(), delta);
+        if let Some(active) = self.slash.active {
+            // The list rows are direct children of the tracked scroll
+            // container, so the filtered-row index maps directly to the
+            // handle's item index.
+            self.slash_scroll.scroll_to_item(active);
+        }
         self.sync_mention_controls(cx);
         cx.notify();
     }
@@ -4162,6 +4175,7 @@ impl Composer {
     fn reset_slash(&mut self, dismissed: Option<(Range<usize>, String)>, cx: &mut Context<Self>) {
         let request = self.slash.request.wrapping_add(1);
         self.slash_task = None;
+        self.slash_scroll.set_offset(Point::default());
         self.slash = SlashState {
             request,
             dismissed,
@@ -4219,6 +4233,18 @@ impl Composer {
                     }),
             );
         } else {
+            // Keep the card on the shared popover/menu material, but make the
+            // command rows their own scroll viewport. The card's max height
+            // clips overflowing content; without a nested scroll container it
+            // would simply hide the rest of the command list.
+            let mut list = div()
+                .id("slash-command-list")
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .max_h(px(272.0))
+                .overflow_y_scroll()
+                .track_scroll(&self.slash_scroll);
             for (row_ix, &cmd_ix) in self.slash.filtered.iter().enumerate() {
                 let Some(command) = commands.get(cmd_ix) else {
                     continue;
@@ -4234,7 +4260,7 @@ impl Composer {
                     }
                 }
                 let description: SharedString = description.into();
-                card = card.child(
+                list = list.child(
                     crate::popover::menu_row(theme, selected, format!("slash-result-{row_ix}"))
                         .id(("slash-result", row_ix))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -4273,6 +4299,7 @@ impl Composer {
                         ),
                 );
             }
+            card = card.child(list);
         }
         let anchor = self
             .input
