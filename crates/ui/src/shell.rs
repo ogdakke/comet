@@ -882,6 +882,8 @@ pub struct Shell {
     chat_status_hover: Option<String>,
     /// Scroll position of the sidebar lists region (drives its edge fades).
     sidebar_scroll: gpui::ScrollHandle,
+    /// Scroll position of the Studio conversation list (drives its edge fades).
+    studio_sidebar_scroll: gpui::ScrollHandle,
     /// `settings.last_space_id` applied once after the first spaces frame.
     space_boot_applied: bool,
     /// Last seen session status per chat — the chime trigger compares against
@@ -1124,6 +1126,7 @@ impl Shell {
             spaces_menu: popover::Popup::default(),
             chat_status_hover: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
+            studio_sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
             user_menu: popover::Popup::default(),
@@ -3970,17 +3973,26 @@ impl Shell {
             .flex_col()
             .child(header)
             .child(
-                div()
-                    .id("studio-conversation-list")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px(px(Theme::SPACE_SM))
-                    .pt(px(4.0))
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .children(rows),
+                crate::edge_fade::edge_faded(
+                    SIDEBAR_GLASS_FADE_BAND,
+                    true,
+                    true,
+                    div().relative().flex_1().min_h_0().child(
+                        div()
+                            .id("studio-conversation-list")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.studio_sidebar_scroll)
+                            .px(px(Theme::SPACE_SM))
+                            .pt(px(4.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .pb(px(Theme::SPACE_SM))
+                            .children(rows),
+                    ),
+                )
+                .fade_overflow_y(&self.studio_sidebar_scroll),
             )
             .child(
                 div().px(px(Theme::SPACE_SM)).pb(px(Theme::SPACE_SM)).child(
