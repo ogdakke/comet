@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
 use gpui::{
-    AnyElement, Context, CursorStyle, ListAlignment, ListOffset, ListScrollEvent, ListState,
-    SharedString, Window, canvas, div, list, prelude::*, px,
+    AnyElement, ClipboardItem, Context, CursorStyle, ListAlignment, ListOffset, ListScrollEvent,
+    ListState, SharedString, Window, canvas, div, list, prelude::*, px,
 };
 use zeron_proto::{StudioRunState, StudioRunView, StudioTurnView};
 use zeron_studio::{MediaKind, StudioArtifactId};
@@ -527,6 +527,37 @@ pub(super) fn turn_action(
         ))
         .on_hover(motion::hover_listener(SharedString::from(fade)))
         .child(label.into())
+}
+
+/// Tiny copy glyph beside Fork — writes the turn's prompt to the clipboard.
+fn copy_prompt_action(
+    id: impl Into<SharedString>,
+    prompt: String,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    let id = id.into();
+    let fade = id.to_string();
+    div()
+        .id(id)
+        .flex_none()
+        .size(px(16.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .on_hover(motion::hover_listener(SharedString::from(fade.clone())))
+        .on_click(move |_, _, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(prompt.clone()));
+        })
+        .child(
+            icons::icon(icons::COPY)
+                .size(px(11.0))
+                .text_color(motion::hover_blend(
+                    &fade,
+                    theme.text_muted.opacity(0.7),
+                    theme.text,
+                )),
+        )
 }
 
 /// Inline clamp toggle used by the feed bubble and the artifact inspector.
@@ -1466,10 +1497,26 @@ impl StudioPage {
                                 )),
                             )
                             .child(
-                                turn_action(format!("studio-fork-{turn_ix}"), "Fork", theme)
-                                    .on_click(cx.listener(move |page, _, _, cx| {
-                                        page.fork_from(&turn_for_fork, cx)
-                                    })),
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .child(
+                                        turn_action(
+                                            format!("studio-fork-{turn_ix}"),
+                                            "Fork",
+                                            theme,
+                                        )
+                                        .on_click(cx.listener(move |page, _, _, cx| {
+                                            page.fork_from(&turn_for_fork, cx)
+                                        })),
+                                    )
+                                    .child(copy_prompt_action(
+                                        format!("studio-copy-prompt-{turn_ix}"),
+                                        turn.prompt.clone(),
+                                        theme,
+                                    )),
                             )
                             .children(retry_runs.into_iter().map(|(run_id, retry_anyway)| {
                                 let fade = format!("studio-retry-{}", run_id.0);
