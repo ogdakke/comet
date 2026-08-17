@@ -790,6 +790,17 @@ pub(crate) fn selectable_plain_text(
         strikethrough: None,
     };
     let styled = StyledText::new(text.clone()).with_runs(vec![run]);
+    selectable_styled_text(key, text, styled, theme)
+}
+
+/// Selection chrome around an already-styled text element (syntax-highlighted
+/// code lines). Same registry / wash / mouse path as [`selectable_plain_text`].
+pub(crate) fn selectable_styled_text(
+    key: impl Into<std::sync::Arc<str>>,
+    text: SharedString,
+    styled: StyledText,
+    theme: &Theme,
+) -> AnyElement {
     let layout = styled.layout().clone();
     let sel_key: std::sync::Arc<str> = key.into();
     let sel_theme = theme.clone();
@@ -1086,6 +1097,29 @@ fn register_drag_listeners(window: &mut Window) {
     });
 }
 
+/// Byte ranges `[start, end)` of each visual row in a shaped layout, in
+/// document order. Hard newlines advance by `len + 1`; wrap boundaries are
+/// the first byte of the *next* visual row (gpui reports that index on the
+/// previous row, which is why a y-probe walk skips the first wrapped glyph).
+fn visual_line_byte_ranges(hard_lines: &[(usize, Vec<usize>)]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut hard_start = 0usize;
+    for (len, wraps) in hard_lines {
+        let mut starts = vec![0usize];
+        for &wrap in wraps {
+            if wrap > *starts.last().unwrap() && wrap <= *len {
+                starts.push(wrap);
+            }
+        }
+        starts.push(*len);
+        for pair in starts.windows(2) {
+            out.push((hard_start + pair[0], hard_start + pair[1]));
+        }
+        hard_start = hard_start.saturating_add(*len).saturating_add(1);
+    }
+    out
+}
+
 /// The wash boxes for one byte range: one box per visual line the range
 /// covers (soft wraps split it), in window coordinates from the laid-out
 /// text's own geometry. `pad_x` overhangs the box horizontally (inline code);
@@ -1097,51 +1131,88 @@ pub(crate) fn range_rects(
     pad_x: f32,
     inset_y: f32,
 ) -> Vec<Bounds<gpui::Pixels>> {
-    let mut rects = Vec::new();
+    if range.start >= range.end {
+        return Vec::new();
+    }
     let line_height = layout.line_height();
-    let mut cur = range.start;
-    // Walk the range one visual row at a time: find the furthest index that
-    // still sits on the current row (binary search over glyph positions).
-    let mut guard = 0;
-    while cur < range.end && guard < 256 {
-        guard += 1;
-        let Some(p1) = layout.position_for_index(cur) else {
-            break;
-        };
-        // `seg_end` closes the wash on this row; `next` is the first index on
-        // the following row (strict progress even though a row-end index's
-        // position still reports the earlier row).
-        let (seg_end, next) = match layout.position_for_index(range.end) {
-            Some(pe) if pe.y == p1.y => (range.end, range.end),
-            _ => {
-                // Largest ix on this row (probes stay on char boundaries only
-                // at the ends; intermediate probes just need a y).
-                let (mut lo, mut hi) = (cur, range.end);
-                while hi - lo > 1 {
-                    let mid = lo + (hi - lo) / 2;
-                    match layout.position_for_index(mid) {
-                        Some(pm) if pm.y == p1.y => lo = mid,
-                        _ => hi = mid,
-                    }
-                }
-                (lo, hi)
+    let bounds = layout.bounds();
+    let hard = layout.line_layouts();
+    if hard.is_empty() {
+        return Vec::new();
+    }
+    let spec: Vec<(usize, Vec<usize>)> = hard
+        .iter()
+        .map(|wl| {
+            let wraps = wl
+                .wrap_boundaries()
+                .iter()
+                .filter_map(|b| {
+                    let run = wl.runs().get(b.run_ix)?;
+                    let glyph = run.glyphs.get(b.glyph_ix)?;
+                    Some(glyph.index)
+                })
+                .collect();
+            (wl.len(), wraps)
+        })
+        .collect();
+    let origin_y = layout
+        .position_for_index(0)
+        .map(|p| p.y)
+        .unwrap_or(bounds.origin.y);
+
+    let mut rects = Vec::new();
+    for (row, (vs, ve)) in visual_line_byte_ranges(&spec).into_iter().enumerate() {
+        let from = vs.max(range.start);
+        let to = ve.min(range.end);
+        if from >= to {
+            continue;
+        }
+        let y = origin_y + line_height * row as f32;
+        let left = if from == vs {
+            // Start of a visual row — including wrap starts, whose
+            // `position_for_index` reports the previous row's trailing
+            // edge. Pin to the layout's left so the first glyph is covered.
+            bounds.left()
+        } else {
+            match layout.position_for_index(from) {
+                Some(p) => p.x,
+                None => continue,
             }
         };
-        if let Some(p2) = layout.position_for_index(seg_end)
-            && p2.x > p1.x
-        {
+        let right = if to == ve {
+            // End of this visual row: the wrap-start index (or the hard
+            // line's end) reports the trailing x on this row.
+            match layout.position_for_index(to.min(layout.len())) {
+                Some(p) => {
+                    if (f32::from(p.y) - f32::from(y)).abs() <= f32::from(line_height) * 0.6 {
+                        p.x
+                    } else {
+                        layout
+                            .position_for_index(to.saturating_sub(1))
+                            .map(|p| p.x.max(left + px(1.0)))
+                            .unwrap_or(left)
+                    }
+                }
+                None => layout
+                    .position_for_index(to.saturating_sub(1))
+                    .map(|p| p.x.max(left + px(1.0)))
+                    .unwrap_or(left),
+            }
+        } else {
+            match layout.position_for_index(to) {
+                Some(p) => p.x,
+                None => continue,
+            }
+        };
+        if right > left {
             rects.push(Bounds::new(
-                point(p1.x - px(pad_x), p1.y + px(inset_y)),
+                point(left - px(pad_x), y + px(inset_y)),
                 size(
-                    p2.x - p1.x + px(2.0 * pad_x),
+                    right - left + px(2.0 * pad_x),
                     line_height - px(2.0 * inset_y),
                 ),
             ));
         }
-        if next <= cur {
-            break;
-        }
-        cur = next;
     }
     rects
 }
@@ -1228,6 +1299,9 @@ fn render_code_block(
         None => Vec::new(),
     };
     let scroll_id: SharedString = format!("{}-code{ix}", opts.row_key).into();
+    let row_key = opts.row_key.clone();
+    let block_ix = ix;
+    let line_theme = theme.clone();
     // Copy affordance (round 9; no source counterpart — the original block is
     // header + body only): a small ghost button in the block's top-right,
     // absolutely overlaid so clicking / the "Copied" flash never shifts
@@ -1314,11 +1388,18 @@ fn render_code_block(
                     *off = start + line.len() + 1; // +1 for the '\n'
                     let local = slice_spans(&veil_spans, start, start + line.len());
                     let runs = apply_veil(runs.clone(), &local);
+                    let styled = StyledText::new(line.clone()).with_runs(runs);
+                    let key: std::sync::Arc<str> = format!("{row_key}:{block_ix}:c{li}").into();
                     Some(
                         div()
                             .h(px(CODE_LINE_HEIGHT))
                             .flex_none()
-                            .child(StyledText::new(line.clone()).with_runs(runs)),
+                            .child(selectable_styled_text(
+                                key,
+                                line.clone(),
+                                styled,
+                                &line_theme,
+                            )),
                     )
                 })),
         )
@@ -1383,6 +1464,22 @@ pub fn runs_for_syntax_line_with_plain(
 mod tests {
     use super::*;
     use crate::markdown::parser::InlineStyle;
+
+    #[test]
+    fn visual_line_ranges_split_wraps_and_hard_breaks() {
+        // One hard line wrapped at byte 10, then a second hard line of 6.
+        let lines = visual_line_byte_ranges(&[(20, vec![10]), (6, vec![])]);
+        assert_eq!(lines, vec![(0, 10), (10, 20), (21, 27)]);
+    }
+
+    #[test]
+    fn visual_line_ranges_keep_the_wrap_start_on_the_next_row() {
+        // The wrap index is the first glyph of the next visual row — it must
+        // start that row, not be consumed as the previous row's exclusive end
+        // plus one (that skipped the first highlighted character).
+        let lines = visual_line_byte_ranges(&[(15, vec![8])]);
+        assert_eq!(lines, vec![(0, 8), (8, 15)]);
+    }
 
     #[test]
     fn code_line_runs_cover_exactly() {
