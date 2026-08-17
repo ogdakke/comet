@@ -34,6 +34,7 @@ pub mod studio_credentials;
 pub mod terminals;
 pub mod titles;
 pub mod uploads;
+pub mod venice_import;
 pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
@@ -62,6 +63,10 @@ pub use studio_credentials::{
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
 pub use uploads::{AttachmentChunk, Uploads};
+pub use venice_import::{
+    ImportReport, ImportedArtifact, ImportedConversation, ImportedRun, ImportedStudioHistory,
+    ImportedTurn, VeniceImportError, load_venice_image_dump,
+};
 pub use workspace_host::{
     DEFAULT_ORG_ID, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,
 };

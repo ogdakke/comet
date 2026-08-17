@@ -25,6 +25,8 @@ use zeron_studio::{
     StudioTurnId, SubmissionCapabilities,
 };
 
+use crate::venice_import::{ImportReport, ImportedStudioHistory};
+
 const DATABASE_FILE: &str = "studio.sqlite3";
 const SCHEMA_VERSION: i64 = 1;
 const MAX_CREATE_TURN_RUNS: usize = 16;
@@ -583,6 +585,243 @@ impl StudioStore {
         transaction.commit()?;
         self.notify_change();
         Ok(stored)
+    }
+
+    /// Persist already-finished studio history. Conversations whose ids already
+    /// exist are skipped so the same dump can be applied more than once.
+    pub fn import_completed_history(
+        &self,
+        history: &ImportedStudioHistory,
+        owner_device_id: &str,
+    ) -> Result<ImportReport, StudioStoreError> {
+        if owner_device_id.trim().is_empty() {
+            return Err(StudioStoreError::InvalidValue(
+                "import owner device id is required".into(),
+            ));
+        }
+        let mut report = ImportReport {
+            missing_files: history.missing_files,
+            ..ImportReport::default()
+        };
+        for conversation in &history.conversations {
+            if self.conversation_exists(conversation.id)? {
+                report.conversations_skipped += 1;
+                continue;
+            }
+            let title = validate_title(&conversation.title)?.to_owned();
+            let mut staged = Vec::new();
+            for turn in &conversation.turns {
+                if turn.prompt.trim().is_empty() || turn.prompt.chars().count() > 32_000 {
+                    return Err(StudioStoreError::InvalidValue(
+                        "imported prompt must contain 1 to 32000 characters".into(),
+                    ));
+                }
+                if turn.runs.is_empty() || turn.runs.len() > MAX_TURN_RUNS {
+                    return Err(StudioStoreError::InvalidValue(format!(
+                        "an imported turn must contain 1 to {MAX_TURN_RUNS} model runs"
+                    )));
+                }
+                for (run_index, run) in turn.runs.iter().enumerate() {
+                    let mut published = Vec::new();
+                    for artifact in &run.artifacts {
+                        let bytes = fs::read(&artifact.path)?;
+                        let mime_type = zeron_studio::sniff_media_mime(&bytes)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| artifact.mime_type.clone());
+                        let extension = extension_for_mime(&mime_type).ok_or_else(|| {
+                            StudioStoreError::InvalidValue(format!(
+                                "unsupported imported artifact MIME {mime_type}"
+                            ))
+                        })?;
+                        let path = self.artifacts.ensure(artifact.id, extension, &bytes)?;
+                        let relative_path = path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .ok_or(StudioStoreError::InvalidArtifact)?
+                            .to_owned();
+                        published.push((
+                            artifact.id,
+                            relative_path,
+                            mime_type,
+                            bytes.len() as i64,
+                            format!("{:x}", Sha256::digest(&bytes)),
+                            artifact.width,
+                            artifact.height,
+                            artifact.created_at,
+                            artifact.metadata.to_string(),
+                        ));
+                    }
+                    staged.push((turn.id, run_index, published));
+                }
+            }
+
+            let mut connection = self.connection()?;
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "INSERT INTO studio_conversations (id, title, created_at, updated_at, forked_from_turn_id) VALUES (?1, ?2, ?3, ?4, NULL)",
+                rusqlite::params![
+                    conversation.id.0.to_string(),
+                    title,
+                    conversation.created_at,
+                    conversation.updated_at.max(conversation.created_at)
+                ],
+            )?;
+            for (position, turn) in conversation.turns.iter().enumerate() {
+                let batch_id = StudioBatchId::new();
+                let turn_created = if turn.created_at > 0 {
+                    turn.created_at
+                } else {
+                    conversation.created_at
+                };
+                transaction.execute(
+                    "INSERT INTO studio_turns (id, conversation_id, position, prompt, source_turn_id, created_at) VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+                    rusqlite::params![
+                        turn.id.0.to_string(),
+                        conversation.id.0.to_string(),
+                        position as i64,
+                        turn.prompt,
+                        turn_created
+                    ],
+                )?;
+                let batch_succeeded = turn.runs.iter().enumerate().any(|(run_position, run)| {
+                    let published = staged
+                        .iter()
+                        .find(|(turn_id, staged_index, _)| {
+                            *turn_id == turn.id && *staged_index == run_position
+                        })
+                        .map(|(_, _, published)| published.as_slice())
+                        .unwrap_or(&[]);
+                    run.succeeded && !published.is_empty()
+                });
+                transaction.execute(
+                    "INSERT INTO studio_batches (id, turn_id, state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
+                    rusqlite::params![
+                        batch_id.0.to_string(),
+                        turn.id.0.to_string(),
+                        if batch_succeeded { "succeeded" } else { "failed" },
+                        turn_created
+                    ],
+                )?;
+                for (run_position, run) in turn.runs.iter().enumerate() {
+                    let published = staged
+                        .iter()
+                        .find(|(turn_id, staged_index, _)| {
+                            *turn_id == turn.id && *staged_index == run_position
+                        })
+                        .map(|(_, _, published)| published.as_slice())
+                        .unwrap_or(&[]);
+                    let succeeded = run.succeeded && !published.is_empty();
+                    let run_id = StudioRunId::new();
+                    let attempt_id = StudioAttemptId::new();
+                    let model_json = serde_json::to_string(&run.model)
+                        .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
+                    let settings_json = serde_json::to_string(&run.request.controls)
+                        .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
+                    let request_json = serde_json::to_string(&run.request)
+                        .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
+                    let request_hash = format!("{:x}", Sha256::digest(request_json.as_bytes()));
+                    let state = if succeeded { "succeeded" } else { "failed" };
+                    let error_json = (!succeeded).then(|| {
+                        serde_json::json!({ "message": "venice dump had no output file for this turn" })
+                            .to_string()
+                    });
+                    transaction.execute(
+                        "INSERT INTO studio_runs (id, batch_id, position, provider_id, model_id, operation, model_manifest_json, settings_json, owner_device_id, state, quote_json, progress, error_json, output_count, display_aspect_width, display_aspect_height, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12, ?13, ?14, ?15, ?16, ?16)",
+                        rusqlite::params![
+                            run_id.0.to_string(),
+                            batch_id.0.to_string(),
+                            run_position as i64,
+                            run.request.provider_id.as_str(),
+                            run.request.model_id.as_str(),
+                            operation_name(run.request.operation),
+                            model_json,
+                            settings_json,
+                            owner_device_id,
+                            state,
+                            succeeded.then_some(1.0),
+                            error_json,
+                            run.request.output_count.max(1),
+                            run.request.display_aspect_ratio.0,
+                            run.request.display_aspect_ratio.1,
+                            turn_created
+                        ],
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO studio_attempts (id, run_id, attempt_number, idempotency_key, request_json, request_wire_hash, state, provider_connection_id, created_at, submitted_at, completed_at, error_json) VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, ?9)",
+                        rusqlite::params![
+                            attempt_id.0.to_string(),
+                            run_id.0.to_string(),
+                            Uuid::new_v4().to_string(),
+                            request_json,
+                            request_hash,
+                            state,
+                            run.request.provider_id.as_str(),
+                            turn_created,
+                            error_json
+                        ],
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO studio_run_events (run_id, attempt_id, state, created_at) VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![
+                            run_id.0.to_string(),
+                            attempt_id.0.to_string(),
+                            state,
+                            turn_created
+                        ],
+                    )?;
+                    for (position, published) in published.iter().enumerate() {
+                        let (
+                            artifact_id,
+                            relative_path,
+                            mime_type,
+                            size_bytes,
+                            hash,
+                            width,
+                            height,
+                            created_at,
+                            metadata,
+                        ) = published;
+                        transaction.execute(
+                            "INSERT INTO studio_artifacts (id, run_id, attempt_id, output_position, media_kind, relative_path, mime_type, size_bytes, content_hash, width, height, duration_seconds, metadata_json, created_at) VALUES (?1, ?2, ?3, ?4, 'image', ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12)",
+                            rusqlite::params![
+                                artifact_id.0.to_string(),
+                                run_id.0.to_string(),
+                                attempt_id.0.to_string(),
+                                position as i64,
+                                relative_path,
+                                mime_type,
+                                size_bytes,
+                                hash,
+                                width,
+                                height,
+                                metadata,
+                                if *created_at > 0 { *created_at } else { turn_created }
+                            ],
+                        )?;
+                        report.artifacts_imported += 1;
+                    }
+                    if !succeeded {
+                        report.failed_turns += 1;
+                    }
+                }
+                report.turns_imported += 1;
+            }
+            transaction.commit()?;
+            report.conversations_imported += 1;
+        }
+        if report.conversations_imported > 0 {
+            self.notify_change();
+        }
+        Ok(report)
+    }
+
+    fn conversation_exists(&self, id: StudioConversationId) -> Result<bool, StudioStoreError> {
+        let exists = self.connection()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM studio_conversations WHERE id = ?1)",
+            [id.0.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
     }
 
     /// Original model-run specs for a turn: one per distinct first-generation
@@ -1589,6 +1828,19 @@ impl ArtifactStore {
                 Err(StudioStoreError::ArtifactExists)
             }
             Err(error) => Err(error.into()),
+        }
+    }
+
+    fn ensure(
+        &self,
+        artifact_id: StudioArtifactId,
+        extension: &str,
+        bytes: &[u8],
+    ) -> Result<PathBuf, StudioStoreError> {
+        match self.publish(artifact_id, extension, bytes) {
+            Ok(path) => Ok(path),
+            Err(StudioStoreError::ArtifactExists) => self.path_for(artifact_id, extension),
+            Err(error) => Err(error),
         }
     }
 
