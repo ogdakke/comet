@@ -64,6 +64,24 @@ pub(super) fn select_index_range(count: usize, from: usize, to: usize) -> Range<
     if count == 0 { 0..0 } else { start..end + 1 }
 }
 
+/// If `row` is outside the last known gallery viewport, the list row to
+/// scroll to so that tile becomes visible. `None` means stay put — including
+/// when the viewport is unknown, so a close without cycling does not jump.
+pub(super) fn gallery_scroll_row_for_reveal(visible: Range<usize>, row: usize) -> Option<usize> {
+    if visible.end <= visible.start {
+        return None;
+    }
+    if visible.contains(&row) {
+        return None;
+    }
+    if row >= visible.end {
+        let span = visible.end - visible.start;
+        Some(row.saturating_sub(span.saturating_sub(1)))
+    } else {
+        Some(row)
+    }
+}
+
 fn gallery_prefetch_row_order(total_rows: usize, visible: Range<usize>) -> Vec<usize> {
     let start = visible.start.min(total_rows);
     let end = visible.end.min(total_rows).max(start);
@@ -115,6 +133,27 @@ impl StudioPage {
 
     pub fn is_gallery(&self) -> bool {
         self.selected_conversation.is_none()
+    }
+
+    pub(super) fn reveal_gallery_artifact_if_needed(&mut self, id: StudioArtifactId) {
+        if !self.is_gallery() {
+            return;
+        }
+        let Some(index) = self.gallery.iter().position(|item| item.id == id) else {
+            return;
+        };
+        let columns = self.gallery_list_columns.max(1);
+        let row = index / columns;
+        let Some(target) = gallery_scroll_row_for_reveal(self.gallery_visible_rows.clone(), row)
+        else {
+            return;
+        };
+        self.gallery_list.scroll_to(ListOffset {
+            item_ix: target,
+            offset_in_item: px(0.0),
+        });
+        let span = (self.gallery_visible_rows.end - self.gallery_visible_rows.start).max(1);
+        self.gallery_visible_rows = target..(target + span);
     }
 
     pub fn gallery_image_count(&self) -> u32 {
@@ -1214,5 +1253,17 @@ mod tests {
         );
         assert_eq!(gallery_prefetch_row_order(4, 0..1), vec![1, 2, 3]);
         assert_eq!(gallery_prefetch_row_order(4, 3..4), vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn gallery_close_scrolls_only_when_the_tile_is_off_screen() {
+        assert_eq!(gallery_scroll_row_for_reveal(4..8, 5), None);
+        assert_eq!(gallery_scroll_row_for_reveal(4..8, 4), None);
+        assert_eq!(gallery_scroll_row_for_reveal(4..8, 7), None);
+        assert_eq!(gallery_scroll_row_for_reveal(0..0, 12), None);
+        assert_eq!(gallery_scroll_row_for_reveal(4..8, 2), Some(2));
+        assert_eq!(gallery_scroll_row_for_reveal(4..8, 12), Some(9));
+        assert_eq!(gallery_scroll_row_for_reveal(0..1, 0), None);
+        assert_eq!(gallery_scroll_row_for_reveal(0..1, 3), Some(3));
     }
 }

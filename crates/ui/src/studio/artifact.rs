@@ -867,7 +867,8 @@ impl StudioPage {
 
     pub fn close_artifact(&mut self, cx: &mut Context<Self>) {
         self.close_image_menu(cx);
-        if self.selected_artifact.take().is_some() {
+        if let Some(id) = self.selected_artifact.take() {
+            self.reveal_gallery_artifact_if_needed(id);
             self.lightbox_frames.clear();
             self.reset_lightbox_viewer();
             self.request_visible_gallery_images(cx);
@@ -878,7 +879,8 @@ impl StudioPage {
     /// Close via chrome, empty-space click, or Escape. Emits so the shell
     /// pops the artifact route; [`close_artifact`] then clears viewer state.
     pub(super) fn request_close_artifact(&mut self, cx: &mut Context<Self>) {
-        if self.selected_artifact.take().is_some() {
+        if let Some(id) = self.selected_artifact.take() {
+            self.reveal_gallery_artifact_if_needed(id);
             cx.emit(StudioEvent::CloseArtifact);
             cx.notify();
         }
