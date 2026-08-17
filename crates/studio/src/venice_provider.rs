@@ -420,7 +420,6 @@ fn image_payload(request: &GenerationRequest, binary: bool) -> ProviderResult<se
 }
 
 const UPSCALE_MIN_PIXELS: u64 = 65_536;
-const UPSCALE_MAX_OUTPUT_PIXELS: u64 = 16_777_216;
 const UPSCALE_MAX_INPUT_BYTES: u64 = 25 * 1024 * 1024;
 
 fn upscale_payload(
@@ -456,7 +455,7 @@ fn upscale_payload(
         ));
     }
     let scale = upscale_scale(request)?;
-    enforce_upscale_pixel_limits(&bytes, scale)?;
+    enforce_upscale_source_floor(&bytes)?;
     let mut payload = serde_json::Map::from_iter([(
         "image".into(),
         serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(bytes)),
@@ -490,7 +489,7 @@ fn upscale_scale(request: &GenerationRequest) -> ProviderResult<i64> {
     }
 }
 
-fn enforce_upscale_pixel_limits(bytes: &[u8], scale: i64) -> ProviderResult<()> {
+fn enforce_upscale_source_floor(bytes: &[u8]) -> ProviderResult<()> {
     let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|error| {
@@ -511,14 +510,6 @@ fn enforce_upscale_pixel_limits(bytes: &[u8], scale: i64) -> ProviderResult<()> 
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidRequest,
             format!("upscale source must be at least {UPSCALE_MIN_PIXELS} pixels"),
-        ));
-    }
-    let scale = u64::try_from(scale).unwrap_or(0);
-    let output = area.saturating_mul(scale.saturating_mul(scale));
-    if output > UPSCALE_MAX_OUTPUT_PIXELS {
-        return Err(ProviderError::new(
-            ProviderErrorKind::InvalidRequest,
-            "upscale output would exceed Venice's 16777216 pixel limit",
         ));
     }
     Ok(())
