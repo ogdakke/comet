@@ -447,6 +447,20 @@ unknown video playback dependency blocks the MVP.
 Exit: a Venice text-to-image generation completes end to end, survives restart, and a second fake
 provider is registered in tests without changing engine or UI run logic.
 
+### Artifact viewer tools — upscale first
+
+Artifact actions belong to the routed artifact viewer's inspector rather than to image context menus.
+The first tool is a split Upscale control above Download/Delete: the wide button starts the operation,
+while the adjacent settings button opens a model-style menu for scale and creativity. The last-used
+values default to 4× and creativity 0, then persist through the existing Studio defaults store.
+
+Upscale models stay out of the normal generation composer. Starting an upscale creates a provider
+upscale run against the source artifact, keeps the inspector button in an `Upscaling…` state while
+the run is active, and leaves the rest of the app navigable. Completion is intentionally
+uncancellable in this UI; the resulting artifact is saved to the user's Downloads folder and does
+not replace the artifact currently shown in the viewer. This composition leaves the inspector ready
+for future edit tools with their own controls and background state.
+
 ### Phase 2 — video jobs
 
 1. Add studio asset import with validated image references.

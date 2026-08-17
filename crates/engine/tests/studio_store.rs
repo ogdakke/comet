@@ -2129,6 +2129,24 @@ async fn upscale_turn_uses_an_existing_artifact_and_empty_prompt() {
     );
     wait_for_success(&mut updates, 2).await;
 
+    let gallery: ListStudioArtifactsResponse = serde_json::from_value(
+        client
+            .call(methods::LIST_STUDIO_ARTIFACTS, serde_json::json!({}))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let upscaled_item = gallery
+        .artifacts
+        .iter()
+        .find(|item| item.model_display_name == "Upscaler")
+        .expect("upscaled image should be in the gallery");
+    assert_eq!(
+        upscaled_item.upscaled_from_artifact_id,
+        Some(source.id),
+        "gallery metadata should retain the original/upscale relationship"
+    );
+
     let input_count: i64 = engine
         .studio
         .connection()

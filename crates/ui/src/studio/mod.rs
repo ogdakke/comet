@@ -6,6 +6,7 @@
 //! - [`composer`] — model picker, per-model controls, and generate;
 //! - [`artifact`] — full-bleed image strip, filmstrip, and inspector;
 //! - [`image_menu`] — right-click / two-finger-tap actions on visible images;
+//! - [`upscale`] — artifact-viewer upscale action, settings, and completion;
 //! - [`providers`] — connect / validate / remove image accounts;
 //! - [`draft`] — per-model draft settings and control chrome;
 //! - [`defaults`] — sticky last-used models and settings.
@@ -21,6 +22,7 @@ mod image_menu;
 mod images;
 mod page;
 mod providers;
+mod upscale;
 
 pub use feed::grid_columns;
 pub use page::StudioPage;

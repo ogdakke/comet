@@ -103,6 +103,7 @@ impl StudioPage {
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
+        self.close_upscale_settings_menu(cx);
         self.image_menu.open(ImageMenu {
             artifact_id,
             conversation_id,

@@ -35,12 +35,14 @@ use super::feed::{
 use super::gallery::new_gallery_list;
 use super::image_menu::ImageMenu;
 use super::images::StudioImages;
+use super::upscale::UpscaleJob;
 
 pub struct StudioPage {
     pub(super) state: Entity<AppState>,
     pub(super) conversations: Vec<StudioConversationSummary>,
     pub(super) providers: Vec<StudioProviderConnection>,
     pub(super) models: Vec<zeron_studio::MediaModel>,
+    pub(super) upscale_models: Vec<zeron_studio::MediaModel>,
     pub(super) selected_models: BTreeSet<zeron_studio::ModelId>,
     pub(super) draft_runs: HashMap<zeron_studio::ModelId, DraftRunConfig>,
     pub(super) remembered: StudioDefaults,
@@ -104,8 +106,13 @@ pub struct StudioPage {
     pub(super) gallery_selected: BTreeSet<StudioArtifactId>,
     pub(super) gallery_anchor: Option<StudioArtifactId>,
     pub(super) image_menu: popover::Popup<ImageMenu>,
+    pub(super) upscale_settings_menu: popover::Popup<StudioArtifactId>,
+    pub(super) upscale_jobs: HashMap<StudioArtifactId, UpscaleJob>,
+    pub(super) upscale_watch_tasks: HashMap<StudioConversationId, Task<()>>,
+    pub(super) upscale_download_tasks: HashMap<StudioArtifactId, Task<()>>,
     pub(super) selected_artifact: Option<StudioArtifactId>,
     pub(super) lightbox_frames: Vec<super::artifact::ArtifactFrame>,
+    pub(super) compare_pressed: bool,
     pub(super) lightbox_zoom: f32,
     pub(super) lightbox_pan: Point<Pixels>,
     pub(super) lightbox_drag: Option<Point<Pixels>>,
@@ -170,6 +177,7 @@ impl StudioPage {
             conversations: Vec::new(),
             providers: Vec::new(),
             models: Vec::new(),
+            upscale_models: Vec::new(),
             selected_models: BTreeSet::new(),
             draft_runs: HashMap::new(),
             remembered,
@@ -228,8 +236,13 @@ impl StudioPage {
             gallery_selected: BTreeSet::new(),
             gallery_anchor: None,
             image_menu: popover::Popup::default(),
+            upscale_settings_menu: popover::Popup::default(),
+            upscale_jobs: HashMap::new(),
+            upscale_watch_tasks: HashMap::new(),
+            upscale_download_tasks: HashMap::new(),
             selected_artifact: None,
             lightbox_frames: Vec::new(),
+            compare_pressed: false,
             lightbox_zoom: 1.0,
             lightbox_pan: Point::default(),
             lightbox_drag: None,
@@ -580,17 +593,19 @@ impl StudioPage {
                 };
                 if this
                     .update(cx, |page, cx| {
+                        let visible_view = super::upscale::visible_conversation_view(&view);
                         let first_open = page.conversation.is_none();
                         let settled = page
                             .conversation
                             .as_ref()
-                            .is_some_and(|previous| newly_settled_runs(previous, &view));
+                            .is_some_and(|previous| newly_settled_runs(previous, &visible_view));
                         let submitted_turn_arrived = page
                             .scroll_after_turn_count
-                            .is_some_and(|before| view.turns.len() > before);
-                        let last_turn_id = view.turns.last().map(|turn| turn.id);
-                        page.apply_conversation_summary(view.conversation.clone(), cx);
-                        page.conversation = Some(view);
+                            .is_some_and(|before| visible_view.turns.len() > before);
+                        let last_turn_id = visible_view.turns.last().map(|turn| turn.id);
+                        page.observe_upscale_view(&view, cx);
+                        page.apply_conversation_summary(visible_view.conversation.clone(), cx);
+                        page.conversation = Some(visible_view);
                         if settled {
                             page.refresh_account_balance(cx, true);
                         }
@@ -892,6 +907,10 @@ impl StudioPage {
     }
 
     pub(super) fn apply_models(&mut self, models: Vec<zeron_studio::MediaModel>) {
+        let (upscale_models, models): (Vec<_>, Vec<_>) = models
+            .into_iter()
+            .partition(|model| model.operation == zeron_studio::MediaOperation::Upscale);
+        self.upscale_models = upscale_models;
         self.models = models;
         apply_remembered_drafts(&mut self.draft_runs, &self.models, &self.remembered.drafts);
     }
@@ -936,6 +955,7 @@ impl StudioPage {
                 &self.selected_models,
                 &self.draft_runs,
                 &self.remembered.favorites,
+                &self.remembered.upscale,
             );
             if let Err(err) = self.remembered.save(&dir) {
                 tracing::warn!(error = %err, "studio-defaults save failed");
@@ -1479,6 +1499,8 @@ impl Render for StudioPage {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|page, event: &gpui::KeyDownEvent, _, cx| {
                 if page.dismiss_image_menu(event, cx) {
+                    cx.stop_propagation();
+                } else if page.dismiss_upscale_settings_menu(event, cx) {
                     cx.stop_propagation();
                 }
             }))

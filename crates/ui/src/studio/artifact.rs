@@ -13,7 +13,10 @@ use gpui::{
 };
 use zeron_proto::{StudioConversationView, StudioGalleryItem};
 use zeron_rpc::methods;
-use zeron_studio::{MediaKind, StudioArtifactId, StudioConversationId, StudioTurnId};
+use zeron_studio::{
+    GenerationInputSource, MediaKind, MediaOperation, StudioArtifactId, StudioConversationId,
+    StudioTurnId,
+};
 
 use crate::state::EngineHandle;
 use crate::theme::Theme;
@@ -76,6 +79,7 @@ pub(super) struct ArtifactFrame {
     pub size_bytes: u64,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    pub upscaled_from_artifact_id: Option<StudioArtifactId>,
 }
 
 pub(super) fn frames_from_gallery(items: &[StudioGalleryItem]) -> Vec<ArtifactFrame> {
@@ -91,6 +95,7 @@ pub(super) fn frames_from_gallery(items: &[StudioGalleryItem]) -> Vec<ArtifactFr
             size_bytes: item.size_bytes,
             width: item.width,
             height: item.height,
+            upscaled_from_artifact_id: item.upscaled_from_artifact_id,
         })
         .collect()
 }
@@ -113,6 +118,16 @@ pub(super) fn frames_from_conversation(view: &StudioConversationView) -> Vec<Art
                         size_bytes: artifact.size_bytes,
                         width: artifact.width,
                         height: artifact.height,
+                        upscaled_from_artifact_id: (run.model.operation == MediaOperation::Upscale)
+                            .then(|| {
+                                run.inputs.iter().find_map(|input| match &input.source {
+                                    GenerationInputSource::Artifact { artifact_id } => {
+                                        Some(*artifact_id)
+                                    }
+                                    GenerationInputSource::Asset { .. } => None,
+                                })
+                            })
+                            .flatten(),
                     })
             })
         })
@@ -780,6 +795,41 @@ impl StudioPage {
             .find(|frame| frame.id == artifact_id)
     }
 
+    fn upscaled_source_for(&self, artifact_id: StudioArtifactId) -> Option<StudioArtifactId> {
+        self.artifact_frame(artifact_id)
+            .and_then(|frame| frame.upscaled_from_artifact_id)
+    }
+
+    fn lightbox_display_artifact_id(&self) -> Option<StudioArtifactId> {
+        let selected = self.selected_artifact?;
+        if self.compare_pressed {
+            self.upscaled_source_for(selected).or(Some(selected))
+        } else {
+            Some(selected)
+        }
+    }
+
+    pub(super) fn begin_artifact_compare(&mut self, cx: &mut Context<Self>) {
+        let Some(selected) = self.selected_artifact else {
+            return;
+        };
+        let Some(source) = self.upscaled_source_for(selected) else {
+            return;
+        };
+        self.compare_pressed = true;
+        self.request_images(vec![source], true, cx);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    pub(super) fn end_artifact_compare(&mut self, cx: &mut Context<Self>) {
+        if self.compare_pressed {
+            self.compare_pressed = false;
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
     pub(super) fn artifact_conversation(
         &self,
         artifact_id: StudioArtifactId,
@@ -797,6 +847,7 @@ impl StudioPage {
         cx: &mut Context<Self>,
     ) {
         self.close_image_menu(cx);
+        self.close_upscale_settings_menu(cx);
         self.lightbox_frames = frames;
         if let Some(index) = self.lightbox_frames.iter().position(|frame| frame.id == id) {
             self.select_artifact_index(index, cx);
@@ -849,6 +900,7 @@ impl StudioPage {
     }
 
     pub(super) fn reset_lightbox_viewer(&mut self) {
+        self.compare_pressed = false;
         self.snap_lightbox_to_fit();
         self.lightbox_drag = None;
         self.reset_lightbox_swipe();
@@ -862,9 +914,11 @@ impl StudioPage {
         };
         let changed = self.selected_artifact != Some(artifact_id);
         self.selected_artifact = Some(artifact_id);
+        self.compare_pressed = false;
         self.snap_lightbox_to_fit();
         self.lightbox_drag = None;
         if changed {
+            self.close_upscale_settings_menu(cx);
             self.inspector_scroll.set_offset(Point::default());
         }
         if let Some(conversation_id) = self.artifact_conversation(artifact_id) {
@@ -967,6 +1021,7 @@ impl StudioPage {
 
     pub fn close_artifact(&mut self, cx: &mut Context<Self>) {
         self.close_image_menu(cx);
+        self.close_upscale_settings_menu(cx);
         if let Some(id) = self.selected_artifact.take() {
             self.reveal_gallery_artifact_if_needed(id);
             self.lightbox_frames.clear();
@@ -979,6 +1034,7 @@ impl StudioPage {
     /// Close via chrome, empty-space click, or Escape. Emits so the shell
     /// pops the artifact route; [`close_artifact`] then clears viewer state.
     pub(super) fn request_close_artifact(&mut self, cx: &mut Context<Self>) {
+        self.close_upscale_settings_menu(cx);
         if let Some(id) = self.selected_artifact.take() {
             self.reveal_gallery_artifact_if_needed(id);
             cx.emit(StudioEvent::CloseArtifact);
@@ -997,7 +1053,7 @@ impl StudioPage {
     }
 
     fn lightbox_image_pixel_size(&self, window: &mut Window, cx: &mut App) -> Option<(u32, u32)> {
-        let id = self.selected_artifact?;
+        let id = self.lightbox_display_artifact_id()?;
         if let Some(frame) = self.artifact_frame(id)
             && let (Some(width), Some(height)) = (frame.width, frame.height)
             && width > 0
@@ -1107,7 +1163,10 @@ impl StudioPage {
         if let Some(focus) = focus {
             let pan = zoom_pan_around(
                 previous,
-                point(f32::from(self.lightbox_pan.x), f32::from(self.lightbox_pan.y)),
+                point(
+                    f32::from(self.lightbox_pan.x),
+                    f32::from(self.lightbox_pan.y),
+                ),
                 next,
                 point(f32::from(focus.x), f32::from(focus.y)),
                 self.lightbox_stage_center(),
@@ -1547,10 +1606,12 @@ impl StudioPage {
         // GPU-warm only the current slide and its immediate neighbors. Encoded
         // prefetch still walks LIGHTBOX_PREFETCH; uploading all of those
         // originals is what pushed Activity Monitor past 4GB.
-        for id in lightbox_neighbor_ids(&self.lightbox_frames, selected)
-            .into_iter()
-            .take(3)
-        {
+        let mut ids = Vec::with_capacity(LIGHTBOX_PREFETCH * 2 + 2);
+        if let Some(source) = self.upscaled_source_for(selected) {
+            ids.push(source);
+        }
+        ids.extend(lightbox_neighbor_ids(&self.lightbox_frames, selected));
+        for id in ids.into_iter().take(4) {
             if let Some(full) = self.images.get_full(&id) {
                 let _ = full.use_render_image(window, cx);
             }
@@ -1683,6 +1744,10 @@ impl StudioPage {
                 frame.size_bytes,
             )
         });
+        let compare_source = self
+            .compare_pressed
+            .then(|| self.upscaled_source_for(id))
+            .flatten();
         let filmstrip_viewport = filmstrip_viewport_width(self.lightbox_stage_width);
         let filmstrip_range =
             filmstrip_visible_range(selected_index, sequence.len(), filmstrip_viewport);
@@ -1760,7 +1825,9 @@ impl StudioPage {
         let zoomed = self.lightbox_viewer_is_transformed();
         let page_width = self.lightbox_stage_width;
         let mut slides = Vec::new();
-        if !lightbox_uses_paging_slides(
+        if let Some(compare_source) = compare_source {
+            slides.push(self.render_lightbox_slide(Some(compare_source), None, theme, window, cx));
+        } else if !lightbox_uses_paging_slides(
             zoomed,
             page_width,
             self.lightbox_swipe_x,
@@ -1895,6 +1962,43 @@ impl StudioPage {
                     .text_color(theme.text_muted.opacity(0.7)),
             );
 
+        let compare_button = self.upscaled_source_for(id).map(|_| {
+            div()
+                .id("studio-artifact-compare")
+                .size(px(28.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(7.0))
+                .occlude()
+                .cursor_pointer()
+                .when(self.compare_pressed, |button| {
+                    button.bg(crate::theme::wash(0.14))
+                })
+                .hover(|style| style.bg(crate::theme::wash(0.14)))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|page, _, _, cx| page.begin_artifact_compare(cx)),
+                )
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|page, _, _, cx| page.end_artifact_compare(cx)),
+                )
+                .on_mouse_up_out(
+                    gpui::MouseButton::Left,
+                    cx.listener(|page, _, _, cx| page.end_artifact_compare(cx)),
+                )
+                .on_click(|_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .child(
+                    crate::icons::icon(crate::icons::COMPARE)
+                        .size(px(16.0))
+                        .text_color(theme.text_muted.opacity(0.8)),
+                )
+        });
+
         let previous = div()
             .id("studio-artifact-previous")
             .size(px(32.0))
@@ -1954,87 +2058,91 @@ impl StudioPage {
             .when_some(
                 details,
                 |inspector, (turn_id, prompt, model, mime, size)| {
-                    let copy_prompt = prompt.clone();
-                    let expanded = self.expanded_inspector_prompts.contains(&turn_id);
-                    let clampable = super::feed::prompt_exceeds_lines(
-                        &prompt,
-                        inspector_prompt_inner_width(),
-                        INSPECTOR_PROMPT_ADVANCE,
-                        INSPECTOR_PROMPT_COLLAPSED_LINES,
-                    );
-                    let collapsed = clampable && !expanded;
+                    let has_prompt = !prompt.trim().is_empty();
                     inspector
-                        .child(
-                            div()
-                                .flex_none()
-                                .flex()
-                                .items_start()
-                                .gap(px(INSPECTOR_COPY_GAP))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(6.0))
-                                        .child(
-                                            div()
-                                                .w_full()
-                                                .text_size(px(12.0))
-                                                .line_height(px(INSPECTOR_PROMPT_LINE_HEIGHT))
-                                                .text_color(theme.text)
-                                                .when(collapsed, |box_| {
-                                                    box_.max_h(px(INSPECTOR_PROMPT_LINE_HEIGHT
-                                                        * INSPECTOR_PROMPT_COLLAPSED_LINES as f32))
-                                                        .overflow_hidden()
-                                                })
-                                                .child(SharedString::from(prompt)),
-                                        )
-                                        .when(clampable, |col| {
-                                            col.child(
-                                                super::feed::show_more_action(
-                                                    format!(
-                                                        "studio-inspector-toggle-prompt-{}",
-                                                        turn_id.0
-                                                    ),
-                                                    expanded,
-                                                    theme,
-                                                )
-                                                .on_click(cx.listener(move |page, _, _, cx| {
-                                                    page.toggle_inspector_prompt_expanded(
-                                                        turn_id, cx,
-                                                    );
-                                                })),
+                        .when(has_prompt, |inspector| {
+                            let copy_prompt = prompt.clone();
+                            let expanded = self.expanded_inspector_prompts.contains(&turn_id);
+                            let clampable = super::feed::prompt_exceeds_lines(
+                                &prompt,
+                                inspector_prompt_inner_width(),
+                                INSPECTOR_PROMPT_ADVANCE,
+                                INSPECTOR_PROMPT_COLLAPSED_LINES,
+                            );
+                            let collapsed = clampable && !expanded;
+                            inspector.child(
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .items_start()
+                                    .gap(px(INSPECTOR_COPY_GAP))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(6.0))
+                                            .child(
+                                                div()
+                                                    .w_full()
+                                                    .text_size(px(12.0))
+                                                    .line_height(px(INSPECTOR_PROMPT_LINE_HEIGHT))
+                                                    .text_color(theme.text)
+                                                    .when(collapsed, |box_| {
+                                                        box_.max_h(px(INSPECTOR_PROMPT_LINE_HEIGHT
+                                                            * INSPECTOR_PROMPT_COLLAPSED_LINES
+                                                                as f32))
+                                                            .overflow_hidden()
+                                                    })
+                                                    .child(SharedString::from(prompt)),
                                             )
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .id("studio-copy-prompt")
-                                        .size(px(INSPECTOR_COPY_SIZE))
-                                        .flex_none()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded(px(6.0))
-                                        .cursor_pointer()
-                                        .hover(|style| style.bg(crate::theme::wash(0.14)))
-                                        .on_click(move |_, _, cx| {
-                                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                                copy_prompt.clone(),
-                                            ));
-                                        })
-                                        .child(
-                                            crate::icons::icon(crate::icons::COPY)
-                                                .size(px(14.0))
-                                                .text_color(theme.text_muted.opacity(0.7)),
-                                        ),
-                                ),
-                        )
+                                            .when(clampable, |col| {
+                                                col.child(
+                                                    super::feed::show_more_action(
+                                                        format!(
+                                                            "studio-inspector-toggle-prompt-{}",
+                                                            turn_id.0
+                                                        ),
+                                                        expanded,
+                                                        theme,
+                                                    )
+                                                    .on_click(cx.listener(move |page, _, _, cx| {
+                                                        page.toggle_inspector_prompt_expanded(
+                                                            turn_id, cx,
+                                                        );
+                                                    })),
+                                                )
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("studio-copy-prompt")
+                                            .size(px(INSPECTOR_COPY_SIZE))
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded(px(6.0))
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(crate::theme::wash(0.14)))
+                                            .on_click(move |_, _, cx| {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    copy_prompt.clone(),
+                                                ));
+                                            })
+                                            .child(
+                                                crate::icons::icon(crate::icons::COPY)
+                                                    .size(px(14.0))
+                                                    .text_color(theme.text_muted.opacity(0.7)),
+                                            ),
+                                    ),
+                            )
+                        })
                         .child(
                             div()
                                 .flex_none()
-                                .mt(px(14.0))
+                                .when(has_prompt, |meta| meta.mt(px(14.0)))
                                 .text_size(px(11.0))
                                 .text_color(theme.text_muted)
                                 .child(SharedString::from(format!(
@@ -2045,8 +2153,10 @@ impl StudioPage {
                 },
             )
             .child(div().flex_1())
+            .child(self.render_artifact_upscale_actions(id, theme, cx))
             .child(
                 div()
+                    .mt(px(8.0))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -2106,8 +2216,24 @@ impl StudioPage {
                 .flex()
                 .min_w_0()
                 .track_focus(&self.focus)
+                // The compare trigger is a press-and-hold gesture. Keep the
+                // release handler on the whole viewer as well as the button
+                // so releasing over the image, inspector, or another chrome
+                // element always restores the upscale.
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|page, _, _, cx| page.end_artifact_compare(cx)),
+                )
+                .on_mouse_up_out(
+                    gpui::MouseButton::Left,
+                    cx.listener(|page, _, _, cx| page.end_artifact_compare(cx)),
+                )
                 .on_key_down(cx.listener(|page, event: &gpui::KeyDownEvent, _, cx| {
                     if page.dismiss_image_menu(event, cx) {
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if page.dismiss_upscale_settings_menu(event, cx) {
                         cx.stop_propagation();
                         return;
                     }
@@ -2138,6 +2264,18 @@ impl StudioPage {
                                 stage,
                             )
                             .band_bottom(ARTIFACT_FILMSTRIP_HEIGHT),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .top(px(Theme::TITLEBAR_TOP_PAD))
+                                .left(px(16.0))
+                                .h(px(Theme::TITLEBAR_HEIGHT))
+                                .flex()
+                                .items_center()
+                                .when_some(compare_button, |controls, compare| {
+                                    controls.child(compare)
+                                }),
                         )
                         .child(
                             div()
@@ -2329,14 +2467,8 @@ mod tests {
             origin: point(px(0.0), px(0.0)),
             size: size(px(1000.0), px(800.0)),
         };
-        let painted = lightbox_image_paint_bounds(
-            stage,
-            2000,
-            1000,
-            0.8,
-            point(px(-40.0), px(10.0)),
-            0.0,
-        );
+        let painted =
+            lightbox_image_paint_bounds(stage, 2000, 1000, 0.8, point(px(-40.0), px(10.0)), 0.0);
         assert!((f32::from(painted.size.width) - 800.0).abs() < 0.5);
         assert!((f32::from(painted.size.height) - 400.0).abs() < 0.5);
         assert!(!lightbox_click_hits_empty(
@@ -2457,6 +2589,7 @@ mod tests {
             size_bytes: 1,
             width: Some(1),
             height: Some(1),
+            upscaled_from_artifact_id: None,
         }
     }
 

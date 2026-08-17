@@ -322,6 +322,9 @@ pub struct StudioGalleryItem {
     pub created_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbhash: Option<String>,
+    /// The source image for an upscale artifact, when the engine persisted one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upscaled_from_artifact_id: Option<StudioArtifactId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

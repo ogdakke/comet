@@ -150,6 +150,7 @@ fn gallery_items_use_camel_case_wire_shape() {
             model_display_name: "Image model".into(),
             created_at: chrono::Utc::now(),
             thumbhash: Some("3OcRJYB4d3h/iIeHeEh3eIhw+j3A".into()),
+            upscaled_from_artifact_id: None,
         }],
     };
     let json = serde_json::to_value(response).unwrap();

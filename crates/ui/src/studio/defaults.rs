@@ -16,6 +16,24 @@ use super::draft::{DraftRunConfig, RememberedDraft};
 
 const FILE_NAME: &str = "studio-defaults.json";
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(super) struct UpscaleDefaults {
+    /// The output multiplier offered by the provider's upscale model.
+    pub(super) scale: i64,
+    /// Provider-specific creativity amount. Venice accepts 0.0 through 0.02.
+    pub(super) creativity: f64,
+}
+
+impl Default for UpscaleDefaults {
+    fn default() -> Self {
+        Self {
+            scale: 4,
+            creativity: 0.0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(super) struct StudioDefaults {
@@ -23,6 +41,9 @@ pub(super) struct StudioDefaults {
     pub(super) drafts: BTreeMap<ModelId, RememberedDraft>,
     /// Starred models in the picker, in starring order.
     pub(super) favorites: Vec<ModelId>,
+    /// Last-used settings for the artifact viewer's upscale action.
+    #[serde(default)]
+    pub(super) upscale: UpscaleDefaults,
 }
 
 impl StudioDefaults {
@@ -57,6 +78,7 @@ impl StudioDefaults {
         selected: &BTreeSet<ModelId>,
         drafts: &HashMap<ModelId, DraftRunConfig>,
         favorites: &[ModelId],
+        upscale: &UpscaleDefaults,
     ) -> Self {
         Self {
             selected_model_ids: selected.iter().cloned().collect(),
@@ -73,6 +95,7 @@ impl StudioDefaults {
                 })
                 .collect(),
             favorites: favorites.to_vec(),
+            upscale: upscale.clone(),
         }
     }
 
@@ -117,7 +140,12 @@ mod tests {
                 )]),
             },
         );
-        let defaults = StudioDefaults::capture(&selected, &drafts, &[ModelId::new("flux")]);
+        let defaults = StudioDefaults::capture(
+            &selected,
+            &drafts,
+            &[ModelId::new("flux")],
+            &UpscaleDefaults::default(),
+        );
         defaults.save(dir.path()).unwrap();
         assert_eq!(StudioDefaults::load(dir.path()), defaults);
         assert_eq!(
@@ -142,6 +170,18 @@ mod tests {
     }
 
     #[test]
+    fn upscale_settings_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut defaults = StudioDefaults::default();
+        defaults.upscale = UpscaleDefaults {
+            scale: 4,
+            creativity: 0.007,
+        };
+        defaults.save(dir.path()).unwrap();
+        assert_eq!(StudioDefaults::load(dir.path()).upscale, defaults.upscale);
+    }
+
+    #[test]
     fn missing_and_corrupt_files_yield_defaults() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(StudioDefaults::load(dir.path()), StudioDefaults::default());
@@ -155,5 +195,6 @@ mod tests {
         let loaded = StudioDefaults::load(dir.path());
         assert_eq!(loaded.selected_model_ids, vec![ModelId::new("flux")]);
         assert!(loaded.favorites.is_empty());
+        assert_eq!(loaded.upscale, UpscaleDefaults::default());
     }
 }

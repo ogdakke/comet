@@ -506,7 +506,13 @@ impl StudioStore {
             "SELECT a.id, a.output_position, a.media_kind, a.mime_type, a.size_bytes,
                     a.width, a.height, a.created_at,
                     t.conversation_id, t.id, t.prompt, r.model_manifest_json,
-                    a.thumbhash
+                    a.thumbhash,
+                    CASE WHEN r.operation = 'upscale' THEN (
+                        SELECT artifact_id
+                        FROM studio_run_inputs
+                        WHERE run_id = r.id AND role = 'source' AND ordinal = 0
+                        LIMIT 1
+                    ) ELSE NULL END
              FROM studio_artifacts a
              JOIN studio_runs r ON r.id = a.run_id
              JOIN studio_batches b ON b.id = r.batch_id
@@ -2053,6 +2059,11 @@ fn gallery_item_from_row(row: &rusqlite::Row<'_>) -> Result<StudioGalleryItem, r
         prompt: row.get(10)?,
         model_display_name: model.display_name,
         thumbhash: row.get(12)?,
+        upscaled_from_artifact_id: row
+            .get::<_, Option<String>>(13)?
+            .map(|value| parse_uuid(13, value))
+            .transpose()?
+            .map(StudioArtifactId),
     })
 }
 
