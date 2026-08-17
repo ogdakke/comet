@@ -3,7 +3,7 @@
 //! One [`gpui::ListState`] item per turn — the same variable-height list the
 //! agent transcript uses — so long conversations keep measured heights and only
 //! paint the visible window plus overdraw. Image fetches follow the gallery:
-//! visible turns load full frames, neighbors prefetch thumbs.
+//! visible turns load preview thumbs, neighbors prefetch more thumbs.
 
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -45,7 +45,7 @@ const STUDIO_READING_BOTTOM_INSET: f32 = 220.0;
 const FEED_TURN_GAP: f32 = 28.0;
 /// Paint / measure window past the viewport — same order as the gallery so a
 /// fling reveals the next turn already decoded.
-const FEED_OVERDRAW_PX: f32 = 1600.0;
+const FEED_OVERDRAW_PX: f32 = 720.0;
 /// Turns above and below the visible range that prefetch thumbs.
 const FEED_PREFETCH_TURNS: usize = 2;
 /// Horizontal inset matching the previous overflow-scroll padding.
@@ -586,7 +586,7 @@ impl StudioPage {
             );
         }
         if let Some(id) = artifact_id {
-            let (image, full) = self.display_layers(id, window, cx);
+            let (image, full) = self.display_layers(id, false, window, cx);
             if let Some(image) = image {
                 return base
                     .relative()
@@ -611,10 +611,11 @@ impl StudioPage {
                             .size_full()
                             .relative()
                             .child(contain_image(image).size_full().rounded(px(10.0)))
-                            .when_some(full, |layer, full| {
-                                layer.child(
-                                    contain_image(full).absolute().inset_0().rounded(px(10.0)),
-                                )
+                            .when_some(full, |layer, thumb| {
+                                layer.child(crate::motion::fade_quick(
+                                    SharedString::from(format!("studio-thumb-ready-{}", id.0)),
+                                    contain_image(thumb).absolute().inset_0().rounded(px(10.0)),
+                                ))
                             }),
                     ))
                     .when_some(self.artifact_focus_ring(id, theme), |tile, ring| {
@@ -848,6 +849,7 @@ impl StudioPage {
         self.image_protect = visible.iter().chain(thumbs.iter()).copied().collect();
         self.image_protect
             .extend(self.loading_images.iter().copied());
+        self.warm_placeholders(visible.iter().chain(thumbs.iter()).copied());
         self.request_images(visible, false, cx);
         self.request_images(thumbs, false, cx);
     }
@@ -1550,6 +1552,7 @@ mod tests {
             duration_seconds: None,
             metadata: serde_json::Value::Null,
             created_at: Utc::now(),
+            thumbhash: None,
         }
     }
 

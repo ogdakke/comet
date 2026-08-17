@@ -443,9 +443,9 @@ pub(super) fn write_artifact_file(destination: PathBuf, bytes: Vec<u8>) -> Resul
 /// Minimum short edge retained for a gallery preview. The old longest-edge
 /// thumbnail left only ~288 source pixels across the short edge of a common
 /// 16:9 image, then enlarged that crop into a ~250px Retina tile.
-const GALLERY_THUMB_SHORT_EDGE: u32 = 640;
+const GALLERY_THUMB_SHORT_EDGE: u32 = 512;
 /// Bound panoramas and unusually tall images without changing their aspect.
-const GALLERY_THUMB_LONG_EDGE: u32 = 1920;
+const GALLERY_THUMB_LONG_EDGE: u32 = 1536;
 
 fn gallery_thumb_dimensions(width: u32, height: u32) -> (u32, u32) {
     let short = width.min(height);
@@ -479,8 +479,23 @@ pub(super) fn downsample_gallery_thumb(bytes: Vec<u8>) -> Result<Arc<Image>, Str
     )))
 }
 
+pub(super) async fn read_preview_bytes(
+    engine: &EngineHandle,
+    artifact_id: StudioArtifactId,
+) -> Result<(String, String, Vec<u8>), String> {
+    read_chunked_bytes(engine, methods::READ_STUDIO_PREVIEW_CHUNK, artifact_id).await
+}
+
 pub(super) async fn read_artifact_bytes(
     engine: &EngineHandle,
+    artifact_id: StudioArtifactId,
+) -> Result<(String, String, Vec<u8>), String> {
+    read_chunked_bytes(engine, methods::READ_STUDIO_ARTIFACT_CHUNK, artifact_id).await
+}
+
+async fn read_chunked_bytes(
+    engine: &EngineHandle,
+    method: &str,
     artifact_id: StudioArtifactId,
 ) -> Result<(String, String, Vec<u8>), String> {
     let mut bytes = Vec::new();
@@ -489,7 +504,7 @@ pub(super) async fn read_artifact_bytes(
         let value = engine
             .client()
             .call(
-                methods::READ_STUDIO_ARTIFACT_CHUNK,
+                method,
                 serde_json::json!({ "artifactId": artifact_id, "offset": offset }),
             )
             .await
@@ -1040,24 +1055,45 @@ impl StudioPage {
         cx.stop_propagation();
     }
 
-    /// Thumb (or full, if that is all we have) plus a GPU-ready full overlay.
-    /// The base stays mounted so swapping in the full frame cannot remount.
+    /// Layers for a tile or lightbox slide.
+    ///
+    /// Tiles (`full = false`) never upload the original — a hover-prefetched
+    /// full-res frame is tens of megabytes of Metal texture per cell.
+    /// The lightbox (`full = true`) shows the thumb first, then the original.
     pub(super) fn display_layers(
         &self,
         id: StudioArtifactId,
+        full: bool,
         window: &mut Window,
         cx: &mut gpui::App,
     ) -> (Option<Arc<Image>>, Option<Arc<Image>>) {
-        let base = self.images.get_thumb(&id);
+        let placeholder = self.images.get_placeholder(&id);
+        let thumb = self.images.get_thumb_only(&id);
+        if !full {
+            // Keep the thumbhash mounted. Swapping the FittedImage source to
+            // the JPEG before it has a GPU tile paints one empty frame.
+            if let Some(placeholder) = placeholder {
+                let _ = placeholder.clone().use_render_image(window, cx);
+                let overlay = thumb
+                    .and_then(|thumb| thumb.clone().use_render_image(window, cx).map(|_| thumb));
+                return (Some(placeholder), overlay);
+            }
+            if let Some(thumb) = thumb {
+                let _ = thumb.clone().use_render_image(window, cx);
+                return (Some(thumb), None);
+            }
+            return (None, None);
+        }
+        let base = thumb.or_else(|| self.images.get_thumb(&id)).or(placeholder);
         if let Some(base) = base.as_ref() {
             let _ = base.clone().use_render_image(window, cx);
         }
-        let overlay = self.images.get_full(&id).and_then(|full| {
-            let same_as_base = base.as_ref().is_some_and(|base| Arc::ptr_eq(base, &full));
+        let overlay = self.images.get_full(&id).and_then(|image| {
+            let same_as_base = base.as_ref().is_some_and(|base| Arc::ptr_eq(base, &image));
             if same_as_base {
                 return None;
             }
-            full.clone().use_render_image(window, cx).map(|_| full)
+            image.clone().use_render_image(window, cx).map(|_| image)
         });
         (base, overlay)
     }
@@ -1066,7 +1102,13 @@ impl StudioPage {
         let Some(selected) = self.selected_artifact else {
             return;
         };
-        for id in lightbox_neighbor_ids(&self.lightbox_frames, selected) {
+        // GPU-warm only the current slide and its immediate neighbors. Encoded
+        // prefetch still walks LIGHTBOX_PREFETCH; uploading all of those
+        // originals is what pushed Activity Monitor past 4GB.
+        for id in lightbox_neighbor_ids(&self.lightbox_frames, selected)
+            .into_iter()
+            .take(3)
+        {
             if let Some(full) = self.images.get_full(&id) {
                 let _ = full.use_render_image(window, cx);
             }
@@ -1085,7 +1127,7 @@ impl StudioPage {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (base, overlay) = artifact_id
-            .map(|id| self.display_layers(id, window, cx))
+            .map(|id| self.display_layers(id, true, window, cx))
             .unwrap_or((None, None));
         let slide_id = match artifact_id {
             Some(id) => SharedString::from(format!("studio-artifact-slide-{}", id.0)),
@@ -1207,7 +1249,7 @@ impl StudioPage {
                     .map(|artifact_id| (index, artifact_id))
             })
             .map(|(index, artifact_id)| {
-                let thumbnail = self.images.get_thumb(&artifact_id);
+                let (thumbnail, sharp) = self.display_layers(artifact_id, false, window, cx);
                 let frame_size = filmstrip_thumb_size(index, selected_index);
                 let origin = filmstrip_thumb_origin(index, selected_index)
                     + filmstrip_offset(selected_index, filmstrip_viewport);
@@ -1250,6 +1292,15 @@ impl StudioPage {
                 match thumbnail {
                     Some(thumbnail) => frame
                         .child(cover_image(thumbnail).size_full().rounded(px(7.0)))
+                        .when_some(sharp, |frame, thumb| {
+                            frame.child(crate::motion::fade_quick(
+                                SharedString::from(format!(
+                                    "studio-filmstrip-ready-{}",
+                                    artifact_id.0
+                                )),
+                                cover_image(thumb).absolute().inset_0().rounded(px(7.0)),
+                            ))
+                        })
                         .into_any_element(),
                     None => frame.into_any_element(),
                 }
@@ -1837,14 +1888,15 @@ mod tests {
         assert!(thumb.bytes.len() < 1200 * 800);
         assert_eq!(thumb.format, ImageFormat::Jpeg);
         let decoded = image::load_from_memory(&thumb.bytes).unwrap();
-        assert_eq!(decoded.width(), 960);
+        assert_eq!(decoded.width(), 768);
         assert_eq!(decoded.height(), GALLERY_THUMB_SHORT_EDGE);
     }
 
     #[test]
     fn gallery_thumbs_bound_extreme_aspect_ratios() {
-        assert_eq!(gallery_thumb_dimensions(4096, 1024), (1920, 480));
-        assert_eq!(gallery_thumb_dimensions(800, 600), (800, 600));
+        assert_eq!(gallery_thumb_dimensions(4096, 1024), (1536, 384));
+        assert_eq!(gallery_thumb_dimensions(800, 600), (683, 512));
+        assert_eq!(gallery_thumb_dimensions(400, 300), (400, 300));
     }
 
     #[test]
@@ -1901,6 +1953,7 @@ mod tests {
             duration_seconds: None,
             metadata: serde_json::Value::Null,
             created_at: Utc::now(),
+            thumbhash: None,
         };
         let view = StudioConversationView {
             conversation: zeron_proto::StudioConversationSummary {
@@ -1911,6 +1964,7 @@ mod tests {
                 updated_at: Utc::now(),
                 archived: false,
                 forked_from_turn_id: None,
+                creating: false,
             },
             turns: vec![zeron_proto::StudioTurnView {
                 id: StudioTurnId::new(),

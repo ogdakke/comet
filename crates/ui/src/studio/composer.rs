@@ -521,7 +521,8 @@ impl StudioPage {
             .iter()
             .find(|control| control.id.as_str() == "format")
         {
-            controls = controls.child(self.render_model_control(&model_id, format, draft, theme, cx));
+            controls =
+                controls.child(self.render_model_control(&model_id, format, draft, theme, cx));
         }
 
         for control in &model.controls {

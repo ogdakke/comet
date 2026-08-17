@@ -3648,6 +3648,9 @@ impl Shell {
                     format!("studio-conversation-row-{}", conversation.id.0).into();
                 let age: SharedString = format_time_ago(conversation.updated_at, now).into();
                 let count = conversation.turn_count;
+                let creating = conversation.creating;
+                let creating_color =
+                    spaces::status_dot_color(zeron_proto::ChatIndicator::Working, theme);
                 div()
                     .id(SharedString::from(format!(
                         "studio-conversation-{}",
@@ -3717,11 +3720,38 @@ impl Shell {
                                             .inset_0()
                                             .flex()
                                             .justify_end()
+                                            .items_center()
                                             .whitespace_nowrap()
-                                            .text_size(px(10.0))
-                                            .text_color(theme.text_muted.opacity(0.5))
                                             .group_hover(group.clone(), |style| style.opacity(0.0))
-                                            .child(age),
+                                            .child(if creating {
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap(px(4.0))
+                                                    .child(
+                                                        div()
+                                                            .size(px(6.0))
+                                                            .flex_none()
+                                                            .rounded_full()
+                                                            .bg(creating_color),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(10.0))
+                                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                                            .text_color(creating_color)
+                                                            .child(SharedString::from("Creating")),
+                                                    )
+                                                    .into_any_element()
+                                            } else {
+                                                div()
+                                                    .text_size(px(10.0))
+                                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                                    .text_color(theme.text_muted.opacity(0.5))
+                                                    .child(age)
+                                                    .into_any_element()
+                                            }),
                                     )
                                     .child(
                                         div()
@@ -3782,7 +3812,16 @@ impl Shell {
                             .child(SharedString::from(format!(
                                 "{count} generation{}",
                                 if count == 1 { "" } else { "s" }
-                            ))),
+                            )))
+                            .when(creating, |el| {
+                                el.child(div().flex_1())
+                                    .child(loaders::mini_gradient_spinner(
+                                        format!("studio-creating-{}", conversation.id.0),
+                                        2.0,
+                                        cx.entity_id(),
+                                        cx,
+                                    ))
+                            }),
                     )
                     .into_any_element()
             })

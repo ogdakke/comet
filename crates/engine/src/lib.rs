@@ -31,6 +31,7 @@ pub mod sessions;
 pub mod spaces;
 pub mod studio;
 pub mod studio_credentials;
+mod studio_preview;
 pub mod terminals;
 pub mod titles;
 pub mod uploads;
@@ -281,6 +282,7 @@ impl EngineCore {
             profile.store_root(),
             studio::DEFAULT_MAX_ARTIFACT_BYTES,
         )?);
+        StudioStore::spawn_preview_backfill(studio.clone());
         let recovered_studio_runs = studio.recover_interrupted_image_runs()?;
         if recovered_studio_runs > 0 {
             tracing::warn!(

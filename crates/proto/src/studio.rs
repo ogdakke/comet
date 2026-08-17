@@ -98,6 +98,9 @@ pub struct StudioConversationSummary {
     pub archived: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_from_turn_id: Option<StudioTurnId>,
+    /// True while at least one run is still queued, generating, or downloading.
+    #[serde(default)]
+    pub creating: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +221,13 @@ pub enum StudioRunState {
     Cancelled,
 }
 
+impl StudioRunState {
+    /// Any non-terminal generation — the sidebar "Creating" label.
+    pub fn is_creating(self) -> bool {
+        !matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StudioArtifactView {
@@ -231,6 +241,10 @@ pub struct StudioArtifactView {
     pub duration_seconds: Option<f64>,
     pub metadata: serde_json::Value,
     pub created_at: DateTime<Utc>,
+    /// Compact placeholder (standard base64 of a ThumbHash). Present once a
+    /// preview has been derived; tiles paint this if the JPEG is not in RAM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbhash: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -291,6 +305,8 @@ pub struct StudioGalleryItem {
     pub prompt: String,
     pub model_display_name: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbhash: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

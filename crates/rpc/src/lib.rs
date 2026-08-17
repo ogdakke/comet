@@ -141,6 +141,7 @@ pub mod methods {
     pub const LIST_STUDIO_MODELS: &str = "ListStudioModels";
     pub const LIST_STUDIO_CONVERSATIONS: &str = "ListStudioConversations";
     pub const LIST_STUDIO_ARTIFACTS: &str = "ListStudioArtifacts";
+    pub const WATCH_STUDIO_CONVERSATIONS: &str = "WatchStudioConversations";
     pub const WATCH_STUDIO_GALLERY: &str = "WatchStudioGallery";
     pub const CREATE_STUDIO_CONVERSATION: &str = "CreateStudioConversation";
     pub const RENAME_STUDIO_CONVERSATION: &str = "RenameStudioConversation";
@@ -154,6 +155,7 @@ pub mod methods {
     pub const RETRY_STUDIO_RUN: &str = "RetryStudioRun";
     pub const DELETE_STUDIO_ARTIFACT: &str = "DeleteStudioArtifact";
     pub const READ_STUDIO_ARTIFACT_CHUNK: &str = "ReadStudioArtifactChunk";
+    pub const READ_STUDIO_PREVIEW_CHUNK: &str = "ReadStudioPreviewChunk";
 }
 
 #[derive(Debug, thiserror::Error)]

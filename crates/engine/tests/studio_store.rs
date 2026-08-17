@@ -106,7 +106,7 @@ fn studio_catalog_is_profile_scoped_and_migrated() {
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
 }
 
 #[test]
@@ -262,6 +262,157 @@ fn complete_run_persists_sniffed_supported_mime() {
     let view = store.conversation_view(conversation.id).unwrap();
     assert_eq!(view.turns[0].runs[0].state, StudioRunState::Succeeded);
     assert_eq!(view.turns[0].runs[0].artifacts[0].mime_type, "image/jpeg");
+}
+
+fn rgb_png(width: u32, height: u32) -> Vec<u8> {
+    let mut raw = Vec::new();
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        width,
+        height,
+        image::Rgb([40, 120, 200]),
+    ))
+    .write_to(&mut std::io::Cursor::new(&mut raw), image::ImageFormat::Png)
+    .unwrap();
+    raw
+}
+
+#[test]
+fn complete_run_persists_a_preview_and_thumbhash() {
+    let root = tempdir().unwrap();
+    let store = StudioStore::open(root.path(), 1024 * 1024).unwrap();
+    let conversation = store.create_conversation("preview", None).unwrap();
+    let stored = store
+        .create_turn(
+            conversation.id,
+            "a comet",
+            None,
+            &[prepared_run(&image_model("fake"), "a comet")],
+            "device-a",
+        )
+        .unwrap();
+    store
+        .complete_run(
+            &stored[0],
+            &[ProviderArtifact {
+                media_kind: MediaKind::Image,
+                mime_type: "image/png".into(),
+                bytes: rgb_png(32, 24),
+                width: Some(32),
+                height: Some(24),
+                duration_seconds: None,
+                metadata: serde_json::json!({}),
+            }],
+        )
+        .unwrap();
+    let view = store.conversation_view(conversation.id).unwrap();
+    let artifact = &view.turns[0].runs[0].artifacts[0];
+    assert!(
+        artifact
+            .thumbhash
+            .as_ref()
+            .is_some_and(|hash| !hash.is_empty())
+    );
+    let gallery = store.list_gallery().unwrap();
+    assert_eq!(gallery[0].thumbhash, artifact.thumbhash);
+    let chunk = store.read_preview_chunk(artifact.id, 0).unwrap();
+    assert_eq!(chunk.mime_type, "image/jpeg");
+    assert!(chunk.done);
+    let preview = BASE64.decode(chunk.data).unwrap();
+    assert_eq!(&preview[..2], &[0xff, 0xd8]);
+    store.delete_artifact(artifact.id).unwrap();
+    assert!(store.read_preview_chunk(artifact.id, 0).is_err());
+}
+
+#[test]
+fn preview_read_backfills_legacy_artifacts() {
+    let root = tempdir().unwrap();
+    let store = StudioStore::open(root.path(), 1024 * 1024).unwrap();
+    let conversation = store.create_conversation("legacy", None).unwrap();
+    let stored = store
+        .create_turn(
+            conversation.id,
+            "a comet",
+            None,
+            &[prepared_run(&image_model("fake"), "a comet")],
+            "device-a",
+        )
+        .unwrap();
+    store
+        .complete_run(
+            &stored[0],
+            &[ProviderArtifact {
+                media_kind: MediaKind::Image,
+                mime_type: "image/png".into(),
+                bytes: rgb_png(16, 16),
+                width: Some(16),
+                height: Some(16),
+                duration_seconds: None,
+                metadata: serde_json::json!({}),
+            }],
+        )
+        .unwrap();
+    let id = store.list_gallery().unwrap()[0].id;
+    store
+        .connection()
+        .unwrap()
+        .execute(
+            "UPDATE studio_artifacts SET preview_relative_path = NULL, thumbhash = NULL WHERE id = ?1",
+            [id.0.to_string()],
+        )
+        .unwrap();
+    let _ = store.artifacts().delete_preview(id);
+    assert_eq!(store.artifacts_missing_previews().unwrap(), vec![id]);
+    store.ensure_preview(id).unwrap();
+    let gallery = store.list_gallery().unwrap();
+    assert!(gallery[0].thumbhash.is_some());
+    assert!(store.artifacts().preview_exists(id));
+}
+
+#[test]
+fn schema_v1_gains_a_thumbhash_column() {
+    let root = tempdir().unwrap();
+    let studio = root.path().join("studio");
+    std::fs::create_dir_all(&studio).unwrap();
+    let connection = rusqlite::Connection::open(studio.join("studio.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE studio_artifacts (
+                id TEXT PRIMARY KEY NOT NULL,
+                run_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                output_position INTEGER NOT NULL,
+                media_kind TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                content_hash TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                preview_relative_path TEXT,
+                created_at INTEGER NOT NULL
+            );
+            PRAGMA user_version = 1;
+            "#,
+        )
+        .unwrap();
+    drop(connection);
+    let store = StudioStore::open(root.path(), 1024).unwrap();
+    let version: i64 = store
+        .connection()
+        .unwrap()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+    let has_thumbhash: i64 = store
+        .connection()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('studio_artifacts') WHERE name = 'thumbhash'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(has_thumbhash, 1);
 }
 
 #[test]
@@ -1197,6 +1348,82 @@ async fn create_conversation(client: &zeron_rpc::RpcClient) -> StudioConversatio
             .unwrap(),
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn conversation_summary_marks_in_flight_runs_as_creating() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![image_model("fake")],
+        FakeSubmissionMode::Complete(vec![png_artifact()]),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+    let conversation = create_conversation(&client).await;
+    assert!(
+        !conversation.creating,
+        "a brand-new thread has nothing in flight"
+    );
+
+    let mut updates = client
+        .subscribe(
+            methods::WATCH_STUDIO_CONVERSATION,
+            serde_json::json!({ "conversationId": conversation.id }),
+        )
+        .await
+        .unwrap();
+    let _empty: StudioConversationView =
+        serde_json::from_value(updates.recv().await.unwrap()).unwrap();
+
+    let queued: StudioConversationView = serde_json::from_value(
+        client
+            .call(
+                methods::CREATE_STUDIO_TURN,
+                serde_json::json!({
+                    "conversationId": conversation.id,
+                    "prompt": "a comet above the sea",
+                    "runs": [{
+                        "providerId": "fake",
+                        "modelId": "image-model",
+                        "operation": "text_to_image",
+                        "outputCount": 1,
+                        "controls": {},
+                        "inputs": [],
+                        "manifestVersion": "fixture-v1",
+                        "displayAspectRatio": [1, 1]
+                    }]
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(queued.conversation.creating);
+    assert_eq!(queued.turns[0].runs[0].state, StudioRunState::Queued);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let view: StudioConversationView =
+                serde_json::from_value(updates.recv().await.unwrap()).unwrap();
+            if view.turns[0].runs[0].state == StudioRunState::Succeeded {
+                assert!(!view.conversation.creating);
+                break;
+            }
+        }
+    })
+    .await
+    .expect("generation should settle");
+
+    let listed: ListStudioConversationsResponse = serde_json::from_value(
+        client
+            .call(methods::LIST_STUDIO_CONVERSATIONS, serde_json::json!({}))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(listed.conversations.len(), 1);
+    assert!(!listed.conversations[0].creating);
+    engine.shutdown().await;
 }
 
 #[tokio::test]

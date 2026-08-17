@@ -28,12 +28,22 @@ use zeron_studio::{
 use crate::venice_import::{ImportReport, ImportedStudioHistory};
 
 const DATABASE_FILE: &str = "studio.sqlite3";
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const MAX_CREATE_TURN_RUNS: usize = 16;
 const MAX_TURN_RUNS: usize = 64;
 pub(crate) const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const STUDIO_CATALOG_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const ARTIFACT_READ_CHUNK_BYTES: u64 = 192_000;
+const CONVERSATION_SELECT: &str = "\
+SELECT c.id, c.title, COUNT(t.id), c.created_at, c.updated_at, c.archived_at, c.forked_from_turn_id, \
+EXISTS (\
+    SELECT 1 \
+    FROM studio_turns active_turn \
+    JOIN studio_batches active_batch ON active_batch.turn_id = active_turn.id \
+    JOIN studio_runs active_run ON active_run.batch_id = active_batch.id \
+    WHERE active_turn.conversation_id = c.id \
+      AND active_run.state NOT IN ('succeeded', 'failed', 'cancelled')\
+)";
 const ARTIFACT_FORMATS: &[(&str, &str)] = &[
     ("webp", "image/webp"),
     ("png", "image/png"),
@@ -168,6 +178,7 @@ CREATE TABLE IF NOT EXISTS studio_artifacts (
     duration_seconds REAL CHECK (duration_seconds IS NULL OR duration_seconds >= 0.0),
     metadata_json TEXT NOT NULL CHECK (json_valid(metadata_json)),
     preview_relative_path TEXT,
+    thumbhash TEXT,
     created_at INTEGER NOT NULL,
     deleted_at INTEGER,
     UNIQUE (run_id, output_position)
@@ -189,7 +200,14 @@ CREATE TABLE IF NOT EXISTS studio_run_events (
     created_at INTEGER NOT NULL
 ) STRICT;
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
+COMMIT;
+"#;
+
+const SCHEMA_V2: &str = r#"
+BEGIN IMMEDIATE;
+ALTER TABLE studio_artifacts ADD COLUMN thumbhash TEXT;
+PRAGMA user_version = 2;
 COMMIT;
 "#;
 
@@ -327,6 +345,8 @@ impl StudioStore {
         }
         if version == 0 {
             connection.execute_batch(SCHEMA_V1)?;
+        } else if version == 1 {
+            connection.execute_batch(SCHEMA_V2)?;
         }
 
         let (changes, _) = tokio::sync::watch::channel(0);
@@ -442,14 +462,13 @@ impl StudioStore {
         include_archived: bool,
     ) -> Result<Vec<StudioConversationSummary>, StudioStoreError> {
         let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT c.id, c.title, COUNT(t.id), c.created_at, c.updated_at, c.archived_at, c.forked_from_turn_id
-             FROM studio_conversations c
+        let mut statement = connection.prepare(&format!(
+            "{CONVERSATION_SELECT} FROM studio_conversations c
              LEFT JOIN studio_turns t ON t.conversation_id = c.id
              WHERE (?1 OR c.archived_at IS NULL)
              GROUP BY c.id
-             ORDER BY c.updated_at DESC, c.id DESC",
-        )?;
+             ORDER BY c.updated_at DESC, c.id DESC"
+        ))?;
         let rows = statement.query_map([include_archived], conversation_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
@@ -459,7 +478,8 @@ impl StudioStore {
         let mut statement = connection.prepare(
             "SELECT a.id, a.output_position, a.media_kind, a.mime_type, a.size_bytes,
                     a.width, a.height, a.created_at,
-                    t.conversation_id, t.id, t.prompt, r.model_manifest_json
+                    t.conversation_id, t.id, t.prompt, r.model_manifest_json,
+                    a.thumbhash
              FROM studio_artifacts a
              JOIN studio_runs r ON r.id = a.run_id
              JOIN studio_batches b ON b.id = r.batch_id
@@ -639,6 +659,7 @@ impl StudioStore {
                             .and_then(|name| name.to_str())
                             .ok_or(StudioStoreError::InvalidArtifact)?
                             .to_owned();
+                        let preview = self.artifacts.persist_preview(artifact.id, &bytes);
                         published.push((
                             artifact.id,
                             relative_path,
@@ -649,6 +670,7 @@ impl StudioStore {
                             artifact.height,
                             artifact.created_at,
                             artifact.metadata.to_string(),
+                            preview,
                         ));
                     }
                     staged.push((turn.id, run_index, published));
@@ -780,9 +802,14 @@ impl StudioStore {
                             height,
                             created_at,
                             metadata,
+                            preview,
                         ) = published;
+                        let (preview_relative_path, thumbhash) = match preview {
+                            Some((path, hash)) => (Some(path.as_str()), Some(hash.as_str())),
+                            None => (None, None),
+                        };
                         transaction.execute(
-                            "INSERT INTO studio_artifacts (id, run_id, attempt_id, output_position, media_kind, relative_path, mime_type, size_bytes, content_hash, width, height, duration_seconds, metadata_json, created_at) VALUES (?1, ?2, ?3, ?4, 'image', ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12)",
+                            "INSERT INTO studio_artifacts (id, run_id, attempt_id, output_position, media_kind, relative_path, mime_type, size_bytes, content_hash, width, height, duration_seconds, metadata_json, preview_relative_path, thumbhash, created_at) VALUES (?1, ?2, ?3, ?4, 'image', ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12, ?13, ?14)",
                             rusqlite::params![
                                 artifact_id.0.to_string(),
                                 run_id.0.to_string(),
@@ -795,6 +822,8 @@ impl StudioStore {
                                 width,
                                 height,
                                 metadata,
+                                preview_relative_path,
+                                thumbhash,
                                 if *created_at > 0 { *created_at } else { turn_created }
                             ],
                         )?;
@@ -1132,8 +1161,119 @@ impl StudioStore {
             );
             return Err(error);
         }
+        let _ = self.artifacts.delete_preview(artifact_id);
         self.notify_change();
         Ok(())
+    }
+
+    /// Derive and persist a gallery preview if one is missing. Cheap when the
+    /// JPEG and thumbhash already exist.
+    pub fn ensure_preview(&self, artifact_id: StudioArtifactId) -> Result<(), StudioStoreError> {
+        let (existing_path, existing_hash): (Option<String>, Option<String>) =
+            match self.connection()?.query_row(
+                "SELECT preview_relative_path, thumbhash FROM studio_artifacts
+                 WHERE id = ?1 AND deleted_at IS NULL AND media_kind = 'image'",
+                [artifact_id.0.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ) {
+                Ok(row) => row,
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    return Err(StudioStoreError::ArtifactNotFound);
+                }
+                Err(error) => return Err(error.into()),
+            };
+        let expected = crate::studio_preview::preview_file_name(artifact_id);
+        if existing_path.as_deref() == Some(expected.as_str())
+            && existing_hash.is_some()
+            && self.artifacts.preview_exists(artifact_id)
+        {
+            return Ok(());
+        }
+        let original = self.artifacts.read_all(artifact_id)?;
+        let Some((relative_path, thumbhash)) =
+            self.artifacts.persist_preview(artifact_id, &original)
+        else {
+            return Err(StudioStoreError::InvalidValue(
+                "could not derive a studio preview from the original".into(),
+            ));
+        };
+        self.connection()?.execute(
+            "UPDATE studio_artifacts SET preview_relative_path = ?2, thumbhash = ?3 WHERE id = ?1",
+            rusqlite::params![artifact_id.0.to_string(), relative_path, thumbhash],
+        )?;
+        Ok(())
+    }
+
+    pub fn read_preview_chunk(
+        &self,
+        artifact_id: StudioArtifactId,
+        offset: u64,
+    ) -> Result<StudioArtifactChunk, StudioStoreError> {
+        self.ensure_preview(artifact_id)?;
+        self.artifacts.read_preview_chunk(artifact_id, offset)
+    }
+
+    pub fn artifacts_missing_previews(&self) -> Result<Vec<StudioArtifactId>, StudioStoreError> {
+        let connection = self.connection()?;
+        let current = format!(
+            "%.{}.{}",
+            crate::studio_preview::GALLERY_THUMB_SHORT_EDGE,
+            crate::studio_preview::PREVIEW_EXTENSION
+        );
+        let mut statement = connection.prepare(
+            "SELECT id FROM studio_artifacts
+             WHERE deleted_at IS NULL AND media_kind = 'image'
+               AND (
+                 preview_relative_path IS NULL
+                 OR thumbhash IS NULL
+                 OR preview_relative_path NOT LIKE ?1
+               )
+             ORDER BY created_at DESC",
+        )?;
+        let rows = statement.query_map([current], |row| {
+            let id: String = row.get(0)?;
+            Uuid::parse_str(&id).map(StudioArtifactId).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn spawn_preview_backfill(store: Arc<Self>) {
+        if let Err(error) = std::thread::Builder::new()
+            .name("studio-preview-backfill".into())
+            .spawn(move || {
+                let ids = match store.artifacts_missing_previews() {
+                    Ok(ids) => ids,
+                    Err(error) => {
+                        tracing::warn!(%error, "studio preview backfill could not list artifacts");
+                        return;
+                    }
+                };
+                let mut wrote = false;
+                for id in ids {
+                    match store.ensure_preview(id) {
+                        Ok(()) => wrote = true,
+                        Err(error) => {
+                            tracing::debug!(
+                                %error,
+                                artifact = %id.0,
+                                "studio preview backfill skipped"
+                            );
+                        }
+                    }
+                }
+                if wrote {
+                    store.notify_change();
+                }
+            })
+        {
+            tracing::warn!(%error, "studio preview backfill thread failed to start");
+        }
     }
 
     pub fn prepare_retry(
@@ -1282,10 +1422,16 @@ impl StudioStore {
                 ))
             })?;
             match self.artifacts.publish(id, extension, &artifact.bytes) {
-                Ok(path) => published.push((id, path, extension, artifact, mime_type)),
+                Ok(path) => {
+                    let preview = matches!(artifact.media_kind, zeron_studio::MediaKind::Image)
+                        .then(|| self.artifacts.persist_preview(id, &artifact.bytes))
+                        .flatten();
+                    published.push((id, path, extension, artifact, mime_type, preview));
+                }
                 Err(error) => {
-                    for (id, _, extension, _, _) in &published {
+                    for (id, _, extension, _, _, _) in &published {
                         let _ = self.artifacts.delete(*id, extension);
+                        let _ = self.artifacts.delete_preview(*id);
                     }
                     return Err(error);
                 }
@@ -1296,15 +1442,21 @@ impl StudioStore {
             let mut connection = self.connection()?;
             let transaction = connection.transaction()?;
             let now = chrono::Utc::now().timestamp_millis();
-            for (position, (id, path, _, artifact, mime_type)) in published.iter().enumerate() {
+            for (position, (id, path, _, artifact, mime_type, preview)) in
+                published.iter().enumerate()
+            {
                 let relative_path = path
                     .file_name()
                     .and_then(|name| name.to_str())
                     .ok_or(StudioStoreError::InvalidArtifact)?;
                 let hash = format!("{:x}", Sha256::digest(&artifact.bytes));
+                let (preview_relative_path, thumbhash) = match preview {
+                    Some((path, hash)) => (Some(path.as_str()), Some(hash.as_str())),
+                    None => (None, None),
+                };
                 transaction.execute(
-                    "INSERT INTO studio_artifacts (id, run_id, attempt_id, output_position, media_kind, relative_path, mime_type, size_bytes, content_hash, width, height, duration_seconds, metadata_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-                    rusqlite::params![id.0.to_string(), run.run_id.0.to_string(), run.attempt_id.0.to_string(), position as i64, media_kind_name(artifact.media_kind), relative_path, mime_type, artifact.bytes.len() as i64, hash, artifact.width, artifact.height, artifact.duration_seconds, artifact.metadata.to_string(), now],
+                    "INSERT INTO studio_artifacts (id, run_id, attempt_id, output_position, media_kind, relative_path, mime_type, size_bytes, content_hash, width, height, duration_seconds, metadata_json, preview_relative_path, thumbhash, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                    rusqlite::params![id.0.to_string(), run.run_id.0.to_string(), run.attempt_id.0.to_string(), position as i64, media_kind_name(artifact.media_kind), relative_path, mime_type, artifact.bytes.len() as i64, hash, artifact.width, artifact.height, artifact.duration_seconds, artifact.metadata.to_string(), preview_relative_path, thumbhash, now],
                 )?;
             }
             transaction.execute(
@@ -1324,8 +1476,9 @@ impl StudioStore {
             Ok::<(), StudioStoreError>(())
         })();
         if result.is_err() {
-            for (id, _, extension, _, _) in &published {
+            for (id, _, extension, _, _, _) in &published {
                 let _ = self.artifacts.delete(*id, extension);
+                let _ = self.artifacts.delete_preview(*id);
             }
         }
         if result.is_ok() {
@@ -1449,7 +1602,7 @@ impl StudioStore {
             ) in run_rows
             {
                 let mut artifacts_statement = connection.prepare(
-                    "SELECT id, output_position, media_kind, mime_type, size_bytes, width, height, duration_seconds, metadata_json, created_at FROM studio_artifacts WHERE run_id = ?1 AND deleted_at IS NULL ORDER BY output_position",
+                    "SELECT id, output_position, media_kind, mime_type, size_bytes, width, height, duration_seconds, metadata_json, created_at, thumbhash FROM studio_artifacts WHERE run_id = ?1 AND deleted_at IS NULL ORDER BY output_position",
                 )?;
                 let artifacts = artifacts_statement
                     .query_map([run_id.clone()], artifact_from_row)?
@@ -1510,11 +1663,12 @@ impl StudioStore {
     ) -> Result<StudioConversationSummary, StudioStoreError> {
         self.connection()?
             .query_row(
-                "SELECT c.id, c.title, COUNT(t.id), c.created_at, c.updated_at, c.archived_at, c.forked_from_turn_id
-                 FROM studio_conversations c
-                 LEFT JOIN studio_turns t ON t.conversation_id = c.id
-                 WHERE c.id = ?1
-                 GROUP BY c.id",
+                &format!(
+                    "{CONVERSATION_SELECT} FROM studio_conversations c
+                     LEFT JOIN studio_turns t ON t.conversation_id = c.id
+                     WHERE c.id = ?1
+                     GROUP BY c.id"
+                ),
                 [id.0.to_string()],
                 conversation_from_row,
             )
@@ -1674,6 +1828,7 @@ fn gallery_item_from_row(row: &rusqlite::Row<'_>) -> Result<StudioGalleryItem, r
         turn_id: StudioTurnId(parse_uuid(9, row.get(9)?)?),
         prompt: row.get(10)?,
         model_display_name: model.display_name,
+        thumbhash: row.get(12)?,
     })
 }
 
@@ -1703,6 +1858,7 @@ fn artifact_from_row(row: &rusqlite::Row<'_>) -> Result<StudioArtifactView, rusq
         })?,
         created_at: chrono::DateTime::from_timestamp_millis(created_at)
             .ok_or(rusqlite::Error::InvalidQuery)?,
+        thumbhash: row.get(10)?,
     })
 }
 
@@ -1765,24 +1921,33 @@ fn conversation_from_row(
         forked_from_turn_id: forked
             .map(|value| parse_uuid(6, value).map(StudioTurnId))
             .transpose()?,
+        creating: row.get(7)?,
     })
 }
 
 /// ID-addressed storage. Callers never provide a path or filename.
 pub struct ArtifactStore {
     root: PathBuf,
+    preview_root: PathBuf,
     maximum_artifact_bytes: u64,
 }
 
 impl ArtifactStore {
     fn open(studio_root: &Path, maximum_artifact_bytes: u64) -> Result<Self, StudioStoreError> {
         let root = studio_root.join("artifacts");
+        let preview_root = studio_root.join("previews");
         fs::create_dir_all(&root)?;
-        if fs::symlink_metadata(&root)?.file_type().is_symlink() {
+        fs::create_dir_all(&preview_root)?;
+        if fs::symlink_metadata(&root)?.file_type().is_symlink()
+            || fs::symlink_metadata(&preview_root)?
+                .file_type()
+                .is_symlink()
+        {
             return Err(StudioStoreError::InvalidArtifact);
         }
         Ok(Self {
             root,
+            preview_root,
             maximum_artifact_bytes,
         })
     }
@@ -1934,6 +2099,133 @@ impl ArtifactStore {
             }
         }
         found.ok_or(StudioStoreError::ArtifactNotFound)
+    }
+
+    fn preview_path(&self, artifact_id: StudioArtifactId) -> PathBuf {
+        self.preview_root
+            .join(crate::studio_preview::preview_file_name(artifact_id))
+    }
+
+    pub fn preview_exists(&self, artifact_id: StudioArtifactId) -> bool {
+        let path = self.preview_path(artifact_id);
+        fs::symlink_metadata(&path)
+            .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink())
+    }
+
+    pub fn persist_preview(
+        &self,
+        artifact_id: StudioArtifactId,
+        original: &[u8],
+    ) -> Option<(String, String)> {
+        let preview = crate::studio_preview::derive_preview(original).ok()?;
+        let path = self.publish_preview(artifact_id, &preview.bytes).ok()?;
+        let name = path.file_name()?.to_str()?.to_owned();
+        Some((name, preview.thumbhash))
+    }
+
+    fn publish_preview(
+        &self,
+        artifact_id: StudioArtifactId,
+        bytes: &[u8],
+    ) -> Result<PathBuf, StudioStoreError> {
+        let destination = self.preview_path(artifact_id);
+        if let Ok(metadata) = fs::symlink_metadata(&destination) {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(StudioStoreError::InvalidArtifact);
+            }
+            return Ok(destination);
+        }
+        let temporary = self.preview_root.join(format!(
+            ".{}.tmp-{}-{}",
+            artifact_id.0,
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let write_result = (|| -> Result<(), StudioStoreError> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        let publish_result = fs::hard_link(&temporary, &destination);
+        let _ = fs::remove_file(&temporary);
+        match publish_result {
+            Ok(()) => {
+                sync_directory(&self.preview_root)?;
+                Ok(destination)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(destination),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn delete_preview(&self, artifact_id: StudioArtifactId) -> Result<(), StudioStoreError> {
+        let path = self.preview_path(artifact_id);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                Err(StudioStoreError::InvalidArtifact)
+            }
+            Ok(_) => {
+                fs::remove_file(path)?;
+                sync_directory(&self.preview_root)?;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn read_all(&self, artifact_id: StudioArtifactId) -> Result<Vec<u8>, StudioStoreError> {
+        let (path, _, _) = self.locate(artifact_id)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(StudioStoreError::InvalidArtifact);
+        }
+        Ok(fs::read(path)?)
+    }
+
+    pub fn read_preview_chunk(
+        &self,
+        artifact_id: StudioArtifactId,
+        offset: u64,
+    ) -> Result<StudioArtifactChunk, StudioStoreError> {
+        let path = self.preview_path(artifact_id);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                StudioStoreError::ArtifactNotFound
+            } else {
+                error.into()
+            }
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(StudioStoreError::InvalidArtifact);
+        }
+        let size = metadata.len();
+        let start = offset.min(size);
+        let next_offset = (start + ARTIFACT_READ_CHUNK_BYTES).min(size);
+        let mut bytes = vec![0; (next_offset - start) as usize];
+        let mut file = File::open(&path)?;
+        file.seek(std::io::SeekFrom::Start(start))?;
+        file.read_exact(&mut bytes)?;
+        Ok(StudioArtifactChunk {
+            artifact_id,
+            file_name: format!(
+                "{}.{}",
+                artifact_id.0,
+                crate::studio_preview::PREVIEW_EXTENSION
+            ),
+            mime_type: crate::studio_preview::PREVIEW_MIME.to_owned(),
+            data: BASE64.encode(bytes),
+            next_offset,
+            done: next_offset >= size,
+        })
     }
 }
 

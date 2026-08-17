@@ -242,6 +242,10 @@ impl OverlayScrollbar {
 #[derive(Default)]
 struct DragState {
     drag: Option<Drag>,
+    /// Overlay element top in window space. The list viewport is not always
+    /// the overlay parent (Studio pads the list below the titlebar), so
+    /// hit-testing must use this, not `viewport.origin.y`.
+    overlay_top: Option<f32>,
     /// Last layout fingerprint we notified on. Render reads the handle
     /// *before* the scroller's prepaint, so a content-size change (images
     /// landing, list items measuring) would leave a stale too-tall thumb
@@ -252,6 +256,9 @@ struct DragState {
 #[derive(Clone, Copy)]
 struct Drag {
     grab: f32,
+    /// Overlay top frozen at mousedown so a layout flicker cannot re-base
+    /// the thumb under the pointer.
+    container_top: f32,
 }
 
 impl RenderOnce for OverlayScrollbar {
@@ -296,9 +303,11 @@ impl RenderOnce for OverlayScrollbar {
             let scrub_move = on_scrub.clone();
             let insets = (inset_top, inset_bottom);
             canvas(
-                move |_, _, cx| {
+                move |bounds, _, cx| {
                     let key = metrics_key(source.metrics().as_ref());
+                    let overlay_top = f32::from(bounds.origin.y);
                     state.update(cx, |s, cx| {
+                        s.overlay_top = Some(overlay_top);
                         if s.layout != Some(key) {
                             s.layout = Some(key);
                             cx.notify();
@@ -326,6 +335,7 @@ impl RenderOnce for OverlayScrollbar {
                                 &source,
                                 drag.grab,
                                 f32::from(event.position.y),
+                                drag.container_top,
                                 insets.0,
                                 insets.1,
                                 on_scrub.as_deref(),
@@ -346,8 +356,13 @@ impl RenderOnce for OverlayScrollbar {
                     });
                 },
             )
-            .w(px(0.0))
-            .h(px(0.0))
+            // Pin to the overlay origin so `bounds.origin.y` is the painted
+            // track's parent, not the list viewport (which Studio insets).
+            .absolute()
+            .top_0()
+            .left_0()
+            .w(px(1.0))
+            .h(px(1.0))
         };
 
         let (rest, hover) = thumb_colors();
@@ -377,8 +392,12 @@ impl RenderOnce for OverlayScrollbar {
                         let Some(metrics) = source_down.metrics() else {
                             return;
                         };
+                        let container_top = state_down
+                            .read(cx)
+                            .overlay_top
+                            .unwrap_or_else(|| f32::from(metrics.viewport.origin.y));
                         let Some(geom) = thumb_geom(
-                            f32::from(metrics.viewport.origin.y),
+                            container_top,
                             f32::from(metrics.viewport.size.height),
                             insets.0,
                             insets.1,
@@ -398,19 +417,27 @@ impl RenderOnce for OverlayScrollbar {
                         source_down.begin_drag();
                         motion::set_hover(&hover_key, true, motion::reduced_motion(cx));
                         state_down.update(cx, |s, cx| {
-                            s.drag = Some(Drag { grab });
+                            s.drag = Some(Drag {
+                                grab,
+                                container_top,
+                            });
                             cx.notify();
                         });
-                        apply_drag(
-                            &source_down,
-                            grab,
-                            mouse_y,
-                            insets.0,
-                            insets.1,
-                            scrub_down.as_deref(),
-                            window,
-                            cx,
-                        );
+                        // Grabbing the thumb must not move it. Track clicks
+                        // still jump so the thumb centers on the pointer.
+                        if !on_thumb {
+                            apply_drag(
+                                &source_down,
+                                grab,
+                                mouse_y,
+                                container_top,
+                                insets.0,
+                                insets.1,
+                                scrub_down.as_deref(),
+                                window,
+                                cx,
+                            );
+                        }
                     }
                 })
                 .child(
@@ -462,6 +489,7 @@ fn apply_drag(
     source: &ScrollSource,
     grab: f32,
     mouse_y: f32,
+    container_top: f32,
     inset_top: f32,
     inset_bottom: f32,
     on_scrub: Option<&dyn Fn(&mut Window, &mut App)>,
@@ -472,7 +500,7 @@ fn apply_drag(
         return;
     };
     let Some(geom) = thumb_geom(
-        f32::from(metrics.viewport.origin.y),
+        container_top,
         f32::from(metrics.viewport.size.height),
         inset_top,
         inset_bottom,
@@ -566,6 +594,43 @@ mod tests {
         // thumb must stay on the track (same mapping as an out-of-window drag).
         assert!(offset_for_mouse(-200.0, grab, geom, 800.0) < 1.0);
         assert!((offset_for_mouse(2000.0, grab, geom, 800.0) - 800.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn thumb_grab_uses_overlay_top_not_viewport_top() {
+        // Studio pads the list below the titlebar; the overlay still covers
+        // the parent. A click on the painted thumb must not re-map offset.
+        let overlay_top = 0.0;
+        let viewport_top = 38.0;
+        let height = 400.0;
+        let inset_top = 38.0;
+        // Long feed: thumb is MIN_THUMB, so the 38px viewport shift is
+        // larger than the thumb and a painted-thumb click misses the
+        // viewport-based hit box (the jump in the studio recording).
+        let offset = 2000.0;
+        let max = 10_000.0;
+
+        let paint = thumb_geom(viewport_top, height, inset_top, 0.0, offset, max).unwrap();
+        let visual_thumb_top = overlay_top + inset_top + (paint.thumb_top - paint.track_top);
+        let click = visual_thumb_top + paint.thumb_height * 0.4;
+
+        let hit = thumb_geom(overlay_top, height, inset_top, 0.0, offset, max).unwrap();
+        assert!(
+            click >= hit.thumb_top && click <= hit.thumb_top + hit.thumb_height,
+            "click on the painted thumb must register as a grab"
+        );
+        let grab = click - hit.thumb_top;
+        let new_offset = offset_for_mouse(click, grab, hit, max);
+        assert!(
+            (new_offset - offset).abs() < 1e-2,
+            "thumb grab jumped offset {new_offset}, want {offset}"
+        );
+
+        let wrong = thumb_geom(viewport_top, height, inset_top, 0.0, offset, max).unwrap();
+        assert!(
+            click < wrong.thumb_top || click > wrong.thumb_top + wrong.thumb_height,
+            "mapping from the list viewport is the studio click-jump"
+        );
     }
 
     #[test]

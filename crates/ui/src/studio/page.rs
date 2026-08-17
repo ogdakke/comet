@@ -88,10 +88,10 @@ pub struct StudioPage {
     pub(super) inspector_scroll: gpui::ScrollHandle,
     pub(super) images: StudioImages,
     pub(super) loading_images: HashSet<StudioArtifactId>,
-    /// In-flight image reads that must retain the original encoded frame.
-    /// A thumb read can be promoted when hover/open happens before it finishes.
+    /// In-flight original reads for hover/lightbox. Independent of preview reads.
     pub(super) loading_full_images: HashSet<StudioArtifactId>,
     pub(super) image_failed: HashSet<StudioArtifactId>,
+    pub(super) preview_failed: HashSet<StudioArtifactId>,
     pub(super) image_protect: HashSet<StudioArtifactId>,
     pub(super) gallery: Vec<StudioGalleryItem>,
     pub(super) gallery_list: gpui::ListState,
@@ -122,9 +122,11 @@ pub struct StudioPage {
     pub(super) error: Option<SharedString>,
     pub(super) load_task: Option<Task<()>>,
     pub(super) watch_task: Option<Task<()>>,
+    pub(super) conversations_watch_task: Option<Task<()>>,
     pub(super) gallery_watch_task: Option<Task<()>>,
     pub(super) action_task: Option<Task<()>>,
     pub(super) image_tasks: HashMap<StudioArtifactId, Task<()>>,
+    pub(super) full_image_tasks: HashMap<StudioArtifactId, Task<()>>,
     pub(super) _observe: Subscription,
     pub(super) _prompt_events: Subscription,
     pub(super) _model_search_events: Subscription,
@@ -238,9 +240,12 @@ impl StudioPage {
             error: None,
             load_task: None,
             watch_task: None,
+            conversations_watch_task: None,
             gallery_watch_task: None,
             action_task: None,
             image_tasks: HashMap::new(),
+            full_image_tasks: HashMap::new(),
+            preview_failed: HashSet::new(),
             _observe: observe,
             _prompt_events: prompt_events,
             _model_search_events: model_search_events,
@@ -302,6 +307,7 @@ impl StudioPage {
                         page.apply_remembered_or_default_models();
                         page.persist_composer_defaults(cx);
                         page.refresh_account_balance(cx, false);
+                        page.watch_conversations(cx);
                         page.watch_gallery(cx);
                         cx.emit(StudioEvent::SidebarChanged);
                     }
@@ -395,6 +401,64 @@ impl StudioPage {
         {
             view.conversation = summary;
         }
+    }
+
+    fn apply_conversation_list(
+        &mut self,
+        conversations: Vec<StudioConversationSummary>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.conversations == conversations {
+            return;
+        }
+        self.conversations = conversations;
+        if let Some(view) = self.conversation.as_mut()
+            && let Some(summary) = self
+                .conversations
+                .iter()
+                .find(|item| item.id == view.conversation.id)
+        {
+            view.conversation = summary.clone();
+        }
+        cx.emit(StudioEvent::SidebarChanged);
+    }
+
+    fn watch_conversations(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        self.conversations_watch_task = Some(cx.spawn(async move |this, cx| {
+            let stream = engine
+                .client()
+                .subscribe(methods::WATCH_STUDIO_CONVERSATIONS, serde_json::json!({}))
+                .await;
+            let mut stream = match stream {
+                Ok(stream) => stream,
+                Err(error) => {
+                    this.update(cx, |page, cx| {
+                        page.error = Some(error.to_string().into());
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            while let Some(value) = stream.recv().await {
+                let Ok(list) = serde_json::from_value::<ListStudioConversationsResponse>(value)
+                else {
+                    continue;
+                };
+                if this
+                    .update(cx, |page, cx| {
+                        page.apply_conversation_list(list.conversations, cx);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
     }
 
     pub fn open_conversation(&mut self, id: StudioConversationId, cx: &mut Context<Self>) {
@@ -589,7 +653,9 @@ impl StudioPage {
         self.loading_images.remove(&artifact_id);
         self.loading_full_images.remove(&artifact_id);
         self.image_failed.remove(&artifact_id);
+        self.preview_failed.remove(&artifact_id);
         self.image_tasks.remove(&artifact_id);
+        self.full_image_tasks.remove(&artifact_id);
         self.gallery.retain(|item| item.id != artifact_id);
         self.gallery_selected.remove(&artifact_id);
         if self.gallery_anchor == Some(artifact_id) {

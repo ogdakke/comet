@@ -2,8 +2,8 @@ use zeron_proto::{
     ExtendStudioTurnRequest, ListStudioArtifactsResponse, ListStudioProvidersResponse,
     ProviderValidationState, QuoteStudioBatchResponse, QuoteStudioRunView,
     ReadStudioArtifactChunkRequest, SetStudioProviderCredentialRequest,
-    SetStudioProviderPreferencesRequest, StudioGalleryItem, StudioProviderBalanceResponse,
-    StudioProviderConnection,
+    SetStudioProviderPreferencesRequest, StudioConversationSummary, StudioGalleryItem,
+    StudioProviderBalanceResponse, StudioProviderConnection, StudioRunState,
 };
 use zeron_studio::{
     AccountBalance, MediaKind, Quote, StudioArtifactId, StudioConversationId, StudioTurnId,
@@ -108,6 +108,31 @@ fn quote_batch_uses_camel_case_wire_shape() {
 }
 
 #[test]
+fn conversation_summary_defaults_creating_to_false() {
+    let json = serde_json::json!({
+        "id": StudioConversationId::new(),
+        "title": "Comet studies",
+        "turnCount": 0,
+        "createdAt": "2026-01-01T00:00:00Z",
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "archived": false
+    });
+    let summary: StudioConversationSummary = serde_json::from_value(json).unwrap();
+    assert!(!summary.creating);
+}
+
+#[test]
+fn in_flight_run_states_count_as_creating() {
+    assert!(StudioRunState::Queued.is_creating());
+    assert!(StudioRunState::Running.is_creating());
+    assert!(StudioRunState::Downloading.is_creating());
+    assert!(StudioRunState::Cancelling.is_creating());
+    assert!(!StudioRunState::Succeeded.is_creating());
+    assert!(!StudioRunState::Failed.is_creating());
+    assert!(!StudioRunState::Cancelled.is_creating());
+}
+
+#[test]
 fn gallery_items_use_camel_case_wire_shape() {
     let response = ListStudioArtifactsResponse {
         artifacts: vec![StudioGalleryItem {
@@ -123,6 +148,7 @@ fn gallery_items_use_camel_case_wire_shape() {
             prompt: "a comet".into(),
             model_display_name: "Image model".into(),
             created_at: chrono::Utc::now(),
+            thumbhash: Some("3OcRJYB4d3h/iIeHeEh3eIhw+j3A".into()),
         }],
     };
     let json = serde_json::to_value(response).unwrap();
@@ -131,5 +157,11 @@ fn gallery_items_use_camel_case_wire_shape() {
     assert!(json["artifacts"][0].get("modelDisplayName").is_some());
     assert!(json["artifacts"][0].get("sizeBytes").is_some());
     assert!(json["artifacts"][0].get("createdAt").is_some());
+    assert_eq!(
+        json["artifacts"][0]
+            .get("thumbhash")
+            .and_then(|v| v.as_str()),
+        Some("3OcRJYB4d3h/iIeHeEh3eIhw+j3A")
+    );
     assert!(json["artifacts"][0].get("conversation_id").is_none());
 }

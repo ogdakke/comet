@@ -1291,6 +1291,30 @@ impl RpcService for EngineRpc {
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&ListStudioConversationsResponse { conversations })
             }
+            methods::WATCH_STUDIO_CONVERSATIONS => {
+                let changes = self.studio.subscribe_changes();
+                let store = self.studio.clone();
+                let stream = futures::stream::unfold(
+                    (changes, store, true),
+                    |(mut changes, store, first)| async move {
+                        if !first && changes.changed().await.is_err() {
+                            return None;
+                        }
+                        let value =
+                            store
+                                .list_conversations(false)
+                                .ok()
+                                .and_then(|conversations| {
+                                    serde_json::to_value(ListStudioConversationsResponse {
+                                        conversations,
+                                    })
+                                    .ok()
+                                })?;
+                        Some((value, (changes, store, false)))
+                    },
+                );
+                Ok(RpcReply::Stream(stream.boxed()))
+            }
             methods::LIST_STUDIO_ARTIFACTS => {
                 let artifacts = self
                     .studio
@@ -1498,6 +1522,14 @@ impl RpcService for EngineRpc {
                     .studio
                     .artifacts()
                     .read_chunk(request.artifact_id, request.offset)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&chunk)
+            }
+            methods::READ_STUDIO_PREVIEW_CHUNK => {
+                let request: ReadStudioArtifactChunkRequest = parse_params(params)?;
+                let chunk = self
+                    .studio
+                    .read_preview_chunk(request.artifact_id, request.offset)
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 RpcReply::value(&chunk)
             }
