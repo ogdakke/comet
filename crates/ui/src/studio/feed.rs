@@ -2,9 +2,11 @@
 //!
 //! One [`gpui::ListState`] item per turn — the same variable-height list the
 //! agent transcript uses — so long conversations keep measured heights and only
-//! paint the visible window plus overdraw. Image fetches follow the gallery:
-//! visible turns load preview thumbs, neighbors prefetch more thumbs.
+//! paint the visible window plus overdraw. Off-screen tiles load 512 previews;
+//! tiles that intersect the reading band fetch the original and paint a 1280px
+//! display frame so large thread images stay sharp without 4K GPU textures.
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
@@ -25,7 +27,7 @@ use crate::state::format_time_ago;
 use crate::theme::Theme;
 use crate::transcript::{self, format_timestamp};
 
-use super::artifact::contain_image;
+use super::artifact::{StudioPaint, contain_image};
 use super::page::StudioPage;
 
 /// Scroll runway below the final Studio turn. The composer floats 18px above
@@ -48,6 +50,13 @@ const FEED_TURN_GAP: f32 = 28.0;
 const FEED_OVERDRAW_PX: f32 = 720.0;
 /// Turns above and below the visible range that prefetch thumbs.
 const FEED_PREFETCH_TURNS: usize = 2;
+/// Extra band around the reading window that decodes display frames. Smaller
+/// than [`FEED_OVERDRAW_PX`] — those pixels already have 512 previews.
+const FEED_FULL_OVERDRAW_PX: f32 = 200.0;
+/// Hard cap so a layout miss cannot pin dozens of 1280px GPU tiles.
+const FEED_DISPLAY_MAX: usize = 12;
+/// Opening a conversation, before the list has measured: last-turn images only.
+const FEED_DISPLAY_FALLBACK_MAX: usize = 8;
 /// Horizontal inset matching the previous overflow-scroll padding.
 pub(super) const FEED_PAD_X: f32 = 24.0;
 /// Collapsed prompt bubble: three rows of chat-bubble type, then Show more.
@@ -247,7 +256,7 @@ pub(super) fn artifact_feed_target(
     let turn_ix = turn_index_for_artifact(turns, artifact_id)?;
     let turn = &turns[turn_ix];
     let columns = columns.max(1);
-    let header = estimated_turn_header(turn, content_width);
+    let header = estimated_turn_header(turn, content_width, false);
     let mut slot = 0usize;
     for run in &turn.runs {
         for (_, id) in feed_output_slots(run) {
@@ -269,15 +278,52 @@ pub(super) fn artifact_feed_target(
     })
 }
 
-fn estimated_turn_header(turn: &StudioTurnView, content_width: f32) -> f32 {
+fn estimated_turn_header(turn: &StudioTurnView, content_width: f32, expanded: bool) -> f32 {
     let bubble_width = content_width
         .min(1600.0)
         .min(crate::transcript::MAX_CONTENT_WIDTH * 0.8);
     let inner = (bubble_width - PROMPT_BUBBLE_PAD_X * 2.0).max(1.0);
-    let lines = prompt_visual_lines_at(&turn.prompt, inner, PROMPT_AVG_CHAR_ADVANCE)
-        .clamp(1, PROMPT_COLLAPSED_LINES);
+    let visual = prompt_visual_lines_at(&turn.prompt, inner, PROMPT_AVG_CHAR_ADVANCE);
+    let lines = if expanded {
+        visual.max(1)
+    } else {
+        visual.clamp(1, PROMPT_COLLAPSED_LINES)
+    };
     let prompt_h = 20.0 + lines as f32 * PROMPT_LINE_HEIGHT;
     prompt_h + 8.0 + 24.0 + 12.0
+}
+
+pub(super) fn feed_tile_vertical_span(
+    turn_top: f32,
+    header: f32,
+    slot: usize,
+    columns: usize,
+    tile_h: f32,
+    gap: f32,
+) -> (f32, f32) {
+    let row = slot / columns.max(1);
+    let top = turn_top + header + row as f32 * (tile_h + gap);
+    (top, top + tile_h)
+}
+
+/// Tiles that intersect `band`, nearest the band center first, capped at `max`.
+pub(super) fn feed_display_ids_in_band(
+    tiles: &[(StudioArtifactId, f32, f32)],
+    band_top: f32,
+    band_bottom: f32,
+    max: usize,
+) -> Vec<StudioArtifactId> {
+    if max == 0 {
+        return Vec::new();
+    }
+    let mid = (band_top + band_bottom) * 0.5;
+    let mut hit: Vec<(StudioArtifactId, f32)> = tiles
+        .iter()
+        .filter(|(_, top, bottom)| *bottom > band_top && *top < band_bottom)
+        .map(|(id, top, bottom)| (*id, ((*top + *bottom) * 0.5 - mid).abs()))
+        .collect();
+    hit.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    hit.into_iter().take(max).map(|(id, _)| id).collect()
 }
 
 /// Height-affecting identity of the feed. Remeasure only when this changes
@@ -586,7 +632,12 @@ impl StudioPage {
             );
         }
         if let Some(id) = artifact_id {
-            let (image, full) = self.display_layers(id, false, window, cx);
+            let paint = if self.feed_viewport_fulls.contains(&id) {
+                StudioPaint::Display
+            } else {
+                StudioPaint::Thumb
+            };
+            let (image, full) = self.display_layers(id, paint, window, cx);
             if let Some(image) = image {
                 return base
                     .relative()
@@ -702,6 +753,7 @@ impl StudioPage {
     pub(super) fn reset_feed_list(&mut self) {
         self.feed_list.reset(0);
         self.feed_visible_rows = 0..0;
+        self.feed_viewport_fulls.clear();
         self.feed_layout_sig = None;
         self.feed_columns = 0;
         self.scroll_task = None;
@@ -846,12 +898,112 @@ impl StudioPage {
                 thumbs.push(id);
             }
         }
-        self.image_protect = visible.iter().chain(thumbs.iter()).copied().collect();
+        let fulls: Vec<_> = self.feed_viewport_fulls.iter().copied().collect();
+        self.image_protect = visible
+            .iter()
+            .chain(thumbs.iter())
+            .chain(fulls.iter())
+            .copied()
+            .collect();
         self.image_protect
             .extend(self.loading_images.iter().copied());
+        self.image_protect
+            .extend(self.loading_full_images.iter().copied());
+        self.image_protect
+            .extend(self.loading_displays.iter().copied());
         self.warm_placeholders(visible.iter().chain(thumbs.iter()).copied());
         self.request_images(visible, false, cx);
         self.request_images(thumbs, false, cx);
+        if !fulls.is_empty() {
+            self.request_images(fulls.clone(), true, cx);
+            self.ensure_feed_displays(fulls, cx);
+        }
+    }
+
+    /// Recompute which tiles intersect the reading band. Safe only when the
+    /// list is not already borrowed (render / scrollbar, not the wheel handler).
+    pub(super) fn sync_feed_viewport_fulls(&mut self) {
+        let next = self.compute_feed_viewport_full_ids();
+        let next_set: HashSet<_> = next.into_iter().collect();
+        for id in self.feed_viewport_fulls.difference(&next_set) {
+            if let Some(image) = self.images.get_display(id) {
+                self.images.release_gpu(image);
+            }
+        }
+        self.feed_viewport_fulls = next_set;
+    }
+
+    fn compute_feed_viewport_full_ids(&self) -> Vec<StudioArtifactId> {
+        let turns = self.feed_turns();
+        if turns.is_empty() {
+            return Vec::new();
+        }
+        let visible = feed_visible_or_tail(self.feed_visible_rows.clone(), turns.len());
+        let list = &self.feed_list;
+        let viewport = list.viewport_bounds();
+        let viewport_h = f32::from(viewport.size.height);
+        if viewport_h < 1.0 {
+            let mut fallback = feed_image_ids(turns, visible);
+            fallback.truncate(FEED_DISPLAY_FALLBACK_MAX);
+            return fallback;
+        }
+        let band_top = f32::from(viewport.top()) - FEED_FULL_OVERDRAW_PX;
+        // The composer covers the bottom of the list. Tiles under that glass
+        // stay on 512 previews until they enter the reading band.
+        let band_bottom = f32::from(viewport.bottom()) - STUDIO_READING_BOTTOM_INSET;
+        let width = self.feed_width.max(1.0);
+        let rail = if self.rail_should_show(width) {
+            STUDIO_RAIL_GUTTER
+        } else {
+            0.0
+        };
+        let available = (width - FEED_PAD_X * 2.0 - rail).clamp(240.0, 1600.0);
+        let columns = self.feed_columns.max(1);
+        let gap = if available < 520.0 { 12.0 } else { 16.0 };
+        let tile_width = (available - gap * (columns.saturating_sub(1) as f32)) / columns as f32;
+
+        let start = visible.start.saturating_sub(1);
+        let end = visible.end.saturating_add(1).min(turns.len());
+        let mut tiles = Vec::new();
+        let mut any_bounds = false;
+        for turn_ix in start..end {
+            let Some(bounds) = list.bounds_for_item(turn_ix) else {
+                continue;
+            };
+            any_bounds = true;
+            let turn = &turns[turn_ix];
+            let expanded = self.expanded_prompts.contains(&turn.id);
+            let header = estimated_turn_header(turn, available, expanded);
+            let turn_top = f32::from(bounds.top());
+            let mut slot = 0usize;
+            for run in &turn.runs {
+                let (aw, ah) = run.display_aspect_ratio;
+                let tile_h = tile_width * ah as f32 / aw.max(1) as f32;
+                for (_, id) in feed_output_slots(run) {
+                    if let Some(id) = id
+                        && run.artifacts.iter().any(|artifact| {
+                            artifact.id == id && artifact.media_kind == MediaKind::Image
+                        })
+                    {
+                        let (top, bottom) =
+                            feed_tile_vertical_span(turn_top, header, slot, columns, tile_h, gap);
+                        tiles.push((id, top, bottom));
+                    }
+                    slot += 1;
+                }
+            }
+        }
+        if !any_bounds {
+            let mut fallback = feed_image_ids(turns, visible);
+            fallback.truncate(FEED_DISPLAY_FALLBACK_MAX);
+            return fallback;
+        }
+        feed_display_ids_in_band(
+            &tiles,
+            band_top,
+            band_bottom.max(band_top + 1.0),
+            FEED_DISPLAY_MAX,
+        )
     }
 
     /// Smooth-scroll the feed so `turn_ix` sits at the viewport top — same
@@ -998,6 +1150,7 @@ impl StudioPage {
         if has_turns {
             // Render is outside the list's layout borrow.
             self.sync_feed_visible_rows();
+            self.sync_feed_viewport_fulls();
             self.request_visible_feed_images(cx);
         }
         let rail = self.render_studio_rail(window, theme, cx);
@@ -1100,6 +1253,7 @@ impl StudioPage {
                             scrub
                                 .update(cx, |page: &mut StudioPage, cx| {
                                     page.sync_feed_visible_rows();
+                                    page.sync_feed_viewport_fulls();
                                     page.request_visible_feed_images(cx);
                                     cx.notify();
                                 })
@@ -1791,6 +1945,56 @@ mod tests {
             second_target.offset
         );
         assert!((second_target.offset - first_target.offset - 216.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn feed_tile_span_stacks_rows() {
+        let (top, bottom) = feed_tile_vertical_span(100.0, 80.0, 0, 2, 200.0, 16.0);
+        assert!((top - 180.0).abs() < 0.01);
+        assert!((bottom - 380.0).abs() < 0.01);
+        let second_row = feed_tile_vertical_span(100.0, 80.0, 2, 2, 200.0, 16.0);
+        assert!((second_row.0 - 396.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn feed_display_ids_only_take_tiles_in_the_reading_band() {
+        let a = zeron_studio::StudioArtifactId::new();
+        let b = zeron_studio::StudioArtifactId::new();
+        let c = zeron_studio::StudioArtifactId::new();
+        let d = zeron_studio::StudioArtifactId::new();
+        let tiles = [
+            (a, 0.0, 200.0),
+            (b, 216.0, 416.0),
+            (c, 432.0, 632.0),
+            (d, 648.0, 848.0),
+        ];
+        // Band covers the middle two rows of a tall turn.
+        let hit = feed_display_ids_in_band(&tiles, 250.0, 600.0, 12);
+        assert_eq!(hit.len(), 2);
+        assert!(hit.contains(&b));
+        assert!(hit.contains(&c));
+        assert!(!hit.contains(&a));
+        assert!(!hit.contains(&d));
+    }
+
+    #[test]
+    fn feed_display_ids_cap_nearest_the_band_center() {
+        let ids: Vec<_> = (0..8)
+            .map(|_| zeron_studio::StudioArtifactId::new())
+            .collect();
+        let tiles: Vec<_> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let top = i as f32 * 200.0;
+                (*id, top, top + 180.0)
+            })
+            .collect();
+        // Band covers everything; keep the two closest to the middle.
+        let hit = feed_display_ids_in_band(&tiles, 0.0, 1600.0, 2);
+        assert_eq!(hit.len(), 2);
+        assert!(hit.contains(&ids[3]));
+        assert!(hit.contains(&ids[4]));
     }
 
     #[test]

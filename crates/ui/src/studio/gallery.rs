@@ -15,8 +15,8 @@ use crate::theme::{Theme, hairline};
 
 use super::StudioEvent;
 use super::artifact::{
-    cover_image, downsample_gallery_thumb, read_artifact_bytes, read_preview_bytes,
-    write_artifact_file,
+    StudioPaint, cover_image, downsample_feed_display, downsample_gallery_thumb,
+    read_artifact_bytes, read_preview_bytes, write_artifact_file,
 };
 use super::page::StudioPage;
 
@@ -29,7 +29,7 @@ const GALLERY_CHECK: f32 = 20.0;
 /// Preview JPEGs are tens of kilobytes. Originals stay at two because they
 /// are multi-megabyte PNG/WebP decodes.
 const MAX_IN_FLIGHT_PREVIEWS: usize = 8;
-const MAX_IN_FLIGHT_FULL: usize = 2;
+const MAX_IN_FLIGHT_FULL: usize = 3;
 /// Synchronous runway on every scroll update. Three rows either side is a
 /// fling's worth without pinning hundreds of decoded tiles in the GPU atlas.
 const PREFETCH_ROWS: usize = 3;
@@ -459,6 +459,46 @@ impl StudioPage {
         self.image_tasks.insert(id, task);
     }
 
+    fn spawn_feed_display(&mut self, id: StudioArtifactId, cx: &mut Context<Self>) {
+        if self.images.contains_display(&id) || self.loading_displays.contains(&id) {
+            return;
+        }
+        let Some(full) = self.images.get_full(&id) else {
+            return;
+        };
+        self.loading_displays.insert(id);
+        let bytes = full.bytes.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let display = cx
+                .background_executor()
+                .spawn(async move { downsample_feed_display(bytes) })
+                .await
+                .ok();
+            this.update(cx, |page, cx| {
+                page.loading_displays.remove(&id);
+                if let Some(display) = display {
+                    page.images.insert_display(id, display);
+                }
+                page.display_tasks.remove(&id);
+                page.images.evict(&page.image_protect);
+                page.request_visible_gallery_images(cx);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.display_tasks.insert(id, task);
+    }
+
+    pub(super) fn ensure_feed_displays(
+        &mut self,
+        ids: impl IntoIterator<Item = StudioArtifactId>,
+        cx: &mut Context<Self>,
+    ) {
+        for id in ids {
+            self.spawn_feed_display(id, cx);
+        }
+    }
+
     fn request_originals(&mut self, ids: Vec<StudioArtifactId>, cx: &mut Context<Self>) {
         let Some(engine) = self.engine(cx) else {
             return;
@@ -507,6 +547,9 @@ impl StudioPage {
                             page.images.insert_full(id, full_image);
                             if let Some(thumb) = thumb {
                                 page.images.insert_thumb(id, thumb);
+                            }
+                            if page.feed_viewport_fulls.contains(&id) {
+                                page.spawn_feed_display(id, cx);
                             }
                         }
                         Err(_) => {
@@ -1016,7 +1059,7 @@ impl StudioPage {
     ) -> AnyElement {
         let id = item.id;
         let selected = self.gallery_selected.contains(&id);
-        let (image, full) = self.display_layers(id, false, window, cx);
+        let (image, full) = self.display_layers(id, StudioPaint::Thumb, window, cx);
         let checkbox = div()
             .id(SharedString::from(format!("studio-gallery-check-{}", id.0)))
             .absolute()

@@ -440,26 +440,79 @@ pub(super) fn write_artifact_file(destination: PathBuf, bytes: Vec<u8>) -> Resul
     std::fs::write(destination, bytes).map_err(|error| error.to_string())
 }
 
+/// Which sharp overlay a surface may GPU-upload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StudioPaint {
+    /// Gallery, filmstrip, off-screen thread tiles: 512 preview only.
+    Thumb,
+    /// Visible thread tiles: 1280 display frame derived from the original.
+    Display,
+    /// Lightbox: native original.
+    Full,
+}
+
 /// Minimum short edge retained for a gallery preview. The old longest-edge
 /// thumbnail left only ~288 source pixels across the short edge of a common
 /// 16:9 image, then enlarged that crop into a ~250px Retina tile.
 const GALLERY_THUMB_SHORT_EDGE: u32 = 512;
 /// Bound panoramas and unusually tall images without changing their aspect.
 const GALLERY_THUMB_LONG_EDGE: u32 = 1536;
+/// Thread tiles are ~400–520 CSS px; 1280 covers 2× Retina without keeping a
+/// 4K RGBA bitmap (~30–64MB) on every cell.
+const FEED_DISPLAY_SHORT_EDGE: u32 = 1280;
+const FEED_DISPLAY_LONG_EDGE: u32 = 2048;
 
-fn gallery_thumb_dimensions(width: u32, height: u32) -> (u32, u32) {
+fn fit_image_dimensions(width: u32, height: u32, max_short: u32, max_long: u32) -> (u32, u32) {
     let short = width.min(height);
     let long = width.max(height);
-    if short <= GALLERY_THUMB_SHORT_EDGE && long <= GALLERY_THUMB_LONG_EDGE {
+    if short <= max_short && long <= max_long {
         return (width, height);
     }
-    let scale_for_short = GALLERY_THUMB_SHORT_EDGE as f64 / short.max(1) as f64;
-    let scale_for_long = GALLERY_THUMB_LONG_EDGE as f64 / long.max(1) as f64;
+    let scale_for_short = max_short as f64 / short.max(1) as f64;
+    let scale_for_long = max_long as f64 / long.max(1) as f64;
     let scale = scale_for_short.min(scale_for_long).min(1.0);
     (
         (width as f64 * scale).round().max(1.0) as u32,
         (height as f64 * scale).round().max(1.0) as u32,
     )
+}
+
+fn gallery_thumb_dimensions(width: u32, height: u32) -> (u32, u32) {
+    fit_image_dimensions(
+        width,
+        height,
+        GALLERY_THUMB_SHORT_EDGE,
+        GALLERY_THUMB_LONG_EDGE,
+    )
+}
+
+fn feed_display_dimensions(width: u32, height: u32) -> (u32, u32) {
+    fit_image_dimensions(
+        width,
+        height,
+        FEED_DISPLAY_SHORT_EDGE,
+        FEED_DISPLAY_LONG_EDGE,
+    )
+}
+
+fn encode_jpeg_at(
+    image: image::DynamicImage,
+    width: u32,
+    height: u32,
+) -> Result<Arc<Image>, String> {
+    let resized = if image.width() == width && image.height() == height {
+        image
+    } else {
+        image.resize_exact(width, height, image::imageops::FilterType::Triangle)
+    };
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    resized
+        .write_to(&mut encoded, image::ImageFormat::Jpeg)
+        .map_err(|error| error.to_string())?;
+    Ok(Arc::new(Image::from_bytes(
+        ImageFormat::Jpeg,
+        encoded.into_inner(),
+    )))
 }
 
 pub(super) fn downsample_gallery_thumb(bytes: Vec<u8>) -> Result<Arc<Image>, String> {
@@ -468,15 +521,13 @@ pub(super) fn downsample_gallery_thumb(bytes: Vec<u8>) -> Result<Arc<Image>, Str
     // and filmstrip tiles use Cover. Sizing from the short edge gives cover
     // crops a 2×+ pixel buffer without retaining the original frame.
     let (width, height) = gallery_thumb_dimensions(image.width(), image.height());
-    let thumb = image.resize_exact(width, height, image::imageops::FilterType::Triangle);
-    let mut encoded = std::io::Cursor::new(Vec::new());
-    thumb
-        .write_to(&mut encoded, image::ImageFormat::Jpeg)
-        .map_err(|error| error.to_string())?;
-    Ok(Arc::new(Image::from_bytes(
-        ImageFormat::Jpeg,
-        encoded.into_inner(),
-    )))
+    encode_jpeg_at(image, width, height)
+}
+
+pub(super) fn downsample_feed_display(bytes: Vec<u8>) -> Result<Arc<Image>, String> {
+    let image = image::load_from_memory(&bytes).map_err(|error| error.to_string())?;
+    let (width, height) = feed_display_dimensions(image.width(), image.height());
+    encode_jpeg_at(image, width, height)
 }
 
 pub(super) async fn read_preview_bytes(
@@ -1057,44 +1108,60 @@ impl StudioPage {
 
     /// Layers for a tile or lightbox slide.
     ///
-    /// Tiles (`full = false`) never upload the original — a hover-prefetched
-    /// full-res frame is tens of megabytes of Metal texture per cell.
-    /// The lightbox (`full = true`) shows the thumb first, then the original.
+    /// The thumbhash (or 512 preview) stays mounted as the base. A sharper
+    /// overlay is added only after `use_render_image` has a GPU tile, so
+    /// promoting never paints an empty frame.
     pub(super) fn display_layers(
         &self,
         id: StudioArtifactId,
-        full: bool,
+        paint: StudioPaint,
         window: &mut Window,
         cx: &mut gpui::App,
     ) -> (Option<Arc<Image>>, Option<Arc<Image>>) {
         let placeholder = self.images.get_placeholder(&id);
         let thumb = self.images.get_thumb_only(&id);
-        if !full {
-            // Keep the thumbhash mounted. Swapping the FittedImage source to
-            // the JPEG before it has a GPU tile paints one empty frame.
-            if let Some(placeholder) = placeholder {
-                let _ = placeholder.clone().use_render_image(window, cx);
-                let overlay = thumb
-                    .and_then(|thumb| thumb.clone().use_render_image(window, cx).map(|_| thumb));
-                return (Some(placeholder), overlay);
-            }
-            if let Some(thumb) = thumb {
-                let _ = thumb.clone().use_render_image(window, cx);
-                return (Some(thumb), None);
-            }
-            return (None, None);
+        let sharp = match paint {
+            StudioPaint::Thumb => None,
+            StudioPaint::Display => self.images.get_display(&id),
+            StudioPaint::Full => self.images.get_full(&id),
+        };
+
+        if let Some(placeholder) = placeholder {
+            let _ = placeholder.clone().use_render_image(window, cx);
+            let overlay = match &sharp {
+                Some(image) if image.clone().use_render_image(window, cx).is_some() => {
+                    Some(image.clone())
+                }
+                _ => match &thumb {
+                    Some(image) if image.clone().use_render_image(window, cx).is_some() => {
+                        Some(image.clone())
+                    }
+                    _ => None,
+                },
+            };
+            return (Some(placeholder), overlay);
         }
-        let base = thumb.or_else(|| self.images.get_thumb(&id)).or(placeholder);
+
+        let base = match paint {
+            StudioPaint::Full => thumb
+                .clone()
+                .or_else(|| self.images.get_thumb(&id))
+                .or_else(|| sharp.clone()),
+            StudioPaint::Display => thumb.clone().or_else(|| sharp.clone()),
+            StudioPaint::Thumb => thumb.clone(),
+        };
         if let Some(base) = base.as_ref() {
             let _ = base.clone().use_render_image(window, cx);
         }
-        let overlay = self.images.get_full(&id).and_then(|image| {
-            let same_as_base = base.as_ref().is_some_and(|base| Arc::ptr_eq(base, &image));
-            if same_as_base {
-                return None;
+        let overlay = match &sharp {
+            Some(image)
+                if !base.as_ref().is_some_and(|base| Arc::ptr_eq(base, image))
+                    && image.clone().use_render_image(window, cx).is_some() =>
+            {
+                Some(image.clone())
             }
-            image.clone().use_render_image(window, cx).map(|_| image)
-        });
+            _ => None,
+        };
         (base, overlay)
     }
 
@@ -1127,7 +1194,7 @@ impl StudioPage {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (base, overlay) = artifact_id
-            .map(|id| self.display_layers(id, true, window, cx))
+            .map(|id| self.display_layers(id, StudioPaint::Full, window, cx))
             .unwrap_or((None, None));
         let slide_id = match artifact_id {
             Some(id) => SharedString::from(format!("studio-artifact-slide-{}", id.0)),
@@ -1249,7 +1316,8 @@ impl StudioPage {
                     .map(|artifact_id| (index, artifact_id))
             })
             .map(|(index, artifact_id)| {
-                let (thumbnail, sharp) = self.display_layers(artifact_id, false, window, cx);
+                let (thumbnail, sharp) =
+                    self.display_layers(artifact_id, StudioPaint::Thumb, window, cx);
                 let frame_size = filmstrip_thumb_size(index, selected_index);
                 let origin = filmstrip_thumb_origin(index, selected_index)
                     + filmstrip_offset(selected_index, filmstrip_viewport);
@@ -1897,6 +1965,15 @@ mod tests {
         assert_eq!(gallery_thumb_dimensions(4096, 1024), (1536, 384));
         assert_eq!(gallery_thumb_dimensions(800, 600), (683, 512));
         assert_eq!(gallery_thumb_dimensions(400, 300), (400, 300));
+    }
+
+    #[test]
+    fn feed_display_covers_retina_tiles_without_keeping_4k() {
+        assert_eq!(feed_display_dimensions(4096, 4096), (1280, 1280));
+        // 1080p already fits the short/long caps.
+        assert_eq!(feed_display_dimensions(1920, 1080), (1920, 1080));
+        assert_eq!(feed_display_dimensions(800, 600), (800, 600));
+        assert_eq!(feed_display_dimensions(4096, 1024), (2048, 512));
     }
 
     #[test]

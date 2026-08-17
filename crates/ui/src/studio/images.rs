@@ -1,6 +1,7 @@
 //! Bounded decoded-image cache for Studio. Gallery tiles keep small thumbs;
-//! the lightbox keeps a handful of full-resolution frames. Fulls and thumbs
-//! have separate budgets so hover/lightbox originals cannot evict the grid.
+//! visible thread tiles keep a 1280px display frame; the lightbox keeps a
+//! handful of full-resolution originals. The three budgets are independent
+//! so hover/lightbox originals cannot evict the grid.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
@@ -20,6 +21,16 @@ const FULL_CACHE_BUDGET_BYTES: usize = 96 * 1024 * 1024;
 /// Encoded originals for hover/lightbox only. These must not be uploaded to
 /// the GPU except for the open lightbox slides.
 const FULL_CACHE_MAX: usize = 16;
+/// Viewport-sized thread frames. Larger than a 512 preview, far smaller than
+/// a native 4K texture on every tile.
+const DISPLAY_CACHE_BUDGET_BYTES: usize = 24 * 1024 * 1024;
+const DISPLAY_CACHE_MAX: usize = 16;
+
+enum ImageSlot {
+    Thumb,
+    Display,
+    Full,
+}
 
 struct CachedImage {
     image: Arc<Image>,
@@ -30,10 +41,12 @@ struct CachedImage {
 #[derive(Default)]
 pub(super) struct StudioImages {
     thumbs: HashMap<StudioArtifactId, CachedImage>,
+    displays: HashMap<StudioArtifactId, CachedImage>,
     full: HashMap<StudioArtifactId, CachedImage>,
     placeholders: HashMap<StudioArtifactId, Arc<Image>>,
     tick: u64,
     thumb_bytes: usize,
+    display_bytes: usize,
     full_bytes: usize,
     pending_free: Vec<Arc<Image>>,
 }
@@ -70,12 +83,20 @@ impl StudioImages {
         self.thumbs.get(id).map(|entry| entry.image.clone())
     }
 
+    pub(super) fn get_display(&self, id: &StudioArtifactId) -> Option<Arc<Image>> {
+        self.displays.get(id).map(|entry| entry.image.clone())
+    }
+
     pub(super) fn contains_full(&self, id: &StudioArtifactId) -> bool {
         self.full.contains_key(id)
     }
 
     pub(super) fn contains_thumb(&self, id: &StudioArtifactId) -> bool {
         self.thumbs.contains_key(id)
+    }
+
+    pub(super) fn contains_display(&self, id: &StudioArtifactId) -> bool {
+        self.displays.contains_key(id)
     }
 
     pub(super) fn get_placeholder(&self, id: &StudioArtifactId) -> Option<Arc<Image>> {
@@ -95,44 +116,37 @@ impl StudioImages {
         if self.thumbs.contains_key(&id) {
             return;
         }
-        self.insert_map(false, id, image);
+        self.insert_map(ImageSlot::Thumb, id, image);
+    }
+
+    pub(super) fn insert_display(&mut self, id: StudioArtifactId, image: Arc<Image>) {
+        if self.displays.contains_key(&id) {
+            return;
+        }
+        self.insert_map(ImageSlot::Display, id, image);
     }
 
     pub(super) fn insert_full(&mut self, id: StudioArtifactId, image: Arc<Image>) {
         if self.full.contains_key(&id) {
             return;
         }
-        self.insert_map(true, id, image);
+        self.insert_map(ImageSlot::Full, id, image);
     }
 
-    fn insert_map(&mut self, full: bool, id: StudioArtifactId, image: Arc<Image>) {
+    fn insert_map(&mut self, slot: ImageSlot, id: StudioArtifactId, image: Arc<Image>) {
         self.tick = self.tick.saturating_add(1);
         let bytes = image.bytes.len();
-        let previous = if full {
-            self.full.insert(
-                id,
-                CachedImage {
-                    image,
-                    bytes,
-                    last_used: self.tick,
-                },
-            )
-        } else {
-            self.thumbs.insert(
-                id,
-                CachedImage {
-                    image,
-                    bytes,
-                    last_used: self.tick,
-                },
-            )
+        let entry = CachedImage {
+            image,
+            bytes,
+            last_used: self.tick,
         };
-        let loaded = if full {
-            &mut self.full_bytes
-        } else {
-            &mut self.thumb_bytes
+        let (map, loaded) = match slot {
+            ImageSlot::Thumb => (&mut self.thumbs, &mut self.thumb_bytes),
+            ImageSlot::Display => (&mut self.displays, &mut self.display_bytes),
+            ImageSlot::Full => (&mut self.full, &mut self.full_bytes),
         };
-        if let Some(previous) = previous {
+        if let Some(previous) = map.insert(id, entry) {
             *loaded = loaded.saturating_sub(previous.bytes);
             self.pending_free.push(previous.image);
         }
@@ -142,6 +156,10 @@ impl StudioImages {
     pub(super) fn remove(&mut self, id: &StudioArtifactId) {
         if let Some(previous) = self.thumbs.remove(id) {
             self.thumb_bytes = self.thumb_bytes.saturating_sub(previous.bytes);
+            self.pending_free.push(previous.image);
+        }
+        if let Some(previous) = self.displays.remove(id) {
+            self.display_bytes = self.display_bytes.saturating_sub(previous.bytes);
             self.pending_free.push(previous.image);
         }
         if let Some(previous) = self.full.remove(id) {
@@ -158,10 +176,19 @@ impl StudioImages {
             if let Some(entry) = self.thumbs.get_mut(&id) {
                 entry.last_used = tick;
             }
+            if let Some(entry) = self.displays.get_mut(&id) {
+                entry.last_used = tick;
+            }
             if let Some(entry) = self.full.get_mut(&id) {
                 entry.last_used = tick;
             }
         }
+    }
+
+    /// Drop the GPU atlas tile but keep the encoded bytes. Thread tiles that
+    /// just left the reading band must not keep a 1280px Metal texture.
+    pub(super) fn release_gpu(&mut self, image: Arc<Image>) {
+        self.pending_free.push(image);
     }
 
     pub(super) fn evict(&mut self, protected: &HashSet<StudioArtifactId>) {
@@ -172,6 +199,14 @@ impl StudioImages {
             protected,
             THUMB_CACHE_MAX,
             THUMB_CACHE_BUDGET_BYTES,
+        );
+        evict_map(
+            &mut self.displays,
+            &mut self.display_bytes,
+            &mut self.pending_free,
+            protected,
+            DISPLAY_CACHE_MAX,
+            DISPLAY_CACHE_BUDGET_BYTES,
         );
         evict_map(
             &mut self.full,
@@ -266,5 +301,27 @@ mod tests {
         images.evict(&HashSet::new());
         assert!(images.get_placeholder(&keep).is_some());
         assert!(images.thumbs.len() <= THUMB_CACHE_MAX);
+    }
+
+    #[test]
+    fn displays_do_not_evict_thumbs() {
+        let mut images = StudioImages::default();
+        let thumb_id = id(1);
+        images.insert_thumb(thumb_id, dummy(64));
+        for n in 2..40 {
+            images.insert_display(id(n), dummy(2 * 1024 * 1024));
+        }
+        images.evict(&HashSet::new());
+        assert!(images.contains_thumb(&thumb_id));
+        assert!(images.displays.len() <= DISPLAY_CACHE_MAX);
+    }
+
+    #[test]
+    fn a_cached_original_is_not_a_feed_display() {
+        let mut images = StudioImages::default();
+        let id = id(9);
+        images.insert_full(id, dummy(1024));
+        assert!(!images.contains_display(&id));
+        assert!(images.get_display(&id).is_none());
     }
 }

@@ -72,6 +72,8 @@ pub struct StudioPage {
     pub(super) feed_width: f32,
     pub(super) feed_columns: usize,
     pub(super) feed_visible_rows: Range<usize>,
+    /// Thread tiles whose originals should become 1280px display frames.
+    pub(super) feed_viewport_fulls: HashSet<StudioArtifactId>,
     pub(super) feed_layout_sig: Option<FeedLayoutSig>,
     pub(super) scroll_after_turn_count: Option<usize>,
     pub(super) scroll_after_extend: Option<zeron_studio::StudioTurnId>,
@@ -127,6 +129,8 @@ pub struct StudioPage {
     pub(super) action_task: Option<Task<()>>,
     pub(super) image_tasks: HashMap<StudioArtifactId, Task<()>>,
     pub(super) full_image_tasks: HashMap<StudioArtifactId, Task<()>>,
+    pub(super) display_tasks: HashMap<StudioArtifactId, Task<()>>,
+    pub(super) loading_displays: HashSet<StudioArtifactId>,
     pub(super) _observe: Subscription,
     pub(super) _prompt_events: Subscription,
     pub(super) _model_search_events: Subscription,
@@ -194,6 +198,7 @@ impl StudioPage {
             feed_width: 0.0,
             feed_columns: 0,
             feed_visible_rows: 0..0,
+            feed_viewport_fulls: HashSet::new(),
             feed_layout_sig: None,
             scroll_after_turn_count: None,
             scroll_after_extend: None,
@@ -245,6 +250,8 @@ impl StudioPage {
             action_task: None,
             image_tasks: HashMap::new(),
             full_image_tasks: HashMap::new(),
+            display_tasks: HashMap::new(),
+            loading_displays: HashSet::new(),
             preview_failed: HashSet::new(),
             _observe: observe,
             _prompt_events: prompt_events,
@@ -710,10 +717,13 @@ impl StudioPage {
         self.images.remove(&artifact_id);
         self.loading_images.remove(&artifact_id);
         self.loading_full_images.remove(&artifact_id);
+        self.loading_displays.remove(&artifact_id);
         self.image_failed.remove(&artifact_id);
         self.preview_failed.remove(&artifact_id);
         self.image_tasks.remove(&artifact_id);
         self.full_image_tasks.remove(&artifact_id);
+        self.display_tasks.remove(&artifact_id);
+        self.feed_viewport_fulls.remove(&artifact_id);
         self.gallery.retain(|item| item.id != artifact_id);
         self.gallery_selected.remove(&artifact_id);
         if self.gallery_anchor == Some(artifact_id) {
