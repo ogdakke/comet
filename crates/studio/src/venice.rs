@@ -188,6 +188,9 @@ fn normalize_image(
             visible_when: Vec::new(),
         });
     }
+    // Submitted at the catalog default. Composer does not surface a knob:
+    // hosted models ignore `steps`, and the few diffusion models already
+    // ship a tuned default.
     controls.push(ModelControl {
         id: ControlId::from("steps"),
         label: "Steps".to_owned(),

@@ -437,12 +437,7 @@ impl StudioPage {
                     )),
             );
         }
-        let label = if control.id.as_str() == "steps" {
-            SharedString::from("Inference steps")
-        } else {
-            SharedString::from(control.label.clone())
-        };
-        config_section(label, theme).child(choices)
+        config_section(SharedString::from(control.label.clone()), theme).child(choices)
     }
 
     fn render_model_config_menu(
@@ -521,28 +516,16 @@ impl StudioPage {
             controls = controls.child(resolution_reasoning);
         }
 
-        let mut steps_format = div().w_full().flex().items_start().gap(px(12.0));
-        let mut has_steps_format = false;
-        for id in ["steps", "format"] {
-            if let Some(control) = model
-                .controls
-                .iter()
-                .find(|control| control.id.as_str() == id)
-            {
-                has_steps_format = true;
-                steps_format = steps_format.child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(self.render_model_control(&model_id, control, draft, theme, cx)),
-                );
-            }
-        }
-        if has_steps_format {
-            controls = controls.child(steps_format);
+        if let Some(format) = model
+            .controls
+            .iter()
+            .find(|control| control.id.as_str() == "format")
+        {
+            controls = controls.child(self.render_model_control(&model_id, format, draft, theme, cx));
         }
 
         for control in &model.controls {
+            // `steps` is submitted at the catalog default and is not a user knob.
             if matches!(
                 control.id.as_str(),
                 "aspect_ratio" | "resolution" | "reasoning" | "steps" | "format" | "safe_mode"
