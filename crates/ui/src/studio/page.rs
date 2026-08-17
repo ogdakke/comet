@@ -1435,7 +1435,7 @@ impl Render for StudioPage {
             page
         } else if self.providers.iter().all(|provider| !provider.configured) {
             // Parent is not a flex container, so `flex_1` cannot fill it.
-            // `size_full` + titlebar pad center the CTA in the visible canvas.
+            // Same canvas as the chat "Add a project" empty state.
             div()
                 .size_full()
                 .pt(px(Theme::TITLEBAR_HEIGHT))
@@ -1443,50 +1443,42 @@ impl Render for StudioPage {
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .gap(px(8.0))
-                .child(
+                .child(crate::motion::fade_in(
+                    "studio-no-provider-canvas",
                     div()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child("Connect a provider to begin"),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(theme.text_muted)
-                        .child("Connect an image provider to start generating."),
-                )
-                .child(
-                    div()
-                        .id("studio-add-provider")
-                        .mt(px(16.0))
-                        .w(px(240.0))
-                        .h(px(44.0))
-                        .cursor_pointer()
-                        .rounded(px(10.0))
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(crate::theme::ink(0.02))
-                        .text_color(theme.text)
-                        .px(px(14.0))
                         .flex()
+                        .flex_col()
                         .items_center()
-                        .gap(px(10.0))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .hover(|style| {
-                            style
-                                .bg(crate::theme::ink(0.05))
-                                .border_color(theme.border_strong)
-                        })
-                        .on_click(cx.listener(|_, _, _, cx| {
-                            cx.emit(StudioEvent::OpenProviders);
-                        }))
                         .child(
-                            crate::icons::icon(crate::icons::KEY_MINIMALISTIC)
-                                .size(px(15.0))
-                                .text_color(theme.text_muted),
+                            crate::icons::icon(crate::icons::ZERON_LOGO)
+                                .w(px(41.9))
+                                .h(px(48.0))
+                                .text_color(theme.text.opacity(0.09)),
                         )
-                        .child("Add provider"),
-                )
+                        .child(
+                            div()
+                                .mt(px(24.0))
+                                .text_size(px(16.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child("Connect a provider to begin"),
+                        )
+                        .child(
+                            div()
+                                .mt(px(6.0))
+                                .text_size(px(13.0))
+                                .text_color(theme.text_muted.opacity(0.7))
+                                .child("Connect an image provider to start generating."),
+                        )
+                        .child(
+                            popover::btn_primary(&theme, "Add provider")
+                                .id("studio-add-provider")
+                                .mt(px(20.0))
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    cx.emit(StudioEvent::OpenProviders);
+                                })),
+                        ),
+                ))
                 .into_any_element()
         } else if self.selected_conversation.is_none() {
             self.render_gallery(window, &theme, cx)
