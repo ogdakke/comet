@@ -2290,17 +2290,22 @@ async fn run_session(session: Session) {
     // Done ever comes, and the session strands Working until the engine's
     // quiesce watchdog parks it.
     //
-    // Claude is EXEMPT, even from the env knob: claude-agent-acp forwards
-    // no thinking traffic, so a long silent reasoning stretch in exactly
-    // the "looks finished" state (content streamed, every tool resolved)
-    // is indistinguishable from a dropped reply — 30s of quiet falsely
-    // settled live turns mid-thought (2026-08-13), producing both a
-    // premature Done and the stuck-Working orphan above. Claude's
-    // genuinely dropped replies already settle deterministically (the
-    // cost-frame hint above, `noRunningTurn` steering evidence); the
-    // engine watchdog backstops anything left.
+    // Claude, Codex, and Grok are EXEMPT, even from the env knob: their
+    // adapters can leave long silent reasoning stretches after content has
+    // streamed and every tool has resolved. That "looks finished" state is
+    // indistinguishable from a dropped reply — 30s of quiet falsely
+    // settled live turns mid-thought (Claude 2026-08-13, Codex 2026-08-16,
+    // Grok 2026-08-17), producing both a premature Done and the
+    // stuck-Working orphan above. Claude's genuinely dropped replies
+    // already settle deterministically (the cost-frame hint above,
+    // `noRunningTurn` steering evidence); the engine watchdog backstops
+    // Codex, Grok, and anything left.
     // `ZERON_ACP_QUIET_SETTLE_MS` overrides; 0 disables.
-    let quiet_settle: Option<Duration> = if cost_hint_enabled {
+    let quiet_settle_exempt = matches!(
+        harness,
+        HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::Grok
+    );
+    let quiet_settle: Option<Duration> = if quiet_settle_exempt {
         None
     } else {
         match std::env::var("ZERON_ACP_QUIET_SETTLE_MS")

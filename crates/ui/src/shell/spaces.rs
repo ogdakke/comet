@@ -816,6 +816,7 @@ impl Shell {
                         .on_mouse_down(
                             MouseButton::Right,
                             cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                this.close_studio_menu(cx);
                                 this.chat_menu.open((menu_id.clone(), event.position));
                                 cx.notify();
                             }),

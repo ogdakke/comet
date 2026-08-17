@@ -284,4 +284,91 @@ impl Shell {
         self.titlebar_drag_region("chat-titlebar", bar, cx)
             .into_any_element()
     }
+
+    /// Studio conversation titlebar: title + image count, same type rhythm
+    /// as the chat session's title + "project @ device". Empty when no
+    /// conversation is selected. The lightbox route keeps the blank bar so
+    /// this row does not collide with the back button.
+    pub(super) fn render_studio_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let page = self.ensure_studio_page(cx);
+        let (title, images, balance) = {
+            let page = page.read(cx);
+            (
+                page.selected_title(),
+                page.selected_image_count(),
+                page.account_balance_label(),
+            )
+        };
+        let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+        let content_left = (sidebar_now + Theme::SPACE_LG).max(self.title_bar_content_start());
+
+        let inner = div()
+            .size_full()
+            .flex()
+            .items_center()
+            .pt(px(Theme::TITLEBAR_TOP_PAD))
+            .gap(px(8.0))
+            .pl(px(content_left))
+            .pr(px(titlebar_right_padding(
+                cfg!(target_os = "windows"),
+                Theme::SPACE_LG,
+            )))
+            .when_some(title, |el, title| {
+                el.child(
+                    div()
+                        .min_w_0()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            icon(icons::WIDGET)
+                                .size(px(14.0))
+                                .flex_none()
+                                .text_color(theme.text_muted),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(12.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text.opacity(0.85))
+                                .child(SharedString::from(transcript::single_line(&title))),
+                        )
+                        .when_some(images, |el, count| {
+                            el.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.text_muted.opacity(0.5))
+                                    .child(SharedString::from(if count == 1 {
+                                        "1 image".into()
+                                    } else {
+                                        format!("{count} images")
+                                    })),
+                            )
+                        }),
+                )
+            })
+            .child(div().flex_1())
+            .when_some(balance, |el, label| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted.opacity(0.5))
+                        .child(SharedString::from(label)),
+                )
+            });
+
+        let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
+        // BlockMouse: tiles scroll under this glass strip. Without it the
+        // hit-test continues through, so a window-move that starts on the
+        // bar and ends over an image fires the tile's on_click.
+        self.titlebar_drag_region("studio-titlebar", bar, cx)
+            .occlude()
+            .into_any_element()
+    }
 }

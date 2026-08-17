@@ -611,8 +611,9 @@ pub struct AppState {
     pub local_device_id: Option<String>,
     /// Latest `UpdateStatus` frame — drives the sidebar update strip.
     pub update: Option<zeron_update::UpdateStatus>,
-    /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
-    /// bootstrap so child views can persist small preference files.
+    /// Data directory (`ui-settings.json`, `composer-defaults.json`,
+    /// `studio-defaults.json`); set at bootstrap so child views can persist
+    /// small preference files.
     pub data_dir: Option<PathBuf>,
     engine: Option<EngineHandle>,
     watch_tasks: Vec<Task<()>>,

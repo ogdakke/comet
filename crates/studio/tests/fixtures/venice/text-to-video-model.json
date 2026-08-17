@@ -1,0 +1,33 @@
+{
+  "data": [
+    {
+      "created": 1773964800,
+      "id": "seedance-1-5-pro-text-to-video-basic",
+      "model_spec": {
+        "privacy": "anonymized",
+        "constraints": {
+          "model_type": "text-to-video",
+          "aspect_ratios": ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"],
+          "resolutions": ["1080p", "720p", "480p"],
+          "durations": ["4s", "5s", "6s", "7s", "8s", "9s", "10s", "11s", "12s"],
+          "audio": true,
+          "audio_configurable": true,
+          "audio_input": false,
+          "per_reference_audio": false,
+          "video_input": false,
+          "prompt_character_limit": 3500
+        },
+        "model_sets": ["uncensored", "high_resolution", "audio", "long_duration", "cinematic", "photorealistic"],
+        "name": "Seedance 1.5 Pro",
+        "offline": false,
+        "traits": [],
+        "uncensored": true
+      },
+      "object": "model",
+      "owned_by": "venice.ai",
+      "type": "video"
+    }
+  ],
+  "object": "list",
+  "type": "video"
+}

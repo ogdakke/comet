@@ -29,9 +29,13 @@ pub mod rpc;
 pub mod run_journal;
 pub mod sessions;
 pub mod spaces;
+pub mod studio;
+pub mod studio_credentials;
+mod studio_preview;
 pub mod terminals;
 pub mod titles;
 pub mod uploads;
+pub mod venice_import;
 pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
@@ -50,9 +54,20 @@ pub use rpc::EngineRpc;
 pub use run_journal::{JournalError, RunJournal};
 pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
 pub use spaces::SpacesSync;
+pub use studio::{
+    ArtifactStore, StudioProviderDescriptor, StudioProviderRegistry, StudioRegistryError,
+    StudioStore, StudioStoreError,
+};
+pub use studio_credentials::{
+    StudioCredentialError, StudioCredentials, StudioSecretBackend, SystemStudioSecretBackend,
+};
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
 pub use uploads::{AttachmentChunk, Uploads};
+pub use venice_import::{
+    ImportReport, ImportedArtifact, ImportedConversation, ImportedRun, ImportedStudioHistory,
+    ImportedTurn, VeniceImportError, load_venice_image_dump,
+};
 pub use workspace_host::{
     DEFAULT_ORG_ID, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,
 };
@@ -69,6 +84,10 @@ pub enum EngineError {
     Store(#[from] zeron_sync::StoreError),
     #[error("harness: {0}")]
     Harness(#[from] zeron_harness::HarnessError),
+    #[error("studio: {0}")]
+    Studio(#[from] studio::StudioStoreError),
+    #[error("studio credentials: {0}")]
+    StudioCredentials(#[from] studio_credentials::StudioCredentialError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("{0}")]
@@ -117,6 +136,9 @@ pub struct EngineCore {
     pub spaces_sync: SpacesSync,
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
+    pub studio: Arc<StudioStore>,
+    pub studio_providers: Arc<StudioProviderRegistry>,
+    pub studio_credentials: Arc<StudioCredentials>,
     pub device_id: String,
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
@@ -256,6 +278,26 @@ impl EngineCore {
             )
         });
         let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));
+        let studio = Arc::new(StudioStore::open(
+            profile.store_root(),
+            studio::DEFAULT_MAX_ARTIFACT_BYTES,
+        )?);
+        StudioStore::spawn_preview_backfill(studio.clone());
+        let recovered_studio_runs = studio.recover_interrupted_image_runs()?;
+        if recovered_studio_runs > 0 {
+            tracing::warn!(
+                recovered_studio_runs,
+                "recovered interrupted studio image generations"
+            );
+        }
+        let studio_providers = Arc::new(StudioProviderRegistry::new());
+        studio_providers
+            .register(Arc::new(
+                zeron_studio::VeniceMediaProvider::new()
+                    .map_err(|error| EngineError::Other(error.to_string()))?,
+            ))
+            .map_err(|error| EngineError::Other(error.to_string()))?;
+        let studio_credentials = Arc::new(StudioCredentials::open(profile.device_root())?);
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
@@ -279,6 +321,9 @@ impl EngineCore {
             spaces_sync,
             uploads,
             agent_accounts,
+            studio,
+            studio_providers,
+            studio_credentials,
             device_id,
             local_import,
             workspace_scope: profile.scope(),
@@ -292,6 +337,17 @@ impl EngineCore {
 
     pub fn workspace_scope(&self) -> WorkspaceScope {
         self.workspace_scope
+    }
+
+    /// Fetch each configured Studio provider's catalog in the background.
+    /// Does not block boot; a failed refresh leaves the on-disk cache in place.
+    fn prefetch_studio_catalogs(&self) {
+        let studio = self.studio.clone();
+        let providers = self.studio_providers.clone();
+        let credentials = self.studio_credentials.clone();
+        tokio::spawn(async move {
+            refresh_configured_studio_catalogs(&studio, &providers, &credentials).await;
+        });
     }
 
     /// Attach the auth service (before building the RPC service / relays).
@@ -405,6 +461,9 @@ impl EngineCore {
             self.diff_sync.clone(),
             self.uploads.clone(),
             self.agent_accounts.clone(),
+            self.studio.clone(),
+            self.studio_providers.clone(),
+            self.studio_credentials.clone(),
             self.workspace_scope,
         )
         .with_auth(self.auth());
@@ -466,6 +525,66 @@ impl EngineCore {
         // Break the sessions ⇄ doc-host retain cycle so the replaced graph can
         // actually be freed once the last handle drops.
         self.sessions.clear_doc_host();
+    }
+}
+
+/// Live-fetch every configured Studio provider and replace the on-disk catalog.
+/// Used at process start so picker badges are not stuck on a pre-TTL snapshot.
+pub(crate) async fn refresh_configured_studio_catalogs(
+    studio: &studio::StudioStore,
+    providers: &studio::StudioProviderRegistry,
+    credentials: &StudioCredentials,
+) {
+    let connections = match credentials.list() {
+        Ok(connections) => connections,
+        Err(error) => {
+            tracing::warn!(error = %error, "studio catalog boot refresh skipped");
+            return;
+        }
+    };
+    for connection in connections {
+        let Ok(Some(provider)) = providers.get(&connection.provider_id) else {
+            continue;
+        };
+        let secret = match credentials.secret(&connection.provider_id).await {
+            Ok(secret) => secret,
+            Err(error) => {
+                tracing::warn!(
+                    provider = %connection.provider_id.as_str(),
+                    error = %error,
+                    "studio catalog boot refresh skipped"
+                );
+                continue;
+            }
+        };
+        match provider.list_models(&secret).await {
+            Ok(models) => {
+                if let Err(error) = studio.cache_models(
+                    &connection.provider_id,
+                    &models,
+                    studio::STUDIO_CATALOG_TTL,
+                ) {
+                    tracing::warn!(
+                        provider = %connection.provider_id.as_str(),
+                        error = %error,
+                        "studio catalog boot refresh failed"
+                    );
+                } else {
+                    tracing::info!(
+                        provider = %connection.provider_id.as_str(),
+                        models = models.len(),
+                        "refreshed studio catalog at boot"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    provider = %connection.provider_id.as_str(),
+                    error = %error,
+                    "studio catalog boot refresh failed"
+                );
+            }
+        }
     }
 }
 
@@ -741,6 +860,10 @@ impl Engine {
         // whose CLI is present but whose adapter isn't yet), so a first chat
         // never waits on — or dies inside — an npm run.
         zeron_harness::acp::prewarm_managed_adapters();
+        // Studio catalogs are cached for 6h so submit and the picker share a
+        // schema. Refresh once at process start so a new badge/filter field
+        // is not stuck behind that TTL.
+        core.prefetch_studio_catalogs();
 
         let host_relay = edge.as_ref().map(|edge| {
             let links = zeron_rpc::LinkCache::new(zeron_rpc::LinkCacheConfig::new(

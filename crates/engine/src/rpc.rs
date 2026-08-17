@@ -57,7 +57,18 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use zeron_doc::{MessagePart, SessionCommandPayload};
-use zeron_proto::{ChatConfig, EngineInfo, HarnessId, ToolCall, WorkspaceScope};
+use zeron_proto::{
+    ArchiveStudioConversationRequest, ChatConfig, CreateStudioConversationRequest,
+    CreateStudioTurnRequest, DeleteStudioArtifactRequest, DeleteStudioConversationRequest,
+    EngineInfo, ExtendStudioTurnRequest, HarnessId, ListStudioArtifactsResponse,
+    ListStudioConversationsRequest, ListStudioConversationsResponse, ListStudioModelsRequest,
+    ListStudioModelsResponse, ListStudioProvidersResponse, MarkStudioConversationSeenRequest,
+    ProviderValidationState, QuoteStudioBatchRequest, QuoteStudioBatchResponse, QuoteStudioRunView,
+    ReadStudioArtifactChunkRequest, RenameStudioConversationRequest, RetryStudioRunRequest,
+    SetStudioProviderCredentialRequest, SetStudioProviderPreferencesRequest, StudioModelRunSpec,
+    StudioProviderBalanceResponse, StudioProviderConnection, StudioProviderRequest, ToolCall,
+    WatchStudioConversationRequest, WorkspaceScope,
+};
 use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
 use crate::agent_accounts::AgentAccounts;
@@ -67,6 +78,8 @@ use crate::doc_host::DocHost;
 use crate::registry::HarnessRegistry;
 use crate::repos::{Repos, home_dir};
 use crate::sessions::SessionsEngine;
+use crate::studio::{PreparedStudioRun, StoredStudioRun, StudioProviderRegistry, StudioStore};
+use crate::studio_credentials::StudioCredentials;
 use crate::terminals::Terminals;
 use crate::uploads::Uploads;
 use crate::workspace_host::WorkspaceHost;
@@ -379,6 +392,9 @@ pub struct EngineRpc {
     diff_sync: CheckoutDiffSync,
     uploads: Uploads,
     agent_accounts: AgentAccounts,
+    studio: std::sync::Arc<StudioStore>,
+    studio_providers: std::sync::Arc<StudioProviderRegistry>,
+    studio_credentials: std::sync::Arc<StudioCredentials>,
     auth: Option<Auth>,
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<zeron_update::Updater>,
@@ -398,6 +414,9 @@ impl EngineRpc {
         diff_sync: CheckoutDiffSync,
         uploads: Uploads,
         agent_accounts: AgentAccounts,
+        studio: std::sync::Arc<StudioStore>,
+        studio_providers: std::sync::Arc<StudioProviderRegistry>,
+        studio_credentials: std::sync::Arc<StudioCredentials>,
         workspace_scope: WorkspaceScope,
     ) -> Self {
         let engine_info = EngineInfo {
@@ -414,6 +433,9 @@ impl EngineRpc {
             diff_sync,
             uploads,
             agent_accounts,
+            studio,
+            studio_providers,
+            studio_credentials,
             auth: None,
             links: None,
             updater: None,
@@ -456,6 +478,136 @@ impl EngineRpc {
         self.updater
             .as_ref()
             .ok_or_else(|| RpcError::Failed("updates unavailable".into()))
+    }
+
+    /// Shared catalog for the picker and submit. Fresh cache is the source of
+    /// truth so the form and the validator see the same schema. Live fetch only
+    /// happens when the cache is missing, expired, or a caller asked to refresh
+    /// (the runtime does that once at boot).
+    async fn studio_catalog(
+        &self,
+        provider_id: &zeron_studio::ProviderId,
+        refresh: bool,
+    ) -> Result<ListStudioModelsResponse, RpcError> {
+        let cached = self
+            .studio
+            .cached_models(provider_id)
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+        if !refresh
+            && let Some(response) = cached.clone()
+            && !response.stale
+        {
+            return Ok(response);
+        }
+        let provider = self
+            .studio_providers
+            .get(provider_id)
+            .map_err(|error| RpcError::Failed(error.to_string()))?
+            .ok_or_else(|| RpcError::Failed("unknown studio provider".into()))?;
+        let secret = self
+            .studio_credentials
+            .secret(provider_id)
+            .await
+            .map_err(|error| RpcError::Failed(error.to_string()))?;
+        match provider.list_models(&secret).await {
+            Ok(models) => self
+                .studio
+                .cache_models(provider_id, &models, crate::studio::STUDIO_CATALOG_TTL)
+                .map_err(|error| RpcError::Failed(error.to_string())),
+            Err(error) => cached
+                .map(|mut response| {
+                    response.stale = true;
+                    response
+                })
+                .ok_or_else(|| RpcError::Failed(error.to_string())),
+        }
+    }
+
+    async fn prepare_studio_runs(
+        &self,
+        prompt: &str,
+        specs: Vec<StudioModelRunSpec>,
+        submit: bool,
+    ) -> Result<Vec<PreparedStudioRun>, RpcError> {
+        let mut catalogs =
+            std::collections::BTreeMap::<zeron_studio::ProviderId, ListStudioModelsResponse>::new();
+        let mut prepared = Vec::with_capacity(specs.len());
+        for spec in specs {
+            if submit && !matches!(spec.operation, zeron_studio::MediaOperation::TextToImage) {
+                return Err(RpcError::Failed(
+                    "only text-to-image runs are available in the current Studio slice".into(),
+                ));
+            }
+            let catalog = match catalogs.get(&spec.provider_id) {
+                Some(catalog) => catalog.clone(),
+                None => {
+                    let catalog = self.studio_catalog(&spec.provider_id, false).await?;
+                    catalogs.insert(spec.provider_id.clone(), catalog.clone());
+                    catalog
+                }
+            };
+            let mut model = catalog
+                .models
+                .iter()
+                .find(|model| model.id == spec.model_id)
+                .cloned();
+            if model.is_none() {
+                let catalog = self.studio_catalog(&spec.provider_id, true).await?;
+                catalogs.insert(spec.provider_id.clone(), catalog.clone());
+                model = catalog
+                    .models
+                    .into_iter()
+                    .find(|model| model.id == spec.model_id);
+            }
+            let model =
+                model.ok_or_else(|| RpcError::Failed("studio model is unavailable".into()))?;
+            let mut generation = zeron_studio::GenerationRequest {
+                provider_id: spec.provider_id,
+                model_id: spec.model_id,
+                operation: spec.operation,
+                prompt: prompt.to_owned(),
+                negative_prompt: None,
+                output_count: spec.output_count,
+                controls: spec.controls,
+                inputs: spec.inputs,
+                manifest_version: spec.manifest_version,
+                display_aspect_ratio: spec.display_aspect_ratio,
+            };
+            generation.drop_unknown_controls(&model);
+            generation
+                .bind_to(&model)
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+            if submit
+                && let Some(safe_mode) =
+                    venice_safe_mode_to_persist(&generation, &model, &self.studio_credentials)?
+            {
+                generation.controls.insert(
+                    zeron_studio::ControlId::from("safe_mode"),
+                    zeron_studio::ControlValue::Boolean { value: safe_mode },
+                );
+            }
+            let quote = self.resolve_studio_quote(&generation, &model).await;
+            prepared.push(PreparedStudioRun {
+                model,
+                request: generation,
+                quote,
+            });
+        }
+        Ok(prepared)
+    }
+
+    async fn resolve_studio_quote(
+        &self,
+        request: &zeron_studio::GenerationRequest,
+        model: &zeron_studio::MediaModel,
+    ) -> Option<zeron_studio::Quote> {
+        if let Ok(Some(provider)) = self.studio_providers.get(&request.provider_id)
+            && let Ok(secret) = self.studio_credentials.secret(&request.provider_id).await
+            && let Ok(Some(quote)) = provider.quote(&secret, request).await
+        {
+            return Some(quote);
+        }
+        model.estimate_cost(&request.controls, request.output_count)
     }
 
     fn local_importer(&self) -> Result<&crate::local_import::LocalImporter, RpcError> {
@@ -1019,6 +1171,375 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&models)
+            }
+            methods::LIST_STUDIO_PROVIDERS => {
+                let descriptors = self
+                    .studio_providers
+                    .list()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let mut providers = Vec::with_capacity(descriptors.len());
+                for provider in descriptors {
+                    providers.push(
+                        self.studio_credentials
+                            .connection(&provider.id)
+                            .map_err(|error| RpcError::Failed(error.to_string()))?
+                            .unwrap_or_else(|| StudioProviderConnection {
+                                display_label: studio_provider_label(&provider.id),
+                                provider_id: provider.id,
+                                configured: false,
+                                validation_state: ProviderValidationState::NotValidated,
+                                validated_at: None,
+                                validation_message: None,
+                                safe_mode: false,
+                            }),
+                    );
+                }
+                providers.sort_by(|left, right| left.display_label.cmp(&right.display_label));
+                RpcReply::value(&ListStudioProvidersResponse { providers })
+            }
+            methods::SET_STUDIO_PROVIDER_CREDENTIAL => {
+                let request: SetStudioProviderCredentialRequest = parse_params(params)?;
+                if self
+                    .studio_providers
+                    .get(&request.provider_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
+                    .is_none()
+                {
+                    return Err(RpcError::Failed("unknown studio provider".into()));
+                }
+                let connection = self
+                    .studio_credentials
+                    .set(
+                        request.provider_id,
+                        request.display_label,
+                        zeron_studio::Secret::new(request.secret),
+                    )
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&connection)
+            }
+            methods::REMOVE_STUDIO_PROVIDER_CREDENTIAL => {
+                let request: StudioProviderRequest = parse_params(params)?;
+                self.studio_credentials
+                    .remove(&request.provider_id)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::SET_STUDIO_PROVIDER_PREFERENCES => {
+                let request: SetStudioProviderPreferencesRequest = parse_params(params)?;
+                if self
+                    .studio_providers
+                    .get(&request.provider_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
+                    .is_none()
+                {
+                    return Err(RpcError::Failed("unknown studio provider".into()));
+                }
+                let connection = self
+                    .studio_credentials
+                    .set_preferences(request.provider_id, request.safe_mode)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&connection)
+            }
+            methods::VALIDATE_STUDIO_PROVIDER => {
+                let request: StudioProviderRequest = parse_params(params)?;
+                let provider = self
+                    .studio_providers
+                    .get(&request.provider_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
+                    .ok_or_else(|| RpcError::Failed("unknown studio provider".into()))?;
+                let secret = self
+                    .studio_credentials
+                    .secret(&request.provider_id)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let result = provider.validate_credentials(&secret).await;
+                let (state, message) = match result {
+                    Ok(_) => (ProviderValidationState::Valid, None),
+                    Err(error) => {
+                        let state =
+                            if error.kind == zeron_studio::ProviderErrorKind::InvalidCredential {
+                                ProviderValidationState::Invalid
+                            } else {
+                                ProviderValidationState::Unavailable
+                            };
+                        (state, Some(error.to_string()))
+                    }
+                };
+                let connection = self
+                    .studio_credentials
+                    .record_validation(request.provider_id, state, message)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&connection)
+            }
+            methods::LIST_STUDIO_MODELS => {
+                let request: ListStudioModelsRequest = parse_params(params)?;
+                let mut response = self
+                    .studio_catalog(&request.provider_id, request.refresh)
+                    .await?;
+                if let Some(kind) = request.media_kind {
+                    response.models.retain(|model| model.output_kind == kind);
+                }
+                RpcReply::value(&response)
+            }
+            methods::LIST_STUDIO_CONVERSATIONS => {
+                let request: ListStudioConversationsRequest = parse_params(params)?;
+                let conversations = self
+                    .studio
+                    .list_conversations(request.include_archived)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&ListStudioConversationsResponse { conversations })
+            }
+            methods::WATCH_STUDIO_CONVERSATIONS => {
+                let changes = self.studio.subscribe_changes();
+                let store = self.studio.clone();
+                let stream = futures::stream::unfold(
+                    (changes, store, true),
+                    |(mut changes, store, first)| async move {
+                        if !first && changes.changed().await.is_err() {
+                            return None;
+                        }
+                        let value =
+                            store
+                                .list_conversations(false)
+                                .ok()
+                                .and_then(|conversations| {
+                                    serde_json::to_value(ListStudioConversationsResponse {
+                                        conversations,
+                                    })
+                                    .ok()
+                                })?;
+                        Some((value, (changes, store, false)))
+                    },
+                );
+                Ok(RpcReply::Stream(stream.boxed()))
+            }
+            methods::LIST_STUDIO_ARTIFACTS => {
+                let artifacts = self
+                    .studio
+                    .list_gallery()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&ListStudioArtifactsResponse { artifacts })
+            }
+            methods::WATCH_STUDIO_GALLERY => {
+                let changes = self.studio.subscribe_changes();
+                let store = self.studio.clone();
+                let stream = futures::stream::unfold(
+                    (changes, store, true),
+                    |(mut changes, store, first)| async move {
+                        if !first && changes.changed().await.is_err() {
+                            return None;
+                        }
+                        let value = store.list_gallery().ok().and_then(|artifacts| {
+                            serde_json::to_value(ListStudioArtifactsResponse { artifacts }).ok()
+                        })?;
+                        Some((value, (changes, store, false)))
+                    },
+                );
+                Ok(RpcReply::Stream(stream.boxed()))
+            }
+            methods::CREATE_STUDIO_CONVERSATION => {
+                let request: CreateStudioConversationRequest = parse_params(params)?;
+                let conversation = self
+                    .studio
+                    .create_conversation(&request.title, request.forked_from_turn_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&conversation)
+            }
+            methods::RENAME_STUDIO_CONVERSATION => {
+                let request: RenameStudioConversationRequest = parse_params(params)?;
+                let conversation = self
+                    .studio
+                    .rename_conversation(request.conversation_id, &request.title)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&conversation)
+            }
+            methods::ARCHIVE_STUDIO_CONVERSATION => {
+                let request: ArchiveStudioConversationRequest = parse_params(params)?;
+                let conversation = self
+                    .studio
+                    .archive_conversation(request.conversation_id, request.archived)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&conversation)
+            }
+            methods::DELETE_STUDIO_CONVERSATION => {
+                let request: DeleteStudioConversationRequest = parse_params(params)?;
+                self.studio
+                    .delete_conversation(request.conversation_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::MARK_STUDIO_CONVERSATION_SEEN => {
+                let request: MarkStudioConversationSeenRequest = parse_params(params)?;
+                let conversation = self
+                    .studio
+                    .mark_conversation_seen(request.conversation_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&conversation)
+            }
+            methods::WATCH_STUDIO_CONVERSATION => {
+                let request: WatchStudioConversationRequest = parse_params(params)?;
+                // Fail the subscription synchronously for an unknown conversation.
+                self.studio
+                    .conversation_view(request.conversation_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let changes = self.studio.subscribe_changes();
+                let store = self.studio.clone();
+                let stream = futures::stream::unfold(
+                    (changes, store, request.conversation_id, true),
+                    |(mut changes, store, conversation_id, first)| async move {
+                        if !first && changes.changed().await.is_err() {
+                            return None;
+                        }
+                        let value = store
+                            .conversation_view(conversation_id)
+                            .ok()
+                            .and_then(|view| serde_json::to_value(view).ok())?;
+                        Some((value, (changes, store, conversation_id, false)))
+                    },
+                );
+                Ok(RpcReply::Stream(stream.boxed()))
+            }
+            methods::QUOTE_STUDIO_BATCH => {
+                let request: QuoteStudioBatchRequest = parse_params(params)?;
+                let prepared = self
+                    .prepare_studio_runs(&request.prompt, request.runs, false)
+                    .await?;
+                let runs = prepared
+                    .into_iter()
+                    .map(|run| QuoteStudioRunView {
+                        provider_id: run.request.provider_id,
+                        model_id: run.request.model_id,
+                        quote: run.quote,
+                    })
+                    .collect::<Vec<_>>();
+                let total = runs
+                    .iter()
+                    .map(|run| run.quote.clone())
+                    .collect::<Option<Vec<_>>>()
+                    .and_then(|quotes| zeron_studio::Quote::total(quotes));
+                RpcReply::value(&QuoteStudioBatchResponse { runs, total })
+            }
+            methods::GET_STUDIO_PROVIDER_BALANCE => {
+                let request: StudioProviderRequest = parse_params(params)?;
+                let provider = self
+                    .studio_providers
+                    .get(&request.provider_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
+                    .ok_or_else(|| RpcError::Failed("unknown studio provider".into()))?;
+                let secret = self
+                    .studio_credentials
+                    .secret(&request.provider_id)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let balance = provider
+                    .balance(&secret)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&StudioProviderBalanceResponse { balance })
+            }
+            methods::CREATE_STUDIO_TURN => {
+                let request: CreateStudioTurnRequest = parse_params(params)?;
+                let prepared = self
+                    .prepare_studio_runs(&request.prompt, request.runs, true)
+                    .await?;
+                let stored = self
+                    .studio
+                    .create_turn(
+                        request.conversation_id,
+                        &request.prompt,
+                        request.source_turn_id,
+                        &prepared,
+                        &self.engine_info.device_id,
+                    )
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let initial_view = self
+                    .studio
+                    .conversation_view(request.conversation_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let futures = stored
+                    .into_iter()
+                    .map(|run| {
+                        let store = self.studio.clone();
+                        let providers = self.studio_providers.clone();
+                        let credentials = self.studio_credentials.clone();
+                        execute_studio_run(store, providers, credentials, run)
+                    })
+                    .collect::<Vec<_>>();
+                tokio::spawn(async move {
+                    let _ = futures::future::join_all(futures).await;
+                });
+                RpcReply::value(&initial_view)
+            }
+            methods::EXTEND_STUDIO_TURN => {
+                let request: ExtendStudioTurnRequest = parse_params(params)?;
+                let (_, prompt, specs) = self
+                    .studio
+                    .turn_extend_spec(request.turn_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let prepared = self.prepare_studio_runs(&prompt, specs, true).await?;
+                let (conversation_id, stored) = self
+                    .studio
+                    .extend_turn(request.turn_id, &prepared, &self.engine_info.device_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let initial_view = self
+                    .studio
+                    .conversation_view(conversation_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let futures = stored
+                    .into_iter()
+                    .map(|run| {
+                        let store = self.studio.clone();
+                        let providers = self.studio_providers.clone();
+                        let credentials = self.studio_credentials.clone();
+                        execute_studio_run(store, providers, credentials, run)
+                    })
+                    .collect::<Vec<_>>();
+                tokio::spawn(async move {
+                    let _ = futures::future::join_all(futures).await;
+                });
+                RpcReply::value(&initial_view)
+            }
+            methods::DELETE_STUDIO_ARTIFACT => {
+                let request: DeleteStudioArtifactRequest = parse_params(params)?;
+                self.studio
+                    .delete_artifact(request.artifact_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::RETRY_STUDIO_RUN => {
+                let request: RetryStudioRunRequest = parse_params(params)?;
+                let (run, conversation_id) = self
+                    .studio
+                    .prepare_retry(request.run_id, request.retry_anyway)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let view = self
+                    .studio
+                    .conversation_view(conversation_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let store = self.studio.clone();
+                let providers = self.studio_providers.clone();
+                let credentials = self.studio_credentials.clone();
+                tokio::spawn(execute_studio_run(store, providers, credentials, run));
+                RpcReply::value(&view)
+            }
+            methods::READ_STUDIO_ARTIFACT_CHUNK => {
+                let request: ReadStudioArtifactChunkRequest = parse_params(params)?;
+                let chunk = self
+                    .studio
+                    .artifacts()
+                    .read_chunk(request.artifact_id, request.offset)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&chunk)
+            }
+            methods::READ_STUDIO_PREVIEW_CHUNK => {
+                let request: ReadStudioArtifactChunkRequest = parse_params(params)?;
+                let chunk = self
+                    .studio
+                    .read_preview_chunk(request.artifact_id, request.offset)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&chunk)
             }
             methods::LIST_COMMANDS => {
                 // Same shape as ListModels: forces a lazy resolve, then the
@@ -1717,6 +2238,172 @@ impl RpcService for EngineRpc {
             other => Err(RpcError::UnknownMethod(other.to_string())),
         }
     }
+}
+
+fn studio_provider_label(provider_id: &zeron_studio::ProviderId) -> String {
+    match provider_id.as_str() {
+        "venice" => "Venice".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+fn venice_safe_mode_to_persist(
+    request: &zeron_studio::GenerationRequest,
+    model: &zeron_studio::MediaModel,
+    credentials: &StudioCredentials,
+) -> Result<Option<bool>, RpcError> {
+    if request.provider_id.as_str() != zeron_studio::venice::VENICE_PROVIDER_ID
+        || !model
+            .controls
+            .iter()
+            .any(|control| control.id.as_str() == "safe_mode")
+    {
+        return Ok(None);
+    }
+    Ok(credentials
+        .connection(&request.provider_id)
+        .map_err(|error| RpcError::Failed(error.to_string()))?
+        .map(|connection| connection.safe_mode))
+}
+
+fn apply_venice_safe_mode_for_submit(
+    credentials: &StudioCredentials,
+    mut request: zeron_studio::GenerationRequest,
+) -> zeron_studio::GenerationRequest {
+    if request.provider_id.as_str() != zeron_studio::venice::VENICE_PROVIDER_ID {
+        return request;
+    }
+    if let Ok(Some(connection)) = credentials.connection(&request.provider_id) {
+        request.controls.insert(
+            zeron_studio::ControlId::from("safe_mode"),
+            zeron_studio::ControlValue::Boolean {
+                value: connection.safe_mode,
+            },
+        );
+    }
+    request
+}
+
+async fn execute_studio_run(
+    store: std::sync::Arc<StudioStore>,
+    providers: std::sync::Arc<StudioProviderRegistry>,
+    credentials: std::sync::Arc<StudioCredentials>,
+    run: StoredStudioRun,
+) -> Result<(), String> {
+    let provider = match providers.get(&run.request.provider_id) {
+        Ok(Some(provider)) => provider,
+        Ok(None) => {
+            let message = "unknown studio provider".to_owned();
+            return fail_studio_run(&store, &run, &message, false);
+        }
+        Err(error) => {
+            let message = error.to_string();
+            return fail_studio_run(&store, &run, &message, false);
+        }
+    };
+    let capabilities = provider.submission_capabilities();
+    let secret = match credentials.secret(&run.request.provider_id).await {
+        Ok(secret) => secret,
+        Err(error) => {
+            let message = error.to_string();
+            return fail_studio_run(&store, &run, &message, false);
+        }
+    };
+    store
+        .mark_submitting(&run)
+        .map_err(|error| error.to_string())?;
+    let context = zeron_studio::SubmitContext {
+        idempotency_key: run.idempotency_key.clone(),
+        inputs: Vec::new(),
+    };
+    let request = apply_venice_safe_mode_for_submit(&credentials, run.request.clone());
+    match provider.submit(&secret, &request, &context).await {
+        Ok(zeron_studio::Submission::Completed { artifacts }) => {
+            if let Err(error) = store.complete_run(&run, &artifacts) {
+                let message = error.to_string();
+                fail_studio_run(&store, &run, &message, false)
+            } else {
+                Ok(())
+            }
+        }
+        Ok(zeron_studio::Submission::Queued { .. }) => fail_studio_run(
+            &store,
+            &run,
+            "provider queued an image job that this release cannot poll",
+            true,
+        ),
+        Err(error) => {
+            if error.kind == zeron_studio::ProviderErrorKind::InvalidRequest
+                && let Ok(models) = provider.list_models(&secret).await
+                && let Err(store_error) = store.cache_models(
+                    &run.request.provider_id,
+                    &models,
+                    crate::studio::STUDIO_CATALOG_TTL,
+                )
+            {
+                tracing::warn!(
+                    run_id = %run.run_id.0,
+                    provider = %run.request.provider_id.as_str(),
+                    error = %store_error,
+                    "studio catalog refresh after invalid request failed"
+                );
+            }
+            let unknown = error.kind == zeron_studio::ProviderErrorKind::Transient
+                && !capabilities.accepts_idempotency_key
+                && !capabilities.can_reconcile;
+            tracing::warn!(
+                run_id = %run.run_id.0,
+                attempt_id = %run.attempt_id.0,
+                provider = %run.request.provider_id.as_str(),
+                model = %run.request.model_id.as_str(),
+                error_kind = ?error.kind,
+                provider_code = error.provider_code.as_deref(),
+                retry_after_seconds = error.retry_after_seconds,
+                submission_unknown = unknown,
+                error = %error,
+                "studio generation failed"
+            );
+            store
+                .fail_run(&run, &error.to_string(), unknown)
+                .map_err(|store_error| {
+                    tracing::error!(
+                        run_id = %run.run_id.0,
+                        attempt_id = %run.attempt_id.0,
+                        error = %store_error,
+                        "studio generation failure could not be persisted"
+                    );
+                    store_error.to_string()
+                })
+        }
+    }
+}
+
+fn fail_studio_run(
+    store: &StudioStore,
+    run: &StoredStudioRun,
+    message: &str,
+    submission_unknown: bool,
+) -> Result<(), String> {
+    tracing::warn!(
+        run_id = %run.run_id.0,
+        attempt_id = %run.attempt_id.0,
+        provider = %run.request.provider_id.as_str(),
+        model = %run.request.model_id.as_str(),
+        submission_unknown,
+        error = message,
+        "studio generation failed"
+    );
+    store
+        .fail_run(&run, message, submission_unknown)
+        .map_err(|store_error| {
+            tracing::error!(
+                run_id = %run.run_id.0,
+                attempt_id = %run.attempt_id.0,
+                error = %store_error,
+                "studio generation failure could not be persisted"
+            );
+            store_error.to_string()
+        })
 }
 
 #[cfg(test)]

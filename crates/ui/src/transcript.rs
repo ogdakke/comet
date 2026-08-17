@@ -1466,7 +1466,11 @@ impl Transcript {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         // FollowMode stays Normal: the tail pin is ours (a per-frame spring),
         // not the list's per-layout hard snap.
-        let list = ListState::new(0, ListAlignment::Bottom, px(OVERDRAW_PX));
+        // measure_all: off-screen rows are laid out as roots (no paint) so
+        // the scrollbar sees the real content height, not only the overdraw.
+        // Already-measured items are skipped on later passes; splice of new
+        // rows re-arms the flag below.
+        let list = ListState::new(0, ListAlignment::Bottom, px(OVERDRAW_PX)).measure_all();
         let weak = cx.weak_entity();
         list.set_scroll_handler(move |event: &ListScrollEvent, _window, cx| {
             weak.update(cx, |this: &mut Transcript, cx| {
@@ -1618,96 +1622,107 @@ impl Transcript {
         let this = cx.weak_entity();
         cx.defer(move |cx| {
             this.update(cx, |this: &mut Transcript, cx| {
-                // Wheel/touch while a runway lives: input owns the viewport,
-                // and the BOTTOM PIN must stay out of it entirely. Escaping
-                // releases the hold (the reservation stays behind as plain
-                // scrollable space); returning toward the bottom re-arms the
-                // HOLD, never `pinned` — a restick pin glued the view to the
-                // bottom of the reservation pad, where streaming reads as
-                // text stuck at the viewport top with the runway never
-                // filling (user report; the pad can't resize there either,
-                // its anchor being off-screen). macOS trackpad momentum can
-                // even release-and-restick within one gesture right after a
-                // send, so under the old rules the prompt never landed at
-                // the top at all.
-                if this.own_turn.is_some() {
-                    let distance = this.distance_from_bottom();
-                    let previous = this.last_scroll_distance;
-                    this.last_scroll_distance = distance;
-                    let held = this.own_turn.as_ref().is_some_and(|a| a.held);
-                    if distance > previous + 1.0 && distance > AT_BOTTOM_PX {
-                        // Input moving away from the bottom breaks the hold.
-                        if let Some(anchor) = this.own_turn.as_mut() {
-                            anchor.held = false;
-                        }
-                        this.own_turn_last_tick = None;
-                        this.pinned = false;
-                        this.spring.reset();
-                        this.spring_last_tick = None;
-                    } else if !held
-                        && (distance <= AT_BOTTOM_PX || Self::should_restick(distance, previous))
-                    {
-                        // Returning to the bottom returns to the RUNWAY: the
-                        // glide re-lands the prompt at its inset.
-                        if let Some(anchor) = this.own_turn.as_mut() {
-                            anchor.held = true;
-                            anchor.positioned = false;
-                        }
-                        this.own_turn_last_tick = None;
-                        this.own_turn_kick = true;
-                    } else if held {
-                        // Wheel-down while held: the bottom is a HARD STOP.
-                        // The pad runs one frame behind a streaming commit,
-                        // so the list's own end-clamp can briefly admit
-                        // travel into the transient surplus — re-assert the
-                        // hold in the same effect cycle, before anything
-                        // paints, and the sink never reaches the screen.
-                        // (scroll_to is bounds-free, so this also covers the
-                        // wheel gluing the offset at the end.)
-                        if let Some(ix) = this.own_turn_anchor_ix() {
-                            this.list.scroll_to(ListOffset {
-                                item_ix: ix,
-                                offset_in_item: px(0.0),
-                            });
-                            this.list.scroll_by(px(-Self::own_send_inset(ix)));
-                        }
-                        this.last_scroll_distance = this.distance_from_bottom();
-                    }
-                    let show = distance > SCROLL_BUTTON_THRESHOLD_PX
-                        && !this.own_turn.as_ref().is_some_and(|a| a.held);
-                    if show != this.show_jump_button {
-                        this.show_jump_button = show;
-                    }
-                    cx.notify();
-                    return;
-                }
-                let distance = this.distance_from_bottom();
-                let previous = this.last_scroll_distance;
-                this.last_scroll_distance = distance;
-                if distance > previous + 1.0 && distance > AT_BOTTOM_PX {
-                    // User input moving away from the bottom breaks the pin.
-                    // Content growth never lands here — it doesn't fire the
-                    // scroll handler (mugen §1e: interrupt from input, not
-                    // scrollbar position).
-                    this.pinned = false;
-                    this.spring.reset();
-                    this.spring_last_tick = None;
-                } else if distance <= AT_BOTTOM_PX || Self::should_restick(distance, previous) {
-                    // Returning toward the bottom inside the 70px band (or
-                    // arriving at it) re-engages the pin with a glide.
-                    if !this.pinned {
-                        this.pinned = true;
-                        this.wake_spring();
-                    }
-                }
-                let show = distance > SCROLL_BUTTON_THRESHOLD_PX && !this.pinned;
-                if show != this.show_jump_button {
-                    this.show_jump_button = show;
-                }
-                cx.notify();
+                this.apply_user_scroll(cx);
             })
             .ok();
         });
+    }
+
+    /// Scrollbar-drag counterpart of [`Self::handle_scroll`]: the list
+    /// handler is wheel/touch only, so a thumb scrub has to apply the same
+    /// pin / jump-button rules itself.
+    fn handle_scrollbar_scrub(&mut self, cx: &mut Context<Self>) {
+        self.apply_user_scroll(cx);
+    }
+
+    fn apply_user_scroll(&mut self, cx: &mut Context<Self>) {
+        // Wheel/touch while a runway lives: input owns the viewport,
+        // and the BOTTOM PIN must stay out of it entirely. Escaping
+        // releases the hold (the reservation stays behind as plain
+        // scrollable space); returning toward the bottom re-arms the
+        // HOLD, never `pinned` — a restick pin glued the view to the
+        // bottom of the reservation pad, where streaming reads as
+        // text stuck at the viewport top with the runway never
+        // filling (user report; the pad can't resize there either,
+        // its anchor being off-screen). macOS trackpad momentum can
+        // even release-and-restick within one gesture right after a
+        // send, so under the old rules the prompt never landed at
+        // the top at all.
+        if self.own_turn.is_some() {
+            let distance = self.distance_from_bottom();
+            let previous = self.last_scroll_distance;
+            self.last_scroll_distance = distance;
+            let held = self.own_turn.as_ref().is_some_and(|a| a.held);
+            if distance > previous + 1.0 && distance > AT_BOTTOM_PX {
+                // Input moving away from the bottom breaks the hold.
+                if let Some(anchor) = self.own_turn.as_mut() {
+                    anchor.held = false;
+                }
+                self.own_turn_last_tick = None;
+                self.pinned = false;
+                self.spring.reset();
+                self.spring_last_tick = None;
+            } else if !held
+                && (distance <= AT_BOTTOM_PX || Self::should_restick(distance, previous))
+            {
+                // Returning to the bottom returns to the RUNWAY: the
+                // glide re-lands the prompt at its inset.
+                if let Some(anchor) = self.own_turn.as_mut() {
+                    anchor.held = true;
+                    anchor.positioned = false;
+                }
+                self.own_turn_last_tick = None;
+                self.own_turn_kick = true;
+            } else if held {
+                // Wheel-down while held: the bottom is a HARD STOP.
+                // The pad runs one frame behind a streaming commit,
+                // so the list's own end-clamp can briefly admit
+                // travel into the transient surplus — re-assert the
+                // hold in the same effect cycle, before anything
+                // paints, and the sink never reaches the screen.
+                // (scroll_to is bounds-free, so this also covers the
+                // wheel gluing the offset at the end.)
+                if let Some(ix) = self.own_turn_anchor_ix() {
+                    self.list.scroll_to(ListOffset {
+                        item_ix: ix,
+                        offset_in_item: px(0.0),
+                    });
+                    self.list.scroll_by(px(-Self::own_send_inset(ix)));
+                }
+                self.last_scroll_distance = self.distance_from_bottom();
+            }
+            let show = distance > SCROLL_BUTTON_THRESHOLD_PX
+                && !self.own_turn.as_ref().is_some_and(|a| a.held);
+            if show != self.show_jump_button {
+                self.show_jump_button = show;
+            }
+            cx.notify();
+            return;
+        }
+        let distance = self.distance_from_bottom();
+        let previous = self.last_scroll_distance;
+        self.last_scroll_distance = distance;
+        if distance > previous + 1.0 && distance > AT_BOTTOM_PX {
+            // User input moving away from the bottom breaks the pin.
+            // Content growth never lands here — it doesn't fire the
+            // scroll handler (mugen §1e: interrupt from input, not
+            // scrollbar position).
+            self.pinned = false;
+            self.spring.reset();
+            self.spring_last_tick = None;
+        } else if distance <= AT_BOTTOM_PX || Self::should_restick(distance, previous) {
+            // Returning toward the bottom inside the 70px band (or
+            // arriving at it) re-engages the pin with a glide.
+            if !self.pinned {
+                self.pinned = true;
+                self.wake_spring();
+            }
+        }
+        let show = distance > SCROLL_BUTTON_THRESHOLD_PX && !self.pinned;
+        if show != self.show_jump_button {
+            self.show_jump_button = show;
+        }
+        cx.notify();
     }
 
     /// Reserve the reply's space below a locally-sent prompt — EVERY send,
@@ -2288,6 +2303,11 @@ impl Transcript {
                     self.list.remeasure_items(old_range);
                 } else {
                     self.list.splice(old_range, count);
+                    // splice leaves the measure-all flag set, so new
+                    // Unmeasured rows would stay 0px. Re-arm: the next
+                    // layout measures only those, skipping already-sized
+                    // items.
+                    self.list.clone().measure_all();
                 }
             }
         }
@@ -3958,6 +3978,17 @@ impl Render for Transcript {
             });
         }
         let rail = self.render_rail(cx);
+        let scrub = cx.weak_entity();
+        let scrollbar = crate::scrollbar::overlay("transcript", &self.list)
+            .inset_top(Theme::TITLEBAR_HEIGHT)
+            .inset_bottom(self.bottom_clearance)
+            .on_scrub(move |_, cx| {
+                scrub
+                    .update(cx, |this: &mut Transcript, cx| {
+                        this.handle_scrollbar_scrub(cx);
+                    })
+                    .ok();
+            });
         // The scroll-to-bottom pill is rendered by the SHELL (conversation
         // region overlay): it must float just above the composer and paint
         // OVER the bottom fade gradient, which is a later sibling of this
@@ -3975,7 +4006,8 @@ impl Render for Transcript {
                     .size_full()
                     .with_sizing_behavior(gpui::ListSizingBehavior::Auto),
             )
-            .child(rail);
+            .child(rail)
+            .child(scrollbar);
         // Full-size viewer for a clicked user-bubble thumbnail
         // (AttachmentPreviewDialog: bare lightbox, click closes).
         if let Some(preview) = self.attachment_preview.clone() {

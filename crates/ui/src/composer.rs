@@ -1280,6 +1280,11 @@ pub struct ComposerInput {
     /// after the input has been measured in the new mode).
     layout_epoch: u64,
     display_is_placeholder: bool,
+    /// Compact composers keep text on one measured line until their wrapper
+    /// commits the expanded layout. This avoids measuring a paste at the
+    /// narrow compact width and then using that exaggerated wrapped height
+    /// as the expanded target for one frame.
+    soft_wrap: bool,
     /// Caret blink anchor: reset on every keystroke/caret move so the caret is
     /// solid while typing and blinks at [`CARET_BLINK_MS`] when idle.
     blink_anchor: Instant,
@@ -1310,6 +1315,12 @@ pub struct ComposerInput {
 impl ComposerInput {
     pub fn new(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
         Self::with_context(placeholder, "Composer", cx)
+    }
+
+    /// A picker/filter input whose bare navigation keys are owned by its
+    /// surrounding menu rather than consumed as editor cursor movement.
+    pub fn palette_search(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
+        Self::with_context(placeholder, "PaletteSearch", cx)
     }
 
     /// An input in a custom KEY context — palettes use `"PaletteSearch"`,
@@ -1346,6 +1357,7 @@ impl ComposerInput {
             mentions_enabled: false,
             layout_epoch: 0,
             display_is_placeholder: true,
+            soft_wrap: true,
             blink_anchor: Instant::now(),
             blink_task: None,
             undo_stack: Vec::new(),
@@ -1512,6 +1524,14 @@ impl ComposerInput {
 
     pub fn measured_content_height(&self) -> f32 {
         self.content_height
+    }
+
+    pub fn measured_layout_width(&self) -> f32 {
+        self.last_width
+    }
+
+    pub fn set_soft_wrap(&mut self, soft_wrap: bool) {
+        self.soft_wrap = soft_wrap;
     }
 
     pub fn set_placeholder(
@@ -2507,9 +2527,10 @@ impl ComposerInput {
             }
         };
 
+        let wrap_width = self.soft_wrap.then_some(width);
         let lines = window
             .text_system()
-            .shape_text(display, font_size, &runs, Some(width), None)
+            .shape_text(display, font_size, &runs, wrap_width, None)
             .map(|small| small.into_vec())
             .unwrap_or_default();
 
@@ -3346,6 +3367,10 @@ pub struct Composer {
     /// Pill height actually rendered last frame — a committed flip morphs
     /// from here, so mid-flight reversals hand off without a jump.
     last_rendered_height: f32,
+    /// Last steady auto-grow target. A paste can change this by many lines in
+    /// one edit even without a compact/expanded mode flip; tracking it lets
+    /// that height change use the same smooth morph as a flip.
+    last_target_height: f32,
     /// Monotonic clock anchor for the morph timeline.
     morph_clock: Instant,
     /// Set on every session/route change: flips committed before this instant
@@ -3448,6 +3473,7 @@ impl Composer {
             settle_task: None,
             flip_morph: None,
             last_rendered_height: 0.0,
+            last_target_height: 0.0,
             morph_clock: Instant::now(),
             route_snap_until: None,
             _observe: observe,
@@ -5297,6 +5323,9 @@ impl Render for Composer {
         // New chats render expanded regardless of `expanded_mode` (see below),
         // so a mode flip there changes nothing visible — never morph it.
         let new_chat = self.state.read(cx).selected_chat.is_none();
+        self.input.update(cx, |input, _| {
+            input.set_soft_wrap(self.expanded_mode || new_chat)
+        });
         // Morph clock in ms; dividing by the measurement knob stretches the
         // timeline exactly like shell.rs eval_tween's scaled duration.
         let now_ms = self.morph_clock.elapsed().as_secs_f32() * 1000.0 / motion::speed_scale();
@@ -5425,6 +5454,19 @@ impl Render for Composer {
             COMPACT_TOTAL_HEIGHT
         };
         let target_height = base_height + strip_h;
+        let target_changed =
+            self.last_target_height > 0.0 && (target_height - self.last_target_height).abs() > 0.5;
+        if target_changed && !committed_flip {
+            self.flip_morph = if motion::reduced_motion(cx) || route_snap {
+                None
+            } else {
+                Some(FlipMorph {
+                    from: self.last_rendered_height,
+                    start_ms: now_ms,
+                })
+            };
+        }
+        self.last_target_height = target_height;
         let (pill_height, morph_t, morphing) = match self.flip_morph {
             Some(m) if !m.done(now_ms) => {
                 (m.height(target_height, now_ms), m.progress(now_ms), true)

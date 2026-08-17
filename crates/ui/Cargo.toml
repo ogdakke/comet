@@ -12,6 +12,7 @@ zeron-doc.workspace = true
 zeron-engine.workspace = true
 zeron-harness.workspace = true
 zeron-rpc.workspace = true
+zeron-studio.workspace = true
 zeron-update.workspace = true
 zeron-syntax.workspace = true
 gpui.workspace = true
@@ -25,6 +26,8 @@ serde_json.workspace = true
 pulldown-cmark.workspace = true
 alacritty_terminal.workspace = true
 base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+thumbhash = "0.1"
 unicode-segmentation.workspace = true
 uuid.workspace = true
 chrono.workspace = true

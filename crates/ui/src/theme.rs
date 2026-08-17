@@ -543,15 +543,17 @@ impl Theme {
         }
     }
 
-    /// The composer pill / question panel fill. Light's `input_bg` is opaque
-    /// white (the elevation ladder on an opaque page) — over glass it read as
-    /// a solid slab in front of the frosted blur, so it thins to a
-    /// translucent tint there (0.6 and then 0.45 both still read too bright
-    /// over the 0.80 frost — lowered on user request). Dark's 3% white wash
-    /// is already glass-native.
+    /// The composer pill / question panel fill. A floating input can overlap
+    /// arbitrary content, so its glass tint must establish a predictable text
+    /// plane while still allowing the blurred backdrop to read through. The
+    /// tint follows the appearance: near-black in dark mode, near-white in
+    /// light mode.
     pub fn input_glass_bg(&self) -> Hsla {
-        if self.is_glass() && matches!(self.appearance, Appearance::Light) {
-            self.input_bg.opacity(0.30)
+        if self.is_glass() {
+            match self.appearance {
+                Appearance::Dark => grey(0x08).opacity(0.66),
+                Appearance::Light => grey(0xfa).opacity(0.66),
+            }
         } else {
             self.input_bg
         }
