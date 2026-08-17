@@ -1,11 +1,13 @@
 //! The composer: a hand-rolled multiline text input (adapted from gpui's
 //! `examples/input.rs`), the compact↔expanded flip, the Send/Steer/Stop morph,
-//! optimistic send with failure recovery, per-chat drafts, and the question
-//! wizard that replaces the composer while a run awaits input.
+//! optimistic send with failure recovery, per-chat drafts, thread prompt
+//! history (Up/Down overflow), and the question wizard that replaces the
+//! composer while a run awaits input.
 //!
 //! Pure decision logic (flip, auto-grow math, button morph, wizard reducer,
-//! pending-input detection) lives in free functions/structs with unit tests;
-//! the gpui element only feeds them measurements.
+//! pending-input detection, prompt-history navigation) lives in free
+//! functions/structs with unit tests; the gpui element only feeds them
+//! measurements.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -446,6 +448,156 @@ pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
         (true, true) => SendButtonMode::Steer,
         (true, false) => SendButtonMode::Stop,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Thread prompt history (Up/Down overflow)
+// ---------------------------------------------------------------------------
+
+/// One sent user prompt, oldest first. `text` is the visible body (attachment
+/// ref trailers stripped) — what a recall should put back in the box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptHistoryItem {
+    pub message_id: String,
+    pub text: String,
+}
+
+/// What a history step puts in the composer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryFill {
+    pub text: String,
+    /// `true` after Up (so the next Up can fire immediately); `false` after
+    /// Down (so the next Down can).
+    pub caret_at_start: bool,
+}
+
+/// Browse pointer into this thread's sent prompts. `current_id == None` means
+/// the composer is showing the in-progress draft (the scratch).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptHistory {
+    current_id: Option<String>,
+    scratch: String,
+}
+
+impl PromptHistory {
+    pub fn reset(&mut self) {
+        self.current_id = None;
+        self.scratch.clear();
+    }
+
+    /// Drop the pointer if that message left the thread. Returns `true` when
+    /// the composer should snap back to [`Self::scratch`].
+    pub fn snap_if_vanished(&mut self, prompts: &[PromptHistoryItem]) -> bool {
+        let Some(id) = self.current_id.as_ref() else {
+            return false;
+        };
+        if prompts.iter().any(|item| item.message_id == *id) {
+            return false;
+        }
+        self.current_id = None;
+        true
+    }
+
+    pub fn scratch(&self) -> &str {
+        &self.scratch
+    }
+
+    /// Older prompt. From idle, stashes `current_text` and loads the newest.
+    pub fn up(&mut self, prompts: &[PromptHistoryItem], current_text: &str) -> Option<HistoryFill> {
+        if prompts.is_empty() {
+            return None;
+        }
+        match self.index_of(prompts) {
+            None => {
+                self.scratch = current_text.to_string();
+                let newest = prompts.last()?;
+                self.current_id = Some(newest.message_id.clone());
+                Some(HistoryFill {
+                    text: newest.text.clone(),
+                    caret_at_start: true,
+                })
+            }
+            Some(0) => None,
+            Some(ix) => {
+                let older = &prompts[ix - 1];
+                self.current_id = Some(older.message_id.clone());
+                Some(HistoryFill {
+                    text: older.text.clone(),
+                    caret_at_start: true,
+                })
+            }
+        }
+    }
+
+    /// Newer prompt, or the stashed draft once you fall off the newest.
+    pub fn down(
+        &mut self,
+        prompts: &[PromptHistoryItem],
+        _current_text: &str,
+    ) -> Option<HistoryFill> {
+        match self.index_of(prompts) {
+            None => None,
+            Some(ix) if ix + 1 < prompts.len() => {
+                let newer = &prompts[ix + 1];
+                self.current_id = Some(newer.message_id.clone());
+                Some(HistoryFill {
+                    text: newer.text.clone(),
+                    caret_at_start: false,
+                })
+            }
+            Some(_) => {
+                self.current_id = None;
+                Some(HistoryFill {
+                    text: self.scratch.clone(),
+                    caret_at_start: false,
+                })
+            }
+        }
+    }
+
+    fn index_of(&self, prompts: &[PromptHistoryItem]) -> Option<usize> {
+        self.current_id
+            .as_ref()
+            .and_then(|id| prompts.iter().position(|item| item.message_id == *id))
+    }
+}
+
+/// User prompts in transcript order (doc entries, then unconfirmed echoes),
+/// skipping blanks and image-only sends. Same membership as the message rail,
+/// but the body is the visible prompt — not the rail's "Attached image" label.
+pub fn prompt_history(
+    entries: &[SessionMessageEntry],
+    echoes: &[SessionMessageEntry],
+) -> Vec<PromptHistoryItem> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in entries.iter().chain(echoes.iter()) {
+        if entry.role != MessageRole::User || !seen.insert(entry.id.clone()) {
+            continue;
+        }
+        let text = visible_user_prompt(entry);
+        if text.trim().is_empty() {
+            continue;
+        }
+        out.push(PromptHistoryItem {
+            message_id: entry.id.clone(),
+            text,
+        });
+    }
+    out
+}
+
+fn visible_user_prompt(entry: &SessionMessageEntry) -> String {
+    let raw = entry
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    crate::attachments::parse_user_message_images(&raw).text
 }
 
 /// Find the unresolved input request the panel should serve, if any: an
@@ -1299,6 +1451,9 @@ pub enum ComposerInputEvent {
     MentionNavigate(isize),
     MentionAccept,
     MentionDismiss,
+    /// Caret fell off the top (`-1`) or bottom (`1`) of the document — the
+    /// wrapper walks this thread's sent prompts, stashing the draft.
+    HistoryNavigate(isize),
     /// Images pasted from the clipboard (screenshots / copied image data) —
     /// the wrapper stages them as attachments (use-attachments.ts onPaste).
     PastedImages(Vec<gpui::Image>),
@@ -1652,6 +1807,38 @@ impl ComposerInput {
         cx.notify();
     }
 
+    /// Swap the whole document for a recalled prompt (or the stashed draft).
+    /// Unlike [`Self::set_text`], this is one undo step so Cmd+Z walks fills
+    /// back to whatever was in the box.
+    pub fn replace_from_history(
+        &mut self,
+        text: impl Into<String>,
+        caret_at_start: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let text = text.into();
+        let caret = if caret_at_start { 0 } else { text.len() };
+        if self.content == text {
+            if self.selected_range.start != caret || self.selected_range.end != caret {
+                self.move_to(caret, cx);
+            }
+            return;
+        }
+        self.record_edit(&(0..self.content.len()), &text);
+        self.last_edit = None;
+        self.invalidate_mention_tooltip();
+        self.content = text;
+        self.refresh_projection();
+        self.selected_range = caret..caret;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.scroll_top = 0.0;
+        self.follow_cursor = true;
+        self.reset_blink();
+        cx.emit(ComposerInputEvent::Edited);
+        cx.notify();
+    }
+
     fn invalidate_mention_tooltip(&mut self) {
         self.mention_tooltip_generation = self.mention_tooltip_generation.wrapping_add(1);
         self.mention_tooltip = MentionTooltipPhase::Hidden;
@@ -2000,6 +2187,10 @@ impl ComposerInput {
             cx.emit(ComposerInputEvent::MentionNavigate(-1));
             return;
         }
+        if self.should_emit_history(-1) {
+            cx.emit(ComposerInputEvent::HistoryNavigate(-1));
+            return;
+        }
         if let Some(ix) = self.vertical_target(-1.0) {
             self.move_to(ix, cx);
         }
@@ -2010,8 +2201,25 @@ impl ComposerInput {
             cx.emit(ComposerInputEvent::MentionNavigate(1));
             return;
         }
+        if self.should_emit_history(1) {
+            cx.emit(ComposerInputEvent::HistoryNavigate(1));
+            return;
+        }
         if let Some(ix) = self.vertical_target(1.0) {
             self.move_to(ix, cx);
+        }
+    }
+
+    /// Overflow only: collapsed caret at the document start (Up) or end
+    /// (Down). Completion popups and IME compositions keep the arrows.
+    fn should_emit_history(&self, dir: isize) -> bool {
+        if self.mention_open || self.marked_range.is_some() || !self.selected_range.is_empty() {
+            return false;
+        }
+        if dir < 0 {
+            self.cursor_offset() == 0
+        } else {
+            self.cursor_offset() == self.content.len()
         }
     }
 
@@ -3462,6 +3670,9 @@ pub struct Composer {
     pickers: Entity<Pickers>,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
     drafts: HashMap<String, String>,
+    /// Up/Down overflow through this thread's sent prompts. Reset on send and
+    /// chat switch; the in-progress draft lives in `scratch` while browsing.
+    history: PromptHistory,
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
     /// navigating away and back restores them; memory-only, like the original.
     attachments: HashMap<String, Vec<StagedAttachment>>,
@@ -3591,6 +3802,7 @@ impl Composer {
                 this.add_staged(staged, cx);
             }
             ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
+            ComposerInputEvent::HistoryNavigate(dir) => this.on_history_navigate(*dir, cx),
         });
         let current_key = state.read(cx).selected_chat.clone().unwrap_or_default();
         let mut composer = Self {
@@ -3598,6 +3810,7 @@ impl Composer {
             input,
             pickers,
             drafts: HashMap::new(),
+            history: PromptHistory::default(),
             attachments: HashMap::new(),
             preview: None,
             preview_focus: cx.focus_handle(),
@@ -4485,6 +4698,7 @@ impl Composer {
             self.current_key = key;
             self.failure = None;
             self.wizard = None;
+            self.history.reset();
             // Attachments stay stashed under their chat key (the map swap IS
             // the navigation); only the transient chrome resets.
             self.preview = None;
@@ -4499,6 +4713,19 @@ impl Composer {
             self.last_rendered_height = 0.0;
             self.route_snap_until = Some(Instant::now() + Duration::from_millis(ROUTE_SNAP_MS));
             self.input.update(cx, |input, cx| input.set_text(draft, cx));
+        } else {
+            // Same chat: if the recalled message left the thread, put the
+            // stashed draft back so it cannot vanish with the row.
+            let prompts = {
+                let s = self.state.read(cx);
+                prompt_history(&s.transcript, s.pending_echoes())
+            };
+            if self.history.snap_if_vanished(&prompts) {
+                let scratch = self.history.scratch().to_string();
+                self.input.update(cx, |input, cx| {
+                    input.replace_from_history(scratch, false, cx);
+                });
+            }
         }
 
         // Question panel lifecycle (wizard state cached per request id).
@@ -4570,6 +4797,37 @@ impl Composer {
         // (the prompt body becomes "See the attached image(s).").
         let has_text = !self.input.read(cx).text().trim().is_empty() || !self.staged().is_empty();
         send_button_mode(self.run_live(cx), has_text)
+    }
+
+    fn on_history_navigate(&mut self, dir: isize, cx: &mut Context<Self>) {
+        if self.wizard.is_some() {
+            return;
+        }
+        let (prompts, current_text) = {
+            let state = self.state.read(cx);
+            (
+                prompt_history(&state.transcript, state.pending_echoes()),
+                self.input.read(cx).text().to_string(),
+            )
+        };
+        if self.history.snap_if_vanished(&prompts) {
+            let scratch = self.history.scratch().to_string();
+            self.input.update(cx, |input, cx| {
+                input.replace_from_history(scratch, false, cx);
+            });
+            return;
+        }
+        let fill = if dir < 0 {
+            self.history.up(&prompts, &current_text)
+        } else {
+            self.history.down(&prompts, &current_text)
+        };
+        let Some(fill) = fill else {
+            return;
+        };
+        self.input.update(cx, |input, cx| {
+            input.replace_from_history(fill.text, fill.caret_at_start, cx);
+        });
     }
 
     fn on_submit(&mut self, cx: &mut Context<Self>) {
@@ -4716,6 +4974,7 @@ impl Composer {
 
         self.input.update(cx, |input, cx| input.set_text("", cx));
         self.drafts.remove(&self.current_key);
+        self.history.reset();
         self.failure = None;
         self.sending = true;
         cx.emit(ComposerEvent::Sent {
@@ -6715,5 +6974,125 @@ mod tests {
         let t = vec![entry(Some(MessageStatus::Streaming), vec![resolved])];
         assert!(input_request_resolved(&t, "r1"));
         assert!(!input_request_resolved(&t, "other"));
+    }
+
+    fn user_entry(id: &str, text: &str) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::User,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: text.into(),
+            }],
+            created_at: 0,
+            device_id: "d".into(),
+            status: None,
+            continuation_of: None,
+        }
+    }
+
+    fn assistant_entry(id: &str, text: &str) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: text.into(),
+            }],
+            created_at: 0,
+            device_id: "d".into(),
+            status: None,
+            continuation_of: None,
+        }
+    }
+
+    #[test]
+    fn prompt_history_lists_visible_user_prompts_oldest_first() {
+        let entries = vec![
+            user_entry("u1", "first"),
+            assistant_entry("a1", "reply"),
+            user_entry("u2", "second"),
+        ];
+        let echoes = vec![user_entry("u2", "second"), user_entry("u3", "pending")];
+        let items = prompt_history(&entries, &echoes);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.message_id.as_str(), item.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("u1", "first"), ("u2", "second"), ("u3", "pending")]
+        );
+    }
+
+    #[test]
+    fn prompt_history_skips_blank_and_image_only_sends() {
+        let image_only = crate::attachments::with_attachments("", &["/tmp/a.png".into()]);
+        let with_caption = crate::attachments::with_attachments("look", &["/tmp/b.png".into()]);
+        let entries = vec![
+            user_entry("blank", "   "),
+            user_entry("img", &image_only),
+            user_entry("cap", &with_caption),
+        ];
+        let items = prompt_history(&entries, &[]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].message_id, "cap");
+        assert_eq!(items[0].text, "look");
+    }
+
+    #[test]
+    fn history_up_stashes_the_draft_and_down_returns_it() {
+        let prompts = prompt_history(&[user_entry("a", "older"), user_entry("b", "newer")], &[]);
+        let mut hist = PromptHistory::default();
+        assert!(hist.down(&prompts, "draft").is_none());
+
+        let fill = hist.up(&prompts, "long unsent draft").unwrap();
+        assert_eq!(fill.text, "newer");
+        assert!(fill.caret_at_start);
+
+        let fill = hist.up(&prompts, "edits to newer are discarded").unwrap();
+        assert_eq!(fill.text, "older");
+        assert!(fill.caret_at_start);
+        assert!(hist.up(&prompts, "").is_none());
+
+        let fill = hist.down(&prompts, "").unwrap();
+        assert_eq!(fill.text, "newer");
+        assert!(!fill.caret_at_start);
+
+        let fill = hist.down(&prompts, "still discarded").unwrap();
+        assert_eq!(fill.text, "long unsent draft");
+        assert!(!fill.caret_at_start);
+        assert!(hist.down(&prompts, "long unsent draft").is_none());
+    }
+
+    #[test]
+    fn history_empty_while_browsing_does_not_reenter_at_newest() {
+        let prompts = prompt_history(&[user_entry("a", "older"), user_entry("b", "newer")], &[]);
+        let mut hist = PromptHistory::default();
+        hist.up(&prompts, "");
+        // User deleted the recalled prompt; Up must walk older, not reset.
+        let fill = hist.up(&prompts, "").unwrap();
+        assert_eq!(fill.text, "older");
+    }
+
+    #[test]
+    fn history_vanished_prompt_snaps_back_to_scratch() {
+        let prompts = prompt_history(&[user_entry("a", "keep"), user_entry("gone", "temp")], &[]);
+        let mut hist = PromptHistory::default();
+        hist.up(&prompts, "draft");
+        assert!(!hist.snap_if_vanished(&prompts));
+        let remaining = prompt_history(&[user_entry("a", "keep")], &[]);
+        assert!(hist.snap_if_vanished(&remaining));
+        assert_eq!(hist.scratch(), "draft");
+        // Idle again: Down is a no-op, Up re-enters at the surviving newest.
+        assert!(hist.down(&remaining, "temp").is_none());
+        let fill = hist.up(&remaining, "draft").unwrap();
+        assert_eq!(fill.text, "keep");
+    }
+
+    #[test]
+    fn history_up_with_no_prompts_is_a_noop() {
+        let mut hist = PromptHistory::default();
+        assert!(hist.up(&[], "draft").is_none());
+        assert_eq!(hist.scratch(), "");
     }
 }

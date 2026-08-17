@@ -17,7 +17,7 @@ use zeron_proto::{
 use zeron_rpc::methods;
 use zeron_studio::{StudioArtifactId, StudioConversationId};
 
-use crate::composer::{ComposerInput, ComposerInputEvent};
+use crate::composer::{ComposerInput, ComposerInputEvent, PromptHistory, PromptHistoryItem};
 use crate::popover;
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
@@ -57,6 +57,9 @@ pub struct StudioPage {
     pub(super) selected_conversation: Option<StudioConversationId>,
     pub(super) conversation: Option<StudioConversationView>,
     pub(super) prompt: Entity<ComposerInput>,
+    /// Up/Down overflow through this conversation's turn prompts. Reset on
+    /// submit and conversation switch; the in-progress draft is the scratch.
+    pub(super) prompt_history: PromptHistory,
     pub(super) prompt_expanded: bool,
     pub(super) prompt_morph: Option<crate::composer::FlipMorph>,
     pub(super) prompt_last_height: f32,
@@ -157,6 +160,7 @@ impl StudioPage {
         let prompt_events = cx.subscribe(&prompt, |page: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => page.submit(cx),
             ComposerInputEvent::Edited => cx.notify(),
+            ComposerInputEvent::HistoryNavigate(dir) => page.on_history_navigate(*dir, cx),
             _ => {}
         });
         let model_search_events =
@@ -195,6 +199,7 @@ impl StudioPage {
             selected_conversation: None,
             conversation: None,
             prompt,
+            prompt_history: PromptHistory::default(),
             prompt_expanded: false,
             prompt_morph: None,
             prompt_last_height: 0.0,
@@ -558,6 +563,7 @@ impl StudioPage {
             self.focused_artifact = None;
             self.close_artifact(cx);
             self.composer_seeded_for = None;
+            self.prompt_history.reset();
             self.expanded_prompts.clear();
             self.expanded_inspector_prompts.clear();
             self.inspector_scroll.set_offset(Point::default());
@@ -611,6 +617,7 @@ impl StudioPage {
                         page.observe_upscale_view(&view, cx);
                         page.apply_conversation_summary(visible_view.conversation.clone(), cx);
                         page.conversation = Some(visible_view);
+                        page.snap_prompt_history(cx);
                         if settled {
                             page.refresh_account_balance(cx, true);
                         }
@@ -806,6 +813,46 @@ impl StudioPage {
         }));
     }
 
+    fn current_studio_prompts(&self) -> Vec<PromptHistoryItem> {
+        self.conversation
+            .as_ref()
+            .map(|view| studio_prompt_history(&view.turns))
+            .unwrap_or_default()
+    }
+
+    fn snap_prompt_history(&mut self, cx: &mut Context<Self>) {
+        let prompts = self.current_studio_prompts();
+        if self.prompt_history.snap_if_vanished(&prompts) {
+            let scratch = self.prompt_history.scratch().to_string();
+            self.prompt.update(cx, |input, cx| {
+                input.replace_from_history(scratch, false, cx);
+            });
+        }
+    }
+
+    fn on_history_navigate(&mut self, dir: isize, cx: &mut Context<Self>) {
+        let prompts = self.current_studio_prompts();
+        let current_text = self.prompt.read(cx).text().to_string();
+        if self.prompt_history.snap_if_vanished(&prompts) {
+            let scratch = self.prompt_history.scratch().to_string();
+            self.prompt.update(cx, |input, cx| {
+                input.replace_from_history(scratch, false, cx);
+            });
+            return;
+        }
+        let fill = if dir < 0 {
+            self.prompt_history.up(&prompts, &current_text)
+        } else {
+            self.prompt_history.down(&prompts, &current_text)
+        };
+        let Some(fill) = fill else {
+            return;
+        };
+        self.prompt.update(cx, |input, cx| {
+            input.replace_from_history(fill.text, fill.caret_at_start, cx);
+        });
+    }
+
     pub(super) fn submit(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.engine(cx) else {
             return;
@@ -894,6 +941,7 @@ impl StudioPage {
                 match result {
                     Ok(_) => {
                         page.prompt.update(cx, |input, cx| input.set_text("", cx));
+                        page.prompt_history.reset();
                         page.source_turn = None;
                         page.persist_composer_defaults(cx);
                     }
@@ -1059,6 +1107,7 @@ impl StudioPage {
     }
 
     pub(super) fn use_prompt(&mut self, turn: &StudioTurnView, cx: &mut Context<Self>) {
+        self.prompt_history.reset();
         self.prompt
             .update(cx, |input, cx| input.set_text(turn.prompt.clone(), cx));
         apply_turn_models(
@@ -1232,6 +1281,7 @@ impl StudioPage {
                             page.close_artifact(cx);
                             page.selected_conversation = None;
                             page.conversation = None;
+                            page.prompt_history.reset();
                             if let Some(next) = page.conversations.first() {
                                 page.open_conversation(next.id, cx);
                             }
@@ -1269,6 +1319,7 @@ impl StudioPage {
                         if page.selected_conversation == Some(conversation_id) {
                             page.selected_conversation = None;
                             page.conversation = None;
+                            page.prompt_history.reset();
                             if let Some(next) = page.conversations.first() {
                                 page.open_conversation(next.id, cx);
                             }
@@ -1522,5 +1573,68 @@ impl Render for StudioPage {
             .when_some(self.render_image_menu(&theme, cx), |el, menu| {
                 el.child(menu)
             })
+    }
+}
+
+/// Visible turn prompts, oldest first. Blank bodies are skipped so a recall
+/// never fills the composer with nothing.
+fn studio_prompt_history(turns: &[StudioTurnView]) -> Vec<PromptHistoryItem> {
+    turns
+        .iter()
+        .filter(|turn| !turn.prompt.trim().is_empty())
+        .map(|turn| PromptHistoryItem {
+            message_id: turn.id.0.to_string(),
+            text: turn.prompt.clone(),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use zeron_studio::{StudioBatchId, StudioTurnId};
+
+    fn turn(id: StudioTurnId, prompt: &str) -> StudioTurnView {
+        StudioTurnView {
+            id,
+            position: 0,
+            prompt: prompt.into(),
+            source_turn_id: None,
+            batch_id: StudioBatchId::new(),
+            runs: Vec::new(),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn studio_history_lists_visible_turn_prompts_oldest_first() {
+        let older = StudioTurnId::new();
+        let newer = StudioTurnId::new();
+        let items = studio_prompt_history(&[
+            turn(older, "first look"),
+            turn(StudioTurnId::new(), "   "),
+            turn(newer, "second look"),
+        ]);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].message_id, older.0.to_string());
+        assert_eq!(items[0].text, "first look");
+        assert_eq!(items[1].message_id, newer.0.to_string());
+        assert_eq!(items[1].text, "second look");
+    }
+
+    #[test]
+    fn studio_history_up_stashes_the_draft() {
+        let items = studio_prompt_history(&[
+            turn(StudioTurnId::new(), "older"),
+            turn(StudioTurnId::new(), "newer"),
+        ]);
+        let mut hist = PromptHistory::default();
+        let fill = hist.up(&items, "unsent draft").unwrap();
+        assert_eq!(fill.text, "newer");
+        assert!(fill.caret_at_start);
+        let fill = hist.down(&items, "").unwrap();
+        assert_eq!(fill.text, "unsent draft");
+        assert!(!fill.caret_at_start);
     }
 }
