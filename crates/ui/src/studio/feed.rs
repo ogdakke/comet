@@ -1215,6 +1215,13 @@ impl StudioPage {
             self.sync_feed_visible_rows();
             self.sync_feed_viewport_fulls();
             self.request_visible_feed_images(cx);
+            crate::markdown::selection::bind_document(
+                self.feed_turns()
+                    .iter()
+                    .filter(|turn| !turn.prompt.is_empty())
+                    .map(|turn| (format!("studio-prompt-{}", turn.id.0), turn.prompt.clone()))
+                    .collect(),
+            );
             let vp = self.feed_list.viewport_bounds();
             let top = f32::from(vp.top());
             // Same as the transcript: measure from the window bottom, not the

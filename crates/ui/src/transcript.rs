@@ -1667,6 +1667,32 @@ impl Transcript {
         self.apply_user_scroll(cx);
     }
 
+    /// Full-thread selectable catalog — one slice per painted text key, in
+    /// document order. Bound every frame so a drag can cover rows the
+    /// virtualizer has never painted.
+    fn selection_document(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for row in &self.rows {
+            match &row.kind {
+                RowKind::User { text, .. } if !text.is_empty() => {
+                    out.push((format!("{}:u", row.id), text.to_string()));
+                }
+                RowKind::Markdown { tree, block_ix } | RowKind::LiveMarkdown { tree, block_ix } => {
+                    if let Some(top) = tree.blocks.get(*block_ix) {
+                        render::collect_block_selectables(
+                            &top.block,
+                            *block_ix,
+                            row.id.as_ref(),
+                            &mut out,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
     /// Programmatic scroll from a text-selection drag hitting the reading-band
     /// edge. Unpins when moving toward earlier content so the stick spring
     /// does not fight the selection. Returns whether the list actually moved.
@@ -4086,6 +4112,7 @@ impl Render for Transcript {
                     .ok();
             });
         }
+        crate::markdown::selection::bind_document(self.selection_document());
         {
             let vp = self.list.viewport_bounds();
             let top = f32::from(vp.top()) + Theme::TITLEBAR_HEIGHT;

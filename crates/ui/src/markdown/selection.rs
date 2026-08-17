@@ -3,12 +3,14 @@
 //! gpui has no built-in selection for plain text elements. Zed's markdown
 //! selects continuously because its whole document is ONE element over one
 //! text model; zeron renders a TREE of text elements inside a virtualized
-//! list, so this module rebuilds that continuity: every frame the renderer
-//! registers each painted text element in paint order (= document order),
-//! and a drag anchored in one element resolves against that registry into
-//! per-element SPANS — partial in the anchor/head elements, whole for every
-//! element between. The wash paints per element from its span; copy joins
-//! the spans in order.
+//! list, so this module rebuilds that continuity.
+//!
+//! The list owner binds a document-order catalog of *(key, text)* from its
+//! full row model each frame. Painted elements still register geometry for
+//! hit-testing; a drag's head is a visible key, then resolve walks the
+//! bound catalog so rows the virtualizer never painted stay in the
+//! selection. The wash paints per visible element from its span; copy
+//! joins every span in document order.
 //!
 //! This module is the pure state half (gpui-free, unit-tested); the
 //! registry, geometry and mouse listeners live in `render.rs`.
@@ -49,19 +51,30 @@ struct MdSelection {
     anchor_range: Range<usize>,
     granularity: Granularity,
     dragging: bool,
-    /// Last known drag direction: true = toward earlier content.
-    extending_up: Option<bool>,
-    /// Spans that left the visible registry above the viewport.
-    offscreen_before: Vec<Span>,
-    /// Spans that left the visible registry below the viewport.
-    offscreen_after: Vec<Span>,
-    /// Resolved spans, document order. Empty while a click hasn't moved.
+    /// Resolved spans over the bound document, not just the painted window.
     spans: Vec<Span>,
 }
 
 fn state() -> &'static Mutex<Option<MdSelection>> {
     static STATE: OnceLock<Mutex<Option<MdSelection>>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn document() -> &'static Mutex<Vec<(String, String)>> {
+    static DOC: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
+    DOC.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Replace the document-order catalog of selectable text. The list owner
+/// binds this every frame from its full row model (not the virtualized
+/// paint window) so a drag can cover rows that have never been on screen.
+pub fn bind_document(elements: Vec<(String, String)>) {
+    *document().lock().unwrap() = elements;
+}
+
+/// The bound document, for resolve / tests.
+pub fn bound_document() -> Vec<(String, String)> {
+    document().lock().unwrap().clone()
 }
 
 /// Resolve the spans for a selection between `a` and `b`, each an
@@ -130,9 +143,6 @@ pub fn begin(key: &str, ix: usize) {
         anchor_range: ix..ix,
         granularity: Granularity::Char,
         dragging: true,
-        extending_up: None,
-        offscreen_before: Vec::new(),
-        offscreen_after: Vec::new(),
         spans: Vec::new(),
     });
 }
@@ -153,9 +163,6 @@ fn begin_granular(key: &str, text: &str, range: Range<usize>, granularity: Granu
         anchor_range: range.clone(),
         granularity,
         dragging: true,
-        extending_up: None,
-        offscreen_before: Vec::new(),
-        offscreen_after: Vec::new(),
         spans: vec![Span {
             key: key.to_string(),
             range,
@@ -193,19 +200,38 @@ pub fn drag_owner() -> Option<(String, Range<usize>, Granularity)> {
     })
 }
 
-/// Remember whether the head is moving toward earlier content.
-pub fn set_extending_up(up: bool) {
-    if let Some(sel) = state().lock().unwrap().as_mut() {
-        sel.extending_up = Some(up);
-    }
-}
-
-pub fn extending_up() -> Option<bool> {
-    state()
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|sel| sel.extending_up)
+/// Resolve the live drag against the bound document (falling back to
+/// `visible` when the catalog is empty). The original anchor is never
+/// rewritten, so reversing a drag cannot invert the highlight.
+pub fn resolve_against_document(
+    visible: &[(&str, &str)],
+    head_key: &str,
+    head_range: Range<usize>,
+) -> bool {
+    let Some((anchor_key, anchor_range, _)) = drag_owner() else {
+        return false;
+    };
+    let doc = document().lock().unwrap().clone();
+    let fallback: Vec<(String, String)> = visible
+        .iter()
+        .map(|(k, t)| ((*k).to_string(), (*t).to_string()))
+        .collect();
+    let source = if doc.is_empty() { &fallback } else { &doc };
+    let elements: Vec<(&str, &str)> = source
+        .iter()
+        .map(|(k, t)| (k.as_str(), t.as_str()))
+        .collect();
+    let Some(anchor_ei) = elements.iter().position(|(k, _)| *k == anchor_key) else {
+        return false;
+    };
+    let Some(head_ei) = elements.iter().position(|(k, _)| *k == head_key) else {
+        return false;
+    };
+    update_spans(resolve_span_ranges(
+        &elements,
+        (anchor_ei, anchor_range),
+        (head_ei, head_range),
+    ))
 }
 
 /// Pixels to scroll this frame so a drag-select can grow past the viewport.
@@ -271,69 +297,6 @@ fn finish_drag(guard: &mut Option<MdSelection>) -> Option<String> {
         return None;
     }
     Some(join_spans(&sel.spans))
-}
-
-/// Fold the current-frame live spans with off-screen spans from earlier in
-/// this drag, so a virtualized list can keep growing a selection after the
-/// original anchor has scrolled out.
-///
-/// `reaches_start` / `reaches_end`: the live resolve covers the first/last
-/// visible element fully. Off-screen spans on a side are dropped when the
-/// live selection no longer reaches that edge (the user dragged back).
-pub fn commit_live_spans(
-    live: Vec<Span>,
-    visible_keys: &[String],
-    reaches_start: bool,
-    reaches_end: bool,
-    scroll_up: bool,
-) -> bool {
-    let mut guard = state().lock().unwrap();
-    let Some(sel) = guard.as_mut() else {
-        return false;
-    };
-    let visible: std::collections::HashSet<&str> =
-        visible_keys.iter().map(String::as_str).collect();
-
-    for old in sel.spans.clone() {
-        if visible.contains(old.key.as_str()) {
-            continue;
-        }
-        if sel.offscreen_before.iter().any(|span| span.key == old.key)
-            || sel.offscreen_after.iter().any(|span| span.key == old.key)
-        {
-            continue;
-        }
-        let to_after = match (reaches_start, reaches_end) {
-            (false, true) => true,
-            (true, false) => false,
-            _ => scroll_up,
-        };
-        if to_after {
-            sel.offscreen_after.insert(0, old);
-        } else {
-            sel.offscreen_before.push(old);
-        }
-    }
-
-    if !reaches_start {
-        sel.offscreen_before.clear();
-    }
-    if !reaches_end {
-        sel.offscreen_after.clear();
-    }
-    sel.offscreen_before
-        .retain(|span| !visible.contains(span.key.as_str()));
-    sel.offscreen_after
-        .retain(|span| !visible.contains(span.key.as_str()));
-
-    let mut spans = sel.offscreen_before.clone();
-    spans.extend(live);
-    spans.extend(sel.offscreen_after.iter().cloned());
-    if sel.spans == spans {
-        return false;
-    }
-    sel.spans = spans;
-    true
 }
 
 /// Clear if `key` owns a settled selection (a mouse-down landed outside the
@@ -473,35 +436,50 @@ mod tests {
     }
 
     #[test]
-    fn commit_live_spans_keeps_offscreen_text_when_the_edge_is_covered() {
+    fn document_resolve_covers_unpainted_middles() {
         let _state = state_lock();
-        begin("p2", 0);
-        let live = resolve_spans(&elems(), (1, 0), (2, 5));
-        assert!(commit_live_spans(
-            live,
-            &["p2".into(), "p3".into()],
-            true,
-            true,
-            true,
-        ));
-        // p2/p3 live; now p3 leaves (scrolled up) and p1 appears at the top.
-        let live = resolve_spans(
-            &[("p1", "first paragraph"), ("p2", "second")],
-            (0, 0),
-            (1, 6),
-        );
-        assert!(commit_live_spans(
-            live,
-            &["p1".into(), "p2".into()],
-            true,
-            true,
-            true,
-        ));
+        bind_document(vec![
+            ("p1".into(), "first paragraph".into()),
+            ("p2".into(), "second".into()),
+            ("p3".into(), "third one".into()),
+            ("p4".into(), "fourth".into()),
+        ]);
+        begin("p1", 6);
+        // Only p1 and p4 are "on screen" — p2/p3 were virtualized through.
+        let visible = [("p1", "first paragraph"), ("p4", "fourth")];
+        assert!(resolve_against_document(&visible, "p4", 6..6));
         assert_eq!(
             selected_text().as_deref(),
-            Some("first paragraph\nsecond\nthird")
+            Some("paragraph\nsecond\nthird one\nfourth")
         );
         end_any_drag();
+        bind_document(Vec::new());
+    }
+
+    #[test]
+    fn reversing_a_drag_keeps_the_original_anchor() {
+        let _state = state_lock();
+        bind_document(vec![
+            ("p1".into(), "first paragraph".into()),
+            ("p2".into(), "second".into()),
+            ("p3".into(), "third one".into()),
+        ]);
+        begin("p3", 9);
+        let visible = [
+            ("p1", "first paragraph"),
+            ("p2", "second"),
+            ("p3", "third one"),
+        ];
+        assert!(resolve_against_document(&visible, "p1", 0..0));
+        assert_eq!(
+            selected_text().as_deref(),
+            Some("first paragraph\nsecond\nthird one")
+        );
+        // Drag back toward the anchor: must shrink from the top, not flip.
+        assert!(resolve_against_document(&visible, "p2", 0..0));
+        assert_eq!(selected_text().as_deref(), Some("second\nthird one"));
+        end_any_drag();
+        bind_document(Vec::new());
     }
 
     /// The drag tests below mutate the process-global selection state —

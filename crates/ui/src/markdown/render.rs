@@ -316,6 +316,61 @@ pub fn render_block(
     }
 }
 
+fn inline_plain(runs: &[InlineRun]) -> String {
+    runs.iter().map(|run| run.text.as_str()).collect()
+}
+
+/// Document-order selectable slices for one block, keyed exactly the way
+/// [`render_block`] registers them so a virtualized row can resolve a drag
+/// against text that is not currently painted.
+pub fn collect_block_selectables(
+    block: &Block,
+    ix: usize,
+    row_key: &str,
+    out: &mut Vec<(String, String)>,
+) {
+    match block {
+        Block::Paragraph { runs } | Block::Heading { runs, .. } => {
+            let text = inline_plain(runs);
+            if !text.is_empty() {
+                out.push((format!("{row_key}:{ix}"), text));
+            }
+        }
+        Block::CodeBlock { code, .. } => {
+            for (li, line) in code.split('\n').enumerate() {
+                out.push((format!("{row_key}:{ix}:c{li}"), line.to_string()));
+            }
+        }
+        Block::BlockQuote { children } => {
+            for (ci, child) in children.iter().enumerate() {
+                collect_block_selectables(child, ix * 100 + ci, row_key, out);
+            }
+        }
+        Block::List { items, .. } => {
+            for (item_ix, item) in items.iter().enumerate() {
+                for (ci, child) in item.iter().enumerate() {
+                    collect_block_selectables(child, ix * 100 + item_ix * 10 + ci, row_key, out);
+                }
+            }
+        }
+        Block::Table { header, rows, .. } => {
+            let all: Vec<&[Vec<InlineRun>]> = std::iter::once(header.as_slice())
+                .filter(|h| !h.is_empty())
+                .chain(rows.iter().map(|r| r.as_slice()))
+                .collect();
+            for (r, row) in all.iter().enumerate() {
+                for (c, cell) in row.iter().enumerate() {
+                    let text = inline_plain(cell);
+                    if !text.is_empty() {
+                        out.push((format!("{row_key}:{}", table_cell_ix(ix, r, c)), text));
+                    }
+                }
+            }
+        }
+        Block::Rule => {}
+    }
+}
+
 /// Tight monochrome heading scale (zeron: h2 ≈ 16px semibold; headings step
 /// down quickly toward body size).
 fn heading_metrics(level: u8) -> (f32, f32) {
@@ -892,7 +947,6 @@ fn apply_selection_autoscroll(window: &mut Window, cx: &mut gpui::App) -> bool {
     if delta.abs() < 0.5 {
         return false;
     }
-    super::selection::set_extending_up(delta < 0.0);
     if !(host.scroll)(delta, cx) {
         return false;
     }
@@ -971,10 +1025,11 @@ fn registry_point(position: gpui::Point<gpui::Pixels>) -> Option<(usize, usize)>
     })
 }
 
-/// Resolve the live drag against the current-frame registry and merge any
-/// spans that have scrolled out of view.
+/// Resolve the live drag: the pointer names a visible element, then the
+/// bound document (full thread, not the painted window) fills every
+/// in-between slice — including rows virtualization never painted.
 fn resolve_current_drag(head: (usize, usize)) -> bool {
-    let Some((anchor_key, anchor_range, gran)) = super::selection::drag_owner() else {
+    let Some((_, _, gran)) = super::selection::drag_owner() else {
         return false;
     };
     REGISTRY.with(|r| {
@@ -984,46 +1039,11 @@ fn resolve_current_drag(head: (usize, usize)) -> bool {
         }
         let head_ei = head.0.min(reg.len() - 1);
         let head_range = super::selection::snap_unit(&reg[head_ei].text, head.1, gran);
-        let elements: Vec<(&str, &str)> = reg
+        let visible: Vec<(&str, &str)> = reg
             .iter()
             .map(|e| (e.key.as_ref(), e.text.as_ref()))
             .collect();
-        let live = if let Some(anchor_ei) = reg.iter().position(|e| e.key.as_ref() == anchor_key) {
-            super::selection::set_extending_up(
-                (head_ei, head_range.start) < (anchor_ei, anchor_range.start),
-            );
-            super::selection::resolve_span_ranges(
-                &elements,
-                (anchor_ei, anchor_range),
-                (head_ei, head_range),
-            )
-        } else if super::selection::extending_up().unwrap_or(true) {
-            // Anchor is below the viewport: select from the head through the
-            // last visible element (everything on screen toward the start).
-            super::selection::resolve_span_ranges(
-                &elements,
-                (head_ei, head_range),
-                (reg.len() - 1, 0..reg[reg.len() - 1].text.len()),
-            )
-        } else {
-            // Anchor is above the viewport: select from the first visible
-            // element through the head.
-            super::selection::resolve_span_ranges(
-                &elements,
-                (0, 0..reg[0].text.len()),
-                (head_ei, head_range),
-            )
-        };
-        let visible_keys: Vec<String> = reg.iter().map(|e| e.key.to_string()).collect();
-        let first_full = live
-            .first()
-            .is_some_and(|span| span.key == reg[0].key.as_ref() && span.range.start == 0);
-        let last = reg.len() - 1;
-        let last_full = live.last().is_some_and(|span| {
-            span.key == reg[last].key.as_ref() && span.range.end == reg[last].text.len()
-        });
-        let scroll_up = super::selection::extending_up().unwrap_or(true);
-        super::selection::commit_live_spans(live, &visible_keys, first_full, last_full, scroll_up)
+        super::selection::resolve_against_document(&visible, &reg[head_ei].key, head_range)
     })
 }
 
@@ -1463,7 +1483,32 @@ pub fn runs_for_syntax_line_with_plain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::markdown::parser::InlineStyle;
+    use crate::markdown::parser::{Block, InlineRun, InlineStyle};
+
+    #[test]
+    fn collect_block_selectables_matches_render_keys() {
+        let para = Block::Paragraph {
+            runs: vec![InlineRun {
+                text: "hello".into(),
+                style: Default::default(),
+            }],
+        };
+        let code = Block::CodeBlock {
+            language: Some("rs".into()),
+            code: "a\nb".into(),
+        };
+        let mut out = Vec::new();
+        collect_block_selectables(&para, 0, "row1", &mut out);
+        collect_block_selectables(&code, 1, "row1", &mut out);
+        assert_eq!(
+            out,
+            vec![
+                ("row1:0".into(), "hello".into()),
+                ("row1:1:c0".into(), "a".into()),
+                ("row1:1:c1".into(), "b".into()),
+            ]
+        );
+    }
 
     #[test]
     fn visual_line_ranges_split_wraps_and_hard_breaks() {
