@@ -795,6 +795,22 @@ impl StudioPage {
         self.feed_list.scroll_to_end();
     }
 
+    fn apply_selection_scroll(&mut self, delta: f32, cx: &mut Context<Self>) -> bool {
+        let before = self.feed_list.logical_scroll_top();
+        self.feed_list.scroll_by(px(delta));
+        let after = self.feed_list.logical_scroll_top();
+        let moved = before.item_ix != after.item_ix
+            || (f32::from(before.offset_in_item) - f32::from(after.offset_in_item)).abs() > 0.25;
+        if !moved {
+            return false;
+        }
+        self.sync_feed_visible_rows();
+        self.sync_feed_viewport_fulls();
+        self.request_visible_feed_images(cx);
+        cx.notify();
+        true
+    }
+
     fn feed_content_width(&self, window: &Window) -> f32 {
         let rail_gutter = if self.rail_should_show(self.feed_container_width(window)) {
             STUDIO_RAIL_GUTTER
@@ -1184,6 +1200,17 @@ impl StudioPage {
             self.sync_feed_visible_rows();
             self.sync_feed_viewport_fulls();
             self.request_visible_feed_images(cx);
+            let vp = self.feed_list.viewport_bounds();
+            let top = f32::from(vp.top());
+            let bottom = f32::from(vp.bottom()) - STUDIO_READING_BOTTOM_INSET;
+            let entity = cx.weak_entity();
+            render::bind_selection_scroll(top, bottom, move |delta, cx| {
+                entity
+                    .update(cx, |page: &mut StudioPage, cx| {
+                        page.apply_selection_scroll(delta, cx)
+                    })
+                    .unwrap_or(false)
+            });
         }
         let rail = self.render_studio_rail(window, theme, cx);
         let measure_entity = cx.weak_entity();

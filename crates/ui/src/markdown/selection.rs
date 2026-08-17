@@ -100,6 +100,43 @@ pub fn drag_anchor(key: &str) -> Option<usize> {
     (sel.dragging && sel.anchor_key == key).then_some(sel.anchor_ix)
 }
 
+/// Whether a drag is in flight (used to keep the edge-autoscroll loop alive).
+pub fn is_dragging() -> bool {
+    state()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|sel| sel.dragging)
+}
+
+/// The drag's owning element and byte offset, if a drag is live.
+pub fn drag_owner() -> Option<(String, usize)> {
+    let guard = state().lock().unwrap();
+    let sel = guard.as_ref()?;
+    sel.dragging
+        .then(|| (sel.anchor_key.clone(), sel.anchor_ix))
+}
+
+/// Pixels to scroll this frame so a drag-select can grow past the viewport.
+/// Negative = toward earlier content. Zero when the pointer is inside the
+/// reading band; speed ramps as the pointer enters (or passes) the edge zone.
+pub fn autoscroll_delta(pointer_y: f32, band_top: f32, band_bottom: f32) -> f32 {
+    const ZONE: f32 = 48.0;
+    const MAX: f32 = 14.0;
+    if !pointer_y.is_finite() || band_bottom <= band_top + 1.0 {
+        return 0.0;
+    }
+    if pointer_y < band_top + ZONE {
+        let t = ((band_top + ZONE - pointer_y) / ZONE).clamp(0.0, 2.0);
+        -MAX * t
+    } else if pointer_y > band_bottom - ZONE {
+        let t = ((pointer_y - (band_bottom - ZONE)) / ZONE).clamp(0.0, 2.0);
+        MAX * t
+    } else {
+        0.0
+    }
+}
+
 /// Replace the resolved spans (drag update). Returns true if they changed.
 pub fn update_spans(spans: Vec<Span>) -> bool {
     let mut guard = state().lock().unwrap();
@@ -282,6 +319,31 @@ mod tests {
         begin_with_span("p1", "hello world", 6..11);
         assert_eq!(wash_range("p1"), Some(6..11));
         assert_eq!(end_drag("p1").as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn autoscroll_delta_is_zero_inside_the_band() {
+        assert_eq!(autoscroll_delta(200.0, 100.0, 500.0), 0.0);
+        assert_eq!(autoscroll_delta(148.0, 100.0, 500.0), 0.0);
+        assert_eq!(autoscroll_delta(452.0, 100.0, 500.0), 0.0);
+    }
+
+    #[test]
+    fn autoscroll_delta_ramps_at_the_edges() {
+        // Mid-zone above the top: half speed upward.
+        let up = autoscroll_delta(124.0, 100.0, 500.0);
+        assert!((up - (-7.0)).abs() < 0.01, "{up}");
+        // Mid-zone below the bottom: half speed downward.
+        let down = autoscroll_delta(476.0, 100.0, 500.0);
+        assert!((down - 7.0).abs() < 0.01, "{down}");
+        // Past the band edge: still capped at 2×.
+        assert!((autoscroll_delta(0.0, 100.0, 500.0) - (-28.0)).abs() < 0.01);
+        assert!((autoscroll_delta(600.0, 100.0, 500.0) - 28.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn autoscroll_delta_rejects_a_collapsed_band() {
+        assert_eq!(autoscroll_delta(10.0, 100.0, 100.0), 0.0);
     }
 
     #[test]

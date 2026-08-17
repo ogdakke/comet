@@ -8,7 +8,7 @@
 //! chunk opacity veil over the text runs (see [`super::veil`]) — opacity only,
 //! zero translate, applied after layout-relevant properties are fixed.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
@@ -822,6 +822,73 @@ struct RegEntry {
 
 thread_local! {
     static REGISTRY: RefCell<Vec<RegEntry>> = const { RefCell::new(Vec::new()) };
+    static SCROLL_HOST: RefCell<Option<SelectionScrollHost>> = const { RefCell::new(None) };
+    static AUTOSCROLL_ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The list that should scroll when a drag-select hits its reading-band edge.
+#[derive(Clone)]
+struct SelectionScrollHost {
+    top: f32,
+    bottom: f32,
+    /// Returns whether the list actually moved. False at either end so the
+    /// hold-still loop does not spin frames against a clamp.
+    scroll: Rc<dyn Fn(f32, &mut gpui::App) -> bool>,
+}
+
+/// Register the visible reading band that autoscrolls during a text-selection
+/// drag. The list owner calls this each frame; `scroll` receives a signed
+/// pixel delta (negative = toward earlier content) and returns whether the
+/// list moved.
+pub fn bind_selection_scroll(
+    top: f32,
+    bottom: f32,
+    scroll: impl Fn(f32, &mut gpui::App) -> bool + 'static,
+) {
+    SCROLL_HOST.with(|host| {
+        *host.borrow_mut() = Some(SelectionScrollHost {
+            top,
+            bottom,
+            scroll: Rc::new(scroll),
+        });
+    });
+}
+
+fn apply_selection_autoscroll(window: &mut Window, cx: &mut gpui::App) -> bool {
+    if !super::selection::is_dragging() {
+        return false;
+    }
+    let Some(host) = SCROLL_HOST.with(|h| h.borrow().clone()) else {
+        return false;
+    };
+    let pos = window.mouse_position();
+    let delta = super::selection::autoscroll_delta(f32::from(pos.y), host.top, host.bottom);
+    if delta.abs() < 0.5 {
+        return false;
+    }
+    if !(host.scroll)(delta, cx) {
+        return false;
+    }
+    if let Some((key, anchor_ix)) = super::selection::drag_owner()
+        && let Some(head) = registry_point(pos)
+    {
+        let _ = resolve_drag(&key, anchor_ix, head);
+    }
+    window.refresh();
+    true
+}
+
+fn schedule_selection_autoscroll(window: &mut Window) {
+    if AUTOSCROLL_ARMED.get() {
+        return;
+    }
+    AUTOSCROLL_ARMED.set(true);
+    window.on_next_frame(|window, cx| {
+        AUTOSCROLL_ARMED.set(false);
+        if apply_selection_autoscroll(window, cx) {
+            schedule_selection_autoscroll(window);
+        }
+    });
 }
 
 /// A zero-size canvas that clears the selection registry — paint it FIRST in
@@ -928,7 +995,7 @@ fn register_selection_listeners(
     }
     {
         let key = key.clone();
-        window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, _cx| {
+        window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
             if phase != DispatchPhase::Bubble || !e.dragging() {
                 return;
             }
@@ -936,11 +1003,13 @@ fn register_selection_listeners(
             let Some(anchor_ix) = super::selection::drag_anchor(&key) else {
                 return;
             };
-            let Some(head) = registry_point(e.position) else {
-                return;
-            };
-            if resolve_drag(&key, anchor_ix, head) {
+            if let Some(head) = registry_point(e.position)
+                && resolve_drag(&key, anchor_ix, head)
+            {
                 window.refresh();
+            }
+            if apply_selection_autoscroll(window, cx) {
+                schedule_selection_autoscroll(window);
             }
         });
     }
