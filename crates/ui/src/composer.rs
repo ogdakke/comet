@@ -32,6 +32,7 @@ use zeron_proto::{
 use zeron_rpc::{RpcError, methods};
 
 use crate::attachments::{self, StagedAttachment};
+use crate::markdown::selection::{Granularity, word_range};
 use crate::motion;
 use crate::pickers::Pickers;
 use crate::state::{AppState, Indicator};
@@ -159,6 +160,50 @@ fn input_element_height(
         Some(available) => available.max(0.0),
         None => content_height.min(unconstrained_max).max(0.0),
     }
+}
+
+/// Byte range of the hard line containing `ix` (text between `\n`).
+fn input_line_range(text: &str, ix: usize) -> Range<usize> {
+    let mut ix = ix.min(text.len());
+    while ix > 0 && !text.is_char_boundary(ix) {
+        ix -= 1;
+    }
+    let start = text[..ix].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let end = text[ix..].find('\n').map(|i| ix + i).unwrap_or(text.len());
+    start..end
+}
+
+/// Snap `ix` to the click's unit. Paragraphs in a textarea are hard lines —
+/// the analog of a markdown block — so a triple-click selects one `\n`
+/// delimited row and a drag grows line by line.
+fn input_snap_unit(text: &str, ix: usize, granularity: Granularity) -> Range<usize> {
+    match granularity {
+        Granularity::Char => {
+            let mut ix = ix.min(text.len());
+            while ix > 0 && !text.is_char_boundary(ix) {
+                ix -= 1;
+            }
+            ix..ix
+        }
+        Granularity::Word => word_range(text, ix),
+        Granularity::Paragraph => input_line_range(text, ix),
+    }
+}
+
+/// Union of the click's unit and the head's unit. `reversed` is true when
+/// the active end sits before the original click (caret at the start).
+fn input_select_range(
+    text: &str,
+    anchor: Range<usize>,
+    head: usize,
+    granularity: Granularity,
+) -> (Range<usize>, bool) {
+    let head_unit = input_snap_unit(text, head, granularity);
+    let start = anchor.start.min(head_unit.start);
+    let end = anchor.end.max(head_unit.end);
+    let reversed =
+        head_unit.start < anchor.start || (head_unit.start == anchor.start && head < anchor.start);
+    (start..end, reversed)
 }
 
 /// Apply GPUI's wheel delta to a top-origin input offset. Positive deltas mean
@@ -1264,6 +1309,10 @@ pub struct ComposerInput {
     placeholder: SharedString,
     selected_range: Range<usize>,
     selection_reversed: bool,
+    /// Unit the current mouse gesture grows by (char / word / line).
+    select_granularity: Granularity,
+    /// The click's unit — always included while the drag is live.
+    select_anchor: Range<usize>,
     marked_range: Option<Range<usize>>,
     is_selecting: bool,
     drag_position: Option<Point<Pixels>>,
@@ -1355,6 +1404,8 @@ impl ComposerInput {
             placeholder: placeholder.into(),
             selected_range: 0..0,
             selection_reversed: false,
+            select_granularity: Granularity::Char,
+            select_anchor: 0..0,
             marked_range: None,
             is_selecting: false,
             drag_position: None,
@@ -1806,15 +1857,26 @@ impl ComposerInput {
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        let offset = self.projection.normalize_range(offset..offset).start;
-        if self.selection_reversed {
-            self.selected_range.start = offset;
+        if self.is_selecting && self.select_granularity != Granularity::Char {
+            let (range, reversed) = input_select_range(
+                &self.content,
+                self.select_anchor.clone(),
+                offset,
+                self.select_granularity,
+            );
+            self.selected_range = self.projection.normalize_range(range);
+            self.selection_reversed = reversed;
         } else {
-            self.selected_range.end = offset;
-        }
-        if self.selected_range.end < self.selected_range.start {
-            self.selection_reversed = !self.selection_reversed;
-            self.selected_range = self.selected_range.end..self.selected_range.start;
+            let offset = self.projection.normalize_range(offset..offset).start;
+            if self.selection_reversed {
+                self.selected_range.start = offset;
+            } else {
+                self.selected_range.end = offset;
+            }
+            if self.selected_range.end < self.selected_range.start {
+                self.selection_reversed = !self.selection_reversed;
+                self.selected_range = self.selected_range.end..self.selected_range.start;
+            }
         }
         self.follow_cursor = true;
         self.reset_blink();
@@ -1869,15 +1931,7 @@ impl ComposerInput {
 
     /// Byte range of the logical line containing `offset`.
     fn line_range_at(&self, offset: usize) -> Range<usize> {
-        let start = self.content[..offset]
-            .rfind('\n')
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        let end = self.content[offset..]
-            .find('\n')
-            .map(|i| offset + i)
-            .unwrap_or(self.content.len());
-        start..end
+        input_line_range(&self.content, offset)
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
@@ -2308,10 +2362,32 @@ impl ComposerInput {
         self.drag_autoscroll_active = false;
         let index = self.index_for_mouse_position(event.position);
         if event.modifiers.shift {
+            self.select_granularity = Granularity::Char;
             self.select_to(index, cx);
-        } else {
-            self.move_to(index, cx);
+            return;
         }
+        self.select_granularity = match event.click_count {
+            2 => Granularity::Word,
+            n if n >= 3 => Granularity::Paragraph,
+            _ => Granularity::Char,
+        };
+        if self.select_granularity == Granularity::Char {
+            self.select_anchor = index..index;
+            self.move_to(index, cx);
+            return;
+        }
+        let unit = self.projection.normalize_range(input_snap_unit(
+            &self.content,
+            index,
+            self.select_granularity,
+        ));
+        self.select_anchor = unit.clone();
+        self.selected_range = unit;
+        self.selection_reversed = false;
+        self.follow_cursor = true;
+        self.reset_blink();
+        cx.emit(ComposerInputEvent::CursorMoved);
+        cx.notify();
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
@@ -6146,6 +6222,54 @@ mod tests {
         assert_eq!(input_element_height(50.0, None, 240.0), 50.0);
         assert_eq!(input_element_height(400.0, None, 240.0), 240.0);
         assert_eq!(input_element_height(0.0, None, 240.0), 0.0);
+    }
+
+    #[test]
+    fn input_line_range_is_the_hard_line() {
+        let text = "hello\nworld today\n";
+        assert_eq!(input_line_range(text, 0), 0..5);
+        assert_eq!(input_line_range(text, 5), 0..5);
+        assert_eq!(input_line_range(text, 6), 6..17);
+        assert_eq!(input_line_range(text, 17), 6..17);
+        assert_eq!(input_line_range(text, 18), 18..18);
+        assert_eq!(input_line_range("only", 2), 0..4);
+    }
+
+    #[test]
+    fn input_word_drag_keeps_the_clicked_word() {
+        let text = "hello world today";
+        let anchor = word_range(text, 8); // "world"
+        assert_eq!(anchor, 6..11);
+        let (left, reversed) = input_select_range(text, anchor.clone(), 1, Granularity::Word);
+        assert_eq!(&text[left], "hello world");
+        assert!(reversed);
+        let (right, reversed) = input_select_range(text, anchor, 14, Granularity::Word);
+        assert_eq!(&text[right], "world today");
+        assert!(!reversed);
+    }
+
+    #[test]
+    fn input_line_drag_unions_hard_lines() {
+        let text = "first line\nsecond\nthird one";
+        let anchor = input_line_range(text, 12); // "second"
+        assert_eq!(&text[anchor.clone()], "second");
+        let (up, reversed) = input_select_range(text, anchor.clone(), 3, Granularity::Paragraph);
+        assert_eq!(&text[up], "first line\nsecond");
+        assert!(reversed);
+        let (down, reversed) = input_select_range(text, anchor, 22, Granularity::Paragraph);
+        assert_eq!(&text[down], "second\nthird one");
+        assert!(!reversed);
+    }
+
+    #[test]
+    fn input_char_drag_is_a_plain_range() {
+        let text = "abcdef";
+        let (range, reversed) = input_select_range(text, 2..2, 5, Granularity::Char);
+        assert_eq!(range, 2..5);
+        assert!(!reversed);
+        let (range, reversed) = input_select_range(text, 2..2, 0, Granularity::Char);
+        assert_eq!(range, 0..2);
+        assert!(reversed);
     }
 
     #[test]
