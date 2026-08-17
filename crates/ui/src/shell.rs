@@ -279,11 +279,11 @@ pub enum NavEntry {
     /// A chat route; the id of the selected chat ("" = the new-chat canvas).
     Chat(String),
     /// Studio gallery (`conversation_id` is `None`) or a studio thread.
-    /// `focus_artifact` is set when the visit came from Open in thread so the
-    /// feed can scroll that image into view.
+    /// Open-in-thread scroll is a one-shot action on the click, not route
+    /// state — storing it here would re-scroll the feed every time Back
+    /// (including close-artifact) restored this entry.
     Studio {
         conversation_id: Option<zeron_studio::StudioConversationId>,
-        focus_artifact: Option<zeron_studio::StudioArtifactId>,
     },
     StudioArtifact {
         conversation_id: zeron_studio::StudioConversationId,
@@ -296,17 +296,12 @@ impl NavEntry {
     fn studio_gallery() -> Self {
         NavEntry::Studio {
             conversation_id: None,
-            focus_artifact: None,
         }
     }
 
-    fn studio_thread(
-        conversation_id: zeron_studio::StudioConversationId,
-        focus_artifact: Option<zeron_studio::StudioArtifactId>,
-    ) -> Self {
+    fn studio_thread(conversation_id: zeron_studio::StudioConversationId) -> Self {
         NavEntry::Studio {
             conversation_id: Some(conversation_id),
-            focus_artifact,
         }
     }
 }
@@ -1932,7 +1927,7 @@ impl Shell {
             .as_ref()
             .and_then(|page| page.read(cx).selected_conversation())
         {
-            Some(conversation_id) => NavEntry::studio_thread(conversation_id, None),
+            Some(conversation_id) => NavEntry::studio_thread(conversation_id),
             None => NavEntry::studio_gallery(),
         }
     }
@@ -1967,8 +1962,7 @@ impl Shell {
             });
         }
         self.route = Route::Studio;
-        self.nav
-            .push(NavEntry::studio_thread(conversation_id, focus_artifact));
+        self.nav.push(NavEntry::studio_thread(conversation_id));
         cx.notify();
     }
 
@@ -2049,10 +2043,7 @@ impl Shell {
             NavEntry::Settings(section) => {
                 self.route = Route::Settings(section);
             }
-            NavEntry::Studio {
-                conversation_id,
-                focus_artifact,
-            } => {
+            NavEntry::Studio { conversation_id } => {
                 self.route = Route::Studio;
                 if let Some(page) = self.studio_page.clone() {
                     page.update(cx, |page, cx| {
@@ -2061,9 +2052,6 @@ impl Shell {
                             Some(conversation_id) => {
                                 if page.selected_conversation() != Some(conversation_id) {
                                     page.open_conversation(conversation_id, cx);
-                                }
-                                if let Some(artifact_id) = focus_artifact {
-                                    page.reveal_artifact_in_thread(artifact_id, cx);
                                 }
                             }
                             None => page.show_gallery(cx),
@@ -8013,10 +8001,9 @@ mod tests {
     #[test]
     fn studio_gallery_and_thread_are_distinct_history_entries() {
         let conversation = zeron_studio::StudioConversationId::new();
-        let artifact = zeron_studio::StudioArtifactId::new();
         let mut nav = NavHistory::new(chat("agent"));
         nav.push(NavEntry::studio_gallery());
-        nav.push(NavEntry::studio_thread(conversation, Some(artifact)));
+        nav.push(NavEntry::studio_thread(conversation));
         assert_eq!(nav.len(), 3);
         assert_eq!(
             nav.back(),
@@ -8025,10 +8012,7 @@ mod tests {
         );
         assert_eq!(nav.back(), Some(chat("agent")));
         assert_eq!(nav.forward(), Some(NavEntry::studio_gallery()));
-        assert_eq!(
-            nav.forward(),
-            Some(NavEntry::studio_thread(conversation, Some(artifact)))
-        );
+        assert_eq!(nav.forward(), Some(NavEntry::studio_thread(conversation)));
     }
 
     #[test]
@@ -8040,7 +8024,7 @@ mod tests {
             conversation_id: conversation,
             artifact_id: artifact,
         });
-        nav.push(NavEntry::studio_thread(conversation, Some(artifact)));
+        nav.push(NavEntry::studio_thread(conversation));
         assert_eq!(
             nav.back(),
             Some(NavEntry::StudioArtifact {
@@ -8049,5 +8033,27 @@ mod tests {
             })
         );
         assert_eq!(nav.back(), Some(NavEntry::studio_gallery()));
+    }
+
+    #[test]
+    fn closing_an_artifact_returns_to_a_thread_without_a_reveal() {
+        let conversation = zeron_studio::StudioConversationId::new();
+        let first = zeron_studio::StudioArtifactId::new();
+        let later = zeron_studio::StudioArtifactId::new();
+        let mut nav = NavHistory::new(NavEntry::studio_gallery());
+        nav.push(NavEntry::studio_thread(conversation));
+        nav.push(NavEntry::StudioArtifact {
+            conversation_id: conversation,
+            artifact_id: first,
+        });
+        nav.replace(NavEntry::StudioArtifact {
+            conversation_id: conversation,
+            artifact_id: later,
+        });
+        assert_eq!(
+            nav.back(),
+            Some(NavEntry::studio_thread(conversation)),
+            "close-artifact must restore the thread, not replay Open in thread"
+        );
     }
 }

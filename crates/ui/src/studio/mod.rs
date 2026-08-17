@@ -39,7 +39,8 @@ pub enum StudioEvent {
         artifact_id: StudioArtifactId,
     },
     CloseArtifact,
-    /// Navigate to a thread. `focus_artifact` scrolls that image into view.
+    /// Navigate to a thread. `focus_artifact` is a one-shot scroll on this
+    /// click; it is not stored on the thread's history entry.
     ShowThread {
         conversation_id: StudioConversationId,
         focus_artifact: Option<StudioArtifactId>,
