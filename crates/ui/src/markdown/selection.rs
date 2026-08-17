@@ -299,6 +299,16 @@ fn finish_drag(guard: &mut Option<MdSelection>) -> Option<String> {
     Some(join_spans(&sel.spans))
 }
 
+/// Drop any live or settled selection. True if there was one.
+pub fn clear() -> bool {
+    let mut guard = state().lock().unwrap();
+    if guard.is_none() {
+        return false;
+    }
+    *guard = None;
+    true
+}
+
 /// Clear if `key` owns a settled selection (a mouse-down landed outside the
 /// owner; the element the down landed IN claims right after). True if cleared.
 pub fn clear_if_owner(key: &str) -> bool {
@@ -509,6 +519,16 @@ mod tests {
         assert!(!clear_if_owner("p2"));
         assert!(clear_if_owner("p1"));
         assert_eq!(selected_text(), None);
+    }
+
+    #[test]
+    fn clear_drops_a_live_or_settled_selection() {
+        let _state = state_lock();
+        begin("p1", 3);
+        assert!(clear());
+        assert_eq!(selected_text(), None);
+        assert!(!is_dragging());
+        assert!(!clear());
     }
 
     #[test]

@@ -12,9 +12,9 @@ use std::time::Duration;
 use zeron_proto::WorkspaceScope;
 use zeron_rpc::methods;
 
-use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover;
 use crate::state::AppState;
+use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme::Theme;
 
 /// A device that pinged within this window shows a presence dot (engines
@@ -56,7 +56,7 @@ pub fn devices_subtitle(scope: Option<WorkspaceScope>) -> &'static str {
 
 struct RenameDialog {
     device_id: String,
-    input: Entity<ComposerInput>,
+    input: Entity<TextInput>,
     _events: Subscription,
 }
 
@@ -86,10 +86,10 @@ impl DevicesPage {
     }
 
     fn open_rename(&mut self, device_id: String, current: String, cx: &mut Context<Self>) {
-        let input = cx.new(|cx| ComposerInput::new("Device name", cx));
+        let input = cx.new(|cx| TextInput::new("Device name", cx));
         input.update(cx, |input, cx| input.set_text(current, cx));
         let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
+            if matches!(event, TextInputEvent::Submitted) {
                 this.submit_rename(cx);
             }
         });

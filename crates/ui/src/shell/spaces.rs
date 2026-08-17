@@ -10,6 +10,7 @@
 
 use super::*;
 use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_path};
+use crate::text_input::{TextInput, TextInputEvent};
 use gpui::FocusHandle;
 use zeron_proto::{ChatIndicator, Device, FolderListing, Space};
 
@@ -18,7 +19,7 @@ use zeron_proto::{ChatIndicator, Device, FolderListing, Space};
 /// (`PaletteSearch` context so ↑↓/⏎ bubble to the card), ranked substring
 /// rows, keyboard highlight.
 pub(super) struct SpacesMenu {
-    search: Entity<ComposerInput>,
+    search: Entity<TextInput>,
     /// Keyboard highlight within [`Shell::spaces_menu_rows`].
     active: usize,
     /// Tracked on the card — puts it on the keyboard dispatch path while the
@@ -46,7 +47,7 @@ pub(super) struct AddSpaceFlow {
     /// Filter input; Enter descends into the highlighted folder. Carries the
     /// tab-completion ghost (the faint suffix ⇥ accepts), and a trailing `/`
     /// on a folder-naming query descends immediately.
-    search: Entity<ComposerInput>,
+    search: Entity<TextInput>,
     browser: Loadable<FolderListing>,
     /// Requested browser path (`None` = the device's default, i.e. home).
     browser_path: Option<String>,
@@ -77,7 +78,7 @@ pub(super) struct AddSpaceFlow {
 /// The space-row Rename dialog (same shape as [`RenameChatDialog`]).
 pub(super) struct RenameSpaceDialog {
     pub space_id: String,
-    pub input: Entity<ComposerInput>,
+    pub input: Entity<TextInput>,
     pub focus_pending: bool,
     pub _events: Subscription,
 }
@@ -180,10 +181,9 @@ impl Shell {
     fn open_spaces_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // "PaletteSearch" context: ↑↓/⏎ stay unbound in the input and bubble
         // to the card's key handler.
-        let search =
-            cx.new(|cx| ComposerInput::with_context("Search projects…", "PaletteSearch", cx));
+        let search = cx.new(|cx| TextInput::with_context("Search projects…", "PaletteSearch", cx));
         let search_events = cx.subscribe(&search, |this: &mut Shell, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Edited) {
+            if matches!(event, TextInputEvent::Edited) {
                 if let Some(menu) = this.spaces_menu.open_mut() {
                     menu.active = 0;
                 }
@@ -901,10 +901,9 @@ impl Shell {
         // "PaletteSearch" context: navigation keys stay unbound so ↑↓/←/→/⏎
         // bubble to the palette frame (`add_space_key`) instead of moving the
         // text caret — Enter and ⌘Enter are both handled there.
-        let search =
-            cx.new(|cx| ComposerInput::with_context("Search folders…", "PaletteSearch", cx));
+        let search = cx.new(|cx| TextInput::with_context("Search folders…", "PaletteSearch", cx));
         let search_events = cx.subscribe(&search, |this: &mut Shell, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Edited) {
+            if matches!(event, TextInputEvent::Edited) {
                 // Typing `/` after a query that names a folder descends into
                 // it — the query reads as a path segment, so the slash IS the
                 // pick (shell-style). Otherwise the slash stays in the query
@@ -1923,10 +1922,10 @@ impl Shell {
             .space_row(&space_id)
             .map(|s| s.display_name().to_string())
             .unwrap_or_default();
-        let input = cx.new(|cx| ComposerInput::new("Project name", cx));
+        let input = cx.new(|cx| TextInput::new("Project name", cx));
         input.update(cx, |input, cx| input.set_text(current, cx));
         let events = cx.subscribe(&input, |this: &mut Shell, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
+            if matches!(event, TextInputEvent::Submitted) {
                 this.submit_rename_space(cx);
             }
         });

@@ -17,9 +17,10 @@ use zeron_proto::{
 use zeron_rpc::methods;
 use zeron_studio::{StudioArtifactId, StudioConversationId};
 
-use crate::composer::{ComposerInput, ComposerInputEvent, PromptHistory, PromptHistoryItem};
+use crate::composer::{PromptHistory, PromptHistoryItem};
 use crate::popover;
 use crate::state::{AppState, EngineHandle};
+use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme::Theme;
 
 use super::StudioEvent;
@@ -56,7 +57,7 @@ pub struct StudioPage {
     pub(super) composer_seeded_for: Option<StudioConversationId>,
     pub(super) selected_conversation: Option<StudioConversationId>,
     pub(super) conversation: Option<StudioConversationView>,
-    pub(super) prompt: Entity<ComposerInput>,
+    pub(super) prompt: Entity<TextInput>,
     /// Up/Down overflow through this conversation's turn prompts. Reset on
     /// submit and conversation switch; the in-progress draft is the scratch.
     pub(super) prompt_history: PromptHistory,
@@ -65,7 +66,7 @@ pub struct StudioPage {
     pub(super) prompt_last_height: f32,
     pub(super) prompt_target_height: f32,
     pub(super) prompt_morph_clock: Instant,
-    pub(super) model_search: Entity<ComposerInput>,
+    pub(super) model_search: Entity<TextInput>,
     pub(super) model_picker: popover::Popup<()>,
     pub(super) model_picker_active: Option<usize>,
     pub(super) model_picker_scroll: gpui::ScrollHandle,
@@ -155,22 +156,22 @@ pub struct StudioPage {
 impl StudioPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
-        let prompt = cx.new(|cx| ComposerInput::new("Describe the image you want to create", cx));
-        let model_search = cx.new(|cx| ComposerInput::palette_search("Search models…", cx));
+        let prompt = cx.new(|cx| TextInput::composer("Describe the image you want to create", cx));
+        let model_search = cx.new(|cx| TextInput::palette_search("Search models…", cx));
         let prompt_events = cx.subscribe(&prompt, |page: &mut Self, _, event, cx| match event {
-            ComposerInputEvent::Submitted => page.submit(cx),
-            ComposerInputEvent::Edited => cx.notify(),
-            ComposerInputEvent::HistoryNavigate(dir) => page.on_history_navigate(*dir, cx),
+            TextInputEvent::Submitted => page.submit(cx),
+            TextInputEvent::Edited => cx.notify(),
+            TextInputEvent::HistoryNavigate(dir) => page.on_history_navigate(*dir, cx),
             _ => {}
         });
         let model_search_events =
             cx.subscribe(&model_search, |page: &mut Self, _, event, cx| match event {
-                ComposerInputEvent::Edited => {
+                TextInputEvent::Edited => {
                     page.model_picker_active = None;
                     page.model_picker_scroll.set_offset(Point::default());
                     cx.notify();
                 }
-                ComposerInputEvent::Submitted => page.activate_model_picker_row(cx),
+                TextInputEvent::Submitted => page.activate_model_picker_row(cx),
                 _ => {}
             });
         let remembered = state

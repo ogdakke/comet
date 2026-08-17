@@ -7,17 +7,17 @@ use gpui::{
 use zeron_proto::{ListStudioProvidersResponse, ProviderValidationState, StudioProviderConnection};
 use zeron_rpc::methods;
 
-use crate::composer::ComposerInput;
 use crate::icons;
 use crate::popover;
 use crate::settings::widgets;
 use crate::state::AppState;
+use crate::text_input::TextInput;
 use crate::theme::Theme;
 
 pub struct ProvidersPage {
     state: Entity<AppState>,
     providers: Vec<StudioProviderConnection>,
-    secret: Entity<ComposerInput>,
+    secret: Entity<TextInput>,
     loading: bool,
     error: Option<SharedString>,
     task: Option<Task<()>>,
@@ -27,7 +27,7 @@ pub struct ProvidersPage {
 impl ProvidersPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
-        let secret = cx.new(|cx| ComposerInput::new("Provider API key", cx));
+        let secret = cx.new(|cx| TextInput::new("Provider API key", cx));
         let mut page = Self {
             state,
             providers: Vec::new(),

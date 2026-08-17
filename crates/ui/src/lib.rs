@@ -37,6 +37,7 @@ pub mod state;
 pub mod studio;
 pub mod syntax_cache;
 pub mod terminal;
+pub mod text_input;
 pub mod theme;
 pub mod transcript;
 

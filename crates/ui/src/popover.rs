@@ -607,12 +607,14 @@ fn modal_with(
             .child(
                 div()
                     .occlude()
+                    .relative()
                     .w(viewport.width)
                     .h(viewport.height)
                     .bg(scrim_alpha(scrim))
                     .flex()
                     .items_center()
                     .justify_center()
+                    .child(crate::markdown::render::selection_occluder())
                     .child(motion::dialog_in(id, div().child(card))),
             ),
     )

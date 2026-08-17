@@ -27,7 +27,7 @@ use zeron_proto::{AuthState, WorkspaceScope};
 use zeron_rpc::methods;
 
 use crate::changes::{Changes, ChangesEvent};
-use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
+use crate::composer::{Composer, ComposerEvent};
 use crate::icons::{self, icon};
 use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
@@ -50,6 +50,7 @@ use crate::state::{
 };
 use crate::studio::{ProvidersPage, StudioEvent, StudioPage};
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
+use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript};
 
@@ -517,7 +518,7 @@ enum SplashPhase {
 /// The chat-row Rename dialog.
 struct RenameChatDialog {
     chat_id: String,
-    input: Entity<ComposerInput>,
+    input: Entity<TextInput>,
     /// Focus the input on the dialog's first paint (opened without window access).
     focus_pending: bool,
     _events: Subscription,
@@ -526,7 +527,7 @@ struct RenameChatDialog {
 /// Studio conversation rename dialog — same chrome as session rename.
 struct RenameStudioDialog {
     conversation_id: zeron_studio::StudioConversationId,
-    input: Entity<ComposerInput>,
+    input: Entity<TextInput>,
     focus_pending: bool,
     _events: Subscription,
 }
@@ -781,7 +782,7 @@ fn sync_flow_after_auth(
 
 /// The "Create your workspace" gate (feature-inventory §1.2 OrgGate).
 struct OrgGateUi {
-    name_input: Entity<ComposerInput>,
+    name_input: Entity<TextInput>,
     orgs: Loadable<Vec<OrgRow>>,
     submitting: bool,
     error: Option<SharedString>,
@@ -2231,10 +2232,10 @@ impl Shell {
             .find(|c| c.id == chat_id)
             .and_then(|c| c.title.clone())
             .unwrap_or_default();
-        let input = cx.new(|cx| ComposerInput::new("Session title", cx));
+        let input = cx.new(|cx| TextInput::new("Session title", cx));
         input.update(cx, |input, cx| input.set_text(current, cx));
         let events = cx.subscribe(&input, |this: &mut Shell, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
+            if matches!(event, TextInputEvent::Submitted) {
                 this.submit_rename_chat(cx);
             }
         });
@@ -2304,10 +2305,10 @@ impl Shell {
             .as_ref()
             .and_then(|page| page.read(cx).conversation_title(conversation_id))
             .unwrap_or_default();
-        let input = cx.new(|cx| ComposerInput::new("Thread title", cx));
+        let input = cx.new(|cx| TextInput::new("Thread title", cx));
         input.update(cx, |input, cx| input.set_text(current, cx));
         let events = cx.subscribe(&input, |this: &mut Shell, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
+            if matches!(event, TextInputEvent::Submitted) {
                 this.submit_rename_studio(cx);
             }
         });
@@ -2812,9 +2813,9 @@ impl Shell {
         if self.org.is_some() {
             return;
         }
-        let name_input = cx.new(|cx| ComposerInput::new("Workspace name", cx));
+        let name_input = cx.new(|cx| TextInput::new("Workspace name", cx));
         let events = cx.subscribe(&name_input, |this: &mut Shell, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
+            if matches!(event, TextInputEvent::Submitted) {
                 this.create_org(cx);
             }
         });

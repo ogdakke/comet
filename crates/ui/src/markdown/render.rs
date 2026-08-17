@@ -890,6 +890,11 @@ thread_local! {
     static REGISTRY: RefCell<Vec<RegEntry>> = const { RefCell::new(Vec::new()) };
     static SCROLL_HOST: RefCell<Option<SelectionScrollHost>> = const { RefCell::new(None) };
     static AUTOSCROLL_ARMED: Cell<bool> = const { Cell::new(false) };
+    /// Overlay bounds painted this frame (modals, menus). Window-level
+    /// markdown listeners hit-test layout geometry and ignore z-order, so a
+    /// drag that starts on a dialog over the transcript would otherwise
+    /// select both. Later-painted occluders win.
+    static OCCLUDERS: RefCell<Vec<Bounds<gpui::Pixels>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The list that should scroll when a drag-select hits its reading-band edge.
@@ -980,6 +985,7 @@ pub fn selection_frame_reset() -> impl IntoElement {
         |_, _, _| (),
         |_, _, window, _| {
             REGISTRY.with(|r| r.borrow_mut().clear());
+            OCCLUDERS.with(|o| o.borrow_mut().clear());
             // Window-level drag listeners live here (once per frame), not on
             // each text element: the original click target can scroll out of
             // the virtualized window, and its listeners would vanish with it.
@@ -989,6 +995,33 @@ pub fn selection_frame_reset() -> impl IntoElement {
     .absolute()
     .w(px(0.0))
     .h(px(0.0))
+}
+
+/// Paint-order occluder for window-level markdown selection. Place inside an
+/// overlay that already `.occlude()`s hit-testing (dialogs, menus) so a drag
+/// that starts on the overlay cannot also select the transcript underneath.
+pub fn selection_occluder() -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        |bounds, _, _, _| {
+            if !bounds.is_empty() {
+                OCCLUDERS.with(|o| o.borrow_mut().push(bounds));
+            }
+        },
+    )
+    .absolute()
+    .inset_0()
+}
+
+fn pointer_hits_occluder(position: gpui::Point<gpui::Pixels>) -> bool {
+    OCCLUDERS.with(|o| pointer_hits_any_occluder(position, &o.borrow()))
+}
+
+fn pointer_hits_any_occluder(
+    position: gpui::Point<gpui::Pixels>,
+    occluders: &[Bounds<gpui::Pixels>],
+) -> bool {
+    occluders.iter().any(|bounds| bounds.contains(&position))
 }
 
 /// `(element index, byte offset)` for a window position: the registered
@@ -1061,6 +1094,14 @@ fn register_selection_listeners(
         let (key, text, layout, clip) = (key.clone(), text.clone(), layout.clone(), clip);
         window.on_mouse_event(move |e: &MouseDownEvent, phase, window, _cx| {
             if phase != DispatchPhase::Bubble || e.button != MouseButton::Left {
+                return;
+            }
+            // Overlay geometry wins over text layout: `.occlude()` only
+            // stops element hit-testing, not these window-level listeners.
+            if pointer_hits_occluder(e.position) {
+                if super::selection::clear() {
+                    window.refresh();
+                }
                 return;
             }
             let hit = layout.bounds().intersect(&clip);
@@ -1720,5 +1761,19 @@ mod tests {
         ];
         let flat = flatten_runs(&runs, &theme, false);
         assert_eq!(flat.links, vec![(0..9, "https://x.dev".to_string())]);
+    }
+
+    #[test]
+    fn overlay_bounds_block_markdown_hit_testing() {
+        let overlay = Bounds::new(point(px(100.0), px(80.0)), size(px(360.0), px(160.0)));
+        assert!(pointer_hits_any_occluder(
+            point(px(180.0), px(120.0)),
+            &[overlay]
+        ));
+        assert!(!pointer_hits_any_occluder(
+            point(px(20.0), px(20.0)),
+            &[overlay]
+        ));
+        assert!(!pointer_hits_any_occluder(point(px(180.0), px(120.0)), &[]));
     }
 }

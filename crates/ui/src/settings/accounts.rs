@@ -22,9 +22,9 @@ use zeron_proto::{
 };
 use zeron_rpc::methods;
 
-use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover::{self, Loadable};
 use crate::state::AppState;
+use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
@@ -181,7 +181,7 @@ pub struct AccountsPage {
     busy_account: Option<String>,
     login: Option<LoginFlow>,
     error: Option<SharedString>,
-    code_input: Entity<ComposerInput>,
+    code_input: Entity<TextInput>,
     load_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
@@ -192,9 +192,9 @@ pub struct AccountsPage {
 impl AccountsPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
-        let code_input = cx.new(|cx| ComposerInput::new("Paste the authorization code", cx));
+        let code_input = cx.new(|cx| TextInput::new("Paste the authorization code", cx));
         let code_events = cx.subscribe(&code_input, |this: &mut Self, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
+            if matches!(event, TextInputEvent::Submitted) {
                 this.submit_code(cx);
             }
         });
