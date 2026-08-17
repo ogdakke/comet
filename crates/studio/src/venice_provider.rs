@@ -7,8 +7,8 @@ use reqwest::{Client, Response, StatusCode};
 use serde::Deserialize;
 
 use crate::{
-    CancelResult, ControlValue, GenerationRequest, MediaKind, MediaOperation, MediaProvider,
-    PollResult, ProviderAccount, ProviderAccountId, ProviderArtifact, ProviderError,
+    AccountBalance, CancelResult, ControlValue, GenerationRequest, MediaKind, MediaOperation,
+    MediaProvider, PollResult, ProviderAccount, ProviderAccountId, ProviderArtifact, ProviderError,
     ProviderErrorKind, ProviderId, ProviderResult, Quote, RemoteAttempt, RemoteJob, Secret,
     Submission, SubmissionCapabilities, SubmitContext,
     venice::{VENICE_PROVIDER_ID, normalize_model_catalog},
@@ -67,6 +67,17 @@ impl VeniceMediaProvider {
         normalize_model_catalog(&bytes, chrono::Utc::now()).map_err(|error| {
             ProviderError::new(ProviderErrorKind::MalformedResponse, error.to_string())
         })
+    }
+
+    async fn billing_balance(&self, secret: &Secret) -> ProviderResult<AccountBalance> {
+        let response = self
+            .authenticated(reqwest::Method::GET, "/billing/balance", secret)
+            .send()
+            .await
+            .map_err(network_error)?;
+        let response = require_success(response).await?;
+        let bytes = read_limited(response, MAX_ERROR_BYTES).await?;
+        usd_account_balance(&bytes)
     }
 }
 
@@ -129,6 +140,10 @@ impl MediaProvider for VeniceMediaProvider {
             ));
         }
         Ok(Some(Quote::provider("USD", quoted.quote)))
+    }
+
+    async fn balance(&self, secret: &Secret) -> ProviderResult<Option<AccountBalance>> {
+        self.billing_balance(secret).await.map(Some)
     }
 
     async fn submit(
@@ -477,6 +492,49 @@ fn network_error(error: reqwest::Error) -> ProviderError {
     )
 }
 
+/// Prepaid USD credit only. Venice also reports a DIEM staking allotment on
+/// this endpoint; that is a daily inference grant, not prepaid dollars, and
+/// stays out of the remaining figure.
+fn usd_account_balance(bytes: &[u8]) -> ProviderResult<AccountBalance> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Body {
+        balances: Balances,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Balances {
+        #[serde(default)]
+        usd: Option<f64>,
+        #[serde(default)]
+        bundled_credits: Option<f64>,
+        #[serde(default)]
+        vcu: Option<f64>,
+    }
+
+    let body: Body = serde_json::from_slice(bytes).map_err(|error| {
+        ProviderError::new(ProviderErrorKind::MalformedResponse, error.to_string())
+    })?;
+    let amount = [
+        body.balances.usd,
+        body.balances.bundled_credits,
+        body.balances.vcu,
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|value| value.is_finite() && *value >= 0.0)
+    .sum::<f64>();
+    if !amount.is_finite() {
+        return Err(ProviderError::new(
+            ProviderErrorKind::MalformedResponse,
+            "Venice returned a non-finite USD balance",
+        ));
+    }
+    Ok(AccountBalance {
+        remaining: Quote::catalog("USD", amount),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,6 +712,52 @@ mod tests {
                 .kind,
             ProviderErrorKind::MalformedResponse
         );
+    }
+
+    #[test]
+    fn billing_balance_uses_usd_and_bundled_credits_not_diem() {
+        let balance = usd_account_balance(
+            br#"{"canConsume":true,"consumptionCurrency":"DIEM","balances":{"diem":90.5,"usd":25,"bundledCredits":1.5},"diemEpochAllocation":100}"#,
+        )
+        .unwrap();
+        assert_eq!(balance.remaining.currency, "USD");
+        assert!((balance.remaining.amount - 26.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn billing_balance_treats_missing_usd_as_zero() {
+        let balance = usd_account_balance(
+            br#"{"canConsume":false,"consumptionCurrency":"DIEM","balances":{"diem":12.0,"usd":null},"diemEpochAllocation":12}"#,
+        )
+        .unwrap();
+        assert_eq!(balance.remaining.amount, 0.0);
+    }
+
+    #[tokio::test]
+    async fn billing_balance_reads_the_usd_field() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut incoming = vec![0_u8; 4096];
+            let _ = stream.read(&mut incoming).await;
+            let body = r#"{"canConsume":true,"consumptionCurrency":"USD","balances":{"diem":null,"usd":12.34},"diemEpochAllocation":0}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        let provider = VeniceMediaProvider::with_base_url(format!("http://{addr}"));
+        let balance = provider
+            .balance(&Secret::new("token"))
+            .await
+            .unwrap()
+            .expect("venice usd balance");
+        assert_eq!(balance.remaining.currency, "USD");
+        assert!((balance.remaining.amount - 12.34).abs() < f64::EPSILON);
+        server.await.unwrap();
     }
 
     #[tokio::test]

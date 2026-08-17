@@ -11,7 +11,8 @@ use gpui::{
 use zeron_proto::{
     ListStudioConversationsResponse, ListStudioModelsResponse, ListStudioProvidersResponse,
     QuoteStudioBatchResponse, StudioConversationSummary, StudioConversationView, StudioGalleryItem,
-    StudioProviderConnection, StudioTurnView, UNTITLED_STUDIO_TITLE,
+    StudioProviderBalanceResponse, StudioProviderConnection, StudioRunState, StudioTurnView,
+    UNTITLED_STUDIO_TITLE,
 };
 use zeron_rpc::methods;
 use zeron_studio::{StudioArtifactId, StudioConversationId};
@@ -46,6 +47,10 @@ pub struct StudioPage {
     pub(super) live_quotes: HashMap<zeron_studio::ModelId, zeron_studio::Quote>,
     pub(super) quote_generation: u64,
     pub(super) quote_task: Option<Task<()>>,
+    pub(super) account_balance: Option<zeron_studio::AccountBalance>,
+    pub(super) reserved_spend: Option<zeron_studio::Quote>,
+    pub(super) balance_generation: u64,
+    pub(super) balance_task: Option<Task<()>>,
     pub(super) composer_seeded_for: Option<StudioConversationId>,
     pub(super) selected_conversation: Option<StudioConversationId>,
     pub(super) conversation: Option<StudioConversationView>,
@@ -162,6 +167,10 @@ impl StudioPage {
             live_quotes: HashMap::new(),
             quote_generation: 0,
             quote_task: None,
+            account_balance: None,
+            reserved_spend: None,
+            balance_generation: 0,
+            balance_task: None,
             composer_seeded_for: None,
             selected_conversation: None,
             conversation: None,
@@ -292,6 +301,7 @@ impl StudioPage {
                         page.apply_models(models.models);
                         page.apply_remembered_or_default_models();
                         page.persist_composer_defaults(cx);
+                        page.refresh_account_balance(cx, false);
                         page.watch_gallery(cx);
                         cx.emit(StudioEvent::SidebarChanged);
                     }
@@ -323,6 +333,15 @@ impl StudioPage {
         self.selected_conversation
             .and_then(|id| self.conversation_title(id))
             .or_else(|| Some("Gallery".into()))
+    }
+
+    /// Prepaid USD remaining after in-flight draft reservations.
+    pub fn account_balance_label(&self) -> Option<String> {
+        let remaining = super::cost::remaining_after_spend(
+            &self.account_balance.as_ref()?.remaining,
+            self.reserved_spend.as_ref(),
+        );
+        Some(super::cost::format_quote(&remaining))
     }
 
     /// Images currently on the open conversation, or the gallery when no
@@ -427,12 +446,19 @@ impl StudioPage {
                 if this
                     .update(cx, |page, cx| {
                         let first_open = page.conversation.is_none();
+                        let settled = page
+                            .conversation
+                            .as_ref()
+                            .is_some_and(|previous| newly_settled_runs(previous, &view));
                         let submitted_turn_arrived = page
                             .scroll_after_turn_count
                             .is_some_and(|before| view.turns.len() > before);
                         let last_turn_id = view.turns.last().map(|turn| turn.id);
                         page.apply_conversation_summary(view.conversation.clone(), cx);
                         page.conversation = Some(view);
+                        if settled {
+                            page.refresh_account_balance(cx, true);
+                        }
                         page.seed_composer_from_conversation(cx);
                         page.sync_feed_list();
                         if page.apply_scroll_to_artifact(cx) {
@@ -663,6 +689,16 @@ impl StudioPage {
                 .map_or(0, |view| view.turns.len()),
         );
         self.feed_scroll_to_end();
+        let batch_quote = super::cost::selected_batch_quote(
+            &self.models,
+            &self.selected_models,
+            &self.draft_runs,
+            &self.live_quotes,
+        );
+        if let Some(quote) = batch_quote.as_ref() {
+            self.reserve_account_spend(quote);
+            cx.notify();
+        }
         self.busy = true;
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
@@ -703,6 +739,9 @@ impl StudioPage {
                     }
                     Err(error) => {
                         page.scroll_after_turn_count = None;
+                        if let Some(quote) = batch_quote.as_ref() {
+                            page.release_account_spend(quote);
+                        }
                         page.error = Some(error.to_string().into());
                     }
                 }
@@ -904,6 +943,11 @@ impl StudioPage {
             self.scroll_after_extend = Some(turn_id);
             self.feed_scroll_to_end();
         }
+        let quote = super::cost::turn_quote(turn);
+        if let Some(quote) = quote.as_ref() {
+            self.reserve_account_spend(quote);
+            cx.notify();
+        }
         self.busy = true;
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
@@ -917,6 +961,9 @@ impl StudioPage {
                 page.busy = false;
                 if let Err(error) = result {
                     page.scroll_after_extend = None;
+                    if let Some(quote) = quote.as_ref() {
+                        page.release_account_spend(quote);
+                    }
                     page.error = Some(error.to_string().into());
                 }
                 cx.notify();
@@ -1080,6 +1127,17 @@ impl StudioPage {
         let Some(engine) = self.engine(cx) else {
             return;
         };
+        let quote = self.conversation.as_ref().and_then(|view| {
+            view.turns
+                .iter()
+                .flat_map(|turn| turn.runs.iter())
+                .find(|run| run.id == run_id)
+                .and_then(|run| run.quote.clone())
+        });
+        if let Some(quote) = quote.as_ref() {
+            self.reserve_account_spend(quote);
+            cx.notify();
+        }
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -1090,6 +1148,9 @@ impl StudioPage {
                 .await;
             this.update(cx, |page, cx| {
                 if let Err(error) = result {
+                    if let Some(quote) = quote.as_ref() {
+                        page.release_account_spend(quote);
+                    }
                     page.error = Some(error.to_string().into());
                 }
                 cx.notify();
@@ -1097,6 +1158,87 @@ impl StudioPage {
             .ok();
         }));
     }
+
+    fn configured_provider_id(&self) -> Option<zeron_studio::ProviderId> {
+        self.providers
+            .iter()
+            .find(|provider| provider.configured)
+            .map(|provider| provider.provider_id.clone())
+    }
+
+    fn reserve_account_spend(&mut self, quote: &zeron_studio::Quote) {
+        self.reserved_spend = match self.reserved_spend.as_ref() {
+            Some(existing) => existing
+                .saturating_add(quote)
+                .or_else(|| Some(quote.clone())),
+            None => Some(quote.clone()),
+        };
+    }
+
+    fn release_account_spend(&mut self, quote: &zeron_studio::Quote) {
+        self.reserved_spend = self
+            .reserved_spend
+            .as_ref()
+            .and_then(|existing| existing.saturating_sub(quote))
+            .filter(|remaining| remaining.amount > 0.0);
+    }
+
+    fn refresh_account_balance(&mut self, cx: &mut Context<Self>, clear_reserved: bool) {
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        let Some(provider_id) = self.configured_provider_id() else {
+            self.account_balance = None;
+            self.reserved_spend = None;
+            return;
+        };
+        self.balance_generation = self.balance_generation.saturating_add(1);
+        let generation = self.balance_generation;
+        self.balance_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::GET_STUDIO_PROVIDER_BALANCE,
+                    serde_json::json!({ "providerId": provider_id }),
+                )
+                .await;
+            this.update(cx, |page, cx| {
+                if page.balance_generation != generation {
+                    return;
+                }
+                if let Ok(value) = result
+                    && let Ok(response) =
+                        serde_json::from_value::<StudioProviderBalanceResponse>(value)
+                {
+                    page.account_balance = response.balance;
+                    if clear_reserved {
+                        page.reserved_spend = None;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+}
+
+fn newly_settled_runs(previous: &StudioConversationView, next: &StudioConversationView) -> bool {
+    let before = terminal_run_ids(previous);
+    terminal_run_ids(next).difference(&before).next().is_some()
+}
+
+fn terminal_run_ids(view: &StudioConversationView) -> HashSet<zeron_studio::StudioRunId> {
+    view.turns
+        .iter()
+        .flat_map(|turn| turn.runs.iter())
+        .filter(|run| {
+            matches!(
+                run.state,
+                StudioRunState::Succeeded | StudioRunState::Failed | StudioRunState::Cancelled
+            )
+        })
+        .map(|run| run.id)
+        .collect()
 }
 
 impl EventEmitter<StudioEvent> for StudioPage {}

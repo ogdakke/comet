@@ -16,9 +16,10 @@ use zeron_proto::{
 };
 use zeron_rpc::{memory_client, methods};
 use zeron_studio::{
-    ControlKind, ControlValue, FakeMediaProvider, FakeSubmissionMode, GenerationRequest, MediaKind,
-    MediaModel, MediaOperation, ModelControl, PricingMetadata, PricingUnit, ProviderArtifact,
-    ProviderError, ProviderErrorKind, ProviderId, Quote, QuoteSource, Secret, StudioArtifactId,
+    AccountBalance, ControlKind, ControlValue, FakeMediaProvider, FakeSubmissionMode,
+    GenerationRequest, MediaKind, MediaModel, MediaOperation, ModelControl, PricingMetadata,
+    PricingUnit, ProviderArtifact, ProviderError, ProviderErrorKind, ProviderId, Quote,
+    QuoteSource, Secret, StudioArtifactId,
 };
 
 #[derive(Default)]
@@ -1285,6 +1286,36 @@ async fn quote_studio_batch_prefers_live_provider_quote() {
     assert!((quote.amount - 0.99).abs() < f64::EPSILON);
     let total = quoted.total.expect("batch total");
     assert!((total.amount - 0.99).abs() < f64::EPSILON);
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn get_studio_provider_balance_returns_prepaid_credit() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(
+        FakeMediaProvider::new(
+            "fake",
+            vec![image_model("fake")],
+            FakeSubmissionMode::Complete(Vec::new()),
+        )
+        .with_balance(AccountBalance {
+            remaining: Quote::catalog("USD", 12.34),
+        }),
+    );
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+    let response: zeron_proto::StudioProviderBalanceResponse = serde_json::from_value(
+        client
+            .call(
+                methods::GET_STUDIO_PROVIDER_BALANCE,
+                serde_json::json!({ "providerId": "fake" }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let remaining = response.balance.expect("balance").remaining;
+    assert_eq!(remaining.currency, "USD");
+    assert!((remaining.amount - 12.34).abs() < f64::EPSILON);
     engine.shutdown().await;
 }
 

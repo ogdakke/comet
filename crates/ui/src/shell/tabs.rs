@@ -292,9 +292,13 @@ impl Shell {
     pub(super) fn render_studio_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let page = self.ensure_studio_page(cx);
-        let (title, images) = {
+        let (title, images, balance) = {
             let page = page.read(cx);
-            (page.selected_title(), page.selected_image_count())
+            (
+                page.selected_title(),
+                page.selected_image_count(),
+                page.account_balance_label(),
+            )
         };
         let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
         let content_left = (sidebar_now + Theme::SPACE_LG).max(self.title_bar_content_start());
@@ -348,7 +352,16 @@ impl Shell {
                         }),
                 )
             })
-            .child(div().flex_1());
+            .child(div().flex_1())
+            .when_some(balance, |el, label| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted.opacity(0.5))
+                        .child(SharedString::from(label)),
+                )
+            });
 
         let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
         // BlockMouse: tiles scroll under this glass strip. Without it the

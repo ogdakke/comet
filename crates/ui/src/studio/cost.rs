@@ -80,6 +80,12 @@ pub fn needs_live_quote(
         })
 }
 
+pub fn remaining_after_spend(balance: &Quote, spend: Option<&Quote>) -> Quote {
+    spend
+        .and_then(|spend| balance.saturating_sub(spend))
+        .unwrap_or_else(|| balance.clone())
+}
+
 pub fn turn_quote(turn: &StudioTurnView) -> Option<Quote> {
     let quotes = turn
         .runs
@@ -103,6 +109,25 @@ mod tests {
         assert_eq!(format_amount("USD", 0.52), "$0.52");
         assert_eq!(format_amount("USD", 0.0035), "$0.0035");
         assert_eq!(format_amount("USD", 0.0), "$0");
+    }
+
+    #[test]
+    #[test]
+    fn remaining_after_spend_clamps_at_zero() {
+        let remaining = remaining_after_spend(
+            &Quote::catalog("USD", 0.40),
+            Some(&Quote::catalog("USD", 0.67)),
+        );
+        assert_eq!(format_quote(&remaining), "$0");
+    }
+
+    #[test]
+    fn remaining_after_spend_keeps_the_confirmed_currency() {
+        let remaining = remaining_after_spend(
+            &Quote::catalog("USD", 12.34),
+            Some(&Quote::catalog("USD", 0.34)),
+        );
+        assert_eq!(format_quote(&remaining), "$12.00");
     }
 
     #[test]

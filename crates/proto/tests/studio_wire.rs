@@ -2,9 +2,12 @@ use zeron_proto::{
     ExtendStudioTurnRequest, ListStudioArtifactsResponse, ListStudioProvidersResponse,
     ProviderValidationState, QuoteStudioBatchResponse, QuoteStudioRunView,
     ReadStudioArtifactChunkRequest, SetStudioProviderCredentialRequest,
-    SetStudioProviderPreferencesRequest, StudioGalleryItem, StudioProviderConnection,
+    SetStudioProviderPreferencesRequest, StudioGalleryItem, StudioProviderBalanceResponse,
+    StudioProviderConnection,
 };
-use zeron_studio::{MediaKind, Quote, StudioArtifactId, StudioConversationId, StudioTurnId};
+use zeron_studio::{
+    AccountBalance, MediaKind, Quote, StudioArtifactId, StudioConversationId, StudioTurnId,
+};
 
 #[test]
 fn provider_responses_have_no_secret_field() {
@@ -69,6 +72,19 @@ fn extend_turn_uses_camel_case_wire_shape() {
     let json = serde_json::to_value(request).unwrap();
     assert!(json.get("turnId").is_some());
     assert!(json.get("turn_id").is_none());
+}
+
+#[test]
+fn provider_balance_uses_camel_case_wire_shape() {
+    let response = StudioProviderBalanceResponse {
+        balance: Some(AccountBalance {
+            remaining: Quote::catalog("USD", 12.34),
+        }),
+    };
+    let json = serde_json::to_value(response).unwrap();
+    assert_eq!(json["balance"]["remaining"]["currency"], "USD");
+    assert_eq!(json["balance"]["remaining"]["amount"], 12.34);
+    assert!(json["balance"]["remaining"].get("expiresAt").is_some());
 }
 
 #[test]

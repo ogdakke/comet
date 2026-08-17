@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use zeron_studio::{
-    ControlId, ControlValue, GenerationInput, MediaKind, MediaModel, MediaOperation, ModelId,
-    ProviderId, Quote, StudioArtifactId, StudioBatchId, StudioConversationId, StudioRunId,
-    StudioTurnId,
+    AccountBalance, ControlId, ControlValue, GenerationInput, MediaKind, MediaModel,
+    MediaOperation, ModelId, ProviderId, Quote, StudioArtifactId, StudioBatchId,
+    StudioConversationId, StudioRunId, StudioTurnId,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +194,13 @@ pub struct QuoteStudioBatchResponse {
     pub runs: Vec<QuoteStudioRunView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total: Option<Quote>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudioProviderBalanceResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance: Option<AccountBalance>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

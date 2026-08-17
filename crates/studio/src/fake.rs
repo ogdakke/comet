@@ -11,10 +11,10 @@ use std::{
 use async_trait::async_trait;
 
 use crate::{
-    CancelResult, GenerationRequest, MediaModel, MediaProvider, PollResult, ProviderAccount,
-    ProviderAccountId, ProviderArtifact, ProviderError, ProviderErrorKind, ProviderId,
-    ProviderResult, Quote, RemoteAttempt, RemoteJob, Secret, Submission, SubmissionCapabilities,
-    SubmitContext,
+    AccountBalance, CancelResult, GenerationRequest, MediaModel, MediaProvider, PollResult,
+    ProviderAccount, ProviderAccountId, ProviderArtifact, ProviderError, ProviderErrorKind,
+    ProviderId, ProviderResult, Quote, RemoteAttempt, RemoteJob, Secret, Submission,
+    SubmissionCapabilities, SubmitContext,
 };
 
 #[derive(Clone, Debug)]
@@ -49,6 +49,7 @@ pub struct FakeMediaProvider {
     models: Mutex<Vec<MediaModel>>,
     list_calls: AtomicUsize,
     quote: Option<Quote>,
+    balance: Option<AccountBalance>,
     mode: FakeSubmissionMode,
     state: Mutex<State>,
 }
@@ -61,6 +62,7 @@ impl FakeMediaProvider {
             models: Mutex::new(models),
             list_calls: AtomicUsize::new(0),
             quote: None,
+            balance: None,
             mode,
             state: Mutex::new(State {
                 next_job: 1,
@@ -85,6 +87,11 @@ impl FakeMediaProvider {
 
     pub fn with_quote(mut self, quote: Quote) -> Self {
         self.quote = Some(quote);
+        self
+    }
+
+    pub fn with_balance(mut self, balance: AccountBalance) -> Self {
+        self.balance = Some(balance);
         self
     }
 
@@ -139,6 +146,11 @@ impl MediaProvider for FakeMediaProvider {
     ) -> ProviderResult<Option<Quote>> {
         self.authenticate(secret)?;
         Ok(self.quote.clone())
+    }
+
+    async fn balance(&self, secret: &Secret) -> ProviderResult<Option<AccountBalance>> {
+        self.authenticate(secret)?;
+        Ok(self.balance.clone())
     }
 
     async fn submit(

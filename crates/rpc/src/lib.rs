@@ -150,6 +150,7 @@ pub mod methods {
     pub const CREATE_STUDIO_TURN: &str = "CreateStudioTurn";
     pub const EXTEND_STUDIO_TURN: &str = "ExtendStudioTurn";
     pub const QUOTE_STUDIO_BATCH: &str = "QuoteStudioBatch";
+    pub const GET_STUDIO_PROVIDER_BALANCE: &str = "GetStudioProviderBalance";
     pub const RETRY_STUDIO_RUN: &str = "RetryStudioRun";
     pub const DELETE_STUDIO_ARTIFACT: &str = "DeleteStudioArtifact";
     pub const READ_STUDIO_ARTIFACT_CHUNK: &str = "ReadStudioArtifactChunk";

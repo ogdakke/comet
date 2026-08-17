@@ -81,6 +81,32 @@ impl Quote {
         }
     }
 
+    pub fn saturating_sub(&self, other: &Self) -> Option<Self> {
+        if self.currency != other.currency {
+            return None;
+        }
+        Some(Self {
+            currency: self.currency.clone(),
+            amount: (self.amount - other.amount).max(0.0),
+            detail: None,
+            expires_at: None,
+            source: self.source,
+        })
+    }
+
+    pub fn saturating_add(&self, other: &Self) -> Option<Self> {
+        if self.currency != other.currency {
+            return None;
+        }
+        Some(Self {
+            currency: self.currency.clone(),
+            amount: self.amount + other.amount,
+            detail: None,
+            expires_at: None,
+            source: self.source,
+        })
+    }
+
     /// Sum quotes that share a currency. Mixed currencies yield `None`.
     pub fn total(quotes: impl IntoIterator<Item = Self>) -> Option<Self> {
         let mut quotes = quotes.into_iter();
@@ -196,6 +222,14 @@ impl ProviderError {
 
 pub type ProviderResult<T> = Result<T, ProviderError>;
 
+/// Spendable prepaid credit. Venice maps this to USD / bundled credits only —
+/// staking allotments stay out of the studio chrome.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountBalance {
+    pub remaining: Quote,
+}
+
 #[async_trait]
 pub trait MediaProvider: Send + Sync {
     fn id(&self) -> ProviderId;
@@ -207,6 +241,9 @@ pub trait MediaProvider: Send + Sync {
         secret: &Secret,
         request: &GenerationRequest,
     ) -> ProviderResult<Option<Quote>>;
+    async fn balance(&self, _secret: &Secret) -> ProviderResult<Option<AccountBalance>> {
+        Ok(None)
+    }
     async fn submit(
         &self,
         secret: &Secret,

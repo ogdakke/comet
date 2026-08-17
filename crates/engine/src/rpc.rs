@@ -66,8 +66,8 @@ use zeron_proto::{
     QuoteStudioBatchRequest, QuoteStudioBatchResponse, QuoteStudioRunView,
     ReadStudioArtifactChunkRequest, RenameStudioConversationRequest, RetryStudioRunRequest,
     SetStudioProviderCredentialRequest, SetStudioProviderPreferencesRequest, StudioModelRunSpec,
-    StudioProviderConnection, StudioProviderRequest, ToolCall, WatchStudioConversationRequest,
-    WorkspaceScope,
+    StudioProviderBalanceResponse, StudioProviderConnection, StudioProviderRequest, ToolCall,
+    WatchStudioConversationRequest, WorkspaceScope,
 };
 use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
@@ -1388,6 +1388,24 @@ impl RpcService for EngineRpc {
                     .collect::<Option<Vec<_>>>()
                     .and_then(|quotes| zeron_studio::Quote::total(quotes));
                 RpcReply::value(&QuoteStudioBatchResponse { runs, total })
+            }
+            methods::GET_STUDIO_PROVIDER_BALANCE => {
+                let request: StudioProviderRequest = parse_params(params)?;
+                let provider = self
+                    .studio_providers
+                    .get(&request.provider_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
+                    .ok_or_else(|| RpcError::Failed("unknown studio provider".into()))?;
+                let secret = self
+                    .studio_credentials
+                    .secret(&request.provider_id)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let balance = provider
+                    .balance(&secret)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&StudioProviderBalanceResponse { balance })
             }
             methods::CREATE_STUDIO_TURN => {
                 let request: CreateStudioTurnRequest = parse_params(params)?;
