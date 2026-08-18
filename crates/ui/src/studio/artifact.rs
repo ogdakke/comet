@@ -2676,13 +2676,11 @@ impl StudioPage {
                                 true,
                                 stage,
                             )
-                            .band_bottom(
-                                if self.edit_target.is_some() {
-                                    super::edit::EDIT_COMPOSER_HEIGHT
-                                } else {
-                                    ARTIFACT_FILMSTRIP_HEIGHT
-                                },
-                            )
+                            .band_bottom(if self.edit_target.is_some() {
+                                super::edit::EDIT_COMPOSER_HEIGHT
+                            } else {
+                                ARTIFACT_FILMSTRIP_HEIGHT
+                            })
                             // Same band as the filmstrip / edit composer; a
                             // steeper ease-out so the image stays solid and
                             // only dissolves in the last stretch above the
