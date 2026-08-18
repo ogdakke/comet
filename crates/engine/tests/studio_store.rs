@@ -3519,6 +3519,33 @@ fn import_studio_asset_does_not_restage_after_commit() {
     assert!(!staging.exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn import_sweep_unlinks_tmp_symlink_without_following() {
+    let root = tempdir().unwrap();
+    let store = StudioStore::open(root.path(), 1024 * 1024).unwrap();
+    let tmp = root.path().join("studio/inputs/tmp");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let decoy = root.path().join("decoy");
+    let victim = decoy.join("keep-me");
+    std::fs::create_dir_all(&victim).unwrap();
+    std::os::unix::fs::symlink(&decoy, &tmp).unwrap();
+    assert!(tmp.symlink_metadata().unwrap().file_type().is_symlink());
+
+    let asset_id = StudioAssetId::new();
+    let _ = store.import_asset_chunk(asset_id, 0, b"x", false, None, None);
+
+    assert!(
+        !tmp.symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_symlink()),
+        "sweep must unlink a tmp symlink instead of walking it"
+    );
+    assert!(
+        victim.is_dir(),
+        "sweep must not delete directories through a tmp symlink"
+    );
+}
+
 #[tokio::test]
 async fn quote_studio_batch_accepts_video_specs() {
     let root = tempdir().unwrap();

@@ -2905,6 +2905,14 @@ impl ArtifactStore {
 
     fn sweep_import_staging(&self) {
         let tmp = self.import_tmp_root();
+        match fs::symlink_metadata(&tmp) {
+            Err(_) => return,
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let _ = fs::remove_file(&tmp);
+                return;
+            }
+            Ok(_) => {}
+        }
         let Ok(entries) = fs::read_dir(&tmp) else {
             return;
         };
