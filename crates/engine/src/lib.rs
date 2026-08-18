@@ -55,8 +55,8 @@ pub use run_journal::{JournalError, RunJournal};
 pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
 pub use spaces::SpacesSync;
 pub use studio::{
-    ArtifactStore, CompleteRun, StudioProviderDescriptor, StudioProviderRegistry,
-    StudioRegistryError, StudioStore, StudioStoreError,
+    ArtifactStore, CompleteRun, StudioAttemptCheck, StudioProviderDescriptor,
+    StudioProviderRegistry, StudioRegistryError, StudioStore, StudioStoreError,
 };
 pub use studio_credentials::{
     StudioCredentialError, StudioCredentials, StudioSecretBackend, SystemStudioSecretBackend,
@@ -310,7 +310,7 @@ impl EngineCore {
             turn_diff.note_turn_start(chat_id, cwd);
         }));
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
-        Ok(Self {
+        let core = Self {
             sessions,
             doc_host,
             workspace,
@@ -332,7 +332,12 @@ impl EngineCore {
             updater: std::sync::Mutex::new(None),
             updater_wake: std::sync::Mutex::new(None),
             _instance_lock: lock,
-        })
+        };
+        // Recover already left queued video with a remote id in place. Resume
+        // those polls now that providers and credentials exist. Missing
+        // provider/secret skips the job instead of marking it unknown.
+        core.spawn_resume_queued_video_runs();
+        Ok(core)
     }
 
     pub fn workspace_scope(&self) -> WorkspaceScope {
@@ -348,6 +353,30 @@ impl EngineCore {
         tokio::spawn(async move {
             refresh_configured_studio_catalogs(&studio, &providers, &credentials).await;
         });
+    }
+
+    /// Spawn poll loops for in-flight video jobs that already have a `remote_job_id`.
+    /// No-op when called outside a Tokio runtime (sync unit tests).
+    pub fn spawn_resume_queued_video_runs(&self) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let store = self.studio.clone();
+        let providers = self.studio_providers.clone();
+        let credentials = self.studio_credentials.clone();
+        tokio::spawn(async move {
+            rpc::resume_queued_video_runs(store, providers, credentials).await;
+        });
+    }
+
+    /// Await resume of every durable in-flight video job (tests).
+    pub async fn resume_queued_video_runs(&self) {
+        rpc::resume_queued_video_runs(
+            self.studio.clone(),
+            self.studio_providers.clone(),
+            self.studio_credentials.clone(),
+        )
+        .await;
     }
 
     /// Attach the auth service (before building the RPC service / relays).

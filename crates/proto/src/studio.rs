@@ -427,6 +427,12 @@ pub struct RetryStudioRunRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CheckStudioRunRequest {
+    pub run_id: StudioRunId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReadStudioArtifactChunkRequest {
     pub artifact_id: zeron_studio::StudioArtifactId,
     #[serde(default)]

@@ -375,6 +375,16 @@ pub struct StoredStudioRun {
     pub request: GenerationRequest,
 }
 
+#[derive(Clone, Debug)]
+pub struct StudioAttemptCheck {
+    pub run: StoredStudioRun,
+    pub attempt_state: String,
+    pub run_state: String,
+    pub remote_job: Option<RemoteJob>,
+    pub request_wire_hash: String,
+    pub conversation_id: StudioConversationId,
+}
+
 /// SQLite catalog rooted under one active profile.
 pub struct StudioStore {
     database_path: PathBuf,
@@ -439,9 +449,9 @@ impl StudioStore {
     /// have sent network bytes and becomes an ordinary retryable failure. Once submission began,
     /// the provider may have charged for work, so preserve the ambiguity and require Retry anyway.
     ///
-    /// Video attempts that already reached `queued`/`running` are left in place so a later
-    /// resume pass can keep polling `remote_job_id`. Prepared/submitting video (no remote id)
-    /// still follows the image path.
+    /// Video attempts that already reached `queued`/`running` **with** a `remote_job_id`
+    /// are left in place so a later resume pass can keep polling. Queued/running video
+    /// without an id, and prepared/submitting video, still follow the image path.
     pub fn recover_interrupted_image_runs(&self) -> Result<usize, StudioStoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
@@ -456,6 +466,8 @@ impl StudioStore {
                    AND NOT (
                        r.operation IN ('text_to_video', 'image_to_video', 'reference_to_video', 'video_to_video')
                        AND a.state IN ('queued', 'running')
+                       AND a.remote_job_id IS NOT NULL
+                       AND TRIM(a.remote_job_id) != ''
                    )",
             )?;
             statement
@@ -496,6 +508,162 @@ impl StudioStore {
             self.notify_change();
         }
         Ok(rows.len())
+    }
+
+    /// Queued/running video attempts that already have a durable `remote_job_id`.
+    /// Startup resumes these instead of marking them `submission_unknown`.
+    pub fn resumable_video_attempts(&self) -> Result<Vec<StoredStudioRun>, StudioStoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT a.id, a.run_id, a.idempotency_key, a.request_json
+             FROM studio_attempts a
+             JOIN studio_runs r ON r.id = a.run_id
+             WHERE a.state IN ('queued', 'running')
+               AND r.state IN ('queued', 'running', 'downloading')
+               AND r.operation IN ('text_to_video', 'image_to_video', 'reference_to_video', 'video_to_video')
+               AND a.remote_job_id IS NOT NULL
+               AND TRIM(a.remote_job_id) != ''
+             ORDER BY a.created_at ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut attempts = Vec::new();
+        for row in rows {
+            let (attempt_id, run_id, idempotency_key, request_json) = row?;
+            attempts.push(StoredStudioRun {
+                run_id: StudioRunId(parse_uuid(&run_id)?),
+                attempt_id: StudioAttemptId(parse_uuid(&attempt_id)?),
+                idempotency_key,
+                request: serde_json::from_str(&request_json)
+                    .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?,
+            });
+        }
+        Ok(attempts)
+    }
+
+    pub fn remote_job_for_attempt(
+        &self,
+        attempt_id: StudioAttemptId,
+    ) -> Result<Option<RemoteJob>, StudioStoreError> {
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT remote_job_id, response_metadata_json FROM studio_attempts WHERE id = ?1",
+                [attempt_id.0.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StudioStoreError::RunNotFound,
+                other => other.into(),
+            })?;
+        let Some(id) = row.0.filter(|value| !value.trim().is_empty()) else {
+            return Ok(None);
+        };
+        let metadata = match row.1.as_deref() {
+            Some(json) => serde_json::from_str(json)
+                .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?,
+            None => serde_json::Value::Null,
+        };
+        Ok(Some(RemoteJob { id, metadata }))
+    }
+
+    pub fn latest_attempt_for_check(
+        &self,
+        run_id: StudioRunId,
+    ) -> Result<StudioAttemptCheck, StudioStoreError> {
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT a.id, a.idempotency_key, a.request_json, a.state, a.remote_job_id,
+                        a.response_metadata_json, a.request_wire_hash, r.state, t.conversation_id
+                 FROM studio_runs r
+                 JOIN studio_batches b ON b.id = r.batch_id
+                 JOIN studio_turns t ON t.id = b.turn_id
+                 JOIN studio_attempts a ON a.run_id = r.id
+                 WHERE r.id = ?1 ORDER BY a.attempt_number DESC LIMIT 1",
+                [run_id.0.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                },
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StudioStoreError::RunNotFound,
+                other => other.into(),
+            })?;
+        let remote_job = match row.4.filter(|value| !value.trim().is_empty()) {
+            Some(id) => {
+                let metadata = match row.5.as_deref() {
+                    Some(json) => serde_json::from_str(json)
+                        .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?,
+                    None => serde_json::Value::Null,
+                };
+                Some(RemoteJob { id, metadata })
+            }
+            None => None,
+        };
+        Ok(StudioAttemptCheck {
+            run: StoredStudioRun {
+                run_id,
+                attempt_id: StudioAttemptId(parse_uuid(&row.0)?),
+                idempotency_key: row.1,
+                request: serde_json::from_str(&row.2)
+                    .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?,
+            },
+            attempt_state: row.3,
+            run_state: row.7,
+            remote_job,
+            request_wire_hash: row.6.unwrap_or_default(),
+            conversation_id: StudioConversationId(parse_uuid(&row.8)?),
+        })
+    }
+
+    /// Move a `submission_unknown` attempt that already has a queue id back to
+    /// `queued` so Check status can poll without creating a second attempt.
+    pub fn reopen_unknown_for_poll(&self, run: &StoredStudioRun) -> Result<bool, StudioStoreError> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE studio_attempts SET state = 'queued', error_json = NULL
+             WHERE id = ?1 AND run_id = ?2 AND state = 'submission_unknown'
+               AND remote_job_id IS NOT NULL AND TRIM(remote_job_id) != ''",
+            rusqlite::params![run.attempt_id.0.to_string(), run.run_id.0.to_string()],
+        )?;
+        if changed != 1 {
+            return Ok(false);
+        }
+        transaction.execute(
+            "UPDATE studio_runs SET state = 'queued', progress = NULL, error_json = NULL, updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![run.run_id.0.to_string(), now],
+        )?;
+        transaction.execute(
+            "INSERT INTO studio_run_events (run_id, attempt_id, state, created_at) VALUES (?1, ?2, 'queued', ?3)",
+            rusqlite::params![run.run_id.0.to_string(), run.attempt_id.0.to_string(), now],
+        )?;
+        transaction.commit()?;
+        self.notify_change();
+        Ok(true)
     }
 
     pub fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -1403,7 +1571,7 @@ impl StudioStore {
         let transaction = connection.transaction()?;
         let row = transaction
             .query_row(
-                "SELECT a.id, a.request_json, a.state, r.provider_id, t.conversation_id
+                "SELECT a.id, a.request_json, a.state, r.provider_id, t.conversation_id, r.state
              FROM studio_runs r
              JOIN studio_batches b ON b.id = r.batch_id
              JOIN studio_turns t ON t.id = b.turn_id
@@ -1417,6 +1585,7 @@ impl StudioStore {
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
@@ -1424,6 +1593,11 @@ impl StudioStore {
                 rusqlite::Error::QueryReturnedNoRows => StudioStoreError::RunNotFound,
                 other => other.into(),
             })?;
+        if matches!(row.5.as_str(), "queued" | "running" | "downloading") {
+            return Err(StudioStoreError::InvalidValue(
+                "cannot retry a run that is still queued, running, or downloading".into(),
+            ));
+        }
         if row.2 == "submission_unknown" && !retry_anyway {
             return Err(StudioStoreError::InvalidValue(
                 "retrying this uncertain submission may duplicate provider work; explicit confirmation is required".into(),

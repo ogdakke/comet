@@ -112,6 +112,27 @@ impl FakeMediaProvider {
             .clone()
     }
 
+    /// Insert a queued job so a restarted poll can resume without re-submitting.
+    pub fn seed_queued_job(
+        &self,
+        job_id: impl Into<String>,
+        polls_before_completion: usize,
+        artifacts: Vec<ProviderArtifact>,
+    ) {
+        self.state
+            .lock()
+            .expect("fake provider lock poisoned")
+            .jobs
+            .insert(
+                job_id.into(),
+                FakeJob {
+                    remaining_polls: polls_before_completion,
+                    artifacts,
+                    cancelled: false,
+                },
+            );
+    }
+
     pub fn with_accepted_secret(mut self, secret: impl Into<String>) -> Self {
         self.accepted_secret = secret.into();
         self

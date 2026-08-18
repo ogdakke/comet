@@ -60,16 +60,17 @@ use tokio::sync::watch;
 use zeron_doc::{MessagePart, SessionCommandPayload};
 use zeron_proto::{
     AppendStudioDerivedRunRequest, ArchiveStudioConversationRequest, ChatConfig,
-    CreateStudioConversationRequest, CreateStudioTurnRequest, DeleteStudioArtifactRequest,
-    DeleteStudioConversationRequest, EngineInfo, EvaluateStudioComposerRequest,
-    ExtendStudioTurnRequest, HarnessId, ImportStudioAssetRequest, ListStudioArtifactsResponse,
-    ListStudioConversationsRequest, ListStudioConversationsResponse, ListStudioModelsRequest,
-    ListStudioModelsResponse, ListStudioProvidersResponse, MarkStudioConversationSeenRequest,
-    ProviderValidationState, QuoteStudioBatchRequest, QuoteStudioBatchResponse, QuoteStudioRunView,
-    ReadStudioArtifactChunkRequest, RenameStudioConversationRequest, RetryStudioRunRequest,
-    SetStudioProviderCredentialRequest, SetStudioProviderPreferencesRequest, StudioModelRunSpec,
-    StudioProviderBalanceResponse, StudioProviderConnection, StudioProviderRequest,
-    StudioValidationError, ToolCall, WatchStudioConversationRequest, WorkspaceScope,
+    CheckStudioRunRequest, CreateStudioConversationRequest, CreateStudioTurnRequest,
+    DeleteStudioArtifactRequest, DeleteStudioConversationRequest, EngineInfo,
+    EvaluateStudioComposerRequest, ExtendStudioTurnRequest, HarnessId, ImportStudioAssetRequest,
+    ListStudioArtifactsResponse, ListStudioConversationsRequest, ListStudioConversationsResponse,
+    ListStudioModelsRequest, ListStudioModelsResponse, ListStudioProvidersResponse,
+    MarkStudioConversationSeenRequest, ProviderValidationState, QuoteStudioBatchRequest,
+    QuoteStudioBatchResponse, QuoteStudioRunView, ReadStudioArtifactChunkRequest,
+    RenameStudioConversationRequest, RetryStudioRunRequest, SetStudioProviderCredentialRequest,
+    SetStudioProviderPreferencesRequest, StudioModelRunSpec, StudioProviderBalanceResponse,
+    StudioProviderConnection, StudioProviderRequest, StudioValidationError, ToolCall,
+    WatchStudioConversationRequest, WorkspaceScope,
 };
 use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
@@ -81,8 +82,8 @@ use crate::registry::HarnessRegistry;
 use crate::repos::{Repos, home_dir};
 use crate::sessions::SessionsEngine;
 use crate::studio::{
-    CompleteRun, PreparedStudioRun, StoredStudioRun, StudioProviderRegistry, StudioStore,
-    StudioStoreError,
+    CompleteRun, PreparedStudioRun, StoredStudioRun, StudioAttemptCheck, StudioProviderRegistry,
+    StudioStore, StudioStoreError,
 };
 use crate::studio_credentials::StudioCredentials;
 use crate::terminals::Terminals;
@@ -1784,6 +1785,27 @@ impl RpcService for EngineRpc {
                 tokio::spawn(execute_studio_run(store, providers, credentials, run));
                 RpcReply::value(&view)
             }
+            methods::CHECK_STUDIO_RUN => {
+                let request: CheckStudioRunRequest = parse_params(params)?;
+                let check = self
+                    .studio
+                    .latest_attempt_for_check(request.run_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let view = self
+                    .studio
+                    .conversation_view(check.conversation_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let store = self.studio.clone();
+                let providers = self.studio_providers.clone();
+                let credentials = self.studio_credentials.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = check_studio_run(store, providers, credentials, check).await
+                    {
+                        tracing::warn!(error = %error, "studio check status failed");
+                    }
+                });
+                RpcReply::value(&view)
+            }
             methods::READ_STUDIO_ARTIFACT_CHUNK => {
                 let request: ReadStudioArtifactChunkRequest = parse_params(params)?;
                 let chunk = self
@@ -2822,6 +2844,16 @@ impl VideoPollPolicy {
         }
     }
 
+    /// Restart/Check status: the job has already been queued, so poll immediately.
+    fn resume() -> Self {
+        Self {
+            first_tick: Duration::ZERO,
+            timeout: VIDEO_POLL_TIMEOUT,
+            base_tick: VIDEO_POLL_BASE_TICK,
+            max_backoff: VIDEO_POLL_MAX_BACKOFF,
+        }
+    }
+
     fn timed_out(self, started: Instant) -> bool {
         started.elapsed() >= self.timeout
     }
@@ -2960,6 +2992,178 @@ async fn poll_queued_video_job(
                 return fail_studio_run(store, run, &error.to_string(), false);
             }
         }
+    }
+}
+
+pub(crate) async fn resume_queued_video_runs(
+    store: std::sync::Arc<StudioStore>,
+    providers: std::sync::Arc<StudioProviderRegistry>,
+    credentials: std::sync::Arc<StudioCredentials>,
+) {
+    let attempts = match store.resumable_video_attempts() {
+        Ok(attempts) => attempts,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to list resumable studio video jobs");
+            return;
+        }
+    };
+    if attempts.is_empty() {
+        return;
+    }
+    tracing::info!(
+        count = attempts.len(),
+        "resuming in-flight studio video jobs"
+    );
+    let tasks = attempts.into_iter().map(|run| {
+        let store = store.clone();
+        let providers = providers.clone();
+        let credentials = credentials.clone();
+        async move {
+            if let Err(error) = resume_one_video_job(
+                store,
+                providers,
+                credentials,
+                run,
+                VideoPollPolicy::resume(),
+            )
+            .await
+            {
+                tracing::warn!(error = %error, "studio video resume failed");
+            }
+        }
+    });
+    futures::future::join_all(tasks).await;
+}
+
+async fn resume_one_video_job(
+    store: std::sync::Arc<StudioStore>,
+    providers: std::sync::Arc<StudioProviderRegistry>,
+    credentials: std::sync::Arc<StudioCredentials>,
+    run: StoredStudioRun,
+    policy: VideoPollPolicy,
+) -> Result<(), String> {
+    let provider = match providers.get(&run.request.provider_id) {
+        Ok(Some(provider)) => provider,
+        Ok(None) => {
+            tracing::warn!(
+                run_id = %run.run_id.0,
+                provider = %run.request.provider_id.as_str(),
+                "skipping studio video resume: provider unavailable"
+            );
+            return Ok(());
+        }
+        Err(error) => return fail_studio_run(&store, &run, &error.to_string(), false),
+    };
+    let secret = match credentials.secret(&run.request.provider_id).await {
+        Ok(secret) => secret,
+        Err(error) => {
+            tracing::warn!(
+                run_id = %run.run_id.0,
+                provider = %run.request.provider_id.as_str(),
+                error = %error,
+                "skipping studio video resume: credentials missing"
+            );
+            return Ok(());
+        }
+    };
+    let remote_job = match store.remote_job_for_attempt(run.attempt_id) {
+        Ok(Some(remote_job)) => remote_job,
+        Ok(None) => {
+            tracing::warn!(
+                run_id = %run.run_id.0,
+                "skipping studio video resume: remote_job_id missing"
+            );
+            return Ok(());
+        }
+        Err(error) => return fail_studio_run(&store, &run, &error.to_string(), false),
+    };
+    poll_queued_video_job(
+        &store,
+        provider.as_ref(),
+        &secret,
+        &run,
+        &remote_job,
+        policy,
+    )
+    .await
+}
+
+async fn check_studio_run(
+    store: std::sync::Arc<StudioStore>,
+    providers: std::sync::Arc<StudioProviderRegistry>,
+    credentials: std::sync::Arc<StudioCredentials>,
+    check: StudioAttemptCheck,
+) -> Result<(), String> {
+    if check.remote_job.is_some() {
+        if matches!(
+            check.attempt_state.as_str(),
+            "succeeded" | "cancelled" | "failed"
+        ) {
+            return Ok(());
+        }
+        if check.attempt_state == "submission_unknown"
+            && let Err(error) = store.reopen_unknown_for_poll(&check.run)
+        {
+            return fail_studio_run(&store, &check.run, &error.to_string(), true);
+        }
+        return resume_one_video_job(
+            store,
+            providers,
+            credentials,
+            check.run,
+            VideoPollPolicy::resume(),
+        )
+        .await;
+    }
+    reconcile_studio_attempt(store, providers, credentials, check).await
+}
+
+async fn reconcile_studio_attempt(
+    store: std::sync::Arc<StudioStore>,
+    providers: std::sync::Arc<StudioProviderRegistry>,
+    credentials: std::sync::Arc<StudioCredentials>,
+    check: StudioAttemptCheck,
+) -> Result<(), String> {
+    let provider = match providers.get(&check.run.request.provider_id) {
+        Ok(Some(provider)) => provider,
+        Ok(None) => return Ok(()),
+        Err(error) => return fail_studio_run(&store, &check.run, &error.to_string(), false),
+    };
+    let secret = match credentials.secret(&check.run.request.provider_id).await {
+        Ok(secret) => secret,
+        Err(_) => return Ok(()),
+    };
+    let attempt = zeron_studio::RemoteAttempt {
+        idempotency_key: check.run.idempotency_key.clone(),
+        remote_job_id: None,
+        request_wire_hash: check.request_wire_hash,
+    };
+    match provider.reconcile(&secret, &attempt).await {
+        Ok(None) => Ok(()),
+        Ok(Some(zeron_studio::Submission::Completed { artifacts })) => {
+            match store.complete_run(&check.run, &artifacts) {
+                Ok(_) => Ok(()),
+                Err(error) => fail_studio_run(&store, &check.run, &error.to_string(), false),
+            }
+        }
+        Ok(Some(zeron_studio::Submission::Queued { remote_job })) => {
+            if !is_video_operation(check.run.request.operation) {
+                return Ok(());
+            }
+            if let Err(error) = store.mark_queued(&check.run, &remote_job) {
+                return fail_studio_run(&store, &check.run, &error.to_string(), true);
+            }
+            poll_queued_video_job(
+                &store,
+                provider.as_ref(),
+                &secret,
+                &check.run,
+                &remote_job,
+                VideoPollPolicy::resume(),
+            )
+            .await
+        }
+        Err(error) => fail_studio_run(&store, &check.run, &error.to_string(), false),
     }
 }
 

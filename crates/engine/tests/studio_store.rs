@@ -520,6 +520,110 @@ fn recover_leaves_queued_video_jobs_for_resume() {
         )
         .unwrap();
     assert_eq!(remote_job_id, "queue-keep");
+    let resumable = reopened.resumable_video_attempts().unwrap();
+    assert_eq!(resumable.len(), 1);
+    assert_eq!(resumable[0].run_id, runs[0].run_id);
+    assert_eq!(resumable[0].attempt_id, runs[0].attempt_id);
+    let retry = reopened.prepare_retry(runs[0].run_id, true).unwrap_err();
+    assert!(
+        retry
+            .to_string()
+            .contains("queued, running, or downloading"),
+        "{retry}"
+    );
+}
+
+#[test]
+fn recover_marks_queued_video_without_remote_id_unknown() {
+    let root = tempdir().unwrap();
+    let model = seedance_t2v_model("fake");
+    let store = StudioStore::open(root.path(), 1024).unwrap();
+    let conversation = store.create_conversation("Video unknown", None).unwrap();
+    let runs = store
+        .create_turn(
+            conversation.id,
+            "a comet",
+            None,
+            &[video_prepared_run(&model, "a comet")],
+            "device-a",
+        )
+        .unwrap();
+    store.mark_submitting(&runs[0]).unwrap();
+    store
+        .connection()
+        .unwrap()
+        .execute(
+            "UPDATE studio_attempts SET state = 'queued' WHERE id = ?1",
+            [runs[0].attempt_id.0.to_string()],
+        )
+        .unwrap();
+    drop(store);
+
+    let reopened = StudioStore::open(root.path(), 1024).unwrap();
+    assert_eq!(reopened.recover_interrupted_image_runs().unwrap(), 1);
+    let view = reopened.conversation_view(conversation.id).unwrap();
+    assert_eq!(view.turns[0].runs[0].state, StudioRunState::Failed);
+    assert!(
+        view.turns[0].runs[0]
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("may have completed"))
+    );
+    assert!(reopened.resumable_video_attempts().unwrap().is_empty());
+    assert!(reopened.prepare_retry(runs[0].run_id, false).is_err());
+    assert!(reopened.prepare_retry(runs[0].run_id, true).is_ok());
+}
+
+#[test]
+fn retry_disabled_while_run_is_queued_running_or_downloading() {
+    let root = tempdir().unwrap();
+    let model = seedance_t2v_model("fake");
+    let store = StudioStore::open(root.path(), 1024).unwrap();
+    let conversation = store.create_conversation("Retry lock", None).unwrap();
+    let runs = store
+        .create_turn(
+            conversation.id,
+            "a comet",
+            None,
+            &[video_prepared_run(&model, "a comet")],
+            "device-a",
+        )
+        .unwrap();
+    store.mark_submitting(&runs[0]).unwrap();
+    store
+        .mark_queued(
+            &runs[0],
+            &RemoteJob {
+                id: "queue-lock".into(),
+                metadata: serde_json::json!({ "model": "seedance-t2v" }),
+            },
+        )
+        .unwrap();
+    for _ in 0..2 {
+        let error = store.prepare_retry(runs[0].run_id, true).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("queued, running, or downloading"),
+            "{error}"
+        );
+    }
+    store.mark_running(&runs[0], Some(0.2)).unwrap();
+    assert!(store.prepare_retry(runs[0].run_id, true).is_err());
+    store.mark_downloading(&runs[0], Some(0.8)).unwrap();
+    assert!(store.prepare_retry(runs[0].run_id, true).is_err());
+    assert_eq!(
+        store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM studio_attempts WHERE run_id = ?1",
+                [runs[0].run_id.0.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
 }
 
 #[test]
@@ -3630,6 +3734,200 @@ async fn create_studio_turn_composer_video_completes_via_queue() {
         .unwrap();
     assert!(remote_job_id.starts_with("fake-job-"));
     assert_eq!(provider.complete_call_count(), 1);
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn restart_resumes_queued_video_and_completes_once() {
+    let root = tempdir().unwrap();
+    let profile = EngineProfile::synced(root.path(), "org", "catalog-user");
+    let store = StudioStore::open(profile.store_root(), 1024 * 1024).unwrap();
+    let model = seedance_t2v_model("fake");
+    let conversation = store.create_conversation("Resume", None).unwrap();
+    let runs = store
+        .create_turn(
+            conversation.id,
+            "a comet",
+            None,
+            &[video_prepared_run(&model, "a comet")],
+            "device-a",
+        )
+        .unwrap();
+    store.mark_submitting(&runs[0]).unwrap();
+    store
+        .mark_queued(
+            &runs[0],
+            &RemoteJob {
+                id: "queue-resume".into(),
+                metadata: serde_json::json!({ "model": "seedance-t2v" }),
+            },
+        )
+        .unwrap();
+    store.mark_running(&runs[0], Some(0.3)).unwrap();
+    drop(store);
+
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![seedance_t2v_model("fake")],
+        FakeSubmissionMode::Queue {
+            polls_before_completion: 1,
+            artifacts: vec![mp4_artifact()],
+        },
+    ));
+    provider.seed_queued_job("queue-resume", 0, vec![mp4_artifact()]);
+
+    let (engine, client) = studio_client_with_fake(root.path(), provider.clone()).await;
+    assert_eq!(engine.studio.recover_interrupted_image_runs().unwrap(), 0);
+    assert_eq!(engine.studio.resumable_video_attempts().unwrap().len(), 1);
+    assert!(engine.studio.prepare_retry(runs[0].run_id, true).is_err());
+
+    let mut updates = client
+        .subscribe(
+            methods::WATCH_STUDIO_CONVERSATION,
+            serde_json::json!({ "conversationId": conversation.id }),
+        )
+        .await
+        .unwrap();
+    let _snapshot: StudioConversationView =
+        serde_json::from_value(updates.recv().await.unwrap()).unwrap();
+    engine.resume_queued_video_runs().await;
+    let generated = wait_for_video_success(&mut updates).await;
+    assert_eq!(generated.turns[0].runs[0].state, StudioRunState::Succeeded);
+    assert_eq!(generated.turns[0].runs[0].artifacts.len(), 1);
+    assert_eq!(provider.complete_call_count(), 1);
+    assert_eq!(
+        engine
+            .studio
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM studio_attempts WHERE run_id = ?1",
+                [runs[0].run_id.0.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn check_status_polls_when_remote_job_id_is_present() {
+    let root = tempdir().unwrap();
+    let profile = EngineProfile::synced(root.path(), "org", "catalog-user");
+    let store = StudioStore::open(profile.store_root(), 1024 * 1024).unwrap();
+    let model = seedance_t2v_model("fake");
+    let conversation = store.create_conversation("Check poll", None).unwrap();
+    let runs = store
+        .create_turn(
+            conversation.id,
+            "a comet",
+            None,
+            &[video_prepared_run(&model, "a comet")],
+            "device-a",
+        )
+        .unwrap();
+    store.mark_submitting(&runs[0]).unwrap();
+    store
+        .mark_queued(
+            &runs[0],
+            &RemoteJob {
+                id: "queue-check".into(),
+                metadata: serde_json::json!({ "model": "seedance-t2v" }),
+            },
+        )
+        .unwrap();
+    store
+        .fail_run(&runs[0], "interrupted during submission", true)
+        .unwrap();
+    drop(store);
+
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![seedance_t2v_model("fake")],
+        FakeSubmissionMode::Queue {
+            polls_before_completion: 0,
+            artifacts: vec![mp4_artifact()],
+        },
+    ));
+    provider.seed_queued_job("queue-check", 0, vec![mp4_artifact()]);
+    let (engine, client) = studio_client_with_fake(root.path(), provider.clone()).await;
+    let mut updates = client
+        .subscribe(
+            methods::WATCH_STUDIO_CONVERSATION,
+            serde_json::json!({ "conversationId": conversation.id }),
+        )
+        .await
+        .unwrap();
+    let _snapshot: StudioConversationView =
+        serde_json::from_value(updates.recv().await.unwrap()).unwrap();
+    let _: StudioConversationView = serde_json::from_value(
+        client
+            .call(
+                methods::CHECK_STUDIO_RUN,
+                serde_json::json!({ "runId": runs[0].run_id }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let generated = wait_for_video_success(&mut updates).await;
+    assert_eq!(generated.turns[0].runs[0].state, StudioRunState::Succeeded);
+    assert_eq!(provider.complete_call_count(), 1);
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn check_status_reconciles_when_remote_job_id_is_absent() {
+    let root = tempdir().unwrap();
+    let profile = EngineProfile::synced(root.path(), "org", "catalog-user");
+    let store = StudioStore::open(profile.store_root(), 1024 * 1024).unwrap();
+    let model = seedance_t2v_model("fake");
+    let conversation = store.create_conversation("Check none", None).unwrap();
+    let runs = store
+        .create_turn(
+            conversation.id,
+            "a comet",
+            None,
+            &[video_prepared_run(&model, "a comet")],
+            "device-a",
+        )
+        .unwrap();
+    store.mark_submitting(&runs[0]).unwrap();
+    store
+        .fail_run(&runs[0], "interrupted during submission", true)
+        .unwrap();
+    drop(store);
+
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![seedance_t2v_model("fake")],
+        FakeSubmissionMode::Queue {
+            polls_before_completion: 0,
+            artifacts: vec![mp4_artifact()],
+        },
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+    let view: StudioConversationView = serde_json::from_value(
+        client
+            .call(
+                methods::CHECK_STUDIO_RUN,
+                serde_json::json!({ "runId": runs[0].run_id }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(view.turns[0].runs[0].state, StudioRunState::Failed);
+    assert!(
+        view.turns[0].runs[0]
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("interrupted"))
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let still = engine.studio.conversation_view(conversation.id).unwrap();
+    assert_eq!(still.turns[0].runs[0].state, StudioRunState::Failed);
     engine.shutdown().await;
 }
 

@@ -157,6 +157,7 @@ pub mod methods {
     pub const IMPORT_STUDIO_ASSET: &str = "ImportStudioAsset";
     pub const GET_STUDIO_PROVIDER_BALANCE: &str = "GetStudioProviderBalance";
     pub const RETRY_STUDIO_RUN: &str = "RetryStudioRun";
+    pub const CHECK_STUDIO_RUN: &str = "CheckStudioRun";
     pub const DELETE_STUDIO_ARTIFACT: &str = "DeleteStudioArtifact";
     pub const READ_STUDIO_ARTIFACT_CHUNK: &str = "ReadStudioArtifactChunk";
     pub const READ_STUDIO_PREVIEW_CHUNK: &str = "ReadStudioPreviewChunk";
