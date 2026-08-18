@@ -10,13 +10,15 @@ use crate::{
     AccountBalance, CancelResult, ControlValue, GenerationRequest, MediaKind, MediaOperation,
     MediaProvider, PollResult, ProviderAccount, ProviderAccountId, ProviderArtifact, ProviderError,
     ProviderErrorKind, ProviderId, ProviderResult, Quote, RemoteAttempt, RemoteJob, Secret,
-    Submission, SubmissionCapabilities, SubmitContext,
+    Submission, SubmissionCapabilities, SubmitContext, probe_media, sniff_media_mime,
     venice::{VENICE_PROVIDER_ID, normalize_model_catalog},
+    venice_video,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.venice.ai/api/v1";
 const MAX_CATALOG_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IMAGE_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_VIDEO_RESPONSE_BYTES: usize = 512 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
@@ -37,12 +39,202 @@ impl VeniceMediaProvider {
         })
     }
 
-    #[cfg(test)]
-    fn with_base_url(base_url: impl Into<String>) -> Self {
+    /// Redirect adapter calls to a local fixture server.
+    pub fn with_base_url(base_url: impl Into<String>) -> Self {
         Self {
             client: Client::new(),
             base_url: base_url.into(),
         }
+    }
+
+    /// Delete a retrieved video from Venice after the artifact is published.
+    pub async fn complete_video(
+        &self,
+        secret: &Secret,
+        remote_job: &RemoteJob,
+    ) -> ProviderResult<()> {
+        let model = remote_job_model(remote_job)?;
+        let response = self
+            .authenticated(reqwest::Method::POST, "/video/complete", secret)
+            .json(&serde_json::json!({
+                "model": model,
+                "queue_id": remote_job.id,
+            }))
+            .send()
+            .await
+            .map_err(network_error)?;
+        let response = require_success(response).await?;
+        let bytes = read_limited(response, MAX_ERROR_BYTES).await?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let parsed: CompleteVideoResponse = serde_json::from_slice(&bytes).map_err(|error| {
+            ProviderError::new(ProviderErrorKind::MalformedResponse, error.to_string())
+        })?;
+        if parsed.success == Some(false) {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Other,
+                "Venice video complete reported failure",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn submit_video(
+        &self,
+        secret: &Secret,
+        request: &GenerationRequest,
+        context: &SubmitContext,
+    ) -> ProviderResult<Submission> {
+        let family = venice_video::require_queueable_family(venice_video::adapter_family_for(
+            request.model_id.as_str(),
+        )?)?;
+        let payload = venice_video::video_queue_payload(request, context, family)?;
+        let response = self
+            .authenticated(reqwest::Method::POST, "/video/queue", secret)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(network_error)?;
+        let response = require_success(response).await?;
+        let bytes = read_limited(response, MAX_ERROR_BYTES).await?;
+        let queued: QueueVideoResponse = serde_json::from_slice(&bytes).map_err(|error| {
+            ProviderError::new(ProviderErrorKind::MalformedResponse, error.to_string())
+        })?;
+        if queued.queue_id.trim().is_empty() {
+            return Err(ProviderError::new(
+                ProviderErrorKind::MalformedResponse,
+                "Venice video queue returned an empty queue_id",
+            ));
+        }
+        let mut metadata = serde_json::Map::from_iter([(
+            "model".into(),
+            serde_json::Value::String(
+                if queued.model.is_empty() {
+                    request.model_id.as_str()
+                } else {
+                    queued.model.as_str()
+                }
+                .to_owned(),
+            ),
+        )]);
+        if let Some(download_url) = queued
+            .download_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+        {
+            metadata.insert("download_url".into(), download_url.into());
+        }
+        Ok(Submission::Queued {
+            remote_job: RemoteJob {
+                id: queued.queue_id,
+                metadata: metadata.into(),
+            },
+        })
+    }
+
+    async fn poll_video(
+        &self,
+        secret: &Secret,
+        remote_job: &RemoteJob,
+    ) -> ProviderResult<PollResult> {
+        let model = remote_job_model(remote_job)?;
+        let response = self
+            .authenticated(reqwest::Method::POST, "/video/retrieve", secret)
+            .json(&serde_json::json!({
+                "model": model,
+                "queue_id": remote_job.id,
+            }))
+            .send()
+            .await
+            .map_err(network_error)?;
+        let status = response.status();
+        let retry_after_seconds = retry_after_seconds(response.headers());
+        let content_type = response_content_type(&response);
+        if matches!(
+            status,
+            StatusCode::NOT_FOUND
+                | StatusCode::UNPROCESSABLE_ENTITY
+                | StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            let body = read_limited(response, MAX_ERROR_BYTES)
+                .await
+                .unwrap_or_default();
+            let (kind, fallback) = match status {
+                StatusCode::NOT_FOUND => (ProviderErrorKind::Other, "Venice video job expired"),
+                StatusCode::UNPROCESSABLE_ENTITY => (
+                    ProviderErrorKind::InvalidRequest,
+                    "Venice rejected the video for content policy",
+                ),
+                _ => (
+                    ProviderErrorKind::Transient,
+                    "Venice video retrieve is temporarily unavailable",
+                ),
+            };
+            return Ok(PollResult::Failed {
+                error: poll_status_error(kind, &body, fallback, retry_after_seconds, status),
+            });
+        }
+        let response = require_success(response).await?;
+        let bytes = read_limited(response, MAX_VIDEO_RESPONSE_BYTES).await?;
+        if is_video_body(&bytes, &content_type) {
+            return Ok(PollResult::Completed {
+                artifacts: vec![video_artifact(bytes)?],
+            });
+        }
+        let retrieve: RetrieveVideoResponse = serde_json::from_slice(&bytes).map_err(|error| {
+            ProviderError::new(ProviderErrorKind::MalformedResponse, error.to_string())
+        })?;
+        match retrieve.status.as_str() {
+            "PROCESSING" => Ok(PollResult::Running {
+                progress: poll_progress(
+                    retrieve.execution_duration,
+                    retrieve.average_execution_time,
+                ),
+            }),
+            "COMPLETED" => {
+                let bytes = self.download_completed_video(remote_job).await?;
+                Ok(PollResult::Completed {
+                    artifacts: vec![video_artifact(bytes)?],
+                })
+            }
+            other => Err(ProviderError::new(
+                ProviderErrorKind::MalformedResponse,
+                format!("Venice video retrieve returned unknown status {other}"),
+            )),
+        }
+    }
+
+    async fn download_completed_video(&self, remote_job: &RemoteJob) -> ProviderResult<Vec<u8>> {
+        let download_url = remote_job
+            .metadata
+            .get("download_url")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| {
+                ProviderError::new(
+                    ProviderErrorKind::MalformedResponse,
+                    "Venice completed video is missing download_url",
+                )
+            })?;
+        let response = self
+            .client
+            .get(download_url)
+            .send()
+            .await
+            .map_err(network_error)?;
+        let content_type = response_content_type(&response);
+        let response = require_success(response).await?;
+        let bytes = read_limited(response, MAX_VIDEO_RESPONSE_BYTES).await?;
+        if !is_video_body(&bytes, &content_type) {
+            return Err(ProviderError::new(
+                ProviderErrorKind::MalformedResponse,
+                format!("Venice download_url returned {content_type}, expected video/mp4"),
+            ));
+        }
+        Ok(bytes)
     }
 
     fn authenticated(
@@ -305,7 +497,7 @@ impl MediaProvider for VeniceMediaProvider {
         ) {
             return Ok(None);
         }
-        let payload = video_quote_payload(request)?;
+        let payload = venice_video::video_quote_payload(request, None)?;
         let response = self
             .authenticated(reqwest::Method::POST, "/video/quote", secret)
             .json(&payload)
@@ -344,9 +536,15 @@ impl MediaProvider for VeniceMediaProvider {
             crate::MediaOperation::ImageEdit => {
                 self.submit_image_edit(secret, request, _context).await
             }
+            crate::MediaOperation::TextToVideo
+            | crate::MediaOperation::ImageToVideo
+            | crate::MediaOperation::ReferenceToVideo
+            | crate::MediaOperation::VideoToVideo => {
+                self.submit_video(secret, request, _context).await
+            }
             _ => Err(ProviderError::new(
                 ProviderErrorKind::Unsupported,
-                "this Venice adapter slice supports text-to-image without inputs, image edit, and image upscale",
+                "this Venice adapter slice supports text-to-image without inputs, image edit, image upscale, and video queue",
             )),
         }
     }
@@ -359,11 +557,19 @@ impl MediaProvider for VeniceMediaProvider {
         Ok(None)
     }
 
-    async fn poll(&self, _secret: &Secret, _remote_job: &RemoteJob) -> ProviderResult<PollResult> {
-        Err(ProviderError::new(
-            ProviderErrorKind::Unsupported,
-            "Venice image generation is synchronous",
-        ))
+    async fn poll(&self, secret: &Secret, remote_job: &RemoteJob) -> ProviderResult<PollResult> {
+        if remote_job
+            .metadata
+            .get("model")
+            .and_then(|value| value.as_str())
+            .is_none()
+        {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Unsupported,
+                "Venice image generation is synchronous",
+            ));
+        }
+        self.poll_video(secret, remote_job).await
     }
 
     async fn cancel(
@@ -375,48 +581,119 @@ impl MediaProvider for VeniceMediaProvider {
     }
 }
 
-fn video_quote_payload(request: &GenerationRequest) -> ProviderResult<serde_json::Value> {
-    let mut payload = serde_json::Map::from_iter([(
-        "model".into(),
-        serde_json::Value::String(request.model_id.as_str().into()),
-    )]);
-    for (id, value) in &request.controls {
-        match (id.as_str(), value) {
-            ("duration", ControlValue::DurationSeconds { value }) => {
-                let duration = if value.fract() == 0.0 {
-                    format!("{}s", *value as i64)
-                } else {
-                    format!("{value}s")
-                };
-                payload.insert("duration".into(), duration.into());
-            }
-            ("resolution", ControlValue::Resolution { value }) => {
-                payload.insert("resolution".into(), value.clone().into());
-            }
-            ("aspect_ratio", ControlValue::AspectRatio { width, height }) => {
-                payload.insert("aspect_ratio".into(), format!("{width}:{height}").into());
-            }
-            ("aspect_ratio", ControlValue::AspectRatioAuto) => {
-                payload.insert("aspect_ratio".into(), "auto".into());
-            }
-            ("audio", ControlValue::Boolean { value }) => {
-                payload.insert("audio".into(), (*value).into());
-            }
-            _ => {}
-        }
-    }
-    if !payload.contains_key("duration") {
-        return Err(ProviderError::new(
-            ProviderErrorKind::InvalidRequest,
-            "video quote requires a duration",
-        ));
-    }
-    Ok(payload.into())
-}
-
 #[derive(Deserialize)]
 struct VideoQuoteResponse {
     quote: f64,
+}
+
+#[derive(Deserialize)]
+struct QueueVideoResponse {
+    #[serde(default)]
+    model: String,
+    queue_id: String,
+    #[serde(default)]
+    download_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RetrieveVideoResponse {
+    status: String,
+    #[serde(default)]
+    average_execution_time: Option<f64>,
+    #[serde(default)]
+    execution_duration: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct CompleteVideoResponse {
+    #[serde(default)]
+    success: Option<bool>,
+}
+
+fn remote_job_model(remote_job: &RemoteJob) -> ProviderResult<&str> {
+    remote_job
+        .metadata
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .ok_or_else(|| {
+            ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                "Venice video poll requires model metadata",
+            )
+        })
+}
+
+fn poll_progress(
+    execution_duration: Option<f64>,
+    average_execution_time: Option<f64>,
+) -> Option<f32> {
+    let execution = execution_duration?;
+    let average = average_execution_time?;
+    if !execution.is_finite() || !average.is_finite() || average <= 0.0 {
+        return None;
+    }
+    Some((execution / average).clamp(0.0, 0.99) as f32)
+}
+
+fn is_video_body(bytes: &[u8], content_type: &str) -> bool {
+    matches!(
+        sniff_media_mime(bytes),
+        Some("video/mp4" | "video/quicktime")
+    ) || content_type == "video/mp4"
+}
+
+fn video_artifact(bytes: Vec<u8>) -> ProviderResult<ProviderArtifact> {
+    let mime_type = crate::accepted_output_mime(&bytes, ["video/mp4", "video/quicktime"])
+        .ok_or_else(|| {
+            ProviderError::new(
+                ProviderErrorKind::MalformedResponse,
+                "Venice video bytes are not a supported format",
+            )
+        })?;
+    let probe = probe_media(&bytes, &mime_type);
+    Ok(ProviderArtifact {
+        media_kind: MediaKind::Video,
+        mime_type,
+        bytes,
+        width: probe.width,
+        height: probe.height,
+        duration_seconds: probe.duration_seconds,
+        metadata: serde_json::Value::Null,
+    })
+}
+
+fn retry_after_seconds(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+}
+
+fn poll_status_error(
+    kind: ProviderErrorKind,
+    body: &[u8],
+    fallback: &str,
+    retry_after_seconds: Option<u64>,
+    status: StatusCode,
+) -> ProviderError {
+    let message = venice_error_message(body).unwrap_or_else(|| fallback.to_owned());
+    let mut error = ProviderError::new(kind, message);
+    error.retry_after_seconds = retry_after_seconds;
+    error.provider_code = Some(status.as_u16().to_string());
+    error
+}
+
+fn venice_error_message(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if let Some(message) = value.get("error").and_then(serde_json::Value::as_str) {
+        return Some(message.to_owned());
+    }
+    value
+        .pointer("/error/message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 fn image_payload(request: &GenerationRequest, binary: bool) -> ProviderResult<serde_json::Value> {
@@ -861,30 +1138,19 @@ async fn require_success(response: Response) -> ProviderResult<Response> {
         return Ok(response);
     }
     let status = response.status();
-    let retry_after_seconds = response
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok());
+    let retry_after_seconds = retry_after_seconds(response.headers());
     let body = read_limited(response, MAX_ERROR_BYTES)
         .await
         .unwrap_or_default();
-    let message = serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("error")
-                .and_then(|error| error.as_str())
-                .map(str::to_owned)
-        })
+    let message = venice_error_message(&body)
         .unwrap_or_else(|| format!("Venice request failed with HTTP {status}"));
     let kind = match status {
         StatusCode::UNAUTHORIZED => ProviderErrorKind::InvalidCredential,
         StatusCode::PAYMENT_REQUIRED => ProviderErrorKind::InsufficientFunds,
         StatusCode::TOO_MANY_REQUESTS => ProviderErrorKind::RateLimited,
-        StatusCode::BAD_REQUEST | StatusCode::UNSUPPORTED_MEDIA_TYPE => {
-            ProviderErrorKind::InvalidRequest
-        }
+        StatusCode::BAD_REQUEST
+        | StatusCode::UNSUPPORTED_MEDIA_TYPE
+        | StatusCode::UNPROCESSABLE_ENTITY => ProviderErrorKind::InvalidRequest,
         status if status.is_server_error() => ProviderErrorKind::Transient,
         _ => ProviderErrorKind::Other,
     };
@@ -1078,7 +1344,7 @@ mod tests {
     fn video_request() -> GenerationRequest {
         GenerationRequest {
             provider_id: VENICE_PROVIDER_ID.into(),
-            model_id: "seedance-2-0-text-to-video-basic".into(),
+            model_id: "seedance-1-5-pro-text-to-video-basic".into(),
             operation: crate::MediaOperation::TextToVideo,
             prompt: "a comet".into(),
             negative_prompt: None,
@@ -1111,8 +1377,8 @@ mod tests {
 
     #[test]
     fn video_quote_payload_sends_pricing_inputs() {
-        let value = video_quote_payload(&video_request()).unwrap();
-        assert_eq!(value["model"], "seedance-2-0-text-to-video-basic");
+        let value = venice_video::video_quote_payload(&video_request(), None).unwrap();
+        assert_eq!(value["model"], "seedance-1-5-pro-text-to-video-basic");
         assert_eq!(value["duration"], "10s");
         assert_eq!(value["resolution"], "1080p");
         assert_eq!(value["aspect_ratio"], "16:9");
@@ -1120,11 +1386,25 @@ mod tests {
     }
 
     #[test]
+    fn video_poll_progress_uses_millisecond_ratio_and_clamps() {
+        assert_eq!(
+            poll_progress(Some(53_200.0), Some(145_000.0)),
+            Some(53_200.0 / 145_000.0)
+        );
+        assert_eq!(poll_progress(Some(200_000.0), Some(145_000.0)), Some(0.99));
+        assert_eq!(poll_progress(Some(0.0), Some(145_000.0)), Some(0.0));
+        assert_eq!(poll_progress(None, Some(145_000.0)), None);
+        assert_eq!(poll_progress(Some(10.0), Some(0.0)), None);
+    }
+
+    #[test]
     fn video_quote_requires_duration() {
         let mut request = video_request();
         request.controls.remove(&crate::ControlId::from("duration"));
         assert_eq!(
-            video_quote_payload(&request).unwrap_err().kind,
+            venice_video::video_quote_payload(&request, None)
+                .unwrap_err()
+                .kind,
             ProviderErrorKind::InvalidRequest
         );
     }

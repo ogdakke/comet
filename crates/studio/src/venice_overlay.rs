@@ -274,6 +274,16 @@ impl VeniceVideoOverlay {
         Ok(best)
     }
 
+    /// Overlay family for `model_id`. Unlisted video rows and omitted
+    /// `adapter_family` keys stay Hidden — do not guess Seedance from the id.
+    pub fn adapter_family(&self, model_id: &str) -> AdapterFamily {
+        self.match_model(model_id)
+            .ok()
+            .flatten()
+            .and_then(|row| row.spec.adapter_family)
+            .unwrap_or(AdapterFamily::Hidden)
+    }
+
     pub fn apply(
         &self,
         model: &mut MediaModel,
@@ -563,6 +573,27 @@ reviewed = "2026-08-18"
     #[test]
     fn bundled_overlay_loads() {
         bundled_video_overlay().unwrap();
+    }
+
+    #[test]
+    fn adapter_family_uses_overlay_and_defaults_hidden() {
+        let overlay = bundled_video_overlay().unwrap();
+        assert_eq!(
+            overlay.adapter_family("seedance-1-5-pro-text-to-video-basic"),
+            AdapterFamily::Seedance
+        );
+        assert_eq!(
+            overlay.adapter_family("grok-imagine-reference-to-video-private"),
+            AdapterFamily::Grok
+        );
+        assert_eq!(
+            overlay.adapter_family("kling-o3-pro-reference-to-video"),
+            AdapterFamily::Hidden
+        );
+        assert_eq!(
+            overlay.adapter_family("seedance-2-0-text-to-video-basic"),
+            AdapterFamily::Hidden
+        );
     }
 
     #[test]

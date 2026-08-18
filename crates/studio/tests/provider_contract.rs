@@ -85,3 +85,86 @@ async fn duplicate_idempotency_key_returns_the_same_queued_job() {
         PollResult::Completed { .. }
     ));
 }
+
+#[tokio::test]
+async fn venice_hidden_video_models_are_not_queued() {
+    let provider = zeron_studio::VeniceMediaProvider::with_base_url("http://127.0.0.1:1");
+    let mut video = request();
+    video.provider_id = "venice".into();
+    video.model_id = "kling-o3-pro-reference-to-video".into();
+    video.operation = MediaOperation::ReferenceToVideo;
+    video.controls.insert(
+        "duration".into(),
+        zeron_studio::ControlValue::DurationSeconds { value: 8.0 },
+    );
+    let error = provider
+        .submit(
+            &Secret::new("token"),
+            &video,
+            &SubmitContext {
+                idempotency_key: "hidden".into(),
+                inputs: Vec::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ProviderErrorKind::Unsupported);
+}
+
+#[tokio::test]
+async fn venice_poll_503_is_failed_transient_not_a_poll_variant() {
+    let capacity = include_str!("fixtures/venice/video-503.json");
+    let queue = include_str!("fixtures/venice/video-queue.json");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (status, body) in [(200_u16, queue), (503, capacity)] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut incoming = vec![0_u8; 65536];
+            let _ = stream.read(&mut incoming).await;
+            let response = format!(
+                "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 5\r\nConnection: close\r\n\r\n{body}",
+                if status == 200 {
+                    "OK"
+                } else {
+                    "Service Unavailable"
+                },
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    let provider = zeron_studio::VeniceMediaProvider::with_base_url(format!("http://{addr}"));
+    let mut video = request();
+    video.provider_id = "venice".into();
+    video.model_id = "seedance-1-5-pro-text-to-video-basic".into();
+    video.operation = MediaOperation::TextToVideo;
+    video.controls.insert(
+        "duration".into(),
+        zeron_studio::ControlValue::DurationSeconds { value: 10.0 },
+    );
+    let Submission::Queued { remote_job } = provider
+        .submit(
+            &Secret::new("token"),
+            &video,
+            &SubmitContext {
+                idempotency_key: "transient".into(),
+                inputs: Vec::new(),
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected queued venice video");
+    };
+    let PollResult::Failed { error } = provider
+        .poll(&Secret::new("token"), &remote_job)
+        .await
+        .unwrap()
+    else {
+        panic!("503 must be PollResult::Failed, not a Transient variant");
+    };
+    assert_eq!(error.kind, ProviderErrorKind::Transient);
+    server.await.unwrap();
+}

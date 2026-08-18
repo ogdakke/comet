@@ -15,6 +15,7 @@ pub mod fake;
 pub mod venice;
 pub mod venice_overlay;
 mod venice_provider;
+mod venice_video;
 
 pub use catalog::{CapabilityIntersection, intersect_video_globals, picker_models};
 pub use composer::*;
