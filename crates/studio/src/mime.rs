@@ -10,8 +10,8 @@ pub fn sniff_media_mime(bytes: &[u8]) -> Option<&'static str> {
         Some("image/webp")
     } else if bytes.len() >= 6 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
         Some("image/gif")
-    } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
-        Some("video/mp4")
+    } else if let Some(mime) = sniff_iso_media(bytes) {
+        Some(mime)
     } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
         Some("audio/wav")
     } else if is_mpeg_audio(bytes) {
@@ -19,6 +19,70 @@ pub fn sniff_media_mime(bytes: &[u8]) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn sniff_iso_media(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() < 16 || &bytes[4..8] != b"ftyp" {
+        return None;
+    }
+    let box_size = u32::from_be_bytes(bytes[0..4].try_into().ok()?) as usize;
+    if box_size < 16 || box_size > bytes.len() {
+        return None;
+    }
+    let major = &bytes[8..12];
+    if is_still_image_brand(major) {
+        return None;
+    }
+    if is_quicktime_brand(major) {
+        return Some("video/quicktime");
+    }
+    if is_mp4_video_brand(major) {
+        return Some("video/mp4");
+    }
+    let mut offset = 16;
+    while offset + 4 <= box_size {
+        let brand = &bytes[offset..offset + 4];
+        if is_still_image_brand(brand) {
+            offset += 4;
+            continue;
+        }
+        if is_quicktime_brand(brand) {
+            return Some("video/quicktime");
+        }
+        if is_mp4_video_brand(brand) {
+            return Some("video/mp4");
+        }
+        offset += 4;
+    }
+    None
+}
+
+fn is_quicktime_brand(brand: &[u8]) -> bool {
+    brand == b"qt  "
+}
+
+fn is_mp4_video_brand(brand: &[u8]) -> bool {
+    matches!(
+        brand,
+        b"isom"
+            | b"iso2"
+            | b"iso3"
+            | b"iso4"
+            | b"iso5"
+            | b"iso6"
+            | b"mp41"
+            | b"mp42"
+            | b"avc1"
+            | b"avc3"
+            | b"dash"
+    )
+}
+
+fn is_still_image_brand(brand: &[u8]) -> bool {
+    matches!(
+        brand,
+        b"heic" | b"heix" | b"hevc" | b"hevx" | b"mif1" | b"msf1" | b"avif" | b"avis"
+    )
 }
 
 fn is_mpeg_audio(bytes: &[u8]) -> bool {
@@ -73,7 +137,20 @@ mod tests {
             Some("audio/mpeg")
         );
         assert_eq!(sniff_media_mime(b"ID3\x04rest"), Some("audio/mpeg"));
+        assert_eq!(sniff_media_mime(&ftyp(b"isom")), Some("video/mp4"));
+        assert_eq!(sniff_media_mime(&ftyp(b"qt  ")), Some("video/quicktime"));
+        assert_eq!(sniff_media_mime(&ftyp(b"heic")), None);
+        assert_eq!(sniff_media_mime(&ftyp(b"avif")), None);
         assert_eq!(sniff_media_mime(b"not an image"), None);
+    }
+
+    fn ftyp(brand: &[u8; 4]) -> Vec<u8> {
+        let mut bytes = Vec::from(20u32.to_be_bytes());
+        bytes.extend_from_slice(b"ftyp");
+        bytes.extend_from_slice(brand);
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(brand);
+        bytes
     }
 
     #[test]

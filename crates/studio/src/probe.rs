@@ -47,10 +47,14 @@ fn probe_image(bytes: &[u8]) -> (Option<u32>, Option<u32>) {
 fn probe_iso_media(bytes: &[u8]) -> (Option<u32>, Option<u32>, Option<f64>) {
     // The crate needs ftyp + moov. A QuickTime file without a readable moov
     // stays unproved — do not invent duration from mdat or free atoms.
+    // Never call Mp4Reader::duration(): it does `ticks * 1000 / timescale`
+    // and panics (or wraps) on a crafted mvhd.
     let Ok(reader) = mp4::Mp4Reader::read_header(Cursor::new(bytes), bytes.len() as u64) else {
         return (None, None, None);
     };
-    let duration_seconds = (reader.timescale() > 0).then(|| reader.duration().as_secs_f64());
+    let timescale = reader.moov.mvhd.timescale;
+    let duration_seconds =
+        (timescale > 0).then(|| reader.moov.mvhd.duration as f64 / f64::from(timescale));
     let (width, height) = reader
         .tracks()
         .values()
@@ -297,5 +301,89 @@ mod tests {
         assert_eq!(probe.width, None);
         let mov = probe_media(&bytes, "video/quicktime");
         assert_eq!(mov.duration_seconds, None);
+    }
+
+    fn wrap_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let size = 8 + payload.len() as u32;
+        let mut bytes = Vec::from(size.to_be_bytes());
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn ftyp_box() -> Vec<u8> {
+        let mut bytes = Vec::from(20u32.to_be_bytes());
+        bytes.extend_from_slice(b"ftyp");
+        bytes.extend_from_slice(b"isom");
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(b"isom");
+        bytes
+    }
+
+    fn mvhd_v1(timescale: u32, duration: u64) -> Vec<u8> {
+        let mut payload = vec![1, 0, 0, 0];
+        payload.extend_from_slice(&0u64.to_be_bytes());
+        payload.extend_from_slice(&0u64.to_be_bytes());
+        payload.extend_from_slice(&timescale.to_be_bytes());
+        payload.extend_from_slice(&duration.to_be_bytes());
+        payload.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        payload.extend_from_slice(&0x0100u16.to_be_bytes());
+        payload.extend_from_slice(&0u16.to_be_bytes());
+        payload.extend_from_slice(&0u64.to_be_bytes());
+        for value in [0x0001_0000i32, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000] {
+            payload.extend_from_slice(&value.to_be_bytes());
+        }
+        payload.extend_from_slice(&[0u8; 24]);
+        payload.extend_from_slice(&1u32.to_be_bytes());
+        wrap_box(b"mvhd", &payload)
+    }
+
+    #[test]
+    fn mp4_mvhd_duration_does_not_panic_on_overflowing_ticks() {
+        let mut bytes = ftyp_box();
+        bytes.extend_from_slice(&wrap_box(b"moov", &mvhd_v1(1, u64::MAX)));
+        let probe = probe_media(&bytes, "video/mp4");
+        assert_eq!(probe.duration_seconds, Some(u64::MAX as f64));
+    }
+
+    #[test]
+    fn mp4_probes_duration_and_track_geometry() {
+        let config = mp4::Mp4Config {
+            major_brand: mp4::FourCC::from(*b"isom"),
+            minor_version: 0,
+            compatible_brands: vec![mp4::FourCC::from(*b"isom")],
+            timescale: 1000,
+        };
+        let mut writer =
+            mp4::Mp4Writer::write_start(std::io::Cursor::new(Vec::new()), &config).unwrap();
+        writer
+            .add_track(&mp4::TrackConfig::from(mp4::AvcConfig {
+                width: 64,
+                height: 36,
+                seq_param_set: vec![
+                    0x67, 0x64, 0x00, 0x0D, 0xAC, 0xD9, 0x41, 0x41, 0xFA, 0x10, 0x00, 0x00, 0x03,
+                    0x00, 0x10, 0x00, 0x00, 0x03, 0x03, 0x20, 0xF1, 0x42, 0x99, 0x60,
+                ],
+                pic_param_set: vec![0x68, 0xEB, 0xE3, 0xCB, 0x22, 0xC0],
+            }))
+            .unwrap();
+        writer
+            .write_sample(
+                1,
+                &mp4::Mp4Sample {
+                    start_time: 0,
+                    duration: 5000,
+                    rendering_offset: 0,
+                    is_sync: true,
+                    bytes: mp4::Bytes::from(vec![0u8; 8]),
+                },
+            )
+            .unwrap();
+        writer.write_end().unwrap();
+        let bytes = writer.into_writer().into_inner();
+        let probe = probe_media(&bytes, "video/mp4");
+        assert_eq!(probe.duration_seconds, Some(5.0));
+        assert_eq!(probe.width, Some(64));
+        assert_eq!(probe.height, Some(36));
     }
 }

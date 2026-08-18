@@ -1350,6 +1350,9 @@ impl RpcService for EngineRpc {
             }
             methods::IMPORT_STUDIO_ASSET => {
                 let request: ImportStudioAssetRequest = parse_params(params)?;
+                if request.data.len() > crate::studio::MAX_IMPORT_B64_CHARS {
+                    return Err(RpcError::BadParams("studio asset exceeds 64 MiB".into()));
+                }
                 let data = base64::engine::general_purpose::STANDARD
                     .decode(&request.data)
                     .map_err(|error| {

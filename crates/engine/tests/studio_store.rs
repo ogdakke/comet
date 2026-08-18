@@ -800,7 +800,7 @@ fn bind_accepts_video_role_assets_and_artifacts() {
     assert!(
         error
             .to_string()
-            .contains("studio asset inputs are only accepted as an image-edit mask"),
+            .contains("video roles and ImageEdit masks"),
         "{error}"
     );
 
@@ -3474,6 +3474,49 @@ fn import_studio_asset_rejects_the_64_mib_cap() {
         error,
         zeron_engine::StudioStoreError::ArtifactTooLarge
     ));
+}
+
+#[test]
+fn import_studio_asset_cleans_staging_on_sniff_failure() {
+    let root = tempdir().unwrap();
+    let store = StudioStore::open(root.path(), 1024 * 1024).unwrap();
+    let asset_id = StudioAssetId::new();
+    let garbage = b"not a media file";
+    let hash = format!("{:x}", Sha256::digest(garbage));
+    let error = store
+        .import_asset_chunk(asset_id, 0, garbage, true, Some(&hash), None)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("studio input is not a supported media type"),
+        "{error}"
+    );
+    let staging = root
+        .path()
+        .join("studio/inputs/tmp")
+        .join(asset_id.0.to_string());
+    assert!(!staging.exists());
+}
+
+#[test]
+fn import_studio_asset_does_not_restage_after_commit() {
+    let root = tempdir().unwrap();
+    let store = StudioStore::open(root.path(), 1024 * 1024).unwrap();
+    let bytes = rgb_png(8, 8);
+    let hash = format!("{:x}", Sha256::digest(&bytes));
+    let asset_id = StudioAssetId::new();
+    store
+        .import_asset_chunk(asset_id, 0, &bytes, true, Some(&hash), None)
+        .unwrap();
+    store
+        .import_asset_chunk(asset_id, 0, b"xxxx", false, None, None)
+        .unwrap();
+    let staging = root
+        .path()
+        .join("studio/inputs/tmp")
+        .join(asset_id.0.to_string());
+    assert!(!staging.exists());
 }
 
 #[tokio::test]

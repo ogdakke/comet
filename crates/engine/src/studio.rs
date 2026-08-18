@@ -33,7 +33,11 @@ use crate::venice_import::{ImportReport, ImportedStudioHistory};
 
 const DATABASE_FILE: &str = "studio.sqlite3";
 const SCHEMA_VERSION: i64 = 4;
-const MAX_IMPORT_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_IMPORT_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_IMPORT_B64_CHARS: usize = (MAX_IMPORT_BYTES as usize) / 3 * 4 + 8;
+const IMPORT_STAGING_TTL: Duration = Duration::from_secs(10 * 60);
+const ASSET_INPUT_REJECTED: &str =
+    "studio asset inputs are only accepted for video roles and ImageEdit masks";
 const MAX_CREATE_TURN_RUNS: usize = 16;
 const MAX_TURN_RUNS: usize = 64;
 pub(crate) const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
@@ -1647,9 +1651,7 @@ impl StudioStore {
             match &input.source {
                 GenerationInputSource::Asset { asset_id } => {
                     if !asset_input_allowed(request.operation, input.role.as_str()) {
-                        return Err(StudioStoreError::InvalidValue(
-                            "studio asset inputs are only accepted as an image-edit mask".into(),
-                        ));
+                        return Err(StudioStoreError::InvalidValue(ASSET_INPUT_REJECTED.into()));
                     }
                     let stored_hash = self.asset_input_hash(*asset_id)?;
                     if input.content_hash.is_empty() {
@@ -1706,9 +1708,7 @@ impl StudioStore {
             let (path, stored_hash) = match &input.source {
                 GenerationInputSource::Asset { asset_id } => {
                     if !asset_input_allowed(request.operation, input.role.as_str()) {
-                        return Err(StudioStoreError::InvalidValue(
-                            "studio asset inputs are only accepted as an image-edit mask".into(),
-                        ));
+                        return Err(StudioStoreError::InvalidValue(ASSET_INPUT_REJECTED.into()));
                     }
                     let (path, hash) = self.asset_input_file(*asset_id)?;
                     (path, hash)
@@ -1856,6 +1856,10 @@ impl StudioStore {
         expected_hash: Option<&str>,
         mime_hint: Option<&str>,
     ) -> Result<ImportStudioAssetResponse, StudioStoreError> {
+        self.artifacts.sweep_import_staging();
+        if data.len() as u64 > MAX_IMPORT_BYTES {
+            return Err(StudioStoreError::ArtifactTooLarge);
+        }
         if last {
             let expected = expected_hash
                 .map(str::trim)
@@ -1875,46 +1879,76 @@ impl StudioStore {
                 return Ok(ImportStudioAssetResponse::Complete(existing));
             }
             let next_offset = self.accept_import_chunk(asset_id, offset, data)?;
-            let bytes = self.artifacts.read_import_staging(asset_id)?;
-            if bytes.len() as u64 != next_offset {
-                return Err(StudioStoreError::InvalidValue(
-                    "import staging is incomplete".into(),
-                ));
+            let commit = (|| {
+                let bytes = self.artifacts.read_import_staging(asset_id)?;
+                if bytes.len() as u64 != next_offset {
+                    return Err(StudioStoreError::InvalidValue(
+                        "import staging is incomplete".into(),
+                    ));
+                }
+                let hash = format!("{:x}", Sha256::digest(&bytes));
+                if !hash.eq_ignore_ascii_case(expected) {
+                    return Err(StudioStoreError::InvalidValue(
+                        "import content hash does not match expectedHash".into(),
+                    ));
+                }
+                let sniffed = sniff_media_mime(&bytes).ok_or_else(|| {
+                    StudioStoreError::InvalidValue(
+                        "studio input is not a supported media type.".into(),
+                    )
+                })?;
+                let mime_type = match mime_hint {
+                    Some(hint) if hint == sniffed => sniffed,
+                    _ => sniffed,
+                };
+                let kind = composer_kind_from_mime(mime_type).ok_or_else(|| {
+                    StudioStoreError::InvalidValue(
+                        "studio input is not a supported media type.".into(),
+                    )
+                })?;
+                let extension =
+                    extension_for_mime(mime_type).ok_or(StudioStoreError::InvalidExtension)?;
+                self.insert_published_asset(asset_id, &bytes, mime_type, extension)?;
+                let probe = probe_media(&bytes, mime_type);
+                Ok(ComposerAttachment {
+                    id: asset_id,
+                    kind,
+                    pending: false,
+                    origin: AttachmentOrigin::Asset,
+                    mime_type: mime_type.to_owned(),
+                    byte_size: bytes.len() as u64,
+                    width: probe.width,
+                    height: probe.height,
+                    duration_seconds: probe.duration_seconds,
+                    content_hash: hash,
+                    role_hint: None,
+                })
+            })();
+            match commit {
+                Ok(attachment) => {
+                    self.artifacts.remove_import_staging(asset_id)?;
+                    Ok(ImportStudioAssetResponse::Complete(attachment))
+                }
+                Err(error) => {
+                    let keep_staging = matches!(
+                        &error,
+                        StudioStoreError::InvalidValue(message)
+                            if message.contains("content hash does not match expectedHash")
+                    );
+                    if !keep_staging {
+                        self.artifacts.remove_import_staging(asset_id)?;
+                    }
+                    Err(error)
+                }
             }
-            let hash = format!("{:x}", Sha256::digest(&bytes));
-            if !hash.eq_ignore_ascii_case(expected) {
-                return Err(StudioStoreError::InvalidValue(
-                    "import content hash does not match expectedHash".into(),
-                ));
-            }
-            let sniffed = sniff_media_mime(&bytes).ok_or_else(|| {
-                StudioStoreError::InvalidValue("studio input is not a supported media type.".into())
-            })?;
-            let mime_type = match mime_hint {
-                Some(hint) if hint == sniffed => sniffed,
-                _ => sniffed,
-            };
-            let kind = composer_kind_from_mime(mime_type).ok_or_else(|| {
-                StudioStoreError::InvalidValue("studio input is not a supported media type.".into())
-            })?;
-            let extension =
-                extension_for_mime(mime_type).ok_or(StudioStoreError::InvalidExtension)?;
-            self.insert_published_asset(asset_id, &bytes, mime_type, extension)?;
+        } else if let Some(existing) = self.asset_attachment(asset_id)? {
             self.artifacts.remove_import_staging(asset_id)?;
-            let probe = probe_media(&bytes, mime_type);
-            Ok(ImportStudioAssetResponse::Complete(ComposerAttachment {
-                id: asset_id,
-                kind,
-                pending: false,
-                origin: AttachmentOrigin::Asset,
-                mime_type: mime_type.to_owned(),
-                byte_size: bytes.len() as u64,
-                width: probe.width,
-                height: probe.height,
-                duration_seconds: probe.duration_seconds,
-                content_hash: hash,
-                role_hint: None,
-            }))
+            Ok(ImportStudioAssetResponse::Continue(
+                ImportStudioAssetChunk {
+                    asset_id,
+                    next_offset: existing.byte_size,
+                },
+            ))
         } else {
             let next_offset = self.accept_import_chunk(asset_id, offset, data)?;
             Ok(ImportStudioAssetResponse::Continue(
@@ -2385,6 +2419,40 @@ fn composer_kind_from_mime(mime: &str) -> Option<ComposerMediaKind> {
     }
 }
 
+fn refuse_symlink(path: &Path) -> Result<(), StudioStoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(StudioStoreError::InvalidArtifact),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn open_jail_file(path: &Path) -> Result<File, StudioStoreError> {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            StudioStoreError::InvalidArtifact
+        } else {
+            error.into()
+        }
+    })
+}
+
+fn write_jail_file(path: &Path, bytes: &[u8]) -> Result<(), StudioStoreError> {
+    let mut file = open_jail_file(path)?;
+    file.set_len(0)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
 fn migrate_studio_assets_v4(connection: &Connection) -> Result<(), StudioStoreError> {
     let has_assets: i64 = connection.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'studio_assets'",
@@ -2613,12 +2681,14 @@ impl ArtifactStore {
         {
             return Err(StudioStoreError::InvalidArtifact);
         }
-        Ok(Self {
+        let store = Self {
             root,
             preview_root,
             inputs_root,
             maximum_artifact_bytes,
-        })
+        };
+        store.sweep_import_staging();
+        Ok(store)
     }
 
     pub fn publish(
@@ -2825,8 +2895,43 @@ impl ArtifactStore {
         }
     }
 
+    fn import_tmp_root(&self) -> PathBuf {
+        self.inputs_root.join("tmp")
+    }
+
     fn import_staging_dir(&self, asset_id: StudioAssetId) -> PathBuf {
-        self.inputs_root.join("tmp").join(asset_id.0.to_string())
+        self.import_tmp_root().join(asset_id.0.to_string())
+    }
+
+    fn sweep_import_staging(&self) {
+        let tmp = self.import_tmp_root();
+        let Ok(entries) = fs::read_dir(&tmp) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if refuse_symlink(&path).is_err() {
+                let _ = fs::remove_dir_all(&path);
+                continue;
+            }
+            let newest = fs::read_dir(&path)
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|file| file.metadata().ok()?.modified().ok())
+                .max();
+            let expired = match newest {
+                Some(at) => at
+                    .elapsed()
+                    .map(|age| age > IMPORT_STAGING_TTL)
+                    .unwrap_or(true),
+                None => true,
+            };
+            if expired {
+                let _ = fs::remove_dir_all(&path);
+            }
+        }
     }
 
     fn import_staging_offsets(
@@ -2836,9 +2941,16 @@ impl ArtifactStore {
         let dir = self.import_staging_dir(asset_id);
         let data_path = dir.join("data");
         let last_path = dir.join("last");
-        if !dir.exists() {
-            return Ok((None, 0));
+        match fs::symlink_metadata(&dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((None, 0)),
+            Err(error) => return Err(error.into()),
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(StudioStoreError::InvalidArtifact);
+            }
+            Ok(_) => {}
         }
+        refuse_symlink(&data_path)?;
+        refuse_symlink(&last_path)?;
         let next_offset = match fs::metadata(&data_path) {
             Ok(metadata) => metadata.len(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
@@ -2860,15 +2972,21 @@ impl ArtifactStore {
         offset: u64,
         data: &[u8],
     ) -> Result<(), StudioStoreError> {
+        self.sweep_import_staging();
+        let tmp = self.import_tmp_root();
+        refuse_symlink(&tmp)?;
+        fs::create_dir_all(&tmp)?;
+        refuse_symlink(&tmp)?;
         let dir = self.import_staging_dir(asset_id);
+        refuse_symlink(&dir)?;
         fs::create_dir_all(&dir)?;
+        refuse_symlink(&dir)?;
         let data_path = dir.join("data");
         let last_path = dir.join("last");
-        fs::write(&last_path, offset.to_string())?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&data_path)?;
+        refuse_symlink(&data_path)?;
+        refuse_symlink(&last_path)?;
+        write_jail_file(&last_path, offset.to_string().as_bytes())?;
+        let mut file = open_jail_file(&data_path)?;
         file.set_len(offset)?;
         file.seek(std::io::SeekFrom::Start(offset))?;
         file.write_all(data)?;
@@ -2878,6 +2996,7 @@ impl ArtifactStore {
 
     fn read_import_staging(&self, asset_id: StudioAssetId) -> Result<Vec<u8>, StudioStoreError> {
         let path = self.import_staging_dir(asset_id).join("data");
+        refuse_symlink(&path)?;
         match fs::read(&path) {
             Ok(bytes) => Ok(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -2887,8 +3006,11 @@ impl ArtifactStore {
 
     fn remove_import_staging(&self, asset_id: StudioAssetId) -> Result<(), StudioStoreError> {
         let dir = self.import_staging_dir(asset_id);
-        match fs::remove_dir_all(&dir) {
-            Ok(()) => Ok(()),
+        match fs::symlink_metadata(&dir) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                Err(StudioStoreError::InvalidArtifact)
+            }
+            Ok(_) => fs::remove_dir_all(&dir).map_err(Into::into),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         }
