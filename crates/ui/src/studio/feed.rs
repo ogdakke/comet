@@ -30,6 +30,7 @@ use crate::transcript::{self, format_timestamp};
 
 use super::artifact::{StudioPaint, contain_layers};
 use super::page::StudioPage;
+use super::video::format_duration_badge;
 
 /// Scroll runway below the final Studio turn. The composer floats 18px above
 /// the viewport and is 191px tall at its largest first-release configuration;
@@ -718,6 +719,22 @@ pub(super) fn feed_tile_element_id(
     }
 }
 
+fn video_duration_badge(seconds: Option<f64>, theme: &Theme) -> AnyElement {
+    div()
+        .absolute()
+        .right(px(8.0))
+        .bottom(px(8.0))
+        .px(px(6.0))
+        .py(px(2.0))
+        .rounded(px(4.0))
+        .bg(crate::theme::ink(0.72))
+        .text_size(px(11.0))
+        .line_height(px(14.0))
+        .text_color(theme.text)
+        .child(SharedString::from(format_duration_badge(seconds)))
+        .into_any_element()
+}
+
 fn lattice_seed(turn_ix: usize, run_ix: usize, output_ix: usize) -> u32 {
     let mut x = (turn_ix as u32).wrapping_mul(0x9E37_79B9)
         ^ (run_ix as u32).wrapping_mul(0x85EB_CA6B)
@@ -740,11 +757,14 @@ impl StudioPage {
         artifact_id: Option<StudioArtifactId>,
         run_id: zeron_studio::StudioRunId,
         progress: Option<f32>,
+        media_kind: MediaKind,
+        duration_seconds: Option<f64>,
         theme: &Theme,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let height = width * aspect.1 as f32 / aspect.0.max(1) as f32;
+        let video = media_kind == MediaKind::Video;
         let mut base = div()
             .id(feed_tile_element_id(artifact_id, run_id, output_ix))
             .w(px(width))
@@ -768,8 +788,9 @@ impl StudioPage {
                 cx,
             );
         }
+        let badge = video.then(|| video_duration_badge(duration_seconds, theme));
         if let Some(id) = artifact_id {
-            let paint = if self.feed_viewport_fulls.contains(&id) {
+            let paint = if !video && self.feed_viewport_fulls.contains(&id) {
                 StudioPaint::Display
             } else {
                 StudioPaint::Thumb
@@ -780,7 +801,7 @@ impl StudioPage {
                     .relative()
                     .cursor_pointer()
                     .on_hover(cx.listener(move |page, hovered: &bool, window, cx| {
-                        if *hovered {
+                        if *hovered && !page.artifact_is_video(id) {
                             page.prefetch_gallery_full(id, window, cx);
                         }
                     }))
@@ -802,6 +823,7 @@ impl StudioPage {
                             Some(SharedString::from(format!("studio-thumb-ready-{}", id.0))),
                         )),
                     ))
+                    .when_some(badge, |tile, badge| tile.child(badge))
                     .when_some(self.artifact_focus_ring(id, theme), |tile, ring| {
                         tile.child(ring)
                     })
@@ -818,6 +840,18 @@ impl StudioPage {
                 .w(px(width))
                 .h(px(height))
                 .rounded(px(10.0))
+        });
+        // Succeeded video without a poster keeps the aspect skeleton.
+        let fill = fill.or_else(|| {
+            (video && state == StudioRunState::Succeeded).then(|| {
+                shader(Effect::SoftNoise { seed, amount: 0.55 })
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(px(width))
+                    .h(px(height))
+                    .rounded(px(10.0))
+            })
         });
         let open_key = artifact_id
             .map(super::artifact::ArtifactFrameKey::Ready)
@@ -842,6 +876,7 @@ impl StudioPage {
             .when(state == StudioRunState::Failed, |tile| {
                 tile.child("Generation failed")
             })
+            .when_some(badge, |tile, badge| tile.child(badge))
             .when_some(
                 artifact_id.and_then(|id| self.artifact_focus_ring(id, theme)),
                 |tile, ring| tile.child(ring),
@@ -1237,6 +1272,9 @@ impl StudioPage {
                 continue;
             };
             for tile in self.lineage.tiles_for_root(turn_id) {
+                if tile.media_kind != MediaKind::Image {
+                    continue;
+                }
                 if let Some(id) = tile.artifact_id {
                     ids.push(id);
                     if ids.len() >= max {
@@ -1307,6 +1345,9 @@ impl StudioPage {
                 let (aw, ah) = tile.aspect;
                 let tile_h = tile_width * ah as f32 / aw.max(1) as f32;
                 if let Some(id) = tile.artifact_id {
+                    if tile.media_kind != MediaKind::Image {
+                        continue;
+                    }
                     let (top, bottom) =
                         feed_tile_vertical_span(turn_top, header, slot, columns, tile_h, gap);
                     tiles.push((id, top, bottom));
@@ -1688,6 +1729,8 @@ impl StudioPage {
                         tile.artifact_id,
                         tile.run_id,
                         tile.progress,
+                        tile.media_kind,
+                        tile.duration_seconds,
                         theme,
                         window,
                         cx,
@@ -2281,6 +2324,12 @@ mod tests {
         assert!(!prompt_exceeds_lines(&ten, inner, advance, 10));
         assert!(prompt_exceeds_lines(&eleven, inner, advance, 10));
         assert!(!prompt_exceeds_lines("short", inner, advance, 10));
+    }
+
+    #[test]
+    fn video_duration_badge_uses_clock_style() {
+        assert_eq!(format_duration_badge(Some(6.2)), "0:06");
+        assert_eq!(format_duration_badge(Some(75.0)), "1:15");
     }
 
     #[test]

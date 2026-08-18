@@ -601,6 +601,9 @@ impl StudioPage {
         self.image_protect.extend(ids.iter().copied());
         let mut inflight = self.loading_full_images.len();
         for id in ids {
+            if self.artifact_is_video(id) {
+                continue;
+            }
             if self.images.contains_full(&id) || self.image_failed.contains(&id) {
                 continue;
             }
@@ -879,6 +882,9 @@ impl StudioPage {
         let extension = match mime {
             "image/jpeg" => "jpg",
             "image/webp" => "webp",
+            "video/quicktime" => "mov",
+            "video/webm" => "webm",
+            mime if mime.starts_with("video/") => "mp4",
             _ => "png",
         };
         format!("studio-{}.{extension}", artifact_id.0)

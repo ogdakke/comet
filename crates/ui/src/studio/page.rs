@@ -187,6 +187,9 @@ pub struct StudioPage {
     pub(super) full_image_tasks: HashMap<StudioArtifactId, Task<()>>,
     pub(super) display_tasks: HashMap<StudioArtifactId, Task<()>>,
     pub(super) loading_displays: HashSet<StudioArtifactId>,
+    pub(super) video: Option<super::video::StudioVideoPlayback>,
+    pub(super) video_task: Option<Task<()>>,
+    pub(super) video_frame_scheduled: bool,
     pub(super) _observe: Subscription,
     pub(super) _prompt_events: Subscription,
     pub(super) _edit_prompt_events: Subscription,
@@ -366,6 +369,9 @@ impl StudioPage {
             display_tasks: HashMap::new(),
             loading_displays: HashSet::new(),
             preview_failed: HashSet::new(),
+            video: None,
+            video_task: None,
+            video_frame_scheduled: false,
             _observe: observe,
             _prompt_events: prompt_events,
             _edit_prompt_events: edit_prompt_events,
@@ -869,6 +875,13 @@ impl StudioPage {
         self.full_image_tasks.remove(&artifact_id);
         self.display_tasks.remove(&artifact_id);
         self.feed_viewport_fulls.remove(&artifact_id);
+        if self
+            .video
+            .as_ref()
+            .is_some_and(|player| player.artifact_id == artifact_id)
+        {
+            self.stop_video_playback();
+        }
         self.gallery.retain(|item| item.id != artifact_id);
         self.gallery_selected.remove(&artifact_id);
         if self.gallery_anchor == Some(artifact_id) {
@@ -1632,6 +1645,18 @@ impl Focusable for StudioPage {
 impl Render for StudioPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_lineage();
+        if self.video_needs_frame() && !self.video_frame_scheduled {
+            self.video_frame_scheduled = true;
+            let entity = cx.weak_entity();
+            window.on_next_frame(move |window, cx| {
+                entity
+                    .update(cx, |page: &mut StudioPage, cx| {
+                        page.video_frame_scheduled = false;
+                        page.step_video_frame(window, cx);
+                    })
+                    .ok();
+            });
+        }
         if self.lightbox_motion_pending() && crate::motion::reduced_motion(cx) {
             self.finish_lightbox_snap_immediate(cx);
         } else if self.lightbox_motion_pending() && !self.lightbox_swipe_scheduled {

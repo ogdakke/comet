@@ -101,11 +101,17 @@ pub(super) struct ArtifactFrame {
     pub source_artifact_id: Option<StudioArtifactId>,
     pub state: StudioRunState,
     pub progress: Option<f32>,
+    pub media_kind: MediaKind,
+    pub duration_seconds: Option<f64>,
 }
 
 impl ArtifactFrame {
     pub(super) fn artifact_id(&self) -> Option<StudioArtifactId> {
         self.key.artifact_id()
+    }
+
+    pub(super) fn is_video(&self) -> bool {
+        self.media_kind == MediaKind::Video
     }
 
     pub(super) fn is_loading(&self) -> bool {
@@ -114,6 +120,22 @@ impl ArtifactFrame {
             StudioRunState::Queued | StudioRunState::Running | StudioRunState::Downloading
         ) && self.artifact_id().is_none()
     }
+}
+
+fn run_duration_seconds(run: &zeron_proto::StudioRunView) -> Option<f64> {
+    run.artifacts
+        .iter()
+        .find_map(|artifact| artifact.duration_seconds)
+        .or_else(|| {
+            run.controls.values().find_map(|value| match value {
+                zeron_studio::ControlValue::DurationSeconds { value } => Some(*value),
+                _ => None,
+            })
+        })
+}
+
+fn frame_accepts_run(run: &zeron_proto::StudioRunView) -> bool {
+    matches!(run.model.output_kind, MediaKind::Image | MediaKind::Video)
 }
 
 fn frame_prompt(run: &zeron_proto::StudioRunView, turn: &zeron_proto::StudioTurnView) -> String {
@@ -171,6 +193,8 @@ pub(super) fn frames_from_gallery(items: &[StudioGalleryItem]) -> Vec<ArtifactFr
             source_artifact_id: item.source_artifact_id,
             state: StudioRunState::Succeeded,
             progress: None,
+            media_kind: item.media_kind,
+            duration_seconds: None,
         })
         .collect()
 }
@@ -181,7 +205,7 @@ pub(super) fn frames_from_conversation(view: &StudioConversationView) -> Vec<Art
         .filter_map(|tile| {
             let turn = view.turns.iter().find(|turn| turn.id == tile.turn_id)?;
             let run = turn.runs.iter().find(|run| run.id == tile.run_id)?;
-            if run.model.output_kind != MediaKind::Image {
+            if !frame_accepts_run(run) {
                 return None;
             }
             let prompt = frame_prompt(run, turn);
@@ -191,7 +215,7 @@ pub(super) fn frames_from_conversation(view: &StudioConversationView) -> Vec<Art
                     .artifacts
                     .iter()
                     .find(|artifact| artifact.id == artifact_id)?;
-                if artifact.media_kind != MediaKind::Image {
+                if !matches!(artifact.media_kind, MediaKind::Image | MediaKind::Video) {
                     return None;
                 }
                 return Some(ArtifactFrame {
@@ -209,6 +233,10 @@ pub(super) fn frames_from_conversation(view: &StudioConversationView) -> Vec<Art
                     source_artifact_id: tile.source_artifact_id,
                     state: run.state,
                     progress: run.progress,
+                    media_kind: artifact.media_kind,
+                    duration_seconds: artifact
+                        .duration_seconds
+                        .or_else(|| run_duration_seconds(run)),
                 });
             }
             if !matches!(
@@ -239,6 +267,8 @@ pub(super) fn frames_from_conversation(view: &StudioConversationView) -> Vec<Art
                 source_artifact_id: tile.source_artifact_id,
                 state: run.state,
                 progress: run.progress,
+                media_kind: tile.media_kind,
+                duration_seconds: tile.duration_seconds.or_else(|| run_duration_seconds(run)),
             })
         })
         .collect()
@@ -1096,6 +1126,7 @@ impl StudioPage {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let copied = self.copied_artifact == Some(artifact_id);
+        let video = self.artifact_is_video(artifact_id);
         let menu_open = self.artifact_actions_menu.get() == Some(&artifact_id);
         let menu = menu_open.then(|| self.render_artifact_actions_menu(artifact_id, theme, cx));
         let copy_id = artifact_id;
@@ -1128,20 +1159,34 @@ impl StudioPage {
             .items_center()
             .justify_end()
             .gap(px(4.0))
-            .child(
-                inspector_icon_action(
-                    "studio-copy-artifact",
-                    if copied {
-                        crate::icons::CHECK
-                    } else {
-                        crate::icons::COPY
-                    },
-                    theme,
+            .when(video, |row| {
+                row.child(
+                    inspector_icon_action(
+                        "studio-open-artifact-player",
+                        crate::icons::EXPAND_ARROWS,
+                        theme,
+                    )
+                    .on_click(cx.listener(move |page, _, _, cx| {
+                        page.open_video_in_os_player(artifact_id, cx);
+                    })),
                 )
-                .on_click(cx.listener(move |page, _, _, cx| {
-                    page.copy_artifact_image(copy_id, cx);
-                })),
-            )
+            })
+            .when(!video, |row| {
+                row.child(
+                    inspector_icon_action(
+                        "studio-copy-artifact",
+                        if copied {
+                            crate::icons::CHECK
+                        } else {
+                            crate::icons::COPY
+                        },
+                        theme,
+                    )
+                    .on_click(cx.listener(move |page, _, _, cx| {
+                        page.copy_artifact_image(copy_id, cx);
+                    })),
+                )
+            })
             .child(
                 inspector_icon_action(
                     "studio-download-artifact",
@@ -1347,6 +1392,7 @@ impl StudioPage {
         self.lightbox_drag = None;
         self.reset_lightbox_swipe();
         self.lightbox_swipe_locked = false;
+        self.stop_video_playback();
     }
 
     pub(super) fn adopt_artifact_index(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
@@ -1359,6 +1405,9 @@ impl StudioPage {
         self.compare_pressed = false;
         self.snap_lightbox_to_fit();
         self.lightbox_drag = None;
+        if changed {
+            self.sync_video_playback(cx);
+        }
         if changed {
             self.close_upscale_settings_menu(cx);
             self.close_artifact_actions_menu(cx);
@@ -1898,7 +1947,7 @@ impl StudioPage {
             self.lightbox_snap = None;
             self.lightbox_swipe_last_tick = None;
         }
-        if event.modifiers.platform {
+        if event.modifiers.platform && !self.selected_is_video() {
             let movement = if vertical.abs() >= horizontal.abs() {
                 vertical
             } else {
@@ -1994,6 +2043,10 @@ impl StudioPage {
     }
 
     pub(super) fn on_lightbox_pinch(&mut self, event: &PinchEvent, cx: &mut Context<Self>) {
+        if self.selected_is_video() {
+            cx.stop_propagation();
+            return;
+        }
         if matches!(event.phase, TouchPhase::Started) {
             self.lightbox_zoom_spring = None;
         }
@@ -2129,6 +2182,7 @@ impl StudioPage {
     ) -> AnyElement {
         let artifact_id = key.and_then(ArtifactFrameKey::artifact_id);
         let slot = key.and_then(|key| self.frame_by_key(key));
+        let video = slot.is_some_and(ArtifactFrame::is_video);
         let (base, overlay) = artifact_id
             .map(|id| self.display_layers(id, StudioPaint::Full, window, cx))
             .unwrap_or((None, None));
@@ -2243,7 +2297,13 @@ impl StudioPage {
             layer.child(contain_layers(paint, None, px(0.0), None))
         };
         match base {
-            Some(base) => frame.child(stack(base, overlay)).into_any_element(),
+            Some(base) => {
+                let mut slide = frame.child(stack(base, overlay));
+                if video {
+                    slide = slide.child(self.render_video_stage_overlay(slot, theme, cx));
+                }
+                slide.into_any_element()
+            }
             None => {
                 let loading = slot.and_then(|slot| {
                     let seed = slot.run_id.0.as_u128() as u32 ^ slot.output_ix as u32;
@@ -2275,9 +2335,19 @@ impl StudioPage {
                 });
                 let failed = slot.is_some_and(|slot| slot.state == StudioRunState::Failed);
                 let show_fallback = loading.is_none() && !failed;
+                let fallback = if video {
+                    if self.video.as_ref().is_some_and(|player| player.loading) {
+                        "Loading video…"
+                    } else {
+                        "Video"
+                    }
+                } else {
+                    "Loading image…"
+                };
                 frame
                     .child(
                         div()
+                            .relative()
                             .flex()
                             .items_center()
                             .justify_center()
@@ -2290,12 +2360,93 @@ impl StudioPage {
                             .when(show_fallback, |box_| {
                                 box_.text_size(px(12.0))
                                     .text_color(theme.text_faint)
-                                    .child("Loading image…")
+                                    .child(fallback)
+                            })
+                            .when(video, |box_| {
+                                box_.child(self.render_video_stage_overlay(slot, theme, cx))
                             }),
                     )
                     .into_any_element()
             }
         }
+    }
+
+    fn render_video_stage_overlay(
+        &self,
+        slot: Option<&ArtifactFrame>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let playing = self.video.as_ref().is_some_and(|player| player.playing);
+        let loading = self.video.as_ref().is_some_and(|player| player.loading);
+        let duration = self
+            .video
+            .as_ref()
+            .and_then(|player| player.duration)
+            .or_else(|| slot.and_then(|slot| slot.duration_seconds));
+        let mut overlay = div().absolute().inset_0();
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(buffer) = self
+                .video
+                .as_ref()
+                .and_then(super::video::StudioVideoPlayback::frame)
+            {
+                overlay = overlay.child(
+                    gpui::surface(buffer)
+                        .object_fit(gpui::ObjectFit::Contain)
+                        .absolute()
+                        .inset_0(),
+                );
+            }
+        }
+        overlay
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .id("studio-video-play")
+                    .size(px(56.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(crate::theme::ink(if playing { 0.28 } else { 0.55 }))
+                    .text_size(px(18.0))
+                    .text_color(theme.text)
+                    .opacity(if playing { 0.0 } else { 1.0 })
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(1.0).bg(crate::theme::ink(0.62)))
+                    .on_click(cx.listener(|page, _, _, cx| {
+                        page.toggle_selected_video(cx);
+                        cx.stop_propagation();
+                    }))
+                    .child(SharedString::from(if playing {
+                        "❚❚"
+                    } else if loading {
+                        "…"
+                    } else {
+                        "▶"
+                    })),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .right(px(16.0))
+                    .bottom(px(16.0))
+                    .px(px(8.0))
+                    .py(px(3.0))
+                    .rounded(px(5.0))
+                    .bg(crate::theme::ink(0.72))
+                    .text_size(px(12.0))
+                    .text_color(theme.text)
+                    .child(SharedString::from(super::video::format_duration_badge(
+                        duration,
+                    ))),
+            )
+            .into_any_element()
     }
 
     pub(super) fn render_artifact_page(
@@ -2321,6 +2472,8 @@ impl StudioPage {
                 frame.mime_type.clone(),
                 frame.size_bytes,
                 frame.is_loading() || frame.artifact_id().is_none(),
+                frame.duration_seconds,
+                frame.is_video(),
             )
         });
         let compare_source = id.and_then(|id| {
@@ -2401,6 +2554,23 @@ impl StudioPage {
                 {
                     return frame
                         .child(shader(effect).progress(wash).size_full().rounded(px(7.0)))
+                        .into_any_element();
+                }
+                if self
+                    .frame_by_key(thumb_key)
+                    .is_some_and(ArtifactFrame::is_video)
+                {
+                    return frame
+                        .child(
+                            div()
+                                .size_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from("▶")),
+                        )
                         .into_any_element();
                 }
                 frame.into_any_element()
@@ -2487,6 +2657,10 @@ impl StudioPage {
             )
             .on_click(cx.listener(|page, event: &gpui::ClickEvent, window, cx| {
                 if event.click_count() >= 2 {
+                    if page.selected_is_video() {
+                        page.toggle_selected_video(cx);
+                        return;
+                    }
                     if page.lightbox_zoom > 1.001 || page.lightbox_zoom < 0.999 {
                         page.fit_lightbox(cx);
                     } else {
@@ -2498,9 +2672,16 @@ impl StudioPage {
                     && event.standard_click()
                     && !event.is_keyboard()
                     && page.edit_target.is_none()
-                    && page.lightbox_click_is_empty(event.position(), window, cx)
                 {
-                    page.request_close_artifact(cx);
+                    if page.selected_is_video()
+                        && !page.lightbox_click_is_empty(event.position(), window, cx)
+                    {
+                        page.toggle_selected_video(cx);
+                        return;
+                    }
+                    if page.lightbox_click_is_empty(event.position(), window, cx) {
+                        page.request_close_artifact(cx);
+                    }
                 }
             }))
             .child(
@@ -2667,7 +2848,7 @@ impl StudioPage {
             inspector
                 .when_some(
                     details,
-                    |inspector, (turn_id, prompt, model, mime, size, pending)| {
+                    |inspector, (turn_id, prompt, model, mime, size, pending, duration, video)| {
                         let has_prompt = !prompt.trim().is_empty();
                         inspector
                             .when(has_prompt, |inspector| {
@@ -2760,6 +2941,18 @@ impl StudioPage {
                                     .text_color(theme.text_muted)
                                     .child(SharedString::from(if pending || mime.is_empty() {
                                         model
+                                    } else if video {
+                                        match duration {
+                                            Some(seconds) => format!(
+                                                "{model} · {mime} · {} · {:.1} KB",
+                                                super::video::format_duration_badge(Some(seconds)),
+                                                size as f64 / 1024.0
+                                            ),
+                                            None => format!(
+                                                "{model} · {mime} · {:.1} KB",
+                                                size as f64 / 1024.0
+                                            ),
+                                        }
                                     } else {
                                         format!("{model} · {mime} · {:.1} KB", size as f64 / 1024.0)
                                     })),
@@ -2768,12 +2961,18 @@ impl StudioPage {
                 )
                 .child(div().flex_1())
                 .when_some(id, |inspector, id| {
+                    let video = self.artifact_is_video(id);
                     inspector
-                        .child(self.render_edit_action(id, theme, cx))
-                        .child(div().h(px(8.0)))
+                        .when(!video, |inspector| {
+                            inspector
+                                .child(self.render_edit_action(id, theme, cx))
+                                .child(div().h(px(8.0)))
+                        })
                         .child(self.render_make_video_action(id, theme, cx))
                         .child(div().h(px(8.0)))
-                        .child(self.render_artifact_upscale_actions(id, theme, cx))
+                        .when(!video, |inspector| {
+                            inspector.child(self.render_artifact_upscale_actions(id, theme, cx))
+                        })
                         .child(self.render_inspector_actions(id, theme, cx))
                 })
         };
@@ -2819,6 +3018,10 @@ impl StudioPage {
                             cx.stop_propagation();
                         }
                         "escape" => page.request_close_artifact(cx),
+                        "space" if page.edit_target.is_none() && page.selected_is_video() => {
+                            page.toggle_selected_video(cx);
+                            cx.stop_propagation();
+                        }
                         "left" if page.edit_target.is_none() => page.navigate_artifact(-1, cx),
                         "right" if page.edit_target.is_none() => page.navigate_artifact(1, cx),
                         "home" if page.edit_target.is_none() => {
@@ -3231,6 +3434,8 @@ mod tests {
             source_artifact_id: None,
             state: StudioRunState::Succeeded,
             progress: None,
+            media_kind: MediaKind::Image,
+            duration_seconds: None,
         }
     }
 
@@ -3547,6 +3752,145 @@ mod tests {
         assert_eq!(
             resolve_frame_key(ArtifactFrameKey::Ready(upscale_id), &frames),
             Some(ArtifactFrameKey::Ready(upscale_id))
+        );
+    }
+
+    #[test]
+    fn conversation_frames_include_video_and_keep_swipe_order() {
+        use chrono::Utc;
+        use std::collections::BTreeMap;
+        let conversation_id = StudioConversationId::new();
+        let image_id = StudioArtifactId::new();
+        let video_id = StudioArtifactId::new();
+        let artifact = |id: StudioArtifactId, kind: MediaKind, mime: &str, duration| {
+            zeron_proto::StudioArtifactView {
+                id,
+                output_position: 0,
+                media_kind: kind,
+                mime_type: mime.into(),
+                size_bytes: 1,
+                width: Some(16),
+                height: Some(9),
+                duration_seconds: duration,
+                metadata: serde_json::Value::Null,
+                created_at: Utc::now(),
+                thumbhash: None,
+                content_hash: String::new(),
+            }
+        };
+        let model = |operation: zeron_studio::MediaOperation, kind: MediaKind, name: &str| {
+            zeron_studio::MediaModel {
+                provider_id: "venice".into(),
+                id: name.into(),
+                display_name: name.into(),
+                description: None,
+                operation,
+                output_kind: kind,
+                output_mime_types: vec![if kind == MediaKind::Video {
+                    "video/mp4".into()
+                } else {
+                    "image/png".into()
+                }],
+                input_constraints: Vec::new(),
+                prompt_maximum_chars: None,
+                negative_prompt_maximum_chars: None,
+                maximum_output_count: 4,
+                controls: Vec::new(),
+                pricing: None,
+                features: Vec::new(),
+                video: zeron_studio::VideoModelMeta::default(),
+                manifest_version: "test".into(),
+                fetched_at: Utc::now(),
+            }
+        };
+        let view = StudioConversationView {
+            conversation: zeron_proto::StudioConversationSummary {
+                id: conversation_id,
+                title: "mixed".into(),
+                turn_count: 2,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                archived: false,
+                forked_from_turn_id: None,
+                creating: false,
+                done: false,
+            },
+            turns: vec![
+                zeron_proto::StudioTurnView {
+                    id: StudioTurnId::new(),
+                    position: 0,
+                    prompt: "a fox".into(),
+                    source_turn_id: None,
+                    batch_id: zeron_studio::StudioBatchId::new(),
+                    created_at: Utc::now(),
+                    runs: vec![zeron_proto::StudioRunView {
+                        id: StudioRunId::new(),
+                        position: 0,
+                        provider_id: "venice".into(),
+                        model: model(
+                            zeron_studio::MediaOperation::TextToImage,
+                            MediaKind::Image,
+                            "flux",
+                        ),
+                        controls: BTreeMap::new(),
+                        output_count: 1,
+                        display_aspect_ratio: (1, 1),
+                        state: StudioRunState::Succeeded,
+                        progress: None,
+                        error: None,
+                        quote: None,
+                        prompt: None,
+                        inputs: Vec::new(),
+                        artifacts: vec![artifact(image_id, MediaKind::Image, "image/png", None)],
+                    }],
+                },
+                zeron_proto::StudioTurnView {
+                    id: StudioTurnId::new(),
+                    position: 1,
+                    prompt: "the fox runs".into(),
+                    source_turn_id: None,
+                    batch_id: zeron_studio::StudioBatchId::new(),
+                    created_at: Utc::now(),
+                    runs: vec![zeron_proto::StudioRunView {
+                        id: StudioRunId::new(),
+                        position: 0,
+                        provider_id: "venice".into(),
+                        model: model(
+                            zeron_studio::MediaOperation::TextToVideo,
+                            MediaKind::Video,
+                            "seedance",
+                        ),
+                        controls: BTreeMap::new(),
+                        output_count: 1,
+                        display_aspect_ratio: (16, 9),
+                        state: StudioRunState::Succeeded,
+                        progress: None,
+                        error: None,
+                        quote: None,
+                        prompt: None,
+                        inputs: Vec::new(),
+                        artifacts: vec![artifact(
+                            video_id,
+                            MediaKind::Video,
+                            "video/mp4",
+                            Some(6.0),
+                        )],
+                    }],
+                },
+            ],
+        };
+        let frames = frames_from_conversation(&view);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].artifact_id(), Some(image_id));
+        assert!(!frames[0].is_video());
+        assert_eq!(frames[1].artifact_id(), Some(video_id));
+        assert!(frames[1].is_video());
+        assert_eq!(frames[1].duration_seconds, Some(6.0));
+        let neighbors = lightbox_neighbor_ids(&frames, ArtifactFrameKey::Ready(image_id));
+        assert!(neighbors.contains(&video_id));
+        assert_eq!(
+            resolve_frame_key(ArtifactFrameKey::Ready(video_id), &frames),
+            Some(ArtifactFrameKey::Ready(video_id))
         );
     }
 
