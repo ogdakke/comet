@@ -23,10 +23,10 @@ use zeron_proto::{
 };
 use zeron_studio::{
     GenerationInput, GenerationInputSource, GenerationRequest, InputRole, MediaKind, MediaModel,
-    MediaOperation, MediaProvider, ProviderArtifact, ProviderId, Quote, ResolvedInput,
-    StudioArtifactId, StudioAssetId, StudioAttemptId, StudioBatchId, StudioConversationId,
-    StudioRunId, StudioTurnId, SubmissionCapabilities, probe_media, sniff_media_mime,
-    validate_inputs_against_bytes,
+    MediaOperation, MediaProvider, ProviderArtifact, ProviderId, Quote, ROLE_REFERENCE_VIDEO,
+    RemoteJob, ResolvedInput, StudioArtifactId, StudioAssetId, StudioAttemptId, StudioBatchId,
+    StudioConversationId, StudioRunId, StudioTurnId, SubmissionCapabilities, probe_media,
+    sniff_media_mime, validate_inputs_against_bytes,
 };
 
 use crate::venice_import::{ImportReport, ImportedStudioHistory};
@@ -429,6 +429,10 @@ impl StudioStore {
     /// Resolve image attempts interrupted by a process restart. A prepared attempt is known not to
     /// have sent network bytes and becomes an ordinary retryable failure. Once submission began,
     /// the provider may have charged for work, so preserve the ambiguity and require Retry anyway.
+    ///
+    /// Video attempts that already reached `queued`/`running` are left in place so a later
+    /// resume pass can keep polling `remote_job_id`. Prepared/submitting video (no remote id)
+    /// still follows the image path.
     pub fn recover_interrupted_image_runs(&self) -> Result<usize, StudioStoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
@@ -439,7 +443,11 @@ impl StudioStore {
                  FROM studio_attempts a
                  JOIN studio_runs r ON r.id = a.run_id
                  WHERE a.state IN ('prepared', 'submitting', 'queued', 'running')
-                   AND r.state IN ('queued', 'running', 'downloading')",
+                   AND r.state IN ('queued', 'running', 'downloading')
+                   AND NOT (
+                       r.operation IN ('text_to_video', 'image_to_video', 'reference_to_video', 'video_to_video')
+                       AND a.state IN ('queued', 'running')
+                   )",
             )?;
             statement
                 .query_map([], |row| {
@@ -1488,6 +1496,162 @@ impl StudioStore {
             return Err(StudioStoreError::RunNotFound);
         }
         self.set_run_state(run.run_id, run.attempt_id, "running", None)
+    }
+
+    /// First writer of `remote_job_id`. Persist provider metadata (`model`, `download_url`)
+    /// and move the attempt + run to `queued`.
+    pub fn mark_queued(
+        &self,
+        run: &StoredStudioRun,
+        remote: &RemoteJob,
+    ) -> Result<(), StudioStoreError> {
+        let metadata = serde_json::to_string(&remote.metadata)
+            .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE studio_attempts
+             SET state = 'queued',
+                 remote_job_id = ?3,
+                 response_metadata_json = ?4,
+                 last_polled_at = ?5
+             WHERE id = ?1 AND run_id = ?2 AND state IN ('submitting', 'queued')",
+            rusqlite::params![
+                run.attempt_id.0.to_string(),
+                run.run_id.0.to_string(),
+                remote.id,
+                metadata,
+                now
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StudioStoreError::RunNotFound);
+        }
+        transaction.execute(
+            "UPDATE studio_runs SET state = 'queued', progress = NULL, updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![run.run_id.0.to_string(), now],
+        )?;
+        transaction.execute(
+            "INSERT INTO studio_run_events (run_id, attempt_id, state, created_at) VALUES (?1, ?2, 'queued', ?3)",
+            rusqlite::params![run.run_id.0.to_string(), run.attempt_id.0.to_string(), now],
+        )?;
+        transaction.commit()?;
+        self.notify_change();
+        Ok(())
+    }
+
+    pub fn mark_running(
+        &self,
+        run: &StoredStudioRun,
+        progress: Option<f32>,
+    ) -> Result<(), StudioStoreError> {
+        self.mark_in_flight(run, "running", "running", progress)
+    }
+
+    pub fn mark_downloading(
+        &self,
+        run: &StoredStudioRun,
+        progress: Option<f32>,
+    ) -> Result<(), StudioStoreError> {
+        // Attempt CHECK has no `downloading`; keep the attempt `running`.
+        self.mark_in_flight(run, "running", "downloading", progress)
+    }
+
+    fn mark_in_flight(
+        &self,
+        run: &StoredStudioRun,
+        attempt_state: &str,
+        run_state: &str,
+        progress: Option<f32>,
+    ) -> Result<(), StudioStoreError> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE studio_attempts
+             SET state = ?3,
+                 last_polled_at = ?4
+             WHERE id = ?1 AND run_id = ?2 AND state IN ('queued', 'running')",
+            rusqlite::params![
+                run.attempt_id.0.to_string(),
+                run.run_id.0.to_string(),
+                attempt_state,
+                now
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StudioStoreError::RunNotFound);
+        }
+        transaction.execute(
+            "UPDATE studio_runs SET state = ?2, progress = ?3, updated_at = ?4 WHERE id = ?1",
+            rusqlite::params![run.run_id.0.to_string(), run_state, progress, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO studio_run_events (run_id, attempt_id, state, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![run.run_id.0.to_string(), run.attempt_id.0.to_string(), run_state, now],
+        )?;
+        transaction.commit()?;
+        self.notify_change();
+        Ok(())
+    }
+
+    /// Sum probed durations of `reference_video` inputs. `None` when no clips are
+    /// attached, or when any clip is missing a duration (cannot prove compliance).
+    pub fn reference_video_total_duration(
+        &self,
+        request: &GenerationRequest,
+    ) -> Result<Option<f64>, StudioStoreError> {
+        let mut total = 0.0;
+        let mut any = false;
+        for input in &request.inputs {
+            if input.role.as_str() != ROLE_REFERENCE_VIDEO {
+                continue;
+            }
+            any = true;
+            let duration = match &input.source {
+                GenerationInputSource::Asset { asset_id } => self.asset_duration(*asset_id)?,
+                GenerationInputSource::Artifact { artifact_id } => {
+                    self.artifact_duration(*artifact_id)?
+                }
+            };
+            let Some(duration) = duration.filter(|value| value.is_finite() && *value >= 0.0) else {
+                return Ok(None);
+            };
+            total += duration;
+        }
+        Ok(any.then_some(total))
+    }
+
+    fn asset_duration(&self, asset_id: StudioAssetId) -> Result<Option<f64>, StudioStoreError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT duration_seconds FROM studio_assets WHERE id = ?1",
+                [asset_id.0.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StudioStoreError::AssetNotFound,
+                other => other.into(),
+            })
+    }
+
+    fn artifact_duration(
+        &self,
+        artifact_id: StudioArtifactId,
+    ) -> Result<Option<f64>, StudioStoreError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT duration_seconds FROM studio_artifacts WHERE id = ?1 AND deleted_at IS NULL",
+                [artifact_id.0.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StudioStoreError::ArtifactNotFound,
+                other => other.into(),
+            })
     }
 
     pub fn complete_run(

@@ -66,6 +66,7 @@ impl VeniceMediaProvider {
         let response = require_success(response).await?;
         let bytes = read_limited(response, MAX_ERROR_BYTES).await?;
         if bytes.is_empty() {
+            self.delete_download_url(remote_job).await;
             return Ok(());
         }
         let parsed: CompleteVideoResponse = serde_json::from_slice(&bytes).map_err(|error| {
@@ -77,7 +78,21 @@ impl VeniceMediaProvider {
                 "Venice video complete reported failure",
             ));
         }
+        self.delete_download_url(remote_job).await;
         Ok(())
+    }
+
+    async fn delete_download_url(&self, remote_job: &RemoteJob) {
+        let Some(download_url) = remote_job
+            .metadata
+            .get("download_url")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+        else {
+            return;
+        };
+        let _ = self.client.delete(download_url).send().await;
     }
 
     async fn submit_video(
@@ -487,6 +502,7 @@ impl MediaProvider for VeniceMediaProvider {
         &self,
         secret: &Secret,
         request: &GenerationRequest,
+        reference_video_total_duration: Option<f64>,
     ) -> ProviderResult<Option<Quote>> {
         if !matches!(
             request.operation,
@@ -497,7 +513,7 @@ impl MediaProvider for VeniceMediaProvider {
         ) {
             return Ok(None);
         }
-        let payload = venice_video::video_quote_payload(request, None)?;
+        let payload = venice_video::video_quote_payload(request, reference_video_total_duration)?;
         let response = self
             .authenticated(reqwest::Method::POST, "/video/quote", secret)
             .json(&payload)
@@ -578,6 +594,10 @@ impl MediaProvider for VeniceMediaProvider {
         _remote_job: &RemoteJob,
     ) -> ProviderResult<CancelResult> {
         Ok(CancelResult::Unsupported)
+    }
+
+    async fn complete(&self, secret: &Secret, remote_job: &RemoteJob) -> ProviderResult<()> {
+        self.complete_video(secret, remote_job).await
     }
 }
 
@@ -1485,7 +1505,7 @@ mod tests {
     async fn image_quote_is_catalog_only() {
         let provider = VeniceMediaProvider::with_base_url("http://127.0.0.1:1");
         let quoted = provider
-            .quote(&Secret::new("token"), &request())
+            .quote(&Secret::new("token"), &request(), None)
             .await
             .unwrap();
         assert!(quoted.is_none());
@@ -1509,7 +1529,7 @@ mod tests {
         });
         let provider = VeniceMediaProvider::with_base_url(format!("http://{addr}"));
         let quoted = provider
-            .quote(&Secret::new("token"), &video_request())
+            .quote(&Secret::new("token"), &video_request(), None)
             .await
             .unwrap()
             .expect("venice video quote");

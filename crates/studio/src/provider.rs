@@ -240,6 +240,7 @@ pub trait MediaProvider: Send + Sync {
         &self,
         secret: &Secret,
         request: &GenerationRequest,
+        reference_video_total_duration: Option<f64>,
     ) -> ProviderResult<Option<Quote>>;
     async fn balance(&self, _secret: &Secret) -> ProviderResult<Option<AccountBalance>> {
         Ok(None)
@@ -258,4 +259,9 @@ pub trait MediaProvider: Send + Sync {
     async fn poll(&self, secret: &Secret, remote_job: &RemoteJob) -> ProviderResult<PollResult>;
     async fn cancel(&self, secret: &Secret, remote_job: &RemoteJob)
     -> ProviderResult<CancelResult>;
+    /// Best-effort provider cleanup after a queued job is published locally.
+    async fn complete(&self, secret: &Secret, remote_job: &RemoteJob) -> ProviderResult<()> {
+        let _ = (secret, remote_job);
+        Ok(())
+    }
 }
