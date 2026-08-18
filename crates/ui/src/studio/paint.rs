@@ -3,8 +3,10 @@
 //! A silhouette is a raster: overlapping strokes must flatten to one fill
 //! with a 1px edge, not a stack of ribbons. GPUI's scene cannot hold a
 //! primitive per stamp (that blew the Metal instance buffer), so this
-//! module owns an A8 mask, incrementally paints a BGRA overlay, and
-//! publishes one [`RenderImage`] for the viewer to blit.
+//! module owns an A8 coverage mask, incrementally paints a BGRA overlay,
+//! and publishes one [`RenderImage`] for the viewer to blit.
+//!
+//! Coverage is a 1px anti-aliased distance field so diagonals do not stair-step.
 
 use std::cell::RefCell;
 use std::io::Cursor;
@@ -222,7 +224,7 @@ impl PaintSession {
         }
         let mut rgb = image::RgbImage::new(self.width, self.height);
         for (x, y, pixel) in self.mask.enumerate_pixels() {
-            let value = if pixel.0[0] > 0 { 255 } else { 0 };
+            let value = if pixel.0[0] >= 128 { 255 } else { 0 };
             rgb.put_pixel(x, y, image::Rgb([value, value, value]));
         }
         let mut encoded = Cursor::new(Vec::new());
@@ -370,34 +372,11 @@ fn stamp_stroke_mask(mask: &mut GrayImage, stroke: &Stroke) {
     }
 }
 
+/// Extra bbox padding so the 1px coverage ramp is stamped and refreshed.
+const AA_PAD: f32 = 1.0;
+
 fn stamp_disk_mask(mask: &mut GrayImage, cx: f32, cy: f32, radius: f32, mode: BrushMode) -> bool {
-    let width = mask.width() as i32;
-    let height = mask.height() as i32;
-    let radius = radius.max(0.5);
-    let min_x = ((cx - radius).floor() as i32).max(0);
-    let max_x = ((cx + radius).ceil() as i32).min(width - 1);
-    let min_y = ((cy - radius).floor() as i32).max(0);
-    let max_y = ((cy + radius).ceil() as i32).min(height - 1);
-    let r2 = radius * radius;
-    let want = match mode {
-        BrushMode::Add => 255,
-        BrushMode::Subtract => 0,
-    };
-    let mut changed = false;
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            let dx = x as f32 + 0.5 - cx;
-            let dy = y as f32 + 0.5 - cy;
-            if dx * dx + dy * dy <= r2 {
-                let pixel = mask.get_pixel_mut(x as u32, y as u32);
-                if pixel.0[0] != want {
-                    *pixel = Luma([want]);
-                    changed = true;
-                }
-            }
-        }
-    }
-    changed
+    stamp_coverage(mask, cx, cy, cx, cy, radius, mode)
 }
 
 fn stamp_capsule_mask(
@@ -409,77 +388,90 @@ fn stamp_capsule_mask(
     radius: f32,
     mode: BrushMode,
 ) -> bool {
-    let mut changed = stamp_disk_mask(mask, x0, y0, radius, mode);
-    changed |= stamp_disk_mask(mask, x1, y1, radius, mode);
-    let vx = x1 - x0;
-    let vy = y1 - y0;
-    let len2 = vx * vx + vy * vy;
-    if len2 < f32::EPSILON {
-        return changed;
-    }
+    stamp_coverage(mask, x0, y0, x1, y1, radius, mode)
+}
+
+fn stamp_coverage(
+    mask: &mut GrayImage,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    radius: f32,
+    mode: BrushMode,
+) -> bool {
     let width = mask.width() as i32;
     let height = mask.height() as i32;
     let radius = radius.max(0.5);
-    let min_x = ((x0.min(x1) - radius).floor() as i32).max(0);
-    let max_x = ((x0.max(x1) + radius).ceil() as i32).min(width - 1);
-    let min_y = ((y0.min(y1) - radius).floor() as i32).max(0);
-    let max_y = ((y0.max(y1) + radius).ceil() as i32).min(height - 1);
-    let r2 = radius * radius;
-    let want = match mode {
-        BrushMode::Add => 255,
-        BrushMode::Subtract => 0,
-    };
+    let pad = radius + AA_PAD;
+    let min_x = ((x0.min(x1) - pad).floor() as i32).max(0);
+    let max_x = ((x0.max(x1) + pad).ceil() as i32).min(width - 1);
+    let min_y = ((y0.min(y1) - pad).floor() as i32).max(0);
+    let max_y = ((y0.max(y1) + pad).ceil() as i32).min(height - 1);
+    let mut changed = false;
     for y in min_y..=max_y {
         for x in min_x..=max_x {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-            let t = ((px - x0) * vx + (py - y0) * vy) / len2;
-            if (0.0..=1.0).contains(&t) {
-                let dx = px - (x0 + t * vx);
-                let dy = py - (y0 + t * vy);
-                if dx * dx + dy * dy <= r2 {
-                    let pixel = mask.get_pixel_mut(x as u32, y as u32);
-                    if pixel.0[0] != want {
-                        *pixel = Luma([want]);
-                        changed = true;
-                    }
-                }
+            let coverage = coverage_capsule(x as f32 + 0.5, y as f32 + 0.5, x0, y0, x1, y1, radius);
+            if apply_coverage(mask.get_pixel_mut(x as u32, y as u32), coverage, mode) {
+                changed = true;
             }
         }
     }
     changed
 }
 
+/// 1 inside, 0 outside, linear 1px ramp so the 50% contour sits on `radius`.
+fn coverage_capsule(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32, radius: f32) -> f32 {
+    let vx = x1 - x0;
+    let vy = y1 - y0;
+    let len2 = vx * vx + vy * vy;
+    let t = if len2 < f32::EPSILON {
+        0.0
+    } else {
+        ((px - x0) * vx + (py - y0) * vy) / len2
+    }
+    .clamp(0.0, 1.0);
+    let dx = px - (x0 + t * vx);
+    let dy = py - (y0 + t * vy);
+    let distance = (dx * dx + dy * dy).sqrt();
+    (radius + 0.5 - distance).clamp(0.0, 1.0)
+}
+
+fn apply_coverage(pixel: &mut Luma<u8>, coverage: f32, mode: BrushMode) -> bool {
+    if coverage <= 0.0 {
+        return false;
+    }
+    let cov = (coverage * 255.0).round() as u8;
+    let next = match mode {
+        BrushMode::Add => pixel.0[0].max(cov),
+        BrushMode::Subtract => {
+            let remain = 255u16.saturating_sub(cov as u16);
+            ((pixel.0[0] as u16 * remain + 127) / 255) as u8
+        }
+    };
+    if next == pixel.0[0] {
+        return false;
+    }
+    pixel.0[0] = next;
+    true
+}
+
 fn invert_mask(mask: &mut GrayImage) {
     for pixel in mask.pixels_mut() {
-        pixel.0[0] = if pixel.0[0] > 0 { 0 } else { 255 };
+        pixel.0[0] = 255 - pixel.0[0];
     }
 }
 
 fn overlay_pixel(mask: &GrayImage, x: u32, y: u32) -> Rgba<u8> {
-    if mask.get_pixel(x, y).0[0] == 0 {
+    let coverage = mask.get_pixel(x, y).0[0] as f32 / 255.0;
+    if coverage <= 0.0 {
         return Rgba([0, 0, 0, 0]);
     }
-    let alpha = if neighbor_empty(mask, x, y) {
-        255
-    } else {
-        FILL_ALPHA
-    };
+    // 50% contour is the silhouette: opaque white on the edge, 20% fill inside.
+    let fill = ((coverage - 0.5) * 2.0).clamp(0.0, 1.0);
+    let outline = (1.0 - (coverage - 0.5).abs() * 2.0).clamp(0.0, 1.0);
+    let alpha = (FILL_ALPHA as f32 * fill).max(255.0 * outline).round() as u8;
     Rgba([255, 255, 255, alpha])
-}
-
-fn neighbor_empty(mask: &GrayImage, x: u32, y: u32) -> bool {
-    let width = mask.width();
-    let height = mask.height();
-    let neighbors = [
-        (x.wrapping_sub(1), y),
-        (x + 1, y),
-        (x, y.wrapping_sub(1)),
-        (x, y + 1),
-    ];
-    neighbors
-        .into_iter()
-        .any(|(nx, ny)| nx >= width || ny >= height || mask.get_pixel(nx, ny).0[0] == 0)
 }
 
 fn refresh_overlay(mask: &GrayImage, overlay: &mut RgbaImage, rect: (u32, u32, u32, u32)) {
@@ -499,7 +491,7 @@ fn overlay_rgba(mask: &GrayImage) -> RgbaImage {
 }
 
 fn disk_rect(width: u32, height: u32, cx: f32, cy: f32, radius: f32) -> (u32, u32, u32, u32) {
-    let radius = radius.max(0.5);
+    let radius = radius.max(0.5) + AA_PAD;
     let x0 = ((cx - radius).floor() as i32).max(0) as u32;
     let y0 = ((cy - radius).floor() as i32).max(0) as u32;
     let x1 = ((cx + radius).ceil() as i32).min(width as i32 - 1).max(0) as u32;
@@ -587,7 +579,7 @@ mod tests {
                 if pixel.0[3] == 0 {
                     continue;
                 }
-                if pixel.0[3] == 255 {
+                if pixel.0[3] >= 180 {
                     edge_white += 1;
                 } else {
                     interior_white += 1;
@@ -679,6 +671,29 @@ mod tests {
     fn smallest_brush_is_four_source_pixels() {
         assert_eq!(PaintSession::brush_radius(1024, 1024, 0.0), 4.0);
         assert!(PaintSession::brush_radius(1024, 1024, 1.0) > 4.0);
+    }
+
+    #[test]
+    #[test]
+    fn diagonal_stroke_has_an_antialiased_fringe() {
+        let mut session = PaintSession::new(48, 48);
+        session.begin_stroke((8.0, 8.0), 5.0, BrushMode::Add);
+        session.extend_stroke((40.0, 40.0));
+        session.end_stroke();
+        let overlay = overlay_rgba(&session.mask);
+        let mut fringe = 0u32;
+        for y in 0..48 {
+            for x in 0..48 {
+                let alpha = overlay.get_pixel(x, y).0[3];
+                if alpha > 0 && alpha < 255 && alpha != FILL_ALPHA {
+                    fringe += 1;
+                }
+            }
+        }
+        assert!(
+            fringe > 20,
+            "diagonal edge should have intermediate coverage, got {fringe}"
+        );
     }
 
     #[test]
