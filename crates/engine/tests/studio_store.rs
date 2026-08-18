@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, io::Read, sync::Mutex};
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 use zeron_engine::studio::PreparedStudioRun;
 use zeron_engine::{
@@ -10,10 +11,11 @@ use zeron_engine::{
     StudioProviderRegistry, StudioSecretBackend, StudioStore, default_registry,
 };
 use zeron_proto::{
-    ComposerMode, ComposerSnapshot, ListStudioArtifactsResponse, ListStudioConversationsResponse,
-    ListStudioModelsResponse, ListStudioProvidersResponse, ProviderValidationState,
-    STUDIO_VALIDATION_CODE, SelectedModelRef, StudioArtifactChunk, StudioConversationSummary,
-    StudioConversationView, StudioProviderConnection, StudioRunState, StudioValidationError,
+    ComposerMediaKind, ComposerMode, ComposerSnapshot, ImportStudioAssetResponse,
+    ListStudioArtifactsResponse, ListStudioConversationsResponse, ListStudioModelsResponse,
+    ListStudioProvidersResponse, ProviderValidationState, STUDIO_VALIDATION_CODE, SelectedModelRef,
+    StudioArtifactChunk, StudioConversationSummary, StudioConversationView,
+    StudioProviderConnection, StudioRunState, StudioValidationError,
 };
 use zeron_rpc::{RpcError, memory_client, methods};
 use zeron_studio::{
@@ -21,7 +23,7 @@ use zeron_studio::{
     FakeMediaProvider, FakeSubmissionMode, GenerationInput, GenerationInputSource,
     GenerationRequest, InputConstraint, MediaKind, MediaModel, MediaOperation, MimeConstraint,
     ModelControl, PricingMetadata, PricingUnit, ProviderArtifact, ProviderError, ProviderErrorKind,
-    ProviderId, Quote, QuoteSource, Secret, StudioArtifactId, VideoModelMeta,
+    ProviderId, Quote, QuoteSource, Secret, StudioArtifactId, StudioAssetId, VideoModelMeta,
 };
 
 #[derive(Default)]
@@ -172,7 +174,7 @@ fn studio_catalog_is_profile_scoped_and_migrated() {
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
 }
 
 #[test]
@@ -474,7 +476,7 @@ fn schema_v1_gains_a_thumbhash_column() {
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let has_thumbhash: i64 = store
         .connection()
         .unwrap()
@@ -525,7 +527,7 @@ fn schema_v2_gains_a_last_seen_column() {
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let last_seen: i64 = store
         .connection()
         .unwrap()
@@ -536,6 +538,53 @@ fn schema_v2_gains_a_last_seen_column() {
         )
         .unwrap();
     assert_eq!(last_seen, 50);
+}
+
+#[test]
+fn schema_v3_gains_asset_duration_and_media_kind() {
+    let root = tempdir().unwrap();
+    let studio = root.path().join("studio");
+    std::fs::create_dir_all(&studio).unwrap();
+    let connection = rusqlite::Connection::open(studio.join("studio.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE studio_assets (
+                id TEXT PRIMARY KEY NOT NULL,
+                relative_path TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                content_hash TEXT NOT NULL,
+                width INTEGER,
+                height INTEGER,
+                created_at INTEGER NOT NULL
+            );
+            INSERT INTO studio_assets
+                (id, relative_path, mime_type, size_bytes, content_hash, width, height, created_at)
+            VALUES ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'inputs/old.png', 'image/png', 4, 'abcd', 8, 8, 1);
+            PRAGMA user_version = 3;
+            "#,
+        )
+        .unwrap();
+    drop(connection);
+    let store = StudioStore::open(root.path(), 1024).unwrap();
+    let version: i64 = store
+        .connection()
+        .unwrap()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 4);
+    let (duration, kind): (Option<f64>, String) = store
+        .connection()
+        .unwrap()
+        .query_row(
+            "SELECT duration_seconds, media_kind FROM studio_assets WHERE id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(duration, None);
+    assert_eq!(kind, "image");
 }
 
 #[test]
@@ -621,6 +670,189 @@ fn bind_upscale_copies_source_run_aspect_when_artifact_has_no_pixels() {
     };
     store.bind_generation_inputs(&mut request).unwrap();
     assert_eq!(request.display_aspect_ratio, (2, 3));
+}
+
+fn i2v_model(provider_id: &str) -> MediaModel {
+    MediaModel {
+        provider_id: provider_id.into(),
+        id: "seedance-i2v".into(),
+        display_name: "Seedance I2V".into(),
+        description: None,
+        operation: MediaOperation::ImageToVideo,
+        output_kind: MediaKind::Video,
+        output_mime_types: vec!["video/mp4".into()],
+        input_constraints: vec![InputConstraint {
+            role: "source".into(),
+            minimum_count: 1,
+            maximum_count: 1,
+            mime: MimeConstraint {
+                accepted: vec!["image/png".into(), "image/jpeg".into(), "image/webp".into()],
+                maximum_bytes: Some(25 * 1024 * 1024),
+                minimum_short_side: Some(8),
+                ..MimeConstraint::default()
+            },
+        }],
+        prompt_maximum_chars: Some(2_500),
+        negative_prompt_maximum_chars: None,
+        maximum_output_count: 1,
+        controls: vec![ModelControl {
+            id: "duration".into(),
+            label: "Duration".into(),
+            description: None,
+            kind: ControlKind::Duration,
+            required: true,
+            default: None,
+            minimum: None,
+            maximum: None,
+            step: None,
+            choices: vec![zeron_studio::ControlChoice {
+                value: ControlValue::DurationSeconds { value: 6.0 },
+                label: "6s".into(),
+            }],
+            visible_when: Vec::new(),
+        }],
+        pricing: None,
+        features: Vec::new(),
+        video: VideoModelMeta {
+            adapter_family: AdapterFamily::Seedance,
+            generate_audio: zeron_studio::AudioCapability::Configurable { default: true },
+            ..VideoModelMeta::default()
+        },
+        manifest_version: "fixture-v1".into(),
+        fetched_at: chrono::Utc::now(),
+    }
+}
+
+fn v2v_model(provider_id: &str) -> MediaModel {
+    let mut model = i2v_model(provider_id);
+    model.id = "seedance-v2v".into();
+    model.operation = MediaOperation::VideoToVideo;
+    model.input_constraints = vec![InputConstraint {
+        role: "source".into(),
+        minimum_count: 1,
+        maximum_count: 1,
+        mime: MimeConstraint {
+            accepted: vec!["video/mp4".into()],
+            maximum_bytes: Some(50 * 1024 * 1024),
+            ..MimeConstraint::default()
+        },
+    }];
+    model
+}
+
+fn ftyp_mp4() -> Vec<u8> {
+    let mut bytes = vec![0, 0, 0, 20];
+    bytes.extend_from_slice(b"ftypisom");
+    bytes.extend_from_slice(&[0, 0, 0, 0]);
+    bytes.extend_from_slice(b"isom");
+    bytes
+}
+
+#[test]
+fn bind_accepts_video_role_assets_and_artifacts() {
+    let root = tempdir().unwrap();
+    let store = StudioStore::open(root.path(), 1024 * 1024).unwrap();
+    let png = rgb_png(16, 16);
+    let asset_id = store.publish_asset(&png, "image/png").unwrap();
+    let mut i2v = GenerationRequest {
+        provider_id: "fake".into(),
+        model_id: "seedance-i2v".into(),
+        operation: MediaOperation::ImageToVideo,
+        prompt: "a comet".into(),
+        negative_prompt: None,
+        output_count: 1,
+        controls: BTreeMap::new(),
+        inputs: vec![GenerationInput {
+            role: "source".into(),
+            ordinal: 0,
+            source: GenerationInputSource::Asset { asset_id },
+            content_hash: String::new(),
+        }],
+        manifest_version: "fixture-v1".into(),
+        display_aspect_ratio: (1, 1),
+    };
+    store.bind_generation_inputs(&mut i2v).unwrap();
+    assert!(!i2v.inputs[0].content_hash.is_empty());
+    store
+        .resolve_generation_inputs(&i2v, &i2v_model("fake"))
+        .unwrap();
+
+    let still_rejected = GenerationRequest {
+        provider_id: "fake".into(),
+        model_id: "image-model".into(),
+        operation: MediaOperation::TextToImage,
+        prompt: "a comet".into(),
+        negative_prompt: None,
+        output_count: 1,
+        controls: BTreeMap::new(),
+        inputs: vec![GenerationInput {
+            role: "source".into(),
+            ordinal: 0,
+            source: GenerationInputSource::Asset { asset_id },
+            content_hash: String::new(),
+        }],
+        manifest_version: "fixture-v1".into(),
+        display_aspect_ratio: (1, 1),
+    };
+    let error = store
+        .bind_generation_inputs(&mut still_rejected.clone())
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("studio asset inputs are only accepted as an image-edit mask"),
+        "{error}"
+    );
+
+    let conversation = store.create_conversation("video bind", None).unwrap();
+    let mut video = seedance_t2v_model("fake");
+    video.output_mime_types = vec!["video/mp4".into()];
+    let stored = store
+        .create_turn(
+            conversation.id,
+            "a comet",
+            None,
+            &[prepared_run(&video, "a comet")],
+            "device-a",
+        )
+        .unwrap();
+    store
+        .complete_run(
+            &stored[0],
+            &[ProviderArtifact {
+                media_kind: MediaKind::Video,
+                mime_type: "video/mp4".into(),
+                bytes: ftyp_mp4(),
+                width: Some(64),
+                height: Some(36),
+                duration_seconds: Some(4.0),
+                metadata: serde_json::json!({}),
+            }],
+        )
+        .unwrap();
+    let artifact_id =
+        store.conversation_view(conversation.id).unwrap().turns[0].runs[0].artifacts[0].id;
+    let mut v2v = GenerationRequest {
+        provider_id: "fake".into(),
+        model_id: "seedance-v2v".into(),
+        operation: MediaOperation::VideoToVideo,
+        prompt: "remix".into(),
+        negative_prompt: None,
+        output_count: 1,
+        controls: BTreeMap::new(),
+        inputs: vec![GenerationInput {
+            role: "source".into(),
+            ordinal: 0,
+            source: GenerationInputSource::Artifact { artifact_id },
+            content_hash: String::new(),
+        }],
+        manifest_version: "fixture-v1".into(),
+        display_aspect_ratio: (16, 9),
+    };
+    store.bind_generation_inputs(&mut v2v).unwrap();
+    store
+        .resolve_generation_inputs(&v2v, &v2v_model("fake"))
+        .unwrap();
 }
 
 fn prepared_run(model: &MediaModel, prompt: &str) -> PreparedStudioRun {
@@ -3087,7 +3319,7 @@ async fn quote_studio_batch_composer_projects_and_evaluates() {
 }
 
 #[tokio::test]
-async fn import_studio_asset_is_not_routed() {
+async fn import_studio_asset_assembles_chunks_and_is_idempotent() {
     let root = tempdir().unwrap();
     let provider = std::sync::Arc::new(FakeMediaProvider::new(
         "fake",
@@ -3095,13 +3327,189 @@ async fn import_studio_asset_is_not_routed() {
         FakeSubmissionMode::Complete(Vec::new()),
     ));
     let (engine, client) = studio_client_with_fake(root.path(), provider).await;
-    let err = client
-        .call(methods::IMPORT_STUDIO_ASSET, serde_json::json!({}))
+    let bytes = rgb_png(16, 12);
+    let hash = format!("{:x}", Sha256::digest(&bytes));
+    let asset_id = StudioAssetId::new();
+    let mid = bytes.len() / 2;
+    let cont: ImportStudioAssetResponse = serde_json::from_value(
+        client
+            .call(
+                methods::IMPORT_STUDIO_ASSET,
+                serde_json::json!({
+                    "assetId": asset_id,
+                    "offset": 0,
+                    "data": BASE64.encode(&bytes[..mid]),
+                    "last": false
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    match cont {
+        ImportStudioAssetResponse::Continue(chunk) => {
+            assert_eq!(chunk.asset_id, asset_id);
+            assert_eq!(chunk.next_offset, mid as u64);
+        }
+        other => panic!("expected continue, got {other:?}"),
+    }
+    let retry_first: ImportStudioAssetResponse = serde_json::from_value(
+        client
+            .call(
+                methods::IMPORT_STUDIO_ASSET,
+                serde_json::json!({
+                    "assetId": asset_id,
+                    "offset": 0,
+                    "data": BASE64.encode(&bytes[..mid]),
+                    "last": false
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    match retry_first {
+        ImportStudioAssetResponse::Continue(chunk) => {
+            assert_eq!(chunk.next_offset, mid as u64);
+        }
+        other => panic!("expected idempotent first-chunk retry, got {other:?}"),
+    }
+    let offset_err = client
+        .call(
+            methods::IMPORT_STUDIO_ASSET,
+            serde_json::json!({
+                "assetId": asset_id,
+                "offset": 3,
+                "data": BASE64.encode(&bytes[mid..]),
+                "last": true,
+                "expectedHash": hash
+            }),
+        )
         .await
         .unwrap_err();
     assert!(
-        err.to_string().contains(methods::IMPORT_STUDIO_ASSET),
-        "{err:?}"
+        offset_err.to_string().contains("nextOffset"),
+        "{offset_err:?}"
     );
+    let first: ImportStudioAssetResponse = serde_json::from_value(
+        client
+            .call(
+                methods::IMPORT_STUDIO_ASSET,
+                serde_json::json!({
+                    "assetId": asset_id,
+                    "offset": mid,
+                    "data": BASE64.encode(&bytes[mid..]),
+                    "last": true,
+                    "expectedHash": hash
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let ImportStudioAssetResponse::Complete(attachment) = first else {
+        panic!("expected complete import");
+    };
+    assert!(!attachment.pending);
+    assert_eq!(attachment.kind, ComposerMediaKind::Image);
+    assert_eq!(attachment.mime_type, "image/png");
+    assert_eq!(attachment.byte_size, bytes.len() as u64);
+    assert_eq!(attachment.width, Some(16));
+    assert_eq!(attachment.height, Some(12));
+    assert_eq!(attachment.content_hash, hash);
+
+    let retry: ImportStudioAssetResponse = serde_json::from_value(
+        client
+            .call(
+                methods::IMPORT_STUDIO_ASSET,
+                serde_json::json!({
+                    "assetId": asset_id,
+                    "offset": 0,
+                    "data": BASE64.encode(&bytes),
+                    "last": true,
+                    "expectedHash": hash
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let ImportStudioAssetResponse::Complete(again) = retry else {
+        panic!("expected idempotent complete");
+    };
+    assert_eq!(again, attachment);
+
+    let different = rgb_png(8, 8);
+    let different_hash = format!("{:x}", Sha256::digest(&different));
+    let conflict = client
+        .call(
+            methods::IMPORT_STUDIO_ASSET,
+            serde_json::json!({
+                "assetId": asset_id,
+                "offset": 0,
+                "data": BASE64.encode(&different),
+                "last": true,
+                "expectedHash": different_hash
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        conflict.to_string().contains("different content hash"),
+        "{conflict:?}"
+    );
+    engine.shutdown().await;
+}
+
+#[test]
+fn import_studio_asset_rejects_the_64_mib_cap() {
+    let root = tempdir().unwrap();
+    let store = StudioStore::open(root.path(), 128 * 1024 * 1024).unwrap();
+    let asset_id = StudioAssetId::new();
+    let too_big = vec![0u8; 64 * 1024 * 1024 + 1];
+    let error = store
+        .import_asset_chunk(asset_id, 0, &too_big, false, None, None)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        zeron_engine::StudioStoreError::ArtifactTooLarge
+    ));
+}
+
+#[tokio::test]
+async fn quote_studio_batch_accepts_video_specs() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(
+        FakeMediaProvider::new(
+            "fake",
+            vec![seedance_t2v_model("fake")],
+            FakeSubmissionMode::Complete(Vec::new()),
+        )
+        .with_quote(Quote::provider("USD", 1.25)),
+    );
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+    let snapshot = ComposerSnapshot {
+        mode: ComposerMode::Video,
+        prompt: "a comet".into(),
+        duration: Some(ControlValue::DurationSeconds { value: 6.0 }),
+        selected: vec![SelectedModelRef::new("fake", "seedance-t2v")],
+        ..ComposerSnapshot::default()
+    };
+    let quoted: zeron_proto::QuoteStudioBatchResponse = serde_json::from_value(
+        client
+            .call(
+                methods::QUOTE_STUDIO_BATCH,
+                serde_json::json!({
+                    "prompt": "a comet",
+                    "composer": snapshot
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let quote = quoted.runs[0].quote.clone().expect("video quote");
+    assert_eq!(quote.source, QuoteSource::Provider);
+    assert!((quote.amount - 1.25).abs() < f64::EPSILON);
     engine.shutdown().await;
 }

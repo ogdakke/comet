@@ -12,9 +12,28 @@ pub fn sniff_media_mime(bytes: &[u8]) -> Option<&'static str> {
         Some("image/gif")
     } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
         Some("video/mp4")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
+        Some("audio/wav")
+    } else if is_mpeg_audio(bytes) {
+        Some("audio/mpeg")
     } else {
         None
     }
+}
+
+fn is_mpeg_audio(bytes: &[u8]) -> bool {
+    if bytes.len() >= 3 && bytes.starts_with(b"ID3") {
+        return true;
+    }
+    if bytes.len() < 4 {
+        return false;
+    }
+    bytes[0] == 0xff
+        && bytes[1] & 0xe0 == 0xe0
+        && bytes[1] & 0x18 != 0x08
+        && bytes[1] & 0x06 != 0x00
+        && bytes[2] >> 4 != 0x0f
+        && (bytes[2] >> 2) & 0x03 != 0x03
 }
 
 /// Return the sniffed MIME when it is one of `accepted`.
@@ -46,6 +65,14 @@ mod tests {
         let mut webp = b"RIFF....WEBP".to_vec();
         webp[4..8].copy_from_slice(&[1, 0, 0, 0]);
         assert_eq!(sniff_media_mime(&webp), Some("image/webp"));
+        let mut wav = b"RIFF....WAVE".to_vec();
+        wav[4..8].copy_from_slice(&[1, 0, 0, 0]);
+        assert_eq!(sniff_media_mime(&wav), Some("audio/wav"));
+        assert_eq!(
+            sniff_media_mime(&[0xff, 0xfb, 0x90, 0x00]),
+            Some("audio/mpeg")
+        );
+        assert_eq!(sniff_media_mime(b"ID3\x04rest"), Some("audio/mpeg"));
         assert_eq!(sniff_media_mime(b"not an image"), None);
     }
 

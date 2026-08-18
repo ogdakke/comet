@@ -62,7 +62,7 @@ use zeron_proto::{
     AppendStudioDerivedRunRequest, ArchiveStudioConversationRequest, ChatConfig,
     CreateStudioConversationRequest, CreateStudioTurnRequest, DeleteStudioArtifactRequest,
     DeleteStudioConversationRequest, EngineInfo, EvaluateStudioComposerRequest,
-    ExtendStudioTurnRequest, HarnessId, ListStudioArtifactsResponse,
+    ExtendStudioTurnRequest, HarnessId, ImportStudioAssetRequest, ListStudioArtifactsResponse,
     ListStudioConversationsRequest, ListStudioConversationsResponse, ListStudioModelsRequest,
     ListStudioModelsResponse, ListStudioProvidersResponse, MarkStudioConversationSeenRequest,
     ProviderValidationState, QuoteStudioBatchRequest, QuoteStudioBatchResponse, QuoteStudioRunView,
@@ -80,7 +80,9 @@ use crate::doc_host::DocHost;
 use crate::registry::HarnessRegistry;
 use crate::repos::{Repos, home_dir};
 use crate::sessions::SessionsEngine;
-use crate::studio::{PreparedStudioRun, StoredStudioRun, StudioProviderRegistry, StudioStore};
+use crate::studio::{
+    PreparedStudioRun, StoredStudioRun, StudioProviderRegistry, StudioStore, StudioStoreError,
+};
 use crate::studio_credentials::StudioCredentials;
 use crate::terminals::Terminals;
 use crate::uploads::Uploads;
@@ -1346,6 +1348,32 @@ impl RpcService for EngineRpc {
                     &catalog,
                 ))
             }
+            methods::IMPORT_STUDIO_ASSET => {
+                let request: ImportStudioAssetRequest = parse_params(params)?;
+                let data = base64::engine::general_purpose::STANDARD
+                    .decode(&request.data)
+                    .map_err(|error| {
+                        RpcError::BadParams(format!("import chunk is not valid base64: {error}"))
+                    })?;
+                let expected_hash = request.expected_hash.as_deref();
+                if request.last && expected_hash.is_none_or(|value| value.trim().is_empty()) {
+                    return Err(RpcError::BadParams(
+                        "expectedHash is required when last is true".into(),
+                    ));
+                }
+                let response = self
+                    .studio
+                    .import_asset_chunk(
+                        request.asset_id,
+                        request.offset,
+                        &data,
+                        request.last,
+                        expected_hash,
+                        request.mime_hint.as_deref(),
+                    )
+                    .map_err(import_studio_asset_error)?;
+                RpcReply::value(&response)
+            }
             methods::LIST_STUDIO_CONVERSATIONS => {
                 let request: ListStudioConversationsRequest = parse_params(params)?;
                 let conversations = self
@@ -2422,6 +2450,16 @@ impl RpcService for EngineRpc {
             }
             other => Err(RpcError::UnknownMethod(other.to_string())),
         }
+    }
+}
+
+fn import_studio_asset_error(error: StudioStoreError) -> RpcError {
+    match error {
+        StudioStoreError::InvalidValue(message) => RpcError::BadParams(message),
+        StudioStoreError::ArtifactTooLarge => {
+            RpcError::BadParams("studio asset exceeds 64 MiB".into())
+        }
+        other => RpcError::Failed(other.to_string()),
     }
 }
 

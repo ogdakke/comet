@@ -230,7 +230,7 @@ pub struct EvaluateStudioComposerRequest {
     pub provider_id: Option<ProviderId>,
 }
 
-/// Chunked import. Handler is PR 4 — this crate only defines the frames.
+/// Chunked import. Client-generated `asset_id`; idempotent on `(asset_id, content_hash)`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportStudioAssetRequest {

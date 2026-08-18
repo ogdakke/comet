@@ -154,7 +154,6 @@ pub mod methods {
     pub const APPEND_STUDIO_DERIVED_RUN: &str = "AppendStudioDerivedRun";
     pub const QUOTE_STUDIO_BATCH: &str = "QuoteStudioBatch";
     pub const EVALUATE_STUDIO_COMPOSER: &str = "EvaluateStudioComposer";
-    /// Frame types only in this PR. The engine does not route this method yet.
     pub const IMPORT_STUDIO_ASSET: &str = "ImportStudioAsset";
     pub const GET_STUDIO_PROVIDER_BALANCE: &str = "GetStudioProviderBalance";
     pub const RETRY_STUDIO_RUN: &str = "RetryStudioRun";

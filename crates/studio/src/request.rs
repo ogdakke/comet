@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::{
     ControlId, ControlValidationError, ControlValue, InputRole, MediaModel, MediaOperation,
-    ModelId, ProviderId,
+    MediaProbe, MimeConstraint, ModelId, ProviderId,
 };
 
 macro_rules! uuid_id {
@@ -186,6 +186,134 @@ impl GenerationRequest {
     }
 }
 
+/// Check sniffed/re-probed bytes against each role's MIME constraint.
+/// Snapshot metadata is not trusted: `probes[i]` must describe `inputs[i]`.
+pub fn validate_inputs_against_bytes(
+    model: &MediaModel,
+    inputs: &[GenerationInput],
+    probes: &[MediaProbe],
+) -> Result<(), RequestValidationError> {
+    if inputs.len() != probes.len() {
+        return Err(RequestValidationError::InputProbeMismatch);
+    }
+    let mut role_durations: BTreeMap<&InputRole, (f64, bool)> = BTreeMap::new();
+    for (input, probe) in inputs.iter().zip(probes) {
+        let Some(constraint) = model
+            .input_constraints
+            .iter()
+            .find(|constraint| constraint.role == input.role)
+        else {
+            continue;
+        };
+        validate_probe_against_mime(&constraint.mime, probe, &input.role)?;
+        let entry = role_durations.entry(&input.role).or_insert((0.0, false));
+        if let Some(duration) = probe.duration_seconds {
+            entry.0 += duration;
+        } else {
+            entry.1 = true;
+        }
+    }
+    for constraint in &model.input_constraints {
+        let Some(maximum_total) = constraint.mime.maximum_total_duration_seconds else {
+            continue;
+        };
+        let Some((total, missing)) = role_durations.get(&constraint.role) else {
+            continue;
+        };
+        if *missing || *total > maximum_total {
+            return Err(RequestValidationError::InputDuration {
+                role: constraint.role.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_probe_against_mime(
+    mime: &MimeConstraint,
+    probe: &MediaProbe,
+    role: &InputRole,
+) -> Result<(), RequestValidationError> {
+    if !mime.accepted.is_empty()
+        && !mime
+            .accepted
+            .iter()
+            .any(|accepted| accepted == &probe.mime_type)
+    {
+        return Err(RequestValidationError::UnsupportedInputMime {
+            role: role.clone(),
+            mime: probe.mime_type.clone(),
+        });
+    }
+    if mime
+        .maximum_bytes
+        .is_some_and(|maximum| probe.size_bytes > maximum)
+    {
+        return Err(RequestValidationError::InputTooLarge { role: role.clone() });
+    }
+    if geometry_rejected(mime, probe) {
+        return Err(RequestValidationError::InputGeometry { role: role.clone() });
+    }
+    if duration_rejected(mime, probe) {
+        return Err(RequestValidationError::InputDuration { role: role.clone() });
+    }
+    Ok(())
+}
+
+fn geometry_rejected(mime: &MimeConstraint, probe: &MediaProbe) -> bool {
+    let constrained = mime.maximum_width.is_some()
+        || mime.maximum_height.is_some()
+        || mime.minimum_short_side.is_some()
+        || mime.minimum_aspect_ratio.is_some()
+        || mime.maximum_aspect_ratio.is_some();
+    if !constrained {
+        return false;
+    }
+    let Some(width) = probe.width else {
+        return true;
+    };
+    let Some(height) = probe.height else {
+        return true;
+    };
+    if mime.maximum_width.is_some_and(|maximum| width > maximum) {
+        return true;
+    }
+    if mime.maximum_height.is_some_and(|maximum| height > maximum) {
+        return true;
+    }
+    if mime
+        .minimum_short_side
+        .is_some_and(|minimum| width.min(height) < minimum)
+    {
+        return true;
+    }
+    if width == 0 || height == 0 {
+        return true;
+    }
+    let aspect = f64::from(width) / f64::from(height);
+    mime.minimum_aspect_ratio
+        .is_some_and(|minimum| aspect <= minimum)
+        || mime
+            .maximum_aspect_ratio
+            .is_some_and(|maximum| aspect >= maximum)
+}
+
+fn duration_rejected(mime: &MimeConstraint, probe: &MediaProbe) -> bool {
+    let bounded =
+        mime.minimum_duration_seconds.is_some() || mime.maximum_duration_seconds.is_some();
+    if !bounded {
+        return false;
+    }
+    let Some(duration) = probe.duration_seconds else {
+        return true;
+    };
+    mime.minimum_duration_seconds
+        .is_some_and(|minimum| duration < minimum)
+        || mime
+            .maximum_duration_seconds
+            .is_some_and(|maximum| duration > maximum)
+}
+
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum RequestValidationError {
     #[error("request provider does not match model provider")]
@@ -219,6 +347,16 @@ pub enum RequestValidationError {
     },
     #[error("input role {role:?} is not supported by the model")]
     UnsupportedInputRole { role: InputRole },
+    #[error("input probe count does not match input count")]
+    InputProbeMismatch,
+    #[error("studio input MIME {mime} is not accepted for role {role:?}")]
+    UnsupportedInputMime { role: InputRole, mime: String },
+    #[error("studio input exceeds the model size limit")]
+    InputTooLarge { role: InputRole },
+    #[error("studio input does not meet the model's size or aspect requirements")]
+    InputGeometry { role: InputRole },
+    #[error("studio input duration is outside the model's allowed range")]
+    InputDuration { role: InputRole },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
