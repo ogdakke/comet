@@ -1928,7 +1928,8 @@ impl Composer {
                     self.advance_task = None;
                     // The shared input becomes the panel's free-text override.
                     self.input.update(cx, |input, cx| {
-                        input.set_placeholder("Type your own answer, or pick an option above", cx)
+                        input.set_placeholder("Type your own answer, or pick an option above", cx);
+                        input.set_viewport_max(Some(INPUT_LINE_HEIGHT));
                     });
                 }
             }
@@ -1950,8 +1951,10 @@ impl Composer {
                     if released {
                         self.wizard = None;
                         self.advance_task = None;
-                        self.input
-                            .update(cx, |input, cx| input.set_placeholder("Do anything…", cx));
+                        self.input.update(cx, |input, cx| {
+                            input.set_placeholder("Do anything…", cx);
+                            input.set_viewport_max(None);
+                        });
                     }
                 }
             }
@@ -2525,6 +2528,7 @@ impl Composer {
             input.set_text("", cx);
             // The panel borrowed the composer input; hand back its identity.
             input.set_placeholder("Do anything…", cx);
+            input.set_viewport_max(None);
         });
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -2705,15 +2709,18 @@ impl Composer {
             .when(!theme.is_glass(), |el| el.shadow_lg())
             .flex()
             .flex_col()
+            .overflow_hidden()
             .child(
                 div()
                     .px(px(16.0))
                     .pt(px(16.0))
                     .flex()
                     .flex_col()
+                    .min_h_0()
                     // Header: tracked uppercase + counter chip when paged.
                     .child(
                         div()
+                            .flex_none()
                             .flex()
                             .flex_row()
                             .items_center()
@@ -2743,9 +2750,16 @@ impl Composer {
                                 )
                             }),
                     )
+                    // Long plan previews (and other tall questions) scroll
+                    // here so the option rows and free-text field stay in
+                    // view. 8 × 20px line-height matches the body type.
                     .child(
                         div()
+                            .id("wizard-question")
                             .mt(px(6.0))
+                            .min_h_0()
+                            .max_h(px(160.0))
+                            .overflow_y_scroll()
                             .text_size(px(15.0))
                             .line_height(px(20.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
@@ -2755,6 +2769,7 @@ impl Composer {
                     .when(question.multi_select, |el| {
                         el.child(
                             div()
+                                .flex_none()
                                 .mt(px(4.0))
                                 .text_size(px(12.0))
                                 .text_color(theme.text_muted.opacity(0.65))
@@ -2763,6 +2778,7 @@ impl Composer {
                     })
                     .child(
                         div()
+                            .flex_none()
                             .mt(px(12.0))
                             .flex()
                             .flex_col()
@@ -2770,21 +2786,30 @@ impl Composer {
                             .children(options),
                     )
                     // Free-text override over a hairline (shares the composer
-                    // input entity).
+                    // input entity). Height lives on the inner well so the
+                    // 12/4 padding cannot eat the 22.75px line — the old
+                    // `h(line+8)` box clipped the placeholder through its
+                    // own padding (plan-approval field looked half-cut).
                     .child(
                         div()
+                            .flex_none()
                             .mt(px(12.0))
                             .border_t_1()
                             .border_color(crate::theme::hairline(0.06))
                             .pt(px(12.0))
                             .pb(px(4.0))
                             .px(px(4.0))
-                            .h(px(INPUT_LINE_HEIGHT + 8.0))
-                            .child(self.input.clone()),
+                            .child(
+                                div()
+                                    .h(px(INPUT_LINE_HEIGHT))
+                                    .overflow_hidden()
+                                    .child(self.input.clone()),
+                            ),
                     ),
             )
             .child(
                 div()
+                    .flex_none()
                     .flex()
                     .flex_row()
                     .justify_between()
