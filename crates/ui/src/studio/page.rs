@@ -143,6 +143,9 @@ pub struct StudioPage {
     pub(super) edit_brush_track: Option<Bounds<Pixels>>,
     pub(super) edit_add: bool,
     pub(super) edit_model_picker: popover::Popup<()>,
+    pub(super) edit_model_picker_active: Option<usize>,
+    pub(super) edit_model_picker_scroll: gpui::ScrollHandle,
+    pub(super) edit_model_picker_focus: FocusHandle,
     pub(super) edit_space_pan: bool,
     pub(super) pending_edit_source: Option<StudioArtifactId>,
     pub(super) focus: FocusHandle,
@@ -300,6 +303,9 @@ impl StudioPage {
             edit_brush_track: None,
             edit_add: true,
             edit_model_picker: popover::Popup::default(),
+            edit_model_picker_active: None,
+            edit_model_picker_scroll: gpui::ScrollHandle::new(),
+            edit_model_picker_focus: cx.focus_handle(),
             edit_space_pan: false,
             pending_edit_source: None,
             focus: cx.focus_handle(),
@@ -1594,12 +1600,12 @@ impl Render for StudioPage {
             .relative()
             .size_full()
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|page, event: &gpui::KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|page, event: &gpui::KeyDownEvent, window, cx| {
                 if page.dismiss_image_menu(event, cx) {
                     cx.stop_propagation();
                 } else if page.dismiss_upscale_settings_menu(event, cx) {
                     cx.stop_propagation();
-                } else if page.dismiss_edit_model_picker(event, cx) {
+                } else if page.on_edit_model_picker_key(event, window, cx) {
                     cx.stop_propagation();
                 }
             }))

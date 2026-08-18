@@ -1,8 +1,8 @@
 //! Lightbox image-edit mode: slim composer, brush, and derived-run submit.
 
 use gpui::{
-    AnyElement, App, Bounds, Context, Focusable as _, MouseButton, Pixels, Point, SharedString,
-    Window, canvas, div, point, prelude::*, px, size,
+    AnyElement, App, Bounds, Context, Focusable as _, KeyDownEvent, MouseButton, Pixels, Point,
+    SharedString, Window, canvas, div, point, prelude::*, px, size,
 };
 use zeron_proto::StudioConversationView;
 use zeron_rpc::methods;
@@ -19,6 +19,8 @@ use super::paint::{BrushMode, PaintSession};
 const EDIT_COMPOSER_BOTTOM: f32 = 10.0;
 pub(super) const EDIT_COMPOSER_HEIGHT: f32 = COMPACT_TOTAL_HEIGHT + EDIT_COMPOSER_BOTTOM;
 const DEFAULT_BRUSH_T: f32 = 0.28;
+/// Same cap as the agent model picker (`t3 max-h-86.5`).
+const EDIT_MODEL_PICKER_MAX_H: f32 = 346.0;
 
 impl StudioPage {
     pub(super) fn edit_models(&self) -> impl Iterator<Item = &MediaModel> {
@@ -222,26 +224,71 @@ impl StudioPage {
         }
     }
 
-    pub(super) fn dismiss_edit_model_picker(
+    pub(super) fn on_edit_model_picker_key(
         &mut self,
-        event: &gpui::KeyDownEvent,
+        event: &KeyDownEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if event.keystroke.key == "escape" && self.edit_model_picker.is_open() {
-            self.close_edit_model_picker(cx);
-            true
-        } else {
-            false
+        if !self.edit_model_picker.is_open() {
+            return false;
+        }
+        let key = popover::classify_key(
+            event.keystroke.key.as_str(),
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+        );
+        let count = self.edit_models().count();
+        match key {
+            popover::MenuKey::Escape => {
+                self.close_edit_model_picker(cx);
+                true
+            }
+            popover::MenuKey::Up | popover::MenuKey::Down => {
+                let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
+                self.edit_model_picker_active =
+                    popover::menu_step(self.edit_model_picker_active, count, delta);
+                if let Some(active) = self.edit_model_picker_active {
+                    self.edit_model_picker_scroll.scroll_to_item(active);
+                }
+                window.focus(&self.edit_model_picker_focus, cx);
+                cx.notify();
+                true
+            }
+            popover::MenuKey::Enter => {
+                self.activate_edit_model_picker_row(cx);
+                true
+            }
+            _ => false,
         }
     }
 
-    fn toggle_edit_model_picker(&mut self, cx: &mut Context<Self>) {
+    fn activate_edit_model_picker_row(&mut self, cx: &mut Context<Self>) {
+        let models: Vec<_> = self.edit_models().cloned().collect();
+        let Some(index) = self.edit_model_picker_active else {
+            return;
+        };
+        let Some(model) = models.get(index) else {
+            return;
+        };
+        self.select_edit_model(model.id.clone(), cx);
+    }
+
+    fn toggle_edit_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let pressed_open = self.edit_model_picker.take_press_was_open();
         if self.edit_model_picker.is_open() || pressed_open {
             self.close_edit_model_picker(cx);
             return;
         }
+        let selected = self.selected_edit_model().map(|model| model.id);
+        self.edit_model_picker_active =
+            selected.and_then(|id| self.edit_models().position(|model| model.id == id));
+        self.edit_model_picker_scroll.set_offset(Point::default());
+        if let Some(active) = self.edit_model_picker_active {
+            self.edit_model_picker_scroll.scroll_to_item(active);
+        }
         self.edit_model_picker.open(());
+        window.focus(&self.edit_model_picker_focus, cx);
         cx.notify();
     }
 
@@ -555,41 +602,67 @@ impl StudioPage {
         let selected_id = selected.as_ref().map(|model| model.id.clone());
         let open = self.edit_model_picker.is_open() || self.edit_model_picker.is_closing();
         let menu = open.then(|| {
-            let mut card = popover::popover_card(theme)
+            let rows = self
+                .edit_models()
+                .cloned()
+                .enumerate()
+                .map(|(index, model)| {
+                    let id = model.id.clone();
+                    let selected = selected_id.as_ref() == Some(&id);
+                    let highlighted = self.edit_model_picker_active == Some(index);
+                    let fade = format!("studio-edit-model-{}", id.as_str());
+                    let mut row = popover::menu_row_nav(theme, selected, highlighted, fade.clone())
+                        .id(SharedString::from(fade))
+                        .on_hover(cx.listener(move |page, hovered: &bool, _, cx| {
+                            if *hovered && page.edit_model_picker_active != Some(index) {
+                                page.edit_model_picker_active = Some(index);
+                                cx.notify();
+                            }
+                        }))
+                        .on_click(cx.listener(move |page, _, _, cx| {
+                            page.select_edit_model(id.clone(), cx);
+                        }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(SharedString::from(model.display_name)),
+                        );
+                    if selected {
+                        row = row.child(
+                            crate::icons::icon(crate::icons::CHECK)
+                                .size(px(13.0))
+                                .text_color(theme.text_muted),
+                        );
+                    }
+                    row
+                });
+            let list = div()
+                .id("studio-edit-model-list")
+                .w_full()
+                .max_h(px(EDIT_MODEL_PICKER_MAX_H))
+                .overflow_y_scroll()
+                .track_scroll(&self.edit_model_picker_scroll)
+                .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .children(rows);
+            let card = popover::popover_card(theme)
                 .id("studio-edit-model-picker")
-                .min_w(px(200.0))
+                .min_w(px(220.0))
                 .max_w(px(280.0))
+                .track_focus(&self.edit_model_picker_focus)
                 .on_mouse_down_out(cx.listener(|page, _, _, cx| {
                     page.close_edit_model_picker(cx);
                 }))
-                .flex()
-                .flex_col()
-                .gap(px(2.0));
-            for model in self.edit_models() {
-                let id = model.id.clone();
-                let active = selected_id.as_ref() == Some(&id);
-                let fade = format!("studio-edit-model-{}", id.as_str());
-                let mut row = popover::menu_row(theme, active, fade.clone())
-                    .id(SharedString::from(fade))
-                    .on_click(cx.listener(move |page, _, _, cx| {
-                        page.select_edit_model(id.clone(), cx);
-                    }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .child(SharedString::from(model.display_name.clone())),
-                    );
-                if active {
-                    row = row.child(
-                        crate::icons::icon(crate::icons::CHECK)
-                            .size(px(13.0))
-                            .text_color(theme.text_muted),
-                    );
-                }
-                card = card.child(row);
-            }
+                .on_key_down(cx.listener(|page, event: &KeyDownEvent, window, cx| {
+                    if page.on_edit_model_picker_key(event, window, cx) {
+                        cx.stop_propagation();
+                    }
+                }))
+                .child(list);
             popover::anchored_menu_above_end(
                 "studio-edit-model-menu",
                 card.into_any_element(),
@@ -615,15 +688,14 @@ impl StudioPage {
             .when(open, |chip| chip.bg(crate::theme::wash(0.10)))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|page, event: &gpui::MouseDownEvent, _, cx| {
+                cx.listener(|page, _, _, cx| {
                     page.edit_model_picker.note_trigger_press();
                     cx.stop_propagation();
-                    let _ = event;
                 }),
             )
-            .on_click(cx.listener(|page, _, _, cx| {
+            .on_click(cx.listener(|page, _, window, cx| {
                 cx.stop_propagation();
-                page.toggle_edit_model_picker(cx);
+                page.toggle_edit_model_picker(window, cx);
             }))
             .child(div().min_w_0().truncate().child(SharedString::from(label)));
         if let Some(menu) = menu {

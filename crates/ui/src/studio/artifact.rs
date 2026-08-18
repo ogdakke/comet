@@ -2608,7 +2608,7 @@ impl StudioPage {
                     gpui::MouseButton::Left,
                     cx.listener(|page, _, _, cx| page.end_artifact_compare(cx)),
                 )
-                .on_key_down(cx.listener(|page, event: &gpui::KeyDownEvent, _, cx| {
+                .on_key_down(cx.listener(|page, event: &gpui::KeyDownEvent, window, cx| {
                     if page.dismiss_image_menu(event, cx) {
                         cx.stop_propagation();
                         return;
@@ -2617,7 +2617,7 @@ impl StudioPage {
                         cx.stop_propagation();
                         return;
                     }
-                    if page.dismiss_edit_model_picker(event, cx) {
+                    if page.on_edit_model_picker_key(event, window, cx) {
                         cx.stop_propagation();
                         return;
                     }
