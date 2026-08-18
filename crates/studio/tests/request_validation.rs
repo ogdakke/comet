@@ -278,6 +278,16 @@ fn image_edit_accepts_a_source_without_a_mask() {
 }
 
 #[test]
+fn image_edit_model_reports_whether_it_accepts_a_mask() {
+    assert!(edit_model().accepts_mask());
+    let mut model = edit_model();
+    model
+        .input_constraints
+        .retain(|c| c.role.as_str() != "mask");
+    assert!(!model.accepts_mask());
+}
+
+#[test]
 fn image_edit_accepts_an_optional_mask() {
     let mut request = edit_request();
     request.inputs.push(GenerationInput {

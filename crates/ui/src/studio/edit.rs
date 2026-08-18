@@ -45,9 +45,12 @@ impl StudioPage {
             return;
         }
         let (width, height) = self
-            .artifact_frame(artifact_id)
-            .and_then(|frame| frame.width.zip(frame.height))
-            .filter(|(width, height)| *width > 0 && *height > 0)
+            .photo_pixel_size(artifact_id, window, cx)
+            .or_else(|| {
+                self.artifact_frame(artifact_id)
+                    .and_then(|frame| frame.width.zip(frame.height))
+                    .filter(|(width, height)| *width > 0 && *height > 0)
+            })
             .unwrap_or((1024, 1024));
         self.edit_target = Some(artifact_id);
         self.edit_paint = Some(PaintSession::new(width, height));
@@ -93,11 +96,47 @@ impl StudioPage {
             self.error = Some("No edit model is available".into());
             return;
         };
-        let display_aspect_ratio = self.display_aspect_for(source_id);
-        let mask_png_base64 = self
+        let painted = self
             .edit_paint
             .as_ref()
-            .and_then(PaintSession::mask_png)
+            .is_some_and(PaintSession::has_paint);
+        if painted && !model.accepts_mask() {
+            self.error = Some(
+                format!(
+                    "{} does not accept a brush mask. Pick a model like FireRed Edit or Qwen Edit, or clear the brush for a full-image edit.",
+                    model.display_name
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let display_aspect_ratio = self.display_aspect_for(source_id);
+        let (mask_width, mask_height) = self
+            .artifact_frame(source_id)
+            .and_then(|frame| frame.width.zip(frame.height))
+            .filter(|(width, height)| *width > 0 && *height > 0)
+            .unwrap_or_else(|| {
+                self.edit_paint
+                    .as_ref()
+                    .map(|paint| (paint.width, paint.height))
+                    .unwrap_or((1024, 1024))
+            });
+        let mask_png = self
+            .edit_paint
+            .as_ref()
+            .and_then(|paint| paint.mask_png_sized(mask_width, mask_height));
+        if painted && mask_png.is_none() {
+            self.error = Some("Could not encode the brush mask".into());
+            cx.notify();
+            return;
+        }
+        let prompt = if mask_png.is_some() {
+            masked_edit_prompt(&prompt)
+        } else {
+            prompt
+        };
+        let mask_png_base64 = mask_png
             .map(|bytes| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes));
 
         self.remembered.last_edit_model_id = Some(model.id.clone());
@@ -1007,6 +1046,12 @@ fn brush_legend_ring(size_px: f32, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
+fn masked_edit_prompt(prompt: &str) -> String {
+    format!(
+        "Apply this change only inside the white region of the mask. Do not alter any black or unmasked pixels. {prompt}"
+    )
+}
+
 fn preferred_edit_model(
     edits: &[MediaModel],
     last_id: Option<&ModelId>,
@@ -1114,5 +1159,12 @@ mod tests {
                 .id,
             qwen.id
         );
+    }
+
+    #[test]
+    fn masked_prompt_pins_the_change_to_the_white_region() {
+        let prompt = masked_edit_prompt("portrait of an important man");
+        assert!(prompt.contains("white region of the mask"));
+        assert!(prompt.contains("portrait of an important man"));
     }
 }

@@ -329,6 +329,13 @@ impl MediaModel {
         crate::accepted_output_mime(bytes, &self.output_mime_types)
     }
 
+    /// Whether this edit model accepts a painted mask layer.
+    pub fn accepts_mask(&self) -> bool {
+        self.input_constraints
+            .iter()
+            .any(|constraint| constraint.role.as_str() == "mask" && constraint.maximum_count > 0)
+    }
+
     pub fn validate_controls(
         &self,
         values: &BTreeMap<ControlId, ControlValue>,

@@ -219,14 +219,28 @@ impl PaintSession {
     }
 
     pub(super) fn mask_png(&self) -> Option<Vec<u8>> {
+        self.mask_png_sized(self.width, self.height)
+    }
+
+    /// Binary white-on-black mask at `width`×`height`. Venice multi-edit
+    /// treats extra images as layers; a mask that does not match the source
+    /// pixels is ignored and the model rewrites the whole frame.
+    pub(super) fn mask_png_sized(&self, width: u32, height: u32) -> Option<Vec<u8>> {
         if !self.has_paint() {
             return None;
         }
+        let width = width.max(1);
+        let height = height.max(1);
         let mut rgb = image::RgbImage::new(self.width, self.height);
         for (x, y, pixel) in self.mask.enumerate_pixels() {
             let value = if pixel.0[0] >= 128 { 255 } else { 0 };
             rgb.put_pixel(x, y, image::Rgb([value, value, value]));
         }
+        let rgb = if width != self.width || height != self.height {
+            image::imageops::resize(&rgb, width, height, image::imageops::FilterType::Nearest)
+        } else {
+            rgb
+        };
         let mut encoded = Cursor::new(Vec::new());
         image::DynamicImage::ImageRgb8(rgb)
             .write_to(&mut encoded, image::ImageFormat::Png)
@@ -663,6 +677,18 @@ mod tests {
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
         let decoded = image::load_from_memory(&png).unwrap().to_rgb8();
         assert_eq!(*decoded.get_pixel(16, 16), image::Rgb([255, 255, 255]));
+        assert_eq!(*decoded.get_pixel(0, 0), image::Rgb([0, 0, 0]));
+    }
+
+    #[test]
+    fn mask_png_can_be_resized_to_the_source() {
+        let mut session = PaintSession::new(32, 32);
+        session.begin_stroke((16.0, 16.0), 6.0, BrushMode::Add);
+        session.end_stroke();
+        let png = session.mask_png_sized(64, 48).expect("resized mask");
+        let decoded = image::load_from_memory(&png).unwrap().to_rgb8();
+        assert_eq!(decoded.dimensions(), (64, 48));
+        assert_eq!(*decoded.get_pixel(32, 24), image::Rgb([255, 255, 255]));
         assert_eq!(*decoded.get_pixel(0, 0), image::Rgb([0, 0, 0]));
     }
 

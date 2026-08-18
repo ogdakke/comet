@@ -1288,7 +1288,7 @@ impl StudioPage {
 
     /// Real photo size for a slide. Never the ThumbHash decode — that is 5:7
     /// for a 2:3 image and would recreate the side-bar halo.
-    fn photo_pixel_size(
+    pub(super) fn photo_pixel_size(
         &self,
         id: StudioArtifactId,
         window: &mut Window,
