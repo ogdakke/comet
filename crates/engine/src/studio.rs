@@ -1,7 +1,7 @@
 //! Profile-scoped durable storage for Studio metadata and generated media.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, Write},
     path::{Path, PathBuf},
@@ -391,6 +391,9 @@ pub struct StudioStore {
     connection: Mutex<Connection>,
     artifacts: ArtifactStore,
     changes: tokio::sync::watch::Sender<u64>,
+    /// In-process pollers for a given attempt. Process death clears this, which
+    /// is the only case startup resume should start a new 45-minute timer.
+    video_polls: Mutex<HashSet<StudioAttemptId>>,
 }
 
 impl StudioStore {
@@ -428,6 +431,7 @@ impl StudioStore {
             connection: Mutex::new(connection),
             artifacts: ArtifactStore::open(&studio_root, maximum_artifact_bytes)?,
             changes,
+            video_polls: Mutex::new(HashSet::new()),
         })
     }
 
@@ -638,15 +642,29 @@ impl StudioStore {
         })
     }
 
-    /// Move a `submission_unknown` attempt that already has a queue id back to
-    /// `queued` so Check status can poll without creating a second attempt.
+    /// Move a `submission_unknown` or `failed` attempt that already has a queue
+    /// id back to `queued` so Check status can poll the same attempt.
+    ///
+    /// Returns `false` when another attempt is already active for the run
+    /// (`studio_one_active_attempt_per_run`) or this row is no longer reopenable.
     pub fn reopen_unknown_for_poll(&self, run: &StoredStudioRun) -> Result<bool, StudioStoreError> {
         let now = chrono::Utc::now().timestamp_millis();
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
+        let other_active: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM studio_attempts
+             WHERE run_id = ?1 AND id != ?2
+               AND state IN ('prepared', 'submitting', 'submission_unknown', 'queued', 'running')",
+            rusqlite::params![run.run_id.0.to_string(), run.attempt_id.0.to_string()],
+            |row| row.get(0),
+        )?;
+        if other_active > 0 {
+            return Ok(false);
+        }
         let changed = transaction.execute(
             "UPDATE studio_attempts SET state = 'queued', error_json = NULL
-             WHERE id = ?1 AND run_id = ?2 AND state = 'submission_unknown'
+             WHERE id = ?1 AND run_id = ?2
+               AND state IN ('submission_unknown', 'failed')
                AND remote_job_id IS NOT NULL AND TRIM(remote_job_id) != ''",
             rusqlite::params![run.attempt_id.0.to_string(), run.run_id.0.to_string()],
         )?;
@@ -664,6 +682,20 @@ impl StudioStore {
         transaction.commit()?;
         self.notify_change();
         Ok(true)
+    }
+
+    pub(crate) fn try_begin_video_poll(&self, attempt_id: StudioAttemptId) -> bool {
+        self.video_polls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(attempt_id)
+    }
+
+    pub(crate) fn end_video_poll(&self, attempt_id: StudioAttemptId) {
+        self.video_polls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&attempt_id);
     }
 
     pub fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {

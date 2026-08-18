@@ -2919,6 +2919,17 @@ fn jitter_pm_20(duration: Duration) -> Duration {
     Duration::from_secs_f64(duration.as_secs_f64() * factor)
 }
 
+struct VideoPollGuard<'a> {
+    store: &'a StudioStore,
+    attempt_id: zeron_studio::StudioAttemptId,
+}
+
+impl Drop for VideoPollGuard<'_> {
+    fn drop(&mut self) {
+        self.store.end_video_poll(self.attempt_id);
+    }
+}
+
 async fn poll_queued_video_job(
     store: &StudioStore,
     provider: &dyn zeron_studio::MediaProvider,
@@ -2927,6 +2938,18 @@ async fn poll_queued_video_job(
     remote_job: &zeron_studio::RemoteJob,
     policy: VideoPollPolicy,
 ) -> Result<(), String> {
+    if !store.try_begin_video_poll(run.attempt_id) {
+        tracing::debug!(
+            run_id = %run.run_id.0,
+            attempt_id = %run.attempt_id.0,
+            "studio video poll already in flight"
+        );
+        return Ok(());
+    }
+    let _guard = VideoPollGuard {
+        store,
+        attempt_id: run.attempt_id,
+    };
     let started = Instant::now();
     let mut delay = policy.first_tick;
     let mut transient_n = 0u32;
@@ -3095,22 +3118,38 @@ async fn check_studio_run(
     check: StudioAttemptCheck,
 ) -> Result<(), String> {
     if check.remote_job.is_some() {
-        if matches!(
-            check.attempt_state.as_str(),
-            "succeeded" | "cancelled" | "failed"
-        ) {
+        if matches!(check.attempt_state.as_str(), "succeeded" | "cancelled") {
             return Ok(());
         }
-        if check.attempt_state == "submission_unknown"
-            && let Err(error) = store.reopen_unknown_for_poll(&check.run)
+        let provider = match providers.get(&check.run.request.provider_id) {
+            Ok(Some(provider)) => provider,
+            Ok(None) => return Ok(()),
+            Err(error) => return fail_studio_run(&store, &check.run, &error.to_string(), false),
+        };
+        let secret = match credentials.secret(&check.run.request.provider_id).await {
+            Ok(secret) => secret,
+            Err(_) => return Ok(()),
+        };
+        let remote_job = match store.remote_job_for_attempt(check.run.attempt_id) {
+            Ok(Some(remote_job)) => remote_job,
+            Ok(None) => return Ok(()),
+            Err(error) => return fail_studio_run(&store, &check.run, &error.to_string(), false),
+        };
+        if matches!(
+            check.attempt_state.as_str(),
+            "submission_unknown" | "failed"
+        ) && !store
+            .reopen_unknown_for_poll(&check.run)
+            .map_err(|error| error.to_string())?
         {
-            return fail_studio_run(&store, &check.run, &error.to_string(), true);
+            return Ok(());
         }
-        return resume_one_video_job(
-            store,
-            providers,
-            credentials,
-            check.run,
+        return poll_queued_video_job(
+            &store,
+            provider.as_ref(),
+            &secret,
+            &check.run,
+            &remote_job,
             VideoPollPolicy::resume(),
         )
         .await;
@@ -3140,28 +3179,43 @@ async fn reconcile_studio_attempt(
     };
     match provider.reconcile(&secret, &attempt).await {
         Ok(None) => Ok(()),
-        Ok(Some(zeron_studio::Submission::Completed { artifacts })) => {
-            match store.complete_run(&check.run, &artifacts) {
-                Ok(_) => Ok(()),
-                Err(error) => fail_studio_run(&store, &check.run, &error.to_string(), false),
-            }
-        }
-        Ok(Some(zeron_studio::Submission::Queued { remote_job })) => {
-            if !is_video_operation(check.run.request.operation) {
+        Ok(Some(submission)) => {
+            if matches!(
+                check.attempt_state.as_str(),
+                "submission_unknown" | "failed"
+            ) && !store
+                .reopen_unknown_for_poll(&check.run)
+                .map_err(|error| error.to_string())?
+            {
                 return Ok(());
             }
-            if let Err(error) = store.mark_queued(&check.run, &remote_job) {
-                return fail_studio_run(&store, &check.run, &error.to_string(), true);
+            match submission {
+                zeron_studio::Submission::Completed { artifacts } => {
+                    match store.complete_run(&check.run, &artifacts) {
+                        Ok(_) => Ok(()),
+                        Err(error) => {
+                            fail_studio_run(&store, &check.run, &error.to_string(), false)
+                        }
+                    }
+                }
+                zeron_studio::Submission::Queued { remote_job } => {
+                    if !is_video_operation(check.run.request.operation) {
+                        return Ok(());
+                    }
+                    if let Err(error) = store.mark_queued(&check.run, &remote_job) {
+                        return fail_studio_run(&store, &check.run, &error.to_string(), true);
+                    }
+                    poll_queued_video_job(
+                        &store,
+                        provider.as_ref(),
+                        &secret,
+                        &check.run,
+                        &remote_job,
+                        VideoPollPolicy::resume(),
+                    )
+                    .await
+                }
             }
-            poll_queued_video_job(
-                &store,
-                provider.as_ref(),
-                &secret,
-                &check.run,
-                &remote_job,
-                VideoPollPolicy::resume(),
-            )
-            .await
         }
         Err(error) => fail_studio_run(&store, &check.run, &error.to_string(), false),
     }

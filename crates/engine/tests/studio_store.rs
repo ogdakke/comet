@@ -2108,6 +2108,27 @@ async fn studio_client_with_fake(
     (engine, client)
 }
 
+async fn studio_client_with_fake_unconfigured(
+    root: &std::path::Path,
+    provider: std::sync::Arc<FakeMediaProvider>,
+) -> (EngineCore, zeron_rpc::RpcClient) {
+    let profile = EngineProfile::synced(root, "org", "catalog-user");
+    let mut engine = EngineCore::assemble_with_profile(
+        profile,
+        std::sync::Arc::new(default_registry()),
+        HarnessId::Mock,
+        None,
+    )
+    .unwrap();
+    engine.studio_credentials = std::sync::Arc::new(
+        StudioCredentials::with_backend(root, std::sync::Arc::new(MemorySecrets::default()))
+            .unwrap(),
+    );
+    engine.studio_providers.register(provider).unwrap();
+    let client = memory_client(engine.rpc_service());
+    (engine, client)
+}
+
 async fn create_conversation(client: &zeron_rpc::RpcClient) -> StudioConversationSummary {
     serde_json::from_value(
         client
@@ -3928,6 +3949,219 @@ async fn check_status_reconciles_when_remote_job_id_is_absent() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let still = engine.studio.conversation_view(conversation.id).unwrap();
     assert_eq!(still.turns[0].runs[0].state, StudioRunState::Failed);
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn check_status_during_live_poll_does_not_fail_completed() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![seedance_t2v_model("fake")],
+        FakeSubmissionMode::Queue {
+            polls_before_completion: 1,
+            artifacts: vec![mp4_artifact()],
+        },
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider.clone()).await;
+    let conversation = create_conversation(&client).await;
+    let mut updates = client
+        .subscribe(
+            methods::WATCH_STUDIO_CONVERSATION,
+            serde_json::json!({ "conversationId": conversation.id }),
+        )
+        .await
+        .unwrap();
+    let _empty: StudioConversationView =
+        serde_json::from_value(updates.recv().await.unwrap()).unwrap();
+    let snapshot = ComposerSnapshot {
+        mode: ComposerMode::Video,
+        prompt: "a comet".into(),
+        duration: Some(ControlValue::DurationSeconds { value: 6.0 }),
+        selected: vec![SelectedModelRef::new("fake", "seedance-t2v")],
+        ..ComposerSnapshot::default()
+    };
+    let queued: StudioConversationView = serde_json::from_value(
+        client
+            .call(
+                methods::CREATE_STUDIO_TURN,
+                serde_json::json!({
+                    "conversationId": conversation.id,
+                    "prompt": "a comet",
+                    "composer": snapshot
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let run_id = queued.turns[0].runs[0].id;
+    let _: StudioConversationView = serde_json::from_value(
+        client
+            .call(
+                methods::CHECK_STUDIO_RUN,
+                serde_json::json!({ "runId": run_id }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let generated = wait_for_video_success(&mut updates).await;
+    assert_eq!(generated.turns[0].runs[0].state, StudioRunState::Succeeded);
+    assert_eq!(generated.turns[0].runs[0].artifacts.len(), 1);
+    assert_eq!(provider.complete_call_count(), 1);
+    assert_eq!(
+        engine
+            .studio
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM studio_attempts WHERE run_id = ?1",
+                [run_id.0.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn check_status_without_credentials_leaves_unknown_retryable() {
+    let root = tempdir().unwrap();
+    let profile = EngineProfile::synced(root.path(), "org", "catalog-user");
+    let store = StudioStore::open(profile.store_root(), 1024 * 1024).unwrap();
+    let model = seedance_t2v_model("fake");
+    let conversation = store.create_conversation("Check locked", None).unwrap();
+    let runs = store
+        .create_turn(
+            conversation.id,
+            "a comet",
+            None,
+            &[video_prepared_run(&model, "a comet")],
+            "device-a",
+        )
+        .unwrap();
+    store.mark_submitting(&runs[0]).unwrap();
+    store
+        .mark_queued(
+            &runs[0],
+            &RemoteJob {
+                id: "queue-locked".into(),
+                metadata: serde_json::json!({ "model": "seedance-t2v" }),
+            },
+        )
+        .unwrap();
+    store
+        .fail_run(&runs[0], "interrupted during submission", true)
+        .unwrap();
+    drop(store);
+
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![seedance_t2v_model("fake")],
+        FakeSubmissionMode::Queue {
+            polls_before_completion: 0,
+            artifacts: vec![mp4_artifact()],
+        },
+    ));
+    provider.seed_queued_job("queue-locked", 0, vec![mp4_artifact()]);
+    let (engine, client) =
+        studio_client_with_fake_unconfigured(root.path(), provider.clone()).await;
+    let _: StudioConversationView = serde_json::from_value(
+        client
+            .call(
+                methods::CHECK_STUDIO_RUN,
+                serde_json::json!({ "runId": runs[0].run_id }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let attempt_state: String = engine
+        .studio
+        .connection()
+        .unwrap()
+        .query_row(
+            "SELECT state FROM studio_attempts WHERE id = ?1",
+            [runs[0].attempt_id.0.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempt_state, "submission_unknown");
+    let view = engine.studio.conversation_view(conversation.id).unwrap();
+    assert_eq!(view.turns[0].runs[0].state, StudioRunState::Failed);
+    assert!(engine.studio.prepare_retry(runs[0].run_id, false).is_err());
+    assert!(engine.studio.prepare_retry(runs[0].run_id, true).is_ok());
+    assert_eq!(provider.complete_call_count(), 0);
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn check_status_polls_failed_run_with_remote_job_id() {
+    let root = tempdir().unwrap();
+    let profile = EngineProfile::synced(root.path(), "org", "catalog-user");
+    let store = StudioStore::open(profile.store_root(), 1024 * 1024).unwrap();
+    let model = seedance_t2v_model("fake");
+    let conversation = store.create_conversation("Check failed", None).unwrap();
+    let runs = store
+        .create_turn(
+            conversation.id,
+            "a comet",
+            None,
+            &[video_prepared_run(&model, "a comet")],
+            "device-a",
+        )
+        .unwrap();
+    store.mark_submitting(&runs[0]).unwrap();
+    store
+        .mark_queued(
+            &runs[0],
+            &RemoteJob {
+                id: "queue-timeout".into(),
+                metadata: serde_json::json!({ "model": "seedance-t2v" }),
+            },
+        )
+        .unwrap();
+    store
+        .fail_run(&runs[0], "video job timed out after 45 minutes", false)
+        .unwrap();
+    drop(store);
+
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![seedance_t2v_model("fake")],
+        FakeSubmissionMode::Queue {
+            polls_before_completion: 0,
+            artifacts: vec![mp4_artifact()],
+        },
+    ));
+    provider.seed_queued_job("queue-timeout", 0, vec![mp4_artifact()]);
+    let (engine, client) = studio_client_with_fake(root.path(), provider.clone()).await;
+    let mut updates = client
+        .subscribe(
+            methods::WATCH_STUDIO_CONVERSATION,
+            serde_json::json!({ "conversationId": conversation.id }),
+        )
+        .await
+        .unwrap();
+    let _snapshot: StudioConversationView =
+        serde_json::from_value(updates.recv().await.unwrap()).unwrap();
+    let _: StudioConversationView = serde_json::from_value(
+        client
+            .call(
+                methods::CHECK_STUDIO_RUN,
+                serde_json::json!({ "runId": runs[0].run_id }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let generated = wait_for_video_success(&mut updates).await;
+    assert_eq!(generated.turns[0].runs[0].state, StudioRunState::Succeeded);
+    assert_eq!(generated.turns[0].runs[0].artifacts.len(), 1);
+    assert_eq!(provider.complete_call_count(), 1);
     engine.shutdown().await;
 }
 
