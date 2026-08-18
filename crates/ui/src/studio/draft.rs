@@ -96,7 +96,7 @@ pub(super) fn apply_turn_models(
     catalog: &[MediaModel],
     turn: &StudioTurnView,
 ) -> bool {
-    let Some(snapshot) = snapshot_from_committed_turn(turn, catalog) else {
+    let Some(snapshot) = snapshot_from_committed_turn(turn, catalog, &[]) else {
         return false;
     };
     let mut next_selected = BTreeSet::new();
@@ -126,6 +126,7 @@ pub(super) fn apply_turn_models(
 pub(super) fn snapshot_from_committed_turn(
     turn: &StudioTurnView,
     catalog: &[MediaModel],
+    extra_artifacts: &[zeron_proto::StudioArtifactView],
 ) -> Option<ComposerSnapshot> {
     if turn.runs.is_empty() {
         return None;
@@ -163,7 +164,7 @@ pub(super) fn snapshot_from_committed_turn(
         mode,
         prompt: turn.prompt.clone(),
         duration,
-        attachments: attachments_from_committed_turn(turn),
+        attachments: attachments_from_committed_turn(turn, extra_artifacts),
         selected,
         source_turn_id: Some(turn.id),
         ..ComposerSnapshot::default()
@@ -198,7 +199,10 @@ fn duration_from_runs(turn: &StudioTurnView) -> Option<ControlValue> {
     })
 }
 
-fn attachments_from_committed_turn(turn: &StudioTurnView) -> Vec<ComposerAttachment> {
+fn attachments_from_committed_turn(
+    turn: &StudioTurnView,
+    extra_artifacts: &[zeron_proto::StudioArtifactView],
+) -> Vec<ComposerAttachment> {
     let mut inputs: Vec<_> = turn.runs.iter().flat_map(|run| run.inputs.iter()).collect();
     inputs.sort_by_key(|input| (input.role.as_str().to_owned(), input.ordinal));
     let mut seen = HashSet::new();
@@ -220,33 +224,51 @@ fn attachments_from_committed_turn(turn: &StudioTurnView) -> Vec<ComposerAttachm
                 },
             ),
         };
-        let artifact = turn
-            .runs
-            .iter()
-            .flat_map(|run| run.artifacts.iter())
-            .find(|artifact| match &input.source {
-                GenerationInputSource::Artifact { artifact_id } => artifact.id == *artifact_id,
-                GenerationInputSource::Asset { .. } => {
-                    !input.content_hash.is_empty() && artifact.content_hash == input.content_hash
-                }
-            });
+        let artifact = lookup_attachment_artifact(turn, extra_artifacts, input);
+        let Some(artifact) = artifact else {
+            // No GetStudioAsset RPC yet. Empty MIME/geometry fails map_tray.
+            continue;
+        };
+        if artifact.mime_type.is_empty() {
+            continue;
+        }
         attachments.push(ComposerAttachment {
             id,
-            kind: attachment_kind(input.role.as_str(), artifact.map(|item| item.media_kind)),
+            kind: attachment_kind(input.role.as_str(), Some(artifact.media_kind)),
             pending: false,
             origin,
-            mime_type: artifact
-                .map(|item| item.mime_type.clone())
-                .unwrap_or_default(),
-            byte_size: artifact.map(|item| item.size_bytes).unwrap_or(0),
-            width: artifact.and_then(|item| item.width),
-            height: artifact.and_then(|item| item.height),
-            duration_seconds: artifact.and_then(|item| item.duration_seconds),
-            content_hash: input.content_hash.clone(),
+            mime_type: artifact.mime_type.clone(),
+            byte_size: artifact.size_bytes,
+            width: artifact.width,
+            height: artifact.height,
+            duration_seconds: artifact.duration_seconds,
+            content_hash: if input.content_hash.is_empty() {
+                artifact.content_hash.clone()
+            } else {
+                input.content_hash.clone()
+            },
             role_hint: Some(input.role.clone()),
         });
     }
     attachments
+}
+
+fn lookup_attachment_artifact<'a>(
+    turn: &'a StudioTurnView,
+    extra_artifacts: &'a [zeron_proto::StudioArtifactView],
+    input: &zeron_studio::GenerationInput,
+) -> Option<&'a zeron_proto::StudioArtifactView> {
+    let mut known = turn
+        .runs
+        .iter()
+        .flat_map(|run| run.artifacts.iter())
+        .chain(extra_artifacts.iter());
+    known.find(|artifact| match &input.source {
+        GenerationInputSource::Artifact { artifact_id } => artifact.id == *artifact_id,
+        GenerationInputSource::Asset { .. } => {
+            !input.content_hash.is_empty() && artifact.content_hash == input.content_hash
+        }
+    })
 }
 
 fn attachment_kind(role: &str, media_kind: Option<MediaKind>) -> ComposerMediaKind {
@@ -373,7 +395,8 @@ mod tests {
     use chrono::Utc;
     use zeron_proto::{StudioArtifactView, StudioRunState, StudioRunView};
     use zeron_studio::{
-        ControlChoice, ControlKind, GenerationInput, ModelControl, StudioArtifactId, StudioAssetId,
+        ControlChoice, ControlKind, GenerationInput, InputConstraint, MimeConstraint, ModelControl,
+        StudioArtifactId, StudioAssetId, evaluate_composer,
     };
 
     fn test_model(id: &str, controls: Vec<ModelControl>) -> MediaModel {
@@ -650,9 +673,33 @@ mod tests {
             "seedance-r2v",
             MediaOperation::ReferenceToVideo,
             MediaKind::Video,
-            Vec::new(),
+            vec![ModelControl {
+                id: ControlId::new("duration"),
+                label: "Duration".into(),
+                description: None,
+                kind: ControlKind::Duration,
+                required: true,
+                default: None,
+                minimum: None,
+                maximum: None,
+                step: None,
+                choices: vec![ControlChoice {
+                    value: ControlValue::DurationSeconds { value: 8.0 },
+                    label: "8s".into(),
+                }],
+                visible_when: Vec::new(),
+            }],
         );
         r2v.video.adapter_family = zeron_studio::AdapterFamily::Seedance;
+        r2v.input_constraints = vec![InputConstraint {
+            role: zeron_studio::InputRole::new(zeron_studio::ROLE_REFERENCE),
+            minimum_count: 0,
+            maximum_count: 9,
+            mime: MimeConstraint {
+                accepted: vec!["image/png".into(), "image/jpeg".into(), "image/webp".into()],
+                ..MimeConstraint::default()
+            },
+        }];
         let mut run = test_run(
             r2v.clone(),
             2,
@@ -690,7 +737,8 @@ mod tests {
             content_hash: "def".into(),
         }];
         let turn = test_turn(vec![run]);
-        let snapshot = snapshot_from_committed_turn(&turn, &[r2v]).unwrap();
+        let snapshot =
+            snapshot_from_committed_turn(&turn, std::slice::from_ref(&r2v), &[]).unwrap();
         assert_eq!(snapshot.mode, ComposerMode::Video);
         assert_eq!(
             snapshot.duration,
@@ -698,19 +746,27 @@ mod tests {
         );
         assert_eq!(snapshot.selected.len(), 1);
         assert_eq!(snapshot.selected[0].output_count, 1);
-        assert_eq!(snapshot.attachments.len(), 2);
-        assert_eq!(snapshot.attachments[0].id, asset_id);
-        assert_eq!(
-            snapshot.attachments[0]
-                .role_hint
-                .as_ref()
-                .map(|role| role.as_str()),
-            Some(zeron_studio::ROLE_REFERENCE)
+        assert_eq!(snapshot.attachments.len(), 1);
+        assert!(
+            snapshot
+                .attachments
+                .iter()
+                .all(|attachment| attachment.id != asset_id),
+            "unproved asset stubs must not be restored"
         );
         assert!(matches!(
-            snapshot.attachments[1].origin,
+            snapshot.attachments[0].origin,
             AttachmentOrigin::Artifact { artifact_id: id } if id == artifact_id
         ));
         assert_eq!(snapshot.source_turn_id, Some(turn.id));
+        let view = evaluate_composer(&snapshot, std::slice::from_ref(&r2v));
+        assert!(view.send.enabled, "{:?}", view.conflicts);
+        assert!(
+            view.conflicts
+                .iter()
+                .all(|conflict| !conflict.blocks_send()),
+            "{:?}",
+            view.conflicts
+        );
     }
 }

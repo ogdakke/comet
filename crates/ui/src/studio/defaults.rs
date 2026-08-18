@@ -5,7 +5,7 @@
 //! default. Opening a conversation with turns then overlays that chat's last
 //! submitted run.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -121,8 +121,8 @@ impl StudioDefaults {
     }
 
     pub(super) fn capture(
-        image_ids: &BTreeSet<ModelId>,
-        video_ids: &BTreeSet<ModelId>,
+        image_ids: &[ModelId],
+        video_ids: &[ModelId],
         drafts: &HashMap<ModelId, DraftRunConfig>,
         favorites: &[ModelId],
         upscale: &UpscaleDefaults,
@@ -131,8 +131,8 @@ impl StudioDefaults {
         last_edit_model_id: Option<ModelId>,
     ) -> Self {
         Self {
-            selected_image_model_ids: image_ids.iter().cloned().collect(),
-            selected_video_model_ids: video_ids.iter().cloned().collect(),
+            selected_image_model_ids: image_ids.to_vec(),
+            selected_video_model_ids: video_ids.to_vec(),
             selected_model_ids: Vec::new(),
             drafts: drafts
                 .iter()
@@ -178,9 +178,7 @@ mod tests {
     #[test]
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let mut selected = BTreeSet::new();
-        selected.insert(ModelId::new("flux"));
-        selected.insert(ModelId::new("kling"));
+        let selected = [ModelId::new("kling"), ModelId::new("flux")];
         let mut drafts = HashMap::new();
         drafts.insert(
             ModelId::new("flux"),
@@ -197,7 +195,7 @@ mod tests {
         );
         let defaults = StudioDefaults::capture(
             &selected,
-            &BTreeSet::new(),
+            &[],
             &drafts,
             &[ModelId::new("flux")],
             &UpscaleDefaults::default(),
@@ -209,7 +207,7 @@ mod tests {
         assert_eq!(StudioDefaults::load(dir.path()), defaults);
         assert_eq!(
             defaults.selected_image_model_ids,
-            vec![ModelId::new("flux"), ModelId::new("kling")]
+            vec![ModelId::new("kling"), ModelId::new("flux")]
         );
         assert!(defaults.selected_video_model_ids.is_empty());
         assert_eq!(defaults.favorites, vec![ModelId::new("flux")]);
@@ -265,10 +263,8 @@ mod tests {
     #[test]
     fn per_mode_lists_and_video_duration_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let mut image = BTreeSet::new();
-        image.insert(ModelId::new("flux"));
-        let mut video = BTreeSet::new();
-        video.insert(ModelId::new("seedance-t2v"));
+        let image = [ModelId::new("flux")];
+        let video = [ModelId::new("seedance-t2v")];
         let defaults = StudioDefaults::capture(
             &image,
             &video,

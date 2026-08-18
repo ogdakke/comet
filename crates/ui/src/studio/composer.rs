@@ -16,7 +16,7 @@ use crate::motion;
 use crate::popover;
 use crate::theme::Theme;
 
-use super::draft::{DraftRunConfig, control_value_label, draft_aspect, restore_refs};
+use super::draft::{DraftRunConfig, control_value_label, restore_refs};
 use super::page::StudioPage;
 
 const IMAGE_PROMPT_PLACEHOLDER: &str = "Describe the image you want to create";
@@ -235,30 +235,16 @@ impl StudioPage {
         )
     }
 
-    pub(super) fn remembered_mode_lists(
-        &self,
-    ) -> (
-        std::collections::BTreeSet<ModelId>,
-        std::collections::BTreeSet<ModelId>,
-    ) {
-        let current = self.selected_models.clone();
+    pub(super) fn remembered_mode_lists(&self) -> (Vec<ModelId>, Vec<ModelId>) {
+        let current = self
+            .composer
+            .selected
+            .iter()
+            .map(|selected| selected.model_id.clone())
+            .collect();
         match self.composer.mode {
-            ComposerMode::Image => (
-                current,
-                self.remembered
-                    .selected_video_model_ids
-                    .iter()
-                    .cloned()
-                    .collect(),
-            ),
-            ComposerMode::Video => (
-                self.remembered
-                    .selected_image_model_ids
-                    .iter()
-                    .cloned()
-                    .collect(),
-                current,
-            ),
+            ComposerMode::Image => (current, self.remembered.selected_video_model_ids.clone()),
+            ComposerMode::Video => (self.remembered.selected_image_model_ids.clone(), current),
         }
     }
 
@@ -895,21 +881,18 @@ impl StudioPage {
             .cloned()
             .unwrap_or_else(|| DraftRunConfig::from_model(&model));
         let amount = draft.output_count;
-        let aspect = draft_aspect(&model, &draft);
         let aspect_label = model
             .controls
             .iter()
             .find(|control| control.id.as_str() == "aspect_ratio")
             .and_then(|control| draft.controls.get(&control.id).or(control.default.as_ref()))
-            .map(control_value_label)
-            .unwrap_or_else(|| format!("{}:{}", aspect.0, aspect.1));
+            .map(control_value_label);
         let resolution_label = model
             .controls
             .iter()
             .find(|control| control.id.as_str() == "resolution")
             .and_then(|control| draft.controls.get(&control.id).or(control.default.as_ref()))
-            .map(control_value_label)
-            .unwrap_or_else(|| "Auto".into());
+            .map(control_value_label);
         let menu_here = self.model_config_menu.get() == Some(&model.id);
         let menu = menu_here.then(|| {
             popover::anchored_menu_above(
@@ -970,8 +953,12 @@ impl StudioPage {
                     theme,
                 ))
             })
-            .child(config_readout(SharedString::from(aspect_label), theme))
-            .child(config_readout(SharedString::from(resolution_label), theme))
+            .when_some(aspect_label, |chip, label| {
+                chip.child(config_readout(SharedString::from(label), theme))
+            })
+            .when_some(resolution_label, |chip, label| {
+                chip.child(config_readout(SharedString::from(label), theme))
+            })
             .child(
                 div()
                     .id(SharedString::from(format!(

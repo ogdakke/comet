@@ -17,7 +17,7 @@ use zeron_proto::{
 use zeron_rpc::methods;
 use zeron_studio::{
     ComposerEvent, ComposerMode, ComposerSnapshot, ComposerView, ConflictId, StudioArtifactId,
-    StudioConversationId, apply_event, evaluate_composer,
+    StudioConversationId, evaluate_composer,
 };
 
 use crate::composer::{PromptHistory, PromptHistoryItem};
@@ -424,8 +424,7 @@ impl StudioPage {
                         .map(|value| value.conversations)
                         .unwrap_or_default();
                         page.apply_models(models.models);
-                        page.apply_remembered_or_default_models();
-                        page.persist_composer_defaults(cx);
+                        page.apply_remembered_or_default_models(cx);
                         page.refresh_account_balance(cx, false);
                         page.watch_conversations(cx);
                         page.watch_gallery(cx);
@@ -973,6 +972,9 @@ impl StudioPage {
             return;
         }
         self.sync_prompt_into_composer(cx);
+        // Engine requires request.prompt == composer.prompt; do not send a trimmed
+        // request next to an untrimmed snapshot.
+        self.composer.prompt = prompt.clone();
         if !self.composer_view.send.enabled {
             if let Some(conflict) = self
                 .composer_view
@@ -1095,25 +1097,13 @@ impl StudioPage {
         self.reevaluate_composer(None);
     }
 
-    pub(super) fn apply_remembered_or_default_models(&mut self) {
+    pub(super) fn apply_remembered_or_default_models(&mut self, cx: &mut Context<Self>) {
         let mode = self.remembered.last_mode;
         if mode == ComposerMode::Video {
             self.composer.duration = self.remembered.video_duration.clone();
         }
         let restore = self.restore_refs_for(mode);
-        let (snapshot, view) = apply_event(
-            self.composer.clone(),
-            &self.models,
-            ComposerEvent::SetMode { mode, restore },
-        );
-        self.composer = snapshot;
-        self.sync_from_composer_view(
-            &view,
-            &ComposerEvent::SetMode {
-                mode,
-                restore: Vec::new(),
-            },
-        );
+        self.apply_composer_event(ComposerEvent::SetMode { mode, restore }, None, cx);
     }
 
     pub(super) fn seed_composer_from_conversation(&mut self, cx: &mut Context<Self>) {
@@ -1129,14 +1119,15 @@ impl StudioPage {
             return;
         };
         if let Some(turn) = last_turn.as_ref()
-            && let Some(mut snapshot) = snapshot_from_committed_turn(turn, &self.models)
+            && let Some(mut snapshot) =
+                snapshot_from_committed_turn(turn, &self.models, &self.known_studio_artifacts())
         {
             // Opening a thread restores chips/tray, not the last prompt.
             snapshot.prompt = self.prompt.read(cx).text().to_owned();
             self.source_turn = Some(turn.id);
             self.apply_composer_event(ComposerEvent::RestoreDraft { snapshot }, None, cx);
         } else {
-            self.apply_remembered_or_default_models();
+            self.apply_remembered_or_default_models(cx);
         }
         self.composer_seeded_for = Some(conversation_id);
         self.persist_composer_defaults(cx);
@@ -1258,11 +1249,29 @@ impl StudioPage {
         cx.notify();
     }
 
+    fn known_studio_artifacts(&self) -> Vec<zeron_proto::StudioArtifactView> {
+        self.conversation
+            .as_ref()
+            .map(|view| {
+                view.turns
+                    .iter()
+                    .flat_map(|turn| {
+                        turn.runs
+                            .iter()
+                            .flat_map(|run| run.artifacts.iter().cloned())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub(super) fn use_prompt(&mut self, turn: &StudioTurnView, cx: &mut Context<Self>) {
         self.prompt_history.reset();
         self.prompt
             .update(cx, |input, cx| input.set_text(turn.prompt.clone(), cx));
-        if let Some(snapshot) = snapshot_from_committed_turn(turn, &self.models) {
+        if let Some(snapshot) =
+            snapshot_from_committed_turn(turn, &self.models, &self.known_studio_artifacts())
+        {
             self.apply_composer_event(ComposerEvent::RestoreDraft { snapshot }, None, cx);
         }
         if let Some(conversation_id) = self.selected_conversation {
