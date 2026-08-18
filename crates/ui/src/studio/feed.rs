@@ -374,6 +374,21 @@ fn remeasure_changed_feed_rows(list: &ListState, old: Option<&FeedLayoutSig>, ne
     }
 }
 
+/// Image ids on visible turns in `range`, including spliced descendants.
+fn lineage_image_ids(
+    view: &zeron_proto::StudioConversationView,
+    turns: &[StudioTurnView],
+    range: Range<usize>,
+) -> Vec<StudioArtifactId> {
+    let end = range.end.min(turns.len());
+    let start = range.start.min(end);
+    turns[start..end]
+        .iter()
+        .flat_map(|turn| super::lineage::lineage_tiles_for_turn(view, turn.id))
+        .filter_map(|tile| tile.artifact_id)
+        .collect()
+}
+
 /// Image ids on `turns[range]`. Non-image artifacts and holes are skipped.
 pub(super) fn feed_image_ids(
     turns: &[StudioTurnView],
@@ -755,11 +770,11 @@ impl StudioPage {
         )
     }
 
-    pub(super) fn feed_turns(&self) -> &[StudioTurnView] {
+    pub(super) fn feed_turns(&self) -> Vec<StudioTurnView> {
         self.conversation
             .as_ref()
-            .map(|view| view.turns.as_slice())
-            .unwrap_or(&[])
+            .map(super::lineage::visible_root_turns)
+            .unwrap_or_default()
     }
 
     pub(super) fn rail_should_show(&self, container_width: f32) -> bool {
@@ -860,18 +875,23 @@ impl StudioPage {
                 .map(|turn| TurnLayoutSig {
                     id: turn.id,
                     expanded: self.expanded_prompts.contains(&turn.id),
-                    slots: turn
-                        .runs
-                        .iter()
-                        .map(|run| {
-                            let (aw, ah) = run.display_aspect_ratio;
-                            (
-                                aw.min(u16::MAX as u32) as u16,
-                                ah.min(u16::MAX as u32) as u16,
-                                feed_output_slots(run).len() as u16,
-                            )
+                    slots: self
+                        .conversation
+                        .as_ref()
+                        .map(|view| {
+                            super::lineage::lineage_tiles_for_turn(view, turn.id)
+                                .into_iter()
+                                .map(|tile| {
+                                    let (aw, ah) = tile.aspect;
+                                    (
+                                        aw.min(u16::MAX as u32) as u16,
+                                        ah.min(u16::MAX as u32) as u16,
+                                        1u16,
+                                    )
+                                })
+                                .collect()
                         })
-                        .collect(),
+                        .unwrap_or_default(),
                 })
                 .collect(),
         }
@@ -919,7 +939,14 @@ impl StudioPage {
         let visible = feed_visible_or_tail(self.feed_visible_rows.clone(), turns.len());
         let start = visible.start.saturating_sub(extra);
         let end = visible.end.saturating_add(extra).min(turns.len());
-        feed_image_ids(turns, start..end)
+        let Some(view) = self.conversation.as_ref() else {
+            return Vec::new();
+        };
+        turns[start..end]
+            .iter()
+            .flat_map(|turn| super::lineage::lineage_tiles_for_turn(view, turn.id))
+            .filter_map(|tile| tile.artifact_id)
+            .collect()
     }
 
     /// The list's scroll handler is wheel/touch only. Scrollbar
@@ -1001,8 +1028,11 @@ impl StudioPage {
         let list = &self.feed_list;
         let viewport = list.viewport_bounds();
         let viewport_h = f32::from(viewport.size.height);
+        let Some(view) = self.conversation.as_ref() else {
+            return Vec::new();
+        };
         if viewport_h < 1.0 {
-            let mut fallback = feed_image_ids(turns, visible);
+            let mut fallback = lineage_image_ids(view, &turns, visible);
             fallback.truncate(FEED_DISPLAY_FALLBACK_MAX);
             return fallback;
         }
@@ -1035,25 +1065,19 @@ impl StudioPage {
             let header = estimated_turn_header(turn, available, expanded);
             let turn_top = f32::from(bounds.top());
             let mut slot = 0usize;
-            for run in &turn.runs {
-                let (aw, ah) = run.display_aspect_ratio;
+            for tile in super::lineage::lineage_tiles_for_turn(view, turn.id) {
+                let (aw, ah) = tile.aspect;
                 let tile_h = tile_width * ah as f32 / aw.max(1) as f32;
-                for (_, id) in feed_output_slots(run) {
-                    if let Some(id) = id
-                        && run.artifacts.iter().any(|artifact| {
-                            artifact.id == id && artifact.media_kind == MediaKind::Image
-                        })
-                    {
-                        let (top, bottom) =
-                            feed_tile_vertical_span(turn_top, header, slot, columns, tile_h, gap);
-                        tiles.push((id, top, bottom));
-                    }
-                    slot += 1;
+                if let Some(id) = tile.artifact_id {
+                    let (top, bottom) =
+                        feed_tile_vertical_span(turn_top, header, slot, columns, tile_h, gap);
+                    tiles.push((id, top, bottom));
                 }
+                slot += 1;
             }
         }
         if !any_bounds {
-            let mut fallback = feed_image_ids(turns, visible);
+            let mut fallback = lineage_image_ids(view, &turns, visible);
             fallback.truncate(FEED_DISPLAY_FALLBACK_MAX);
             return fallback;
         }
@@ -1407,22 +1431,25 @@ impl StudioPage {
         let clampable = prompt_exceeds_collapsed_lines(&turn.prompt, inner_width);
         let collapsed = clampable && !expanded;
         let mut grid = div().w_full().flex().flex_row().flex_wrap().gap(px(gap));
-        for (run_ix, run) in turn.runs.iter().enumerate() {
-            for (output_ix, artifact) in feed_output_slots(run) {
-                grid = grid.child(self.render_tile(
-                    turn_ix,
-                    run_ix,
-                    output_ix,
-                    tile_width,
-                    run.display_aspect_ratio,
-                    run.state,
-                    artifact,
-                    run.progress,
-                    theme,
-                    window,
-                    cx,
-                ));
-            }
+        let tiles = self
+            .conversation
+            .as_ref()
+            .map(|view| super::lineage::lineage_tiles_for_turn(view, turn.id))
+            .unwrap_or_default();
+        for tile in tiles {
+            grid = grid.child(self.render_tile(
+                turn_ix,
+                tile.run_ix,
+                tile.output_ix,
+                tile_width,
+                tile.aspect,
+                tile.state,
+                tile.artifact_id,
+                tile.progress,
+                theme,
+                window,
+                cx,
+            ));
         }
         let retry_runs = turn
             .runs
@@ -1628,7 +1655,7 @@ impl StudioPage {
         if !self.rail_should_show(self.feed_container_width(window)) {
             return gpui::Empty.into_any_element();
         }
-        let ticks = studio_rail_ticks(self.feed_turns());
+        let ticks = studio_rail_ticks(&self.feed_turns());
         if ticks.len() < 2 {
             return gpui::Empty.into_any_element();
         }

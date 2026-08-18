@@ -20,6 +20,7 @@ mod feed;
 mod gallery;
 mod image_menu;
 mod images;
+mod lineage;
 mod page;
 mod providers;
 mod upscale;

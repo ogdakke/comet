@@ -116,7 +116,6 @@ pub struct StudioPage {
     pub(super) upscale_settings_menu: popover::Popup<StudioArtifactId>,
     pub(super) upscale_jobs: HashMap<StudioArtifactId, UpscaleJob>,
     pub(super) upscale_watch_tasks: HashMap<StudioConversationId, Task<()>>,
-    pub(super) upscale_download_tasks: HashMap<StudioArtifactId, Task<()>>,
     pub(super) selected_artifact: Option<StudioArtifactId>,
     pub(super) lightbox_frames: Vec<super::artifact::ArtifactFrame>,
     pub(super) compare_pressed: bool,
@@ -250,7 +249,6 @@ impl StudioPage {
             upscale_settings_menu: popover::Popup::default(),
             upscale_jobs: HashMap::new(),
             upscale_watch_tasks: HashMap::new(),
-            upscale_download_tasks: HashMap::new(),
             selected_artifact: None,
             lightbox_frames: Vec::new(),
             compare_pressed: false,
@@ -605,19 +603,18 @@ impl StudioPage {
                 };
                 if this
                     .update(cx, |page, cx| {
-                        let visible_view = super::upscale::visible_conversation_view(&view);
                         let first_open = page.conversation.is_none();
                         let settled = page
                             .conversation
                             .as_ref()
-                            .is_some_and(|previous| newly_settled_runs(previous, &visible_view));
+                            .is_some_and(|previous| newly_settled_runs(previous, &view));
                         let submitted_turn_arrived = page
                             .scroll_after_turn_count
-                            .is_some_and(|before| visible_view.turns.len() > before);
-                        let last_turn_id = visible_view.turns.last().map(|turn| turn.id);
+                            .is_some_and(|before| view.turns.len() > before);
+                        let last_turn_id = view.turns.last().map(|turn| turn.id);
                         page.observe_upscale_view(&view, cx);
-                        page.apply_conversation_summary(visible_view.conversation.clone(), cx);
-                        page.conversation = Some(visible_view);
+                        page.apply_conversation_summary(view.conversation.clone(), cx);
+                        page.conversation = Some(view);
                         page.snap_prompt_history(cx);
                         if settled {
                             page.refresh_account_balance(cx, true);

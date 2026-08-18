@@ -13,9 +13,7 @@ use gpui::{
 };
 use zeron_proto::{StudioConversationView, StudioGalleryItem};
 use zeron_rpc::methods;
-use zeron_studio::{
-    GenerationInputSource, MediaKind, StudioArtifactId, StudioConversationId, StudioTurnId,
-};
+use zeron_studio::{MediaKind, StudioArtifactId, StudioConversationId, StudioTurnId};
 
 use crate::state::EngineHandle;
 use crate::theme::Theme;
@@ -100,39 +98,34 @@ pub(super) fn frames_from_gallery(items: &[StudioGalleryItem]) -> Vec<ArtifactFr
 }
 
 pub(super) fn frames_from_conversation(view: &StudioConversationView) -> Vec<ArtifactFrame> {
-    view.turns
-        .iter()
-        .flat_map(|turn| {
-            turn.runs.iter().flat_map(move |run| {
-                run.artifacts
-                    .iter()
-                    .filter(|artifact| artifact.media_kind == MediaKind::Image)
-                    .map(move |artifact| ArtifactFrame {
-                        id: artifact.id,
-                        conversation_id: view.conversation.id,
-                        turn_id: turn.id,
-                        prompt: run
-                            .prompt
-                            .clone()
-                            .filter(|prompt| !prompt.is_empty())
-                            .unwrap_or_else(|| turn.prompt.clone()),
-                        model_display_name: run.model.display_name.clone(),
-                        mime_type: artifact.mime_type.clone(),
-                        size_bytes: artifact.size_bytes,
-                        width: artifact.width,
-                        height: artifact.height,
-                        source_artifact_id: run.inputs.iter().find_map(|input| {
-                            if input.role.as_str() != "source" {
-                                return None;
-                            }
-                            match &input.source {
-                                GenerationInputSource::Artifact { artifact_id } => {
-                                    Some(*artifact_id)
-                                }
-                                GenerationInputSource::Asset { .. } => None,
-                            }
-                        }),
-                    })
+    super::lineage::lineage_tiles(view)
+        .into_iter()
+        .filter_map(|tile| {
+            let artifact_id = tile.artifact_id?;
+            let turn = view.turns.iter().find(|turn| turn.id == tile.turn_id)?;
+            let run = turn.runs.iter().find(|run| run.id == tile.run_id)?;
+            let artifact = run
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.id == artifact_id)?;
+            if artifact.media_kind != MediaKind::Image {
+                return None;
+            }
+            Some(ArtifactFrame {
+                id: artifact.id,
+                conversation_id: view.conversation.id,
+                turn_id: turn.id,
+                prompt: run
+                    .prompt
+                    .clone()
+                    .filter(|prompt| !prompt.is_empty())
+                    .unwrap_or_else(|| turn.prompt.clone()),
+                model_display_name: run.model.display_name.clone(),
+                mime_type: artifact.mime_type.clone(),
+                size_bytes: artifact.size_bytes,
+                width: artifact.width,
+                height: artifact.height,
+                source_artifact_id: tile.source_artifact_id,
             })
         })
         .collect()

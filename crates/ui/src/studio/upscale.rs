@@ -1,14 +1,12 @@
 //! Artifact-viewer upscale action, settings, and background completion work.
 //!
-//! Upscaling is intentionally separate from the normal generation composer:
-//! it is an artifact action with a small persisted settings surface, and its
-//! result is saved to Downloads rather than added to the current viewer.
+//! Upscaling is an artifact action with a small persisted settings surface.
+//! The result is appended to the source image's turn, next to that image.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use gpui::{AnyElement, Context, IntoElement, SharedString, div, prelude::*, px};
-use zeron_proto::{StudioArtifactView, StudioConversationView, StudioRunState, StudioTurnView};
+use zeron_proto::{StudioConversationView, StudioRunState, StudioTurnView};
 use zeron_rpc::methods;
 use zeron_studio::{
     ControlId, ControlValue, GenerationInputSource, MediaModel, MediaOperation, StudioArtifactId,
@@ -364,28 +362,20 @@ impl StudioPage {
             let result = engine
                 .client()
                 .call(
-                    methods::CREATE_STUDIO_TURN,
+                    methods::APPEND_STUDIO_DERIVED_RUN,
                     serde_json::json!({
-                        "conversationId": conversation_id,
+                        "sourceArtifactId": artifact_id,
                         "prompt": "",
-                        "runs": [{
+                        "run": {
                             "providerId": provider_id,
                             "modelId": model_id,
                             "operation": operation,
                             "outputCount": 1,
                             "controls": controls,
-                            "inputs": [{
-                                "role": "source",
-                                "ordinal": 0,
-                                "source": {
-                                    "source": "artifact",
-                                    "artifact_id": artifact_id,
-                                },
-                                "content_hash": "",
-                            }],
+                            "inputs": [],
                             "manifestVersion": manifest_version,
                             "displayAspectRatio": display_aspect_ratio,
-                        }],
+                        },
                     }),
                 )
                 .await;
@@ -484,24 +474,15 @@ impl StudioPage {
                 ) {
                     return None;
                 }
-                Some((
-                    *source_id,
-                    run.state,
-                    run.error.clone(),
-                    run.artifacts.clone(),
-                ))
+                Some((*source_id, run.state, run.error.clone()))
             })
             .collect::<Vec<_>>();
 
         let had_completed = !completed.is_empty();
-        for (source_id, state, error, artifacts) in completed {
+        for (source_id, state, error) in completed {
             self.upscale_jobs.remove(&source_id);
             match state {
-                StudioRunState::Succeeded => {
-                    for artifact in artifacts {
-                        self.queue_upscale_download(&artifact, cx);
-                    }
-                }
+                StudioRunState::Succeeded => {}
                 StudioRunState::Failed => {
                     self.error = Some(
                         format!(
@@ -524,58 +505,14 @@ impl StudioPage {
             cx.notify();
         }
     }
-
-    fn queue_upscale_download(&mut self, artifact: &StudioArtifactView, cx: &mut Context<Self>) {
-        let Some(engine) = self.engine(cx) else {
-            return;
-        };
-        let destination =
-            default_download_directory().join(upscale_file_name(artifact.id, &artifact.mime_type));
-        let artifact_id = artifact.id;
-        let task = cx.spawn(async move |this, cx| {
-            let result = match super::artifact::read_artifact_bytes(&engine, artifact_id).await {
-                Ok((_, _, bytes)) => {
-                    cx.background_executor()
-                        .spawn(async move {
-                            if let Some(parent) = destination.parent() {
-                                std::fs::create_dir_all(parent)
-                                    .map_err(|error| error.to_string())?;
-                            }
-                            super::artifact::write_artifact_file(destination, bytes)
-                        })
-                        .await
-                }
-                Err(error) => Err(error),
-            };
-            this.update(cx, |page, cx| {
-                page.upscale_download_tasks.remove(&artifact_id);
-                if let Err(error) = result {
-                    page.error = Some(format!("Could not save upscaled image: {error}").into());
-                }
-                cx.notify();
-            })
-            .ok();
-        });
-        self.upscale_download_tasks.insert(artifact_id, task);
-    }
 }
 
-/// Upscale runs use a Studio turn as their durable engine job, but that turn
-/// is an internal artifact operation rather than a user-visible message.
+/// Hide derived-only turns as feed rows. Their images are spliced next to
+/// the source by [`super::lineage`].
 pub(super) fn visible_conversation_view(view: &StudioConversationView) -> StudioConversationView {
     let mut visible = view.clone();
+    visible.turns = super::lineage::visible_root_turns(view);
     visible
-        .turns
-        .retain(|turn| !is_background_upscale_turn(turn));
-    visible
-}
-
-fn is_background_upscale_turn(turn: &StudioTurnView) -> bool {
-    !turn.runs.is_empty()
-        && turn
-            .runs
-            .iter()
-            .all(|run| run.model.operation == MediaOperation::Upscale)
 }
 
 fn upscale_controls(
@@ -748,22 +685,6 @@ fn step_button(
         .child(label)
 }
 
-fn default_download_directory() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join("Downloads"))
-        .unwrap_or_else(|| PathBuf::from("Downloads"))
-}
-
-fn upscale_file_name(artifact_id: StudioArtifactId, mime_type: &str) -> String {
-    let extension = match mime_type {
-        "image/jpeg" => "jpg",
-        "image/webp" => "webp",
-        _ => "png",
-    };
-    format!("studio-upscale-{}.{extension}", artifact_id.0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,8 +787,34 @@ mod tests {
     fn background_upscale_turns_are_removed_from_the_visible_view() {
         let mut regular_model = upscale_model();
         regular_model.operation = MediaOperation::TextToImage;
-        let regular = test_turn(regular_model, "a fox");
-        let upscale = test_turn(upscale_model(), "");
+        let source_id = StudioArtifactId::new();
+        let mut regular = test_turn(regular_model, "a fox");
+        regular.runs[0]
+            .artifacts
+            .push(zeron_proto::StudioArtifactView {
+                id: source_id,
+                output_position: 0,
+                media_kind: zeron_studio::MediaKind::Image,
+                mime_type: "image/png".into(),
+                size_bytes: 1,
+                width: Some(1),
+                height: Some(1),
+                duration_seconds: None,
+                metadata: serde_json::Value::Null,
+                created_at: Utc::now(),
+                thumbhash: None,
+                content_hash: String::new(),
+            });
+        regular.runs[0].state = StudioRunState::Succeeded;
+        let mut upscale = test_turn(upscale_model(), "");
+        upscale.runs[0].inputs.push(zeron_studio::GenerationInput {
+            role: "source".into(),
+            ordinal: 0,
+            source: GenerationInputSource::Artifact {
+                artifact_id: source_id,
+            },
+            content_hash: String::new(),
+        });
         let conversation_id = StudioConversationId::new();
         let view = StudioConversationView {
             conversation: zeron_proto::StudioConversationSummary {
