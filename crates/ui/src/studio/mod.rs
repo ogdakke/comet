@@ -4,6 +4,7 @@
 //! - [`gallery`] — profile-wide image grid, multi-select, and bulk actions;
 //! - [`feed`] — tiles, turns, and the tick rail;
 //! - [`composer`] — model picker, per-model controls, and generate;
+//! - [`tray`] — reference attach, ImportStudioAsset, budgets, Make video;
 //! - [`artifact`] — full-bleed image strip, filmstrip, and inspector;
 //! - [`image_menu`] — right-click / two-finger-tap actions on visible images;
 //! - [`upscale`] — artifact-viewer upscale action, settings, and completion;
@@ -26,6 +27,7 @@ mod lineage;
 mod page;
 mod paint;
 mod providers;
+mod tray;
 mod upscale;
 
 pub use feed::grid_columns;

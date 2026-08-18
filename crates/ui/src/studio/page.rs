@@ -2,10 +2,11 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Point, Render,
+    Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Image, Pixels, Point, Render,
     SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 use zeron_proto::{
@@ -17,7 +18,7 @@ use zeron_proto::{
 use zeron_rpc::methods;
 use zeron_studio::{
     ComposerEvent, ComposerMode, ComposerSnapshot, ComposerView, ConflictId, StudioArtifactId,
-    StudioConversationId, evaluate_composer,
+    StudioAssetId, StudioConversationId, evaluate_composer,
 };
 
 use crate::composer::{PromptHistory, PromptHistoryItem};
@@ -55,6 +56,9 @@ pub struct StudioPage {
     pub(super) popup_conflict: Option<ConflictId>,
     pub(super) conflict_more_open: bool,
     pub(super) catalog_refresh_task: Option<Task<()>>,
+    pub(super) import_tasks: HashMap<StudioAssetId, Task<()>>,
+    pub(super) tray_picker_task: Option<Task<()>>,
+    pub(super) tray_previews: HashMap<StudioAssetId, Arc<Image>>,
     pub(super) remembered: StudioDefaults,
     pub(super) live_quotes: HashMap<zeron_studio::ModelId, zeron_studio::Quote>,
     pub(super) quote_generation: u64,
@@ -242,6 +246,9 @@ impl StudioPage {
             popup_conflict: None,
             conflict_more_open: false,
             catalog_refresh_task: None,
+            import_tasks: HashMap::new(),
+            tray_picker_task: None,
+            tray_previews: HashMap::new(),
             remembered,
             live_quotes: HashMap::new(),
             quote_generation: 0,

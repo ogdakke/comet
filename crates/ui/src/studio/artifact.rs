@@ -2771,6 +2771,8 @@ impl StudioPage {
                     inspector
                         .child(self.render_edit_action(id, theme, cx))
                         .child(div().h(px(8.0)))
+                        .child(self.render_make_video_action(id, theme, cx))
+                        .child(div().h(px(8.0)))
                         .child(self.render_artifact_upscale_actions(id, theme, cx))
                         .child(self.render_inspector_actions(id, theme, cx))
                 })

@@ -904,6 +904,12 @@ impl StudioPage {
         let trigger_id = model.id.clone();
         let press_id = model.id.clone();
         let remove_id = model.id.clone();
+        let badge = self
+            .composer_view
+            .models
+            .iter()
+            .find(|chip| chip.model_id == model.id)
+            .and_then(|chip| chip.badge.clone());
 
         div()
             .id(SharedString::from(format!(
@@ -947,6 +953,16 @@ impl StudioPage {
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .child(SharedString::from(model.display_name)),
             )
+            .when_some(badge, |chip, badge| {
+                chip.child(
+                    div()
+                        .max_w(px(92.0))
+                        .truncate()
+                        .text_size(px(10.0))
+                        .text_color(theme.warning)
+                        .child(SharedString::from(badge)),
+                )
+            })
             .when(self.composer.mode != ComposerMode::Video, |chip| {
                 chip.child(config_readout(
                     SharedString::from(format!("{amount}×")),
@@ -1499,6 +1515,7 @@ impl StudioPage {
                 )
             })
             .child(self.render_mode_bar(theme, cx))
+            .children(self.render_attachment_tray(theme, cx))
             .child(body)
             .children(self.render_conflict_popup(theme, cx));
 
@@ -1528,6 +1545,11 @@ impl StudioPage {
             .child(self.render_mode_segment(theme, cx));
         if video {
             row = row.child(self.render_duration_pills(theme, cx));
+        } else {
+            row = row.child(div().flex_1());
+        }
+        if let Some(budget) = self.render_prompt_budget(theme) {
+            row = row.child(budget);
         }
         row
     }
