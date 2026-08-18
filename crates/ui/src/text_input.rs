@@ -779,6 +779,8 @@ fn editor_bindings(
     let mut bindings = vec![
         KeyBinding::new("enter", Submit, ctx),
         KeyBinding::new("shift-enter", Newline, ctx),
+        KeyBinding::new("cmd-enter", Submit, ctx),
+        KeyBinding::new("ctrl-enter", Submit, ctx),
         KeyBinding::new("backspace", Backspace, ctx),
         KeyBinding::new("delete", Delete, ctx),
         KeyBinding::new("left", Left, ctx),
