@@ -14,8 +14,7 @@ use gpui::{
 use zeron_proto::{StudioConversationView, StudioGalleryItem};
 use zeron_rpc::methods;
 use zeron_studio::{
-    GenerationInputSource, MediaKind, MediaOperation, StudioArtifactId, StudioConversationId,
-    StudioTurnId,
+    GenerationInputSource, MediaKind, StudioArtifactId, StudioConversationId, StudioTurnId,
 };
 
 use crate::state::EngineHandle;
@@ -79,7 +78,7 @@ pub(super) struct ArtifactFrame {
     pub size_bytes: u64,
     pub width: Option<u32>,
     pub height: Option<u32>,
-    pub upscaled_from_artifact_id: Option<StudioArtifactId>,
+    pub source_artifact_id: Option<StudioArtifactId>,
 }
 
 pub(super) fn frames_from_gallery(items: &[StudioGalleryItem]) -> Vec<ArtifactFrame> {
@@ -95,7 +94,7 @@ pub(super) fn frames_from_gallery(items: &[StudioGalleryItem]) -> Vec<ArtifactFr
             size_bytes: item.size_bytes,
             width: item.width,
             height: item.height,
-            upscaled_from_artifact_id: item.upscaled_from_artifact_id,
+            source_artifact_id: item.source_artifact_id,
         })
         .collect()
 }
@@ -112,22 +111,27 @@ pub(super) fn frames_from_conversation(view: &StudioConversationView) -> Vec<Art
                         id: artifact.id,
                         conversation_id: view.conversation.id,
                         turn_id: turn.id,
-                        prompt: turn.prompt.clone(),
+                        prompt: run
+                            .prompt
+                            .clone()
+                            .filter(|prompt| !prompt.is_empty())
+                            .unwrap_or_else(|| turn.prompt.clone()),
                         model_display_name: run.model.display_name.clone(),
                         mime_type: artifact.mime_type.clone(),
                         size_bytes: artifact.size_bytes,
                         width: artifact.width,
                         height: artifact.height,
-                        upscaled_from_artifact_id: (run.model.operation == MediaOperation::Upscale)
-                            .then(|| {
-                                run.inputs.iter().find_map(|input| match &input.source {
-                                    GenerationInputSource::Artifact { artifact_id } => {
-                                        Some(*artifact_id)
-                                    }
-                                    GenerationInputSource::Asset { .. } => None,
-                                })
-                            })
-                            .flatten(),
+                        source_artifact_id: run.inputs.iter().find_map(|input| {
+                            if input.role.as_str() != "source" {
+                                return None;
+                            }
+                            match &input.source {
+                                GenerationInputSource::Artifact { artifact_id } => {
+                                    Some(*artifact_id)
+                                }
+                                GenerationInputSource::Asset { .. } => None,
+                            }
+                        }),
                     })
             })
         })
@@ -870,7 +874,7 @@ impl StudioPage {
 
     fn upscaled_source_for(&self, artifact_id: StudioArtifactId) -> Option<StudioArtifactId> {
         self.artifact_frame(artifact_id)
-            .and_then(|frame| frame.upscaled_from_artifact_id)
+            .and_then(|frame| frame.source_artifact_id)
     }
 
     fn lightbox_display_artifact_id(&self) -> Option<StudioArtifactId> {
@@ -2695,7 +2699,7 @@ mod tests {
             size_bytes: 1,
             width: Some(1),
             height: Some(1),
-            upscaled_from_artifact_id: None,
+            source_artifact_id: None,
         }
     }
 
@@ -2784,6 +2788,7 @@ mod tests {
                     progress: None,
                     error: None,
                     quote: None,
+                    prompt: None,
                     inputs: Vec::new(),
                     artifacts: vec![artifact.clone()],
                 }],

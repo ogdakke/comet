@@ -151,6 +151,7 @@ pub mod methods {
     pub const WATCH_STUDIO_CONVERSATION: &str = "WatchStudioConversation";
     pub const CREATE_STUDIO_TURN: &str = "CreateStudioTurn";
     pub const EXTEND_STUDIO_TURN: &str = "ExtendStudioTurn";
+    pub const APPEND_STUDIO_DERIVED_RUN: &str = "AppendStudioDerivedRun";
     pub const QUOTE_STUDIO_BATCH: &str = "QuoteStudioBatch";
     pub const GET_STUDIO_PROVIDER_BALANCE: &str = "GetStudioProviderBalance";
     pub const RETRY_STUDIO_RUN: &str = "RetryStudioRun";

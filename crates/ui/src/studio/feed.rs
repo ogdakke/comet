@@ -1841,6 +1841,7 @@ mod tests {
             progress: None,
             error: None,
             quote: None,
+            prompt: None,
             inputs: Vec::new(),
             artifacts: Vec::new(),
         }

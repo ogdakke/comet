@@ -1,7 +1,7 @@
 use zeron_proto::{
-    ExtendStudioTurnRequest, ListStudioArtifactsResponse, ListStudioProvidersResponse,
-    ProviderValidationState, QuoteStudioBatchResponse, QuoteStudioRunView,
-    ReadStudioArtifactChunkRequest, SetStudioProviderCredentialRequest,
+    AppendStudioDerivedRunRequest, ExtendStudioTurnRequest, ListStudioArtifactsResponse,
+    ListStudioProvidersResponse, ProviderValidationState, QuoteStudioBatchResponse,
+    QuoteStudioRunView, ReadStudioArtifactChunkRequest, SetStudioProviderCredentialRequest,
     SetStudioProviderPreferencesRequest, StudioConversationSummary, StudioGalleryItem,
     StudioProviderBalanceResponse, StudioProviderConnection, StudioRunState,
 };
@@ -72,6 +72,29 @@ fn extend_turn_uses_camel_case_wire_shape() {
     let json = serde_json::to_value(request).unwrap();
     assert!(json.get("turnId").is_some());
     assert!(json.get("turn_id").is_none());
+}
+
+#[test]
+fn append_derived_run_uses_camel_case_wire_shape() {
+    let request = AppendStudioDerivedRunRequest {
+        source_artifact_id: StudioArtifactId::new(),
+        prompt: "make the sky sunrise".into(),
+        run: zeron_proto::StudioModelRunSpec {
+            provider_id: "venice".into(),
+            model_id: "firered-image-edit".into(),
+            operation: zeron_studio::MediaOperation::ImageEdit,
+            output_count: 1,
+            controls: Default::default(),
+            inputs: Vec::new(),
+            manifest_version: "v1".into(),
+            display_aspect_ratio: (1, 1),
+        },
+        mask_png_base64: None,
+    };
+    let json = serde_json::to_value(request).unwrap();
+    assert!(json.get("sourceArtifactId").is_some());
+    assert!(json.get("maskPngBase64").is_none());
+    assert_eq!(json["run"]["operation"], "image_edit");
 }
 
 #[test]
@@ -150,7 +173,7 @@ fn gallery_items_use_camel_case_wire_shape() {
             model_display_name: "Image model".into(),
             created_at: chrono::Utc::now(),
             thumbhash: Some("3OcRJYB4d3h/iIeHeEh3eIhw+j3A".into()),
-            upscaled_from_artifact_id: None,
+            source_artifact_id: None,
         }],
     };
     let json = serde_json::to_value(response).unwrap();

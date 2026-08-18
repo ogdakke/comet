@@ -184,6 +184,19 @@ pub struct ExtendStudioTurnRequest {
     pub turn_id: StudioTurnId,
 }
 
+/// Append an edit or upscale run to the source artifact's existing turn.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppendStudioDerivedRunRequest {
+    pub source_artifact_id: StudioArtifactId,
+    pub prompt: String,
+    pub run: StudioModelRunSpec,
+    /// Optional source-resolution mask PNG (white = edit region). Published as
+    /// a studio asset and attached as `role = mask`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask_png_base64: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteStudioBatchRequest {
@@ -275,6 +288,10 @@ pub struct StudioRunView {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quote: Option<Quote>,
+    /// Prompt stored on the run. Present for image edits; generate runs usually
+    /// match the turn prompt, and upscales are empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
     #[serde(default)]
     pub inputs: Vec<GenerationInput>,
     pub artifacts: Vec<StudioArtifactView>,
@@ -322,9 +339,13 @@ pub struct StudioGalleryItem {
     pub created_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbhash: Option<String>,
-    /// The source image for an upscale artifact, when the engine persisted one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upscaled_from_artifact_id: Option<StudioArtifactId>,
+    /// Parent image for an edit or upscale artifact.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "upscaledFromArtifactId"
+    )]
+    pub source_artifact_id: Option<StudioArtifactId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

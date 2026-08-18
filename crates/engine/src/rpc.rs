@@ -49,6 +49,7 @@
 //! `QueueCommand`, and `WatchDocMessages`.
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde::Deserialize;
@@ -58,16 +59,17 @@ use tokio::sync::watch;
 
 use zeron_doc::{MessagePart, SessionCommandPayload};
 use zeron_proto::{
-    ArchiveStudioConversationRequest, ChatConfig, CreateStudioConversationRequest,
-    CreateStudioTurnRequest, DeleteStudioArtifactRequest, DeleteStudioConversationRequest,
-    EngineInfo, ExtendStudioTurnRequest, HarnessId, ListStudioArtifactsResponse,
-    ListStudioConversationsRequest, ListStudioConversationsResponse, ListStudioModelsRequest,
-    ListStudioModelsResponse, ListStudioProvidersResponse, MarkStudioConversationSeenRequest,
-    ProviderValidationState, QuoteStudioBatchRequest, QuoteStudioBatchResponse, QuoteStudioRunView,
-    ReadStudioArtifactChunkRequest, RenameStudioConversationRequest, RetryStudioRunRequest,
-    SetStudioProviderCredentialRequest, SetStudioProviderPreferencesRequest, StudioModelRunSpec,
-    StudioProviderBalanceResponse, StudioProviderConnection, StudioProviderRequest, ToolCall,
-    WatchStudioConversationRequest, WorkspaceScope,
+    AppendStudioDerivedRunRequest, ArchiveStudioConversationRequest, ChatConfig,
+    CreateStudioConversationRequest, CreateStudioTurnRequest, DeleteStudioArtifactRequest,
+    DeleteStudioConversationRequest, EngineInfo, ExtendStudioTurnRequest, HarnessId,
+    ListStudioArtifactsResponse, ListStudioConversationsRequest, ListStudioConversationsResponse,
+    ListStudioModelsRequest, ListStudioModelsResponse, ListStudioProvidersResponse,
+    MarkStudioConversationSeenRequest, ProviderValidationState, QuoteStudioBatchRequest,
+    QuoteStudioBatchResponse, QuoteStudioRunView, ReadStudioArtifactChunkRequest,
+    RenameStudioConversationRequest, RetryStudioRunRequest, SetStudioProviderCredentialRequest,
+    SetStudioProviderPreferencesRequest, StudioModelRunSpec, StudioProviderBalanceResponse,
+    StudioProviderConnection, StudioProviderRequest, ToolCall, WatchStudioConversationRequest,
+    WorkspaceScope,
 };
 use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
@@ -538,10 +540,11 @@ impl EngineRpc {
                     spec.operation,
                     zeron_studio::MediaOperation::TextToImage
                         | zeron_studio::MediaOperation::Upscale
+                        | zeron_studio::MediaOperation::ImageEdit
                 )
             {
                 return Err(RpcError::Failed(
-                    "only text-to-image and upscale runs are available in the current Studio slice"
+                    "only text-to-image, image-edit, and upscale runs are available in the current Studio slice"
                         .into(),
                 ));
             }
@@ -1451,6 +1454,15 @@ impl RpcService for EngineRpc {
             }
             methods::CREATE_STUDIO_TURN => {
                 let request: CreateStudioTurnRequest = parse_params(params)?;
+                if request
+                    .runs
+                    .iter()
+                    .any(|run| run.operation == zeron_studio::MediaOperation::ImageEdit)
+                {
+                    return Err(RpcError::Failed(
+                        "image edits must be appended to the source image's turn".into(),
+                    ));
+                }
                 let prepared = self
                     .prepare_studio_runs(&request.prompt, request.runs, true)
                     .await?;
@@ -1492,6 +1504,111 @@ impl RpcService for EngineRpc {
                 let (conversation_id, stored) = self
                     .studio
                     .extend_turn(request.turn_id, &prepared, &self.engine_info.device_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let initial_view = self
+                    .studio
+                    .conversation_view(conversation_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let futures = stored
+                    .into_iter()
+                    .map(|run| {
+                        let store = self.studio.clone();
+                        let providers = self.studio_providers.clone();
+                        let credentials = self.studio_credentials.clone();
+                        execute_studio_run(store, providers, credentials, run)
+                    })
+                    .collect::<Vec<_>>();
+                tokio::spawn(async move {
+                    let _ = futures::future::join_all(futures).await;
+                });
+                RpcReply::value(&initial_view)
+            }
+            methods::APPEND_STUDIO_DERIVED_RUN => {
+                let mut request: AppendStudioDerivedRunRequest = parse_params(params)?;
+                if !matches!(
+                    request.run.operation,
+                    zeron_studio::MediaOperation::ImageEdit | zeron_studio::MediaOperation::Upscale
+                ) {
+                    return Err(RpcError::Failed(
+                        "derived runs must be image-edit or upscale".into(),
+                    ));
+                }
+                if request.run.output_count != 1 {
+                    return Err(RpcError::Failed(
+                        "derived runs produce exactly one image".into(),
+                    ));
+                }
+                if request.run.operation == zeron_studio::MediaOperation::ImageEdit
+                    && request.prompt.trim().is_empty()
+                {
+                    return Err(RpcError::Failed("image edit requires a prompt".into()));
+                }
+                if request
+                    .run
+                    .inputs
+                    .iter()
+                    .any(|input| input.role.as_str() == "mask")
+                    && request.mask_png_base64.is_some()
+                {
+                    return Err(RpcError::Failed(
+                        "mask must be supplied either as bytes or as an input, not both".into(),
+                    ));
+                }
+                if !request
+                    .run
+                    .inputs
+                    .iter()
+                    .any(|input| input.role.as_str() == "source")
+                {
+                    request.run.inputs.insert(
+                        0,
+                        zeron_studio::GenerationInput {
+                            role: zeron_studio::InputRole::from("source"),
+                            ordinal: 0,
+                            source: zeron_studio::GenerationInputSource::Artifact {
+                                artifact_id: request.source_artifact_id,
+                            },
+                            content_hash: String::new(),
+                        },
+                    );
+                }
+                if let Some(encoded) = request.mask_png_base64.take() {
+                    if request.run.operation != zeron_studio::MediaOperation::ImageEdit {
+                        return Err(RpcError::Failed(
+                            "only image edits accept a painted mask".into(),
+                        ));
+                    }
+                    let encoded = encoded
+                        .rsplit_once(',')
+                        .map_or(encoded.as_str(), |(_, data)| data);
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .map_err(|error| {
+                            RpcError::Failed(format!("mask PNG is not valid base64: {error}"))
+                        })?;
+                    let mime = zeron_studio::sniff_media_mime(&bytes)
+                        .ok_or_else(|| RpcError::Failed("mask is not a supported image".into()))?;
+                    let asset_id = self
+                        .studio
+                        .publish_asset(&bytes, mime)
+                        .map_err(|error| RpcError::Failed(error.to_string()))?;
+                    request.run.inputs.push(zeron_studio::GenerationInput {
+                        role: zeron_studio::InputRole::from("mask"),
+                        ordinal: 0,
+                        source: zeron_studio::GenerationInputSource::Asset { asset_id },
+                        content_hash: String::new(),
+                    });
+                }
+                let turn_id = self
+                    .studio
+                    .turn_id_for_artifact(request.source_artifact_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let prepared = self
+                    .prepare_studio_runs(&request.prompt, vec![request.run], true)
+                    .await?;
+                let (conversation_id, stored) = self
+                    .studio
+                    .extend_turn(turn_id, &prepared, &self.engine_info.device_id)
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 let initial_view = self
                     .studio

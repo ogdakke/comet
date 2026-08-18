@@ -22,8 +22,8 @@ use zeron_proto::{
 use zeron_studio::{
     GenerationInput, GenerationInputSource, GenerationRequest, InputRole, MediaKind, MediaModel,
     MediaOperation, MediaProvider, ProviderArtifact, ProviderId, Quote, ResolvedInput,
-    StudioArtifactId, StudioAttemptId, StudioBatchId, StudioConversationId, StudioRunId,
-    StudioTurnId, SubmissionCapabilities, sniff_media_mime,
+    StudioArtifactId, StudioAssetId, StudioAttemptId, StudioBatchId, StudioConversationId,
+    StudioRunId, StudioTurnId, SubmissionCapabilities, sniff_media_mime,
 };
 
 use crate::venice_import::{ImportReport, ImportedStudioHistory};
@@ -313,6 +313,8 @@ pub enum StudioStoreError {
     InvalidArtifact,
     #[error("studio artifact was not found")]
     ArtifactNotFound,
+    #[error("studio asset was not found")]
+    AssetNotFound,
     #[error("studio database schema {0} is newer than this application supports")]
     NewerSchema(i64),
     #[error("studio database lock is poisoned")]
@@ -505,14 +507,28 @@ impl StudioStore {
         let mut statement = connection.prepare(
             "SELECT a.id, a.output_position, a.media_kind, a.mime_type, a.size_bytes,
                     a.width, a.height, a.created_at,
-                    t.conversation_id, t.id, t.prompt, r.model_manifest_json,
+                    t.conversation_id, t.id,
+                    COALESCE(
+                        NULLIF(
+                            json_extract((
+                                SELECT attempt.request_json
+                                FROM studio_attempts attempt
+                                WHERE attempt.run_id = r.id
+                                ORDER BY attempt.attempt_number
+                                LIMIT 1
+                            ), '$.prompt'),
+                            ''
+                        ),
+                        t.prompt
+                    ),
+                    r.model_manifest_json,
                     a.thumbhash,
-                    CASE WHEN r.operation = 'upscale' THEN (
+                    (
                         SELECT artifact_id
                         FROM studio_run_inputs
                         WHERE run_id = r.id AND role = 'source' AND ordinal = 0
                         LIMIT 1
-                    ) ELSE NULL END
+                    )
              FROM studio_artifacts a
              JOIN studio_runs r ON r.id = a.run_id
              JOIN studio_batches b ON b.id = r.batch_id
@@ -1601,25 +1617,36 @@ impl StudioStore {
         Ok(())
     }
 
-    /// Stamp and verify artifact-backed inputs. User-uploaded assets are not
-    /// accepted until ImportStudioAsset exists.
+    /// Stamp and verify artifact- and mask-asset inputs.
     pub fn bind_generation_inputs(
         &self,
         request: &mut GenerationRequest,
     ) -> Result<(), StudioStoreError> {
         for input in &mut request.inputs {
             match &input.source {
-                GenerationInputSource::Asset { .. } => {
-                    return Err(StudioStoreError::InvalidValue(
-                        "studio asset inputs are not available yet".into(),
-                    ));
+                GenerationInputSource::Asset { asset_id } => {
+                    if request.operation != MediaOperation::ImageEdit
+                        || input.role.as_str() != "mask"
+                    {
+                        return Err(StudioStoreError::InvalidValue(
+                            "studio asset inputs are only accepted as an image-edit mask".into(),
+                        ));
+                    }
+                    let stored_hash = self.asset_input_hash(*asset_id)?;
+                    if input.content_hash.is_empty() {
+                        input.content_hash = stored_hash;
+                    } else if input.content_hash != stored_hash {
+                        return Err(StudioStoreError::InvalidValue(
+                            "studio input content hash does not match the asset".into(),
+                        ));
+                    }
                 }
                 GenerationInputSource::Artifact { artifact_id } => {
                     let (kind, stored_hash, width, height) =
                         self.artifact_input_row(*artifact_id)?;
                     if kind != MediaKind::Image {
                         return Err(StudioStoreError::InvalidValue(
-                            "upscale source must be an image artifact".into(),
+                            "generation source must be an image artifact".into(),
                         ));
                     }
                     if input.content_hash.is_empty() {
@@ -1629,7 +1656,10 @@ impl StudioStore {
                             "studio input content hash does not match the artifact".into(),
                         ));
                     }
-                    if request.operation == MediaOperation::Upscale
+                    if matches!(
+                        request.operation,
+                        MediaOperation::Upscale | MediaOperation::ImageEdit
+                    ) && input.role.as_str() == "source"
                         && let (Some(width), Some(height)) = (width, height)
                         && width > 0
                         && height > 0
@@ -1649,21 +1679,29 @@ impl StudioStore {
     ) -> Result<Vec<ResolvedInput>, StudioStoreError> {
         let mut resolved = Vec::with_capacity(request.inputs.len());
         for input in &request.inputs {
-            let artifact_id = match &input.source {
-                GenerationInputSource::Asset { .. } => {
-                    return Err(StudioStoreError::InvalidValue(
-                        "studio asset inputs are not available yet".into(),
-                    ));
+            let (path, stored_hash) = match &input.source {
+                GenerationInputSource::Asset { asset_id } => {
+                    if request.operation != MediaOperation::ImageEdit
+                        || input.role.as_str() != "mask"
+                    {
+                        return Err(StudioStoreError::InvalidValue(
+                            "studio asset inputs are only accepted as an image-edit mask".into(),
+                        ));
+                    }
+                    let (path, hash) = self.asset_input_file(*asset_id)?;
+                    (path, hash)
                 }
-                GenerationInputSource::Artifact { artifact_id } => *artifact_id,
+                GenerationInputSource::Artifact { artifact_id } => {
+                    let (kind, stored_hash, _, _) = self.artifact_input_row(*artifact_id)?;
+                    if kind != MediaKind::Image {
+                        return Err(StudioStoreError::InvalidValue(
+                            "generation input must be an image artifact".into(),
+                        ));
+                    }
+                    let (path, _, _) = self.artifacts.locate(*artifact_id)?;
+                    (path, stored_hash)
+                }
             };
-            let (kind, stored_hash, _, _) = self.artifact_input_row(artifact_id)?;
-            if kind != MediaKind::Image {
-                return Err(StudioStoreError::InvalidValue(
-                    "generation input must be an image artifact".into(),
-                ));
-            }
-            let (path, _, _) = self.artifacts.locate(artifact_id)?;
             let mut file = File::open(&path)?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes)?;
@@ -1745,6 +1783,110 @@ impl StudioStore {
             })
     }
 
+    pub fn turn_id_for_artifact(
+        &self,
+        artifact_id: StudioArtifactId,
+    ) -> Result<StudioTurnId, StudioStoreError> {
+        let connection = self.connection()?;
+        let turn_id: String = connection
+            .query_row(
+                "SELECT t.id
+                 FROM studio_artifacts a
+                 JOIN studio_runs r ON r.id = a.run_id
+                 JOIN studio_batches b ON b.id = r.batch_id
+                 JOIN studio_turns t ON t.id = b.turn_id
+                 WHERE a.id = ?1 AND a.deleted_at IS NULL",
+                [artifact_id.0.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StudioStoreError::ArtifactNotFound,
+                other => other.into(),
+            })?;
+        Ok(StudioTurnId(parse_uuid(&turn_id)?))
+    }
+
+    /// Persist a mask (or other derived input) into the profile jail.
+    pub fn publish_asset(
+        &self,
+        bytes: &[u8],
+        mime_type: &str,
+    ) -> Result<StudioAssetId, StudioStoreError> {
+        let mime_type = sniff_media_mime(bytes).filter(|sniffed| *sniffed == mime_type);
+        let mime_type = mime_type.ok_or_else(|| {
+            StudioStoreError::InvalidValue("studio asset is not a supported image".into())
+        })?;
+        if !matches!(mime_type, "image/png" | "image/jpeg" | "image/webp") {
+            return Err(StudioStoreError::InvalidValue(
+                "studio asset MIME is not accepted".into(),
+            ));
+        }
+        if bytes.len() as u64 > DEFAULT_MAX_ARTIFACT_BYTES {
+            return Err(StudioStoreError::ArtifactTooLarge);
+        }
+        let extension = extension_for_mime(mime_type).ok_or(StudioStoreError::InvalidExtension)?;
+        let id = StudioAssetId::new();
+        let relative_path = format!("inputs/{}.{}", id.0, extension);
+        self.artifacts.publish_input(id, extension, bytes)?;
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()
+            .and_then(|reader| reader.into_dimensions().ok())
+            .map(|(width, height)| (Some(width), Some(height)))
+            .unwrap_or((None, None));
+        let now = chrono::Utc::now().timestamp_millis();
+        self.connection()?.execute(
+            "INSERT INTO studio_assets
+             (id, relative_path, mime_type, size_bytes, content_hash, width, height, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                id.0.to_string(),
+                relative_path,
+                mime_type,
+                bytes.len() as i64,
+                hash,
+                width,
+                height,
+                now
+            ],
+        )?;
+        Ok(id)
+    }
+
+    fn asset_input_hash(&self, asset_id: StudioAssetId) -> Result<String, StudioStoreError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT content_hash FROM studio_assets WHERE id = ?1",
+                [asset_id.0.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StudioStoreError::AssetNotFound,
+                other => other.into(),
+            })
+    }
+
+    fn asset_input_file(
+        &self,
+        asset_id: StudioAssetId,
+    ) -> Result<(PathBuf, String), StudioStoreError> {
+        let connection = self.connection()?;
+        let (relative_path, hash): (String, String) = connection
+            .query_row(
+                "SELECT relative_path, content_hash FROM studio_assets WHERE id = ?1",
+                [asset_id.0.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StudioStoreError::AssetNotFound,
+                other => other.into(),
+            })?;
+        let path = self.artifacts.input_path_from_relative(&relative_path)?;
+        Ok((path, hash))
+    }
+
     pub fn conversation_view(
         &self,
         id: StudioConversationId,
@@ -1817,6 +1959,8 @@ impl StudioStore {
                 let inputs = inputs_statement
                     .query_map([run_id.clone()], run_input_from_row)?
                     .collect::<Result<Vec<_>, _>>()?;
+                drop(artifacts_statement);
+                drop(inputs_statement);
                 let model: MediaModel = serde_json::from_str(&model_json)
                     .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
                 let controls = serde_json::from_str(&settings_json)
@@ -1834,6 +1978,19 @@ impl StudioStore {
                     .map(serde_json::from_str)
                     .transpose()
                     .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
+                let run_prompt = connection
+                    .query_row(
+                        "SELECT request_json FROM studio_attempts
+                         WHERE run_id = ?1
+                         ORDER BY attempt_number
+                         LIMIT 1",
+                        [run_id.clone()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+                    .and_then(|json| serde_json::from_str::<GenerationRequest>(&json).ok())
+                    .map(|request| request.prompt)
+                    .filter(|prompt| !prompt.is_empty());
                 run_views.push(StudioRunView {
                     id: StudioRunId(parse_uuid(&run_id)?),
                     position: run_position,
@@ -1846,6 +2003,7 @@ impl StudioStore {
                     progress,
                     error,
                     quote,
+                    prompt: run_prompt,
                     inputs,
                     artifacts,
                 });
@@ -2059,7 +2217,7 @@ fn gallery_item_from_row(row: &rusqlite::Row<'_>) -> Result<StudioGalleryItem, r
         prompt: row.get(10)?,
         model_display_name: model.display_name,
         thumbhash: row.get(12)?,
-        upscaled_from_artifact_id: row
+        source_artifact_id: row
             .get::<_, Option<String>>(13)?
             .map(|value| parse_uuid(13, value))
             .transpose()?
@@ -2194,6 +2352,7 @@ fn conversation_from_row(
 pub struct ArtifactStore {
     root: PathBuf,
     preview_root: PathBuf,
+    inputs_root: PathBuf,
     maximum_artifact_bytes: u64,
 }
 
@@ -2201,18 +2360,22 @@ impl ArtifactStore {
     fn open(studio_root: &Path, maximum_artifact_bytes: u64) -> Result<Self, StudioStoreError> {
         let root = studio_root.join("artifacts");
         let preview_root = studio_root.join("previews");
+        let inputs_root = studio_root.join("inputs");
         fs::create_dir_all(&root)?;
         fs::create_dir_all(&preview_root)?;
+        fs::create_dir_all(&inputs_root)?;
         if fs::symlink_metadata(&root)?.file_type().is_symlink()
             || fs::symlink_metadata(&preview_root)?
                 .file_type()
                 .is_symlink()
+            || fs::symlink_metadata(&inputs_root)?.file_type().is_symlink()
         {
             return Err(StudioStoreError::InvalidArtifact);
         }
         Ok(Self {
             root,
             preview_root,
+            inputs_root,
             maximum_artifact_bytes,
         })
     }
@@ -2347,6 +2510,78 @@ impl ArtifactStore {
             return Err(StudioStoreError::InvalidExtension);
         }
         Ok(self.root.join(format!("{}.{}", artifact_id.0, extension)))
+    }
+
+    fn publish_input(
+        &self,
+        asset_id: StudioAssetId,
+        extension: &str,
+        bytes: &[u8],
+    ) -> Result<PathBuf, StudioStoreError> {
+        if bytes.len() as u64 > self.maximum_artifact_bytes {
+            return Err(StudioStoreError::ArtifactTooLarge);
+        }
+        if !ARTIFACT_FORMATS
+            .iter()
+            .any(|(supported, _)| *supported == extension)
+        {
+            return Err(StudioStoreError::InvalidExtension);
+        }
+        let destination = self
+            .inputs_root
+            .join(format!("{}.{}", asset_id.0, extension));
+        let temporary = self.inputs_root.join(format!(
+            ".{}.tmp-{}-{}",
+            asset_id.0,
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let write_result = (|| -> Result<(), StudioStoreError> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        let publish_result = fs::hard_link(&temporary, &destination);
+        let _ = fs::remove_file(&temporary);
+        match publish_result {
+            Ok(()) => {
+                sync_directory(&self.inputs_root)?;
+                Ok(destination)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(StudioStoreError::ArtifactExists)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn input_path_from_relative(&self, relative_path: &str) -> Result<PathBuf, StudioStoreError> {
+        let Some(name) = relative_path.strip_prefix("inputs/") else {
+            return Err(StudioStoreError::InvalidArtifact);
+        };
+        if name.contains('/') || name.contains('\\') || name.contains("..") {
+            return Err(StudioStoreError::InvalidArtifact);
+        }
+        let path = self.inputs_root.join(name);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                StudioStoreError::AssetNotFound
+            } else {
+                error.into()
+            }
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(StudioStoreError::InvalidArtifact);
+        }
+        Ok(path)
     }
 
     fn locate(

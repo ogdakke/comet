@@ -2030,23 +2030,91 @@ async fn wait_for_success(
     updates: &mut tokio::sync::mpsc::Receiver<serde_json::Value>,
     turns: usize,
 ) -> StudioConversationView {
+    wait_for_view(updates, |view| {
+        view.turns.len() >= turns
+            && view
+                .turns
+                .last()
+                .and_then(|turn| turn.runs.last())
+                .is_some_and(|run| run.state == StudioRunState::Succeeded)
+    })
+    .await
+}
+
+async fn wait_for_succeeded_runs(
+    updates: &mut tokio::sync::mpsc::Receiver<serde_json::Value>,
+    runs: usize,
+) -> StudioConversationView {
+    wait_for_view(updates, |view| {
+        view.turns
+            .iter()
+            .flat_map(|turn| turn.runs.iter())
+            .filter(|run| run.state == StudioRunState::Succeeded)
+            .count()
+            >= runs
+    })
+    .await
+}
+
+async fn wait_for_view(
+    updates: &mut tokio::sync::mpsc::Receiver<serde_json::Value>,
+    pred: impl Fn(&StudioConversationView) -> bool,
+) -> StudioConversationView {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let view: StudioConversationView =
                 serde_json::from_value(updates.recv().await.unwrap()).unwrap();
-            if view.turns.len() >= turns
-                && view
-                    .turns
-                    .last()
-                    .and_then(|turn| turn.runs.last())
-                    .is_some_and(|run| run.state == StudioRunState::Succeeded)
-            {
+            if pred(&view) {
                 break view;
             }
         }
     })
     .await
     .expect("run did not succeed")
+}
+
+fn edit_model(provider_id: &str) -> MediaModel {
+    MediaModel {
+        provider_id: provider_id.into(),
+        id: "image-edit".into(),
+        display_name: "Edit model".into(),
+        description: None,
+        operation: MediaOperation::ImageEdit,
+        output_kind: MediaKind::Image,
+        output_mime_types: vec!["image/png".into()],
+        input_constraints: vec![
+            InputConstraint {
+                role: "source".into(),
+                minimum_count: 1,
+                maximum_count: 1,
+                mime: MimeConstraint {
+                    accepted: vec!["image/png".into(), "image/jpeg".into(), "image/webp".into()],
+                    maximum_bytes: Some(25 * 1024 * 1024),
+                    maximum_width: None,
+                    maximum_height: None,
+                },
+            },
+            InputConstraint {
+                role: "mask".into(),
+                minimum_count: 0,
+                maximum_count: 2,
+                mime: MimeConstraint {
+                    accepted: vec!["image/png".into(), "image/jpeg".into(), "image/webp".into()],
+                    maximum_bytes: Some(25 * 1024 * 1024),
+                    maximum_width: None,
+                    maximum_height: None,
+                },
+            },
+        ],
+        prompt_maximum_chars: Some(5_000),
+        negative_prompt_maximum_chars: None,
+        maximum_output_count: 1,
+        controls: Vec::new(),
+        pricing: None,
+        features: Vec::new(),
+        manifest_version: "fixture-v1".into(),
+        fetched_at: chrono::Utc::now(),
+    }
 }
 
 #[tokio::test]
@@ -2096,38 +2164,34 @@ async fn upscale_turn_uses_an_existing_artifact_and_empty_prompt() {
     let upscaled: StudioConversationView = serde_json::from_value(
         client
             .call(
-                methods::CREATE_STUDIO_TURN,
+                methods::APPEND_STUDIO_DERIVED_RUN,
                 serde_json::json!({
-                    "conversationId": conversation.id,
+                    "sourceArtifactId": source.id,
                     "prompt": "",
-                    "runs": [{
+                    "run": {
                         "providerId": "fake",
                         "modelId": "upscaler",
                         "operation": "upscale",
                         "outputCount": 1,
                         "controls": { "scale": { "type": "integer", "value": 2 } },
-                        "inputs": [{
-                            "role": "source",
-                            "ordinal": 0,
-                            "source": { "source": "artifact", "artifact_id": source.id },
-                            "content_hash": ""
-                        }],
+                        "inputs": [],
                         "manifestVersion": "fixture-v1",
                         "displayAspectRatio": [1, 1]
-                    }]
+                    }
                 }),
             )
             .await
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(upscaled.turns[1].prompt, "");
-    assert_eq!(upscaled.turns[1].runs[0].inputs.len(), 1);
+    assert_eq!(upscaled.turns.len(), 1);
+    assert_eq!(upscaled.turns[0].runs.len(), 2);
+    assert_eq!(upscaled.turns[0].runs[1].inputs.len(), 1);
     assert_eq!(
-        upscaled.turns[1].runs[0].inputs[0].content_hash,
+        upscaled.turns[0].runs[1].inputs[0].content_hash,
         source.content_hash
     );
-    wait_for_success(&mut updates, 2).await;
+    wait_for_succeeded_runs(&mut updates, 2).await;
 
     let gallery: ListStudioArtifactsResponse = serde_json::from_value(
         client
@@ -2142,7 +2206,7 @@ async fn upscale_turn_uses_an_existing_artifact_and_empty_prompt() {
         .find(|item| item.model_display_name == "Upscaler")
         .expect("upscaled image should be in the gallery");
     assert_eq!(
-        upscaled_item.upscaled_from_artifact_id,
+        upscaled_item.source_artifact_id,
         Some(source.id),
         "gallery metadata should retain the original/upscale relationship"
     );
@@ -2228,7 +2292,285 @@ async fn video_and_edit_submits_are_still_blocked() {
         )
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("text-to-image and upscale"));
+    assert!(
+        error
+            .to_string()
+            .contains("text-to-image, image-edit, and upscale")
+    );
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn create_turn_rejects_image_edit() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![edit_model("fake")],
+        FakeSubmissionMode::Complete(vec![png_artifact()]),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+    let conversation = create_conversation(&client).await;
+    let error = client
+        .call(
+            methods::CREATE_STUDIO_TURN,
+            serde_json::json!({
+                "conversationId": conversation.id,
+                "prompt": "change the sky",
+                "runs": [{
+                    "providerId": "fake",
+                    "modelId": "image-edit",
+                    "operation": "image_edit",
+                    "outputCount": 1,
+                    "controls": {},
+                    "inputs": [],
+                    "manifestVersion": "fixture-v1",
+                    "displayAspectRatio": [1, 1]
+                }]
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("appended"));
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn append_edit_stays_on_the_source_turn_and_keeps_the_edit_prompt() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![image_model("fake"), edit_model("fake")],
+        FakeSubmissionMode::Complete(vec![png_artifact()]),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider.clone()).await;
+    let conversation = create_conversation(&client).await;
+    let mut updates = client
+        .subscribe(
+            methods::WATCH_STUDIO_CONVERSATION,
+            serde_json::json!({ "conversationId": conversation.id }),
+        )
+        .await
+        .unwrap();
+    let _empty: StudioConversationView =
+        serde_json::from_value(updates.recv().await.unwrap()).unwrap();
+    client
+        .call(
+            methods::CREATE_STUDIO_TURN,
+            serde_json::json!({
+                "conversationId": conversation.id,
+                "prompt": "a comet",
+                "runs": [{
+                    "providerId": "fake",
+                    "modelId": "image-model",
+                    "operation": "text_to_image",
+                    "outputCount": 1,
+                    "controls": {},
+                    "inputs": [],
+                    "manifestVersion": "fixture-v1",
+                    "displayAspectRatio": [1, 1]
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+    let generated = wait_for_success(&mut updates, 1).await;
+    let source = &generated.turns[0].runs[0].artifacts[0];
+
+    let edited: StudioConversationView = serde_json::from_value(
+        client
+            .call(
+                methods::APPEND_STUDIO_DERIVED_RUN,
+                serde_json::json!({
+                    "sourceArtifactId": source.id,
+                    "prompt": "make the sky sunrise",
+                    "run": {
+                        "providerId": "fake",
+                        "modelId": "image-edit",
+                        "operation": "image_edit",
+                        "outputCount": 1,
+                        "controls": {},
+                        "inputs": [],
+                        "manifestVersion": "fixture-v1",
+                        "displayAspectRatio": [1, 1]
+                    }
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(edited.turns.len(), 1);
+    assert_eq!(edited.turns[0].prompt, "a comet");
+    assert_eq!(edited.turns[0].runs.len(), 2);
+    assert_eq!(
+        edited.turns[0].runs[1].prompt.as_deref(),
+        Some("make the sky sunrise")
+    );
+    let finished = wait_for_succeeded_runs(&mut updates, 2).await;
+    let child = &finished.turns[0].runs[1].artifacts[0];
+
+    let gallery: ListStudioArtifactsResponse = serde_json::from_value(
+        client
+            .call(methods::LIST_STUDIO_ARTIFACTS, serde_json::json!({}))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let edit_item = gallery
+        .artifacts
+        .iter()
+        .find(|item| item.id == child.id)
+        .expect("edited image should be in the gallery");
+    assert_eq!(edit_item.source_artifact_id, Some(source.id));
+    assert_eq!(edit_item.prompt, "make the sky sunrise");
+    assert!(!provider.last_submit_inputs().is_empty());
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn append_edit_publishes_a_mask_asset() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![image_model("fake"), edit_model("fake")],
+        FakeSubmissionMode::Complete(vec![png_artifact()]),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider.clone()).await;
+    let conversation = create_conversation(&client).await;
+    let mut updates = client
+        .subscribe(
+            methods::WATCH_STUDIO_CONVERSATION,
+            serde_json::json!({ "conversationId": conversation.id }),
+        )
+        .await
+        .unwrap();
+    let _empty: StudioConversationView =
+        serde_json::from_value(updates.recv().await.unwrap()).unwrap();
+    client
+        .call(
+            methods::CREATE_STUDIO_TURN,
+            serde_json::json!({
+                "conversationId": conversation.id,
+                "prompt": "a comet",
+                "runs": [{
+                    "providerId": "fake",
+                    "modelId": "image-model",
+                    "operation": "text_to_image",
+                    "outputCount": 1,
+                    "controls": {},
+                    "inputs": [],
+                    "manifestVersion": "fixture-v1",
+                    "displayAspectRatio": [1, 1]
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+    let generated = wait_for_success(&mut updates, 1).await;
+    let source = &generated.turns[0].runs[0].artifacts[0];
+    let mask = BASE64.encode(png_artifact().bytes);
+
+    client
+        .call(
+            methods::APPEND_STUDIO_DERIVED_RUN,
+            serde_json::json!({
+                "sourceArtifactId": source.id,
+                "prompt": "replace the painted area with a sunrise",
+                "maskPngBase64": mask,
+                "run": {
+                    "providerId": "fake",
+                    "modelId": "image-edit",
+                    "operation": "image_edit",
+                    "outputCount": 1,
+                    "controls": {},
+                    "inputs": [],
+                    "manifestVersion": "fixture-v1",
+                    "displayAspectRatio": [1, 1]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    wait_for_succeeded_runs(&mut updates, 2).await;
+
+    let asset_count: i64 = engine
+        .studio
+        .connection()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM studio_assets", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(asset_count, 1);
+    let mask_inputs = provider
+        .last_submit_inputs()
+        .into_iter()
+        .filter(|input| input.role.as_str() == "mask")
+        .count();
+    assert_eq!(mask_inputs, 1);
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn append_edit_requires_a_prompt() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![image_model("fake"), edit_model("fake")],
+        FakeSubmissionMode::Complete(vec![png_artifact()]),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+    let conversation = create_conversation(&client).await;
+    let mut updates = client
+        .subscribe(
+            methods::WATCH_STUDIO_CONVERSATION,
+            serde_json::json!({ "conversationId": conversation.id }),
+        )
+        .await
+        .unwrap();
+    let _empty: StudioConversationView =
+        serde_json::from_value(updates.recv().await.unwrap()).unwrap();
+    client
+        .call(
+            methods::CREATE_STUDIO_TURN,
+            serde_json::json!({
+                "conversationId": conversation.id,
+                "prompt": "a comet",
+                "runs": [{
+                    "providerId": "fake",
+                    "modelId": "image-model",
+                    "operation": "text_to_image",
+                    "outputCount": 1,
+                    "controls": {},
+                    "inputs": [],
+                    "manifestVersion": "fixture-v1",
+                    "displayAspectRatio": [1, 1]
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+    let generated = wait_for_success(&mut updates, 1).await;
+    let source = &generated.turns[0].runs[0].artifacts[0];
+    let error = client
+        .call(
+            methods::APPEND_STUDIO_DERIVED_RUN,
+            serde_json::json!({
+                "sourceArtifactId": source.id,
+                "prompt": "   ",
+                "run": {
+                    "providerId": "fake",
+                    "modelId": "image-edit",
+                    "operation": "image_edit",
+                    "outputCount": 1,
+                    "controls": {},
+                    "inputs": [],
+                    "manifestVersion": "fixture-v1",
+                    "displayAspectRatio": [1, 1]
+                }
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("prompt"));
     engine.shutdown().await;
 }
 
