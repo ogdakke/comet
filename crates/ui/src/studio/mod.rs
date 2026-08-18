@@ -16,12 +16,14 @@ mod composer;
 mod cost;
 mod defaults;
 mod draft;
+mod edit;
 mod feed;
 mod gallery;
 mod image_menu;
 mod images;
 mod lineage;
 mod page;
+mod paint;
 mod providers;
 mod upscale;
 

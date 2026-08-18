@@ -44,6 +44,7 @@ pub struct StudioPage {
     pub(super) providers: Vec<StudioProviderConnection>,
     pub(super) models: Vec<zeron_studio::MediaModel>,
     pub(super) upscale_models: Vec<zeron_studio::MediaModel>,
+    pub(super) edit_models: Vec<zeron_studio::MediaModel>,
     pub(super) selected_models: BTreeSet<zeron_studio::ModelId>,
     pub(super) draft_runs: HashMap<zeron_studio::ModelId, DraftRunConfig>,
     pub(super) remembered: StudioDefaults,
@@ -134,6 +135,14 @@ pub struct StudioPage {
     pub(super) lightbox_stage_height: f32,
     pub(super) lightbox_stage_origin: Point<Pixels>,
     pub(super) filmstrip_scroll_accum: f32,
+    pub(super) edit_target: Option<StudioArtifactId>,
+    pub(super) edit_prompt: Entity<TextInput>,
+    pub(super) edit_paint: Option<super::paint::PaintSession>,
+    pub(super) edit_overlay: Option<std::sync::Arc<gpui::Image>>,
+    pub(super) edit_brush_t: f32,
+    pub(super) edit_brush_drag: bool,
+    pub(super) edit_space_pan: bool,
+    pub(super) pending_edit_source: Option<StudioArtifactId>,
     pub(super) focus: FocusHandle,
     pub(super) loading: bool,
     pub(super) busy: bool,
@@ -149,6 +158,7 @@ pub struct StudioPage {
     pub(super) loading_displays: HashSet<StudioArtifactId>,
     pub(super) _observe: Subscription,
     pub(super) _prompt_events: Subscription,
+    pub(super) _edit_prompt_events: Subscription,
     pub(super) _model_search_events: Subscription,
 }
 
@@ -156,6 +166,7 @@ impl StudioPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
         let prompt = cx.new(|cx| TextInput::composer("Describe the image you want to create", cx));
+        let edit_prompt = cx.new(|cx| TextInput::composer("Describe the edit…", cx));
         let model_search = cx.new(|cx| TextInput::palette_search("Search models…", cx));
         let prompt_events = cx.subscribe(&prompt, |page: &mut Self, _, event, cx| match event {
             TextInputEvent::Submitted => page.submit(cx),
@@ -163,6 +174,12 @@ impl StudioPage {
             TextInputEvent::HistoryNavigate(dir) => page.on_history_navigate(*dir, cx),
             _ => {}
         });
+        let edit_prompt_events =
+            cx.subscribe(&edit_prompt, |page: &mut Self, _, event, cx| match event {
+                TextInputEvent::Submitted => page.submit_edit(cx),
+                TextInputEvent::Edited => cx.notify(),
+                _ => {}
+            });
         let model_search_events =
             cx.subscribe(&model_search, |page: &mut Self, _, event, cx| match event {
                 TextInputEvent::Edited => {
@@ -185,6 +202,7 @@ impl StudioPage {
             providers: Vec::new(),
             models: Vec::new(),
             upscale_models: Vec::new(),
+            edit_models: Vec::new(),
             selected_models: BTreeSet::new(),
             draft_runs: HashMap::new(),
             remembered,
@@ -199,6 +217,7 @@ impl StudioPage {
             selected_conversation: None,
             conversation: None,
             prompt,
+            edit_prompt,
             prompt_history: PromptHistory::default(),
             prompt_expanded: false,
             prompt_morph: None,
@@ -267,6 +286,13 @@ impl StudioPage {
             lightbox_stage_height: 0.0,
             lightbox_stage_origin: Point::default(),
             filmstrip_scroll_accum: 0.0,
+            edit_target: None,
+            edit_paint: None,
+            edit_overlay: None,
+            edit_brush_t: 0.28,
+            edit_brush_drag: false,
+            edit_space_pan: false,
+            pending_edit_source: None,
             focus: cx.focus_handle(),
             loading: false,
             busy: false,
@@ -283,6 +309,7 @@ impl StudioPage {
             preview_failed: HashSet::new(),
             _observe: observe,
             _prompt_events: prompt_events,
+            _edit_prompt_events: edit_prompt_events,
             _model_search_events: model_search_events,
         };
         page.load(cx);
@@ -614,7 +641,12 @@ impl StudioPage {
                         let last_turn_id = view.turns.last().map(|turn| turn.id);
                         page.observe_upscale_view(&view, cx);
                         page.apply_conversation_summary(view.conversation.clone(), cx);
-                        page.conversation = Some(view);
+                        page.conversation = Some(view.clone());
+                        if let Some(source_id) = page.pending_edit_source {
+                            page.select_pending_edit(&view, source_id, cx);
+                        } else if page.selected_artifact.is_some() {
+                            page.refresh_lightbox_frames();
+                        }
                         page.snap_prompt_history(cx);
                         if settled {
                             page.refresh_account_balance(cx, true);
@@ -958,10 +990,14 @@ impl StudioPage {
     }
 
     pub(super) fn apply_models(&mut self, models: Vec<zeron_studio::MediaModel>) {
-        let (upscale_models, models): (Vec<_>, Vec<_>) = models
+        let (upscale_models, rest): (Vec<_>, Vec<_>) = models
             .into_iter()
             .partition(|model| model.operation == zeron_studio::MediaOperation::Upscale);
+        let (edit_models, models): (Vec<_>, Vec<_>) = rest
+            .into_iter()
+            .partition(|model| model.operation == zeron_studio::MediaOperation::ImageEdit);
         self.upscale_models = upscale_models;
+        self.edit_models = edit_models;
         self.models = models;
         apply_remembered_drafts(&mut self.draft_runs, &self.models, &self.remembered.drafts);
     }
@@ -1002,12 +1038,14 @@ impl StudioPage {
 
     pub(super) fn persist_composer_defaults(&mut self, cx: &mut Context<Self>) {
         if let Some(dir) = self.state.read(cx).data_dir.clone() {
+            let last_edit_model_id = self.remembered.last_edit_model_id.clone();
             self.remembered = StudioDefaults::capture(
                 &self.selected_models,
                 &self.draft_runs,
                 &self.remembered.favorites,
                 &self.remembered.upscale,
             );
+            self.remembered.last_edit_model_id = last_edit_model_id;
             if let Err(err) = self.remembered.save(&dir) {
                 tracing::warn!(error = %err, "studio-defaults save failed");
             }

@@ -605,7 +605,7 @@ fn lightbox_contain_size(stage_w: f32, stage_h: f32, image_w: f32, image_h: f32)
 }
 
 /// Contained-image box inside the stage, including zoom, pan, and swipe.
-fn lightbox_image_paint_bounds(
+pub(super) fn lightbox_image_paint_bounds(
     stage: Bounds<Pixels>,
     image_width: u32,
     image_height: u32,
@@ -1105,6 +1105,7 @@ impl StudioPage {
     /// pops the artifact route; [`close_artifact`] then clears viewer state.
     pub(super) fn request_close_artifact(&mut self, cx: &mut Context<Self>) {
         self.close_upscale_settings_menu(cx);
+        self.exit_edit_mode(cx);
         if let Some(id) = self.selected_artifact.take() {
             self.reveal_gallery_artifact_if_needed(id);
             cx.emit(StudioEvent::CloseArtifact);
@@ -1355,7 +1356,15 @@ impl StudioPage {
         cx.notify();
     }
 
-    pub(super) fn begin_lightbox_pan(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+    pub(super) fn begin_lightbox_pan(
+        &mut self,
+        position: Point<Pixels>,
+        modifiers: &gpui::Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        if self.edit_target.is_some() && self.begin_edit_stroke(position, modifiers, cx) {
+            return;
+        }
         if self.lightbox_viewer_is_transformed() {
             self.lightbox_zoom_spring = None;
             self.lightbox_drag = Some(position);
@@ -1364,6 +1373,14 @@ impl StudioPage {
     }
 
     pub(super) fn update_lightbox_pan(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if self
+            .edit_paint
+            .as_ref()
+            .is_some_and(super::paint::PaintSession::is_drawing)
+        {
+            self.extend_edit_stroke(position, cx);
+            return;
+        }
         let Some(previous) = self.lightbox_drag else {
             return;
         };
@@ -1376,6 +1393,14 @@ impl StudioPage {
     }
 
     pub(super) fn end_lightbox_pan(&mut self, cx: &mut Context<Self>) {
+        if self
+            .edit_paint
+            .as_ref()
+            .is_some_and(super::paint::PaintSession::is_drawing)
+        {
+            self.end_edit_stroke(cx);
+            return;
+        }
         if self.lightbox_drag.take().is_some() {
             if self.lightbox_zoom_should_settle() {
                 self.settle_lightbox_zoom(cx);
@@ -1811,7 +1836,18 @@ impl StudioPage {
                     .left(self.lightbox_pan.x)
                     .top(self.lightbox_pan.y)
             };
-            layer.child(contain_layers(paint, None, px(0.0), None))
+            let mut layer = layer.child(contain_layers(paint, None, px(0.0), None));
+            if self.edit_target == artifact_id
+                && let Some(mask) = &self.edit_overlay
+            {
+                layer = layer.child(div().absolute().inset_0().child(contain_layers(
+                    mask.clone(),
+                    None,
+                    px(0.0),
+                    None,
+                )));
+            }
+            layer
         };
         match base {
             Some(base) => frame.child(stack(base, overlay)).into_any_element(),
@@ -1976,7 +2012,7 @@ impl StudioPage {
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|page, event: &gpui::MouseDownEvent, _, cx| {
-                    page.begin_lightbox_pan(event.position, cx);
+                    page.begin_lightbox_pan(event.position, &event.modifiers, cx);
                 }),
             )
             .on_mouse_move(cx.listener(|page, event: &gpui::MouseMoveEvent, _, cx| {
@@ -2004,6 +2040,7 @@ impl StudioPage {
                 if event.click_count() == 1
                     && event.standard_click()
                     && !event.is_keyboard()
+                    && page.edit_target.is_none()
                     && page.lightbox_click_is_empty(event.position(), window, cx)
                 {
                     page.request_close_artifact(cx);
@@ -2256,6 +2293,8 @@ impl StudioPage {
                 },
             )
             .child(div().flex_1())
+            .child(self.render_edit_action(id, theme, cx))
+            .child(div().h(px(8.0)))
             .child(self.render_artifact_upscale_actions(id, theme, cx))
             .child(
                 div()
@@ -2341,11 +2380,34 @@ impl StudioPage {
                         return;
                     }
                     match event.keystroke.key.as_str() {
+                        "escape" if page.edit_target.is_some() => {
+                            page.exit_edit_mode(cx);
+                            cx.stop_propagation();
+                        }
                         "escape" => page.request_close_artifact(cx),
-                        "left" => page.navigate_artifact(-1, cx),
-                        "right" => page.navigate_artifact(1, cx),
-                        "home" => page.select_artifact_edge(false, cx),
-                        "end" => page.select_artifact_edge(true, cx),
+                        "left" if page.edit_target.is_none() => page.navigate_artifact(-1, cx),
+                        "right" if page.edit_target.is_none() => page.navigate_artifact(1, cx),
+                        "home" if page.edit_target.is_none() => {
+                            page.select_artifact_edge(false, cx)
+                        }
+                        "end" if page.edit_target.is_none() => page.select_artifact_edge(true, cx),
+                        "z" if page.edit_target.is_some()
+                            && (event.keystroke.modifiers.platform
+                                || event.keystroke.modifiers.control)
+                            && event.keystroke.modifiers.shift =>
+                        {
+                            if page.redo_edit_stroke(cx) {
+                                cx.stop_propagation();
+                            }
+                        }
+                        "z" if page.edit_target.is_some()
+                            && (event.keystroke.modifiers.platform
+                                || event.keystroke.modifiers.control) =>
+                        {
+                            if page.undo_edit_stroke(cx) {
+                                cx.stop_propagation();
+                            }
+                        }
                         _ => {}
                     }
                 }))
@@ -2366,7 +2428,13 @@ impl StudioPage {
                                 true,
                                 stage,
                             )
-                            .band_bottom(ARTIFACT_FILMSTRIP_HEIGHT),
+                            .band_bottom(
+                                if self.edit_target.is_some() {
+                                    super::edit::EDIT_COMPOSER_HEIGHT
+                                } else {
+                                    ARTIFACT_FILMSTRIP_HEIGHT
+                                },
+                            ),
                         )
                         .child(
                             div()
@@ -2410,37 +2478,44 @@ impl StudioPage {
                                 .items_center()
                                 .child(next),
                         )
-                        .child(
-                            div()
-                                .id("studio-artifact-filmstrip")
-                                .absolute()
-                                .bottom_0()
-                                .left_0()
-                                .right_0()
-                                .h(px(ARTIFACT_FILMSTRIP_HEIGHT))
-                                .flex()
-                                .justify_center()
-                                .occlude()
-                                .on_scroll_wheel(cx.listener(|page, event, _, cx| {
-                                    page.on_filmstrip_scroll(event, cx)
-                                }))
-                                .child(
-                                    crate::edge_fade::edge_faded(
-                                        ARTIFACT_FILMSTRIP_FADE,
-                                        false,
-                                        false,
-                                        div()
-                                            .w(px(filmstrip_viewport))
-                                            .h_full()
-                                            .flex_none()
-                                            .overflow_hidden()
-                                            .relative()
-                                            .children(thumbnails),
-                                    )
-                                    .fade_left(fade_left)
-                                    .fade_right(fade_right),
-                                ),
-                        ),
+                        .when(self.edit_target.is_some(), |stage| {
+                            stage
+                                .child(self.render_brush_slider(theme, cx))
+                                .child(self.render_edit_composer(theme, cx))
+                        })
+                        .when(self.edit_target.is_none(), |stage| {
+                            stage.child(
+                                div()
+                                    .id("studio-artifact-filmstrip")
+                                    .absolute()
+                                    .bottom_0()
+                                    .left_0()
+                                    .right_0()
+                                    .h(px(ARTIFACT_FILMSTRIP_HEIGHT))
+                                    .flex()
+                                    .justify_center()
+                                    .occlude()
+                                    .on_scroll_wheel(cx.listener(|page, event, _, cx| {
+                                        page.on_filmstrip_scroll(event, cx)
+                                    }))
+                                    .child(
+                                        crate::edge_fade::edge_faded(
+                                            ARTIFACT_FILMSTRIP_FADE,
+                                            false,
+                                            false,
+                                            div()
+                                                .w(px(filmstrip_viewport))
+                                                .h_full()
+                                                .flex_none()
+                                                .overflow_hidden()
+                                                .relative()
+                                                .children(thumbnails),
+                                        )
+                                        .fade_left(fade_left)
+                                        .fade_right(fade_right),
+                                    ),
+                            )
+                        }),
                 )
                 .child(
                     div()

@@ -44,6 +44,9 @@ pub(super) struct StudioDefaults {
     /// Last-used settings for the artifact viewer's upscale action.
     #[serde(default)]
     pub(super) upscale: UpscaleDefaults,
+    /// Last ImageEdit model used from the lightbox composer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) last_edit_model_id: Option<ModelId>,
 }
 
 impl StudioDefaults {
@@ -96,6 +99,7 @@ impl StudioDefaults {
                 .collect(),
             favorites: favorites.to_vec(),
             upscale: upscale.clone(),
+            last_edit_model_id: None,
         }
     }
 
