@@ -149,27 +149,62 @@ pub fn open_external_markdown_url(url: &str, cx: &mut gpui::App) {
     }
 }
 
-/// GFM / GitHub heading id: lowercase, drop punctuation, spaces → `-`.
+/// GFM / GitHub heading id ([`github-slugger`]): lowercase, drop the
+/// punctuation class (includes em/en dashes), then each ASCII space
+/// becomes `-`. Two spaces around a removed dash stay as `--` — that's
+/// why `Appendix A — Fake Sequence` is `#appendix-a--fake-sequence`.
 /// Duplicate headings get `-1`, `-2` via [`top_heading_slugs`].
 pub fn gfm_heading_slug(text: &str) -> String {
-    let mut out = String::new();
+    let mut stripped = String::new();
     for ch in text.chars() {
-        if ch.is_whitespace() {
-            if !out.is_empty() && !out.ends_with('-') {
-                out.push('-');
-            }
-        } else if ch.is_alphanumeric() {
-            for c in ch.to_lowercase() {
-                out.push(c);
-            }
-        } else if ch == '_' || ch == '-' {
-            out.push(ch);
+        if is_gfm_slug_punctuation(ch) {
+            continue;
+        }
+        for c in ch.to_lowercase() {
+            stripped.push(c);
         }
     }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    out
+    stripped.replace(' ', "-")
+}
+
+/// github-slugger's removed set: General Punctuation + Supplemental
+/// Punctuation + the listed ASCII marks. Hyphen and underscore stay.
+fn is_gfm_slug_punctuation(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{2000}'..='\u{206F}'
+            | '\u{2E00}'..='\u{2E7F}'
+            | '\\'
+            | '\''
+            | '!'
+            | '"'
+            | '#'
+            | '$'
+            | '%'
+            | '&'
+            | '('
+            | ')'
+            | '*'
+            | '+'
+            | ','
+            | '.'
+            | '/'
+            | ':'
+            | ';'
+            | '<'
+            | '='
+            | '>'
+            | '?'
+            | '@'
+            | '['
+            | ']'
+            | '^'
+            | '`'
+            | '{'
+            | '|'
+            | '}'
+            | '~'
+    )
 }
 
 /// `(top-level block index, slug)` for every heading in document order.
@@ -199,9 +234,32 @@ pub fn heading_index_for_fragment(tree: &BlockTree, fragment: &str) -> Option<us
         return None;
     }
     let slugged = gfm_heading_slug(want);
+    let folded = fold_hyphens(want);
     top_heading_slugs(tree).into_iter().find_map(|(ix, slug)| {
-        (slug.eq_ignore_ascii_case(want) || (!slugged.is_empty() && slug == slugged)).then_some(ix)
+        (slug.eq_ignore_ascii_case(want)
+            || (!slugged.is_empty() && slug == slugged)
+            || fold_hyphens(&slug) == folded)
+            .then_some(ix)
     })
+}
+
+/// Collapse `--` runs so a generator that kept one hyphen still matches
+/// GitHub's two-space `--` slugs (and the reverse).
+fn fold_hyphens(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_hyphen = false;
+    for ch in s.chars() {
+        if ch == '-' {
+            if !prev_hyphen {
+                out.push('-');
+            }
+            prev_hyphen = true;
+        } else {
+            out.push(ch);
+            prev_hyphen = false;
+        }
+    }
+    out
 }
 
 fn inline_plain_text(runs: &[InlineRun]) -> String {
@@ -1712,6 +1770,29 @@ mod tests {
         assert_eq!(
             gfm_heading_slug("Architecture Sketch"),
             "architecture-sketch"
+        );
+        // Em dash is punctuation; the two surrounding spaces become `--`.
+        assert_eq!(
+            gfm_heading_slug("Appendix A — Fake Sequence"),
+            "appendix-a--fake-sequence"
+        );
+        assert_eq!(
+            gfm_heading_slug("Appendix B — Nested Spec"),
+            "appendix-b--nested-spec"
+        );
+        assert_eq!(
+            heading_index_for_fragment(
+                &super::super::parse_full("## Appendix A — Fake Sequence\n\nbody\n"),
+                "appendix-a--fake-sequence"
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            heading_index_for_fragment(
+                &super::super::parse_full("## Appendix A — Fake Sequence\n\nbody\n"),
+                "appendix-a-fake-sequence"
+            ),
+            Some(0)
         );
         let tree = super::super::parse_full(
             "## Executive Summary\n\ntext\n\n## Executive Summary\n\nmore\n",
