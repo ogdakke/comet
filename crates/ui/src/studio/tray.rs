@@ -1,5 +1,6 @@
 //! Composer attachment tray: file pick, ImportStudioAsset, budgets, Make video.
 
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -10,11 +11,12 @@ use gpui::{
 };
 use sha2::{Digest, Sha256};
 use zeron_proto::ImportStudioAssetResponse;
-use zeron_rpc::methods;
+use zeron_rpc::{RpcError, methods};
 use zeron_studio::{
     AttachmentOrigin, BudgetKind, ComposerAttachment, ComposerEvent, ComposerMediaKind,
-    ComposerMode, InputRole, LimitBudget, MediaKind, MediaOperation, ROLE_REFERENCE, ROLE_SOURCE,
-    StudioArtifactId, StudioAssetId, TrayAccept,
+    ComposerMode, InputRole, LimitBudget, MediaKind, MediaOperation, ROLE_REFERENCE,
+    ROLE_REFERENCE_AUDIO, ROLE_REFERENCE_VIDEO, ROLE_SOURCE, StudioArtifactId, StudioAssetId,
+    StudioConversationId, TrayAccept, sniff_media_mime,
 };
 
 use crate::state::EngineHandle;
@@ -66,35 +68,36 @@ impl StudioPage {
         });
         self.tray_picker_task = Some(cx.spawn(async move |this, cx| {
             let paths = match rx.await {
-                Ok(Ok(Some(paths))) => paths,
+                Ok(Ok(Some(paths))) if !paths.is_empty() => paths,
                 _ => return,
             };
-            this.update(cx, |page, cx| page.attach_tray_paths(paths, &accept, cx))
-                .ok();
-        }));
-    }
-
-    pub(super) fn attach_tray_paths(
-        &mut self,
-        paths: Vec<PathBuf>,
-        accept: &TrayAccept,
-        cx: &mut Context<Self>,
-    ) {
-        let mut first_error = None;
-        for path in paths {
-            match stage_studio_file(&path, accept) {
-                Ok(file) => self.begin_tray_import(file, cx),
-                Err(error) => {
-                    if first_error.is_none() {
-                        first_error = Some(error);
+            let accept = this
+                .update(cx, |page, _| page.composer_view.attachments.accept.clone())
+                .ok()
+                .unwrap_or(accept);
+            let staged = cx
+                .background_executor()
+                .spawn(async move { stage_studio_paths(paths, &accept) })
+                .await;
+            this.update(cx, |page, cx| {
+                let mut first_error = None;
+                for result in staged {
+                    match result {
+                        Ok(file) => page.begin_tray_import(file, cx),
+                        Err(error) => {
+                            if first_error.is_none() {
+                                first_error = Some(error);
+                            }
+                        }
                     }
                 }
-            }
-        }
-        if let Some(error) = first_error {
-            self.error = Some(error.into());
-            cx.notify();
-        }
+                if let Some(error) = first_error {
+                    page.error = Some(error.into());
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     fn begin_tray_import(&mut self, file: StagedStudioFile, cx: &mut Context<Self>) {
@@ -133,7 +136,8 @@ impl StudioPage {
             asset_id,
             cx.spawn(async move |this, cx| {
                 let result =
-                    import_studio_asset(&engine, asset_id, &bytes, &hash, Some(&mime)).await;
+                    import_studio_asset(&engine, asset_id, &bytes, &hash, Some(&mime), "This file")
+                        .await;
                 this.update(cx, |page, cx| {
                     page.import_tasks.remove(&asset_id);
                     let still_present = page
@@ -179,17 +183,20 @@ impl StudioPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.request_close_artifact(cx);
-        if self.selected_conversation.is_none()
-            && let Some(conversation_id) = self.artifact_menu_conversation(artifact_id)
-        {
+        let conversation_id = self.artifact_menu_conversation(artifact_id);
+        if make_video_already_on_thread(self.selected_conversation, conversation_id) {
+            self.request_close_artifact(cx);
+        } else if let Some(conversation_id) = conversation_id {
+            // ShowThread dismisses the lightbox without bouncing through the
+            // gallery nav entry (CloseArtifact would call show_gallery).
             self.open_conversation(conversation_id, cx);
-            // Skip last-turn restore so this pin is not overwritten.
             self.composer_seeded_for = Some(conversation_id);
             cx.emit(super::StudioEvent::ShowThread {
                 conversation_id,
                 focus_artifact: None,
             });
+        } else {
+            self.request_close_artifact(cx);
         }
         if self.composer.mode != ComposerMode::Video {
             self.set_composer_mode(ComposerMode::Video, window, cx);
@@ -369,11 +376,12 @@ impl StudioPage {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(
-                            crate::icons::icon(crate::icons::REFRESH)
-                                .size(px(12.0))
-                                .text_color(theme.text),
-                        ),
+                        .child(crate::loaders::mini_gradient_spinner(
+                            format!("studio-att-spin-{}", asset_id.0),
+                            2.0,
+                            cx.entity_id(),
+                            cx,
+                        )),
                 )
             })
             .child(crate::frost::layered(
@@ -516,6 +524,16 @@ impl StudioPage {
     }
 }
 
+pub(super) fn make_video_already_on_thread(
+    selected: Option<StudioConversationId>,
+    artifact_conversation: Option<StudioConversationId>,
+) -> bool {
+    matches!(
+        (selected, artifact_conversation),
+        (Some(selected), Some(artifact)) if selected == artifact
+    )
+}
+
 pub(super) fn make_video_role_hint(
     operations: impl IntoIterator<Item = MediaOperation>,
 ) -> Option<InputRole> {
@@ -566,16 +584,17 @@ pub(super) fn budget_label(budget: &LimitBudget) -> Option<String> {
             "{}/{} {}",
             budget.used,
             maximum,
-            role_budget_noun(role.as_str())
+            role_budget_noun(role.as_str())?
         )),
     }
 }
 
-fn role_budget_noun(role: &str) -> &'static str {
+fn role_budget_noun(role: &str) -> Option<&'static str> {
     match role {
-        zeron_studio::ROLE_REFERENCE_VIDEO => "videos",
-        zeron_studio::ROLE_REFERENCE_AUDIO | zeron_studio::ROLE_AUDIO => "audios",
-        _ => "images",
+        ROLE_REFERENCE => Some("images"),
+        ROLE_REFERENCE_VIDEO => Some("videos"),
+        ROLE_REFERENCE_AUDIO => Some("audios"),
+        _ => None,
     }
 }
 
@@ -637,38 +656,73 @@ fn image_format_for_mime(mime: &str) -> Option<ImageFormat> {
     }
 }
 
+fn stage_studio_paths(
+    paths: Vec<PathBuf>,
+    accept: &TrayAccept,
+) -> Vec<Result<StagedStudioFile, String>> {
+    paths
+        .iter()
+        .map(|path| stage_studio_file(path, accept))
+        .collect()
+}
+
 fn stage_studio_file(path: &Path, accept: &TrayAccept) -> Result<StagedStudioFile, String> {
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".into());
-    let Some(mime) = mime_for_path(path) else {
-        return Err(format!("{name} is not a supported reference."));
-    };
+    let meta = std::fs::metadata(path).map_err(|_| format!("{name} could not be read."))?;
+    if meta.len() > MAX_IMPORT_BYTES {
+        return Err(too_large_message(&name));
+    }
+    if meta.len() == 0 {
+        return Err(format!("{name} is empty."));
+    }
+    let bytes = std::fs::read(path).map_err(|_| format!("{name} could not be read."))?;
+    if bytes.len() as u64 > MAX_IMPORT_BYTES {
+        return Err(too_large_message(&name));
+    }
+    if bytes.is_empty() {
+        return Err(format!("{name} is empty."));
+    }
+    let mime = sniff_media_mime(&bytes)
+        .or_else(|| mime_for_path(path))
+        .ok_or_else(|| format!("{name} is not a supported reference."))?;
     if !accepts_mime(accept, mime) {
         return Err(format!("{name} is not accepted by the selected models."));
     }
     let Some(kind) = kind_for_mime(mime) else {
         return Err(format!("{name} is not a supported reference."));
     };
-    let meta = std::fs::metadata(path).map_err(|_| format!("{name} could not be read."))?;
-    if meta.len() > MAX_IMPORT_BYTES {
-        return Err(format!("{name} is too large (64 MB max)."));
-    }
-    if meta.len() == 0 {
-        return Err(format!("{name} is empty."));
-    }
-    let bytes = std::fs::read(path).map_err(|_| format!("{name} could not be read."))?;
     let hash = format!("{:x}", Sha256::digest(&bytes));
-    let preview = image_format_for_mime(mime)
-        .map(|format| Arc::new(Image::from_bytes(format, bytes.clone())));
     Ok(StagedStudioFile {
+        preview: tray_preview(&bytes, mime),
         bytes,
         mime: mime.to_owned(),
         kind,
         hash,
-        preview,
     })
+}
+
+fn too_large_message(name: &str) -> String {
+    format!("{name} is too large (64 MiB max).")
+}
+
+fn tray_preview(bytes: &[u8], mime: &str) -> Option<Arc<Image>> {
+    image_format_for_mime(mime)?;
+    let decoded = image::load_from_memory(bytes).ok()?;
+    const MAX_EDGE: u32 = 88;
+    let image = if decoded.width() > MAX_EDGE || decoded.height() > MAX_EDGE {
+        decoded.thumbnail(MAX_EDGE, MAX_EDGE)
+    } else {
+        decoded
+    };
+    let mut encoded = Cursor::new(Vec::new());
+    image.write_to(&mut encoded, image::ImageFormat::Png).ok()?;
+    Some(Arc::new(Image::from_bytes(
+        ImageFormat::Png,
+        encoded.into_inner(),
+    )))
 }
 
 async fn import_studio_asset(
@@ -677,12 +731,13 @@ async fn import_studio_asset(
     bytes: &[u8],
     hash: &str,
     mime_hint: Option<&str>,
+    name: &str,
 ) -> Result<ComposerAttachment, String> {
     let mut offset = 0u64;
     loop {
         let start = offset as usize;
         if start > bytes.len() {
-            return Err("import offset exceeded the file".into());
+            return Err(format!("{name} could not be uploaded."));
         }
         let remaining = bytes.len() - start;
         let last = remaining <= IMPORT_CHUNK_BYTES;
@@ -692,7 +747,8 @@ async fn import_studio_asset(
             engine,
             import_params(asset_id, offset, chunk, last, hash, mime_hint),
         )
-        .await?;
+        .await
+        .map_err(|error| friendly_import_error(&error.to_string(), name))?;
         let response = serde_json::from_value::<ImportStudioAssetResponse>(value)
             .map_err(|error| error.to_string())?;
         match response {
@@ -701,9 +757,28 @@ async fn import_studio_asset(
                 if last {
                     return Err("import finished without a committed attachment".into());
                 }
-                offset = continued.next_offset;
+                offset = import_next_offset(offset, continued.next_offset)?;
             }
         }
+    }
+}
+
+fn import_next_offset(current: u64, next: u64) -> Result<u64, String> {
+    if next <= current {
+        Err("import stopped advancing".into())
+    } else {
+        Ok(next)
+    }
+}
+
+fn friendly_import_error(message: &str, name: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("64 mib") || lower.contains("too large") || lower.contains("exceeds 64") {
+        too_large_message(name)
+    } else if lower.contains("nextoffset") || lower.contains("offset") {
+        format!("{name} could not be uploaded.")
+    } else {
+        message.to_string()
     }
 }
 
@@ -733,8 +808,7 @@ fn import_params(
 async fn call_import(
     engine: &EngineHandle,
     params: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let mut last_error = String::new();
+) -> Result<serde_json::Value, RpcError> {
     for attempt in 0..3 {
         match engine
             .client()
@@ -742,15 +816,15 @@ async fn call_import(
             .await
         {
             Ok(value) => return Ok(value),
-            Err(error) => {
-                last_error = error.to_string();
-                if attempt == 2 {
-                    break;
-                }
-            }
+            Err(error) if import_error_is_retryable(&error) && attempt < 2 => {}
+            Err(error) => return Err(error),
         }
     }
-    Err(last_error)
+    Err(RpcError::Closed)
+}
+
+fn import_error_is_retryable(error: &RpcError) -> bool {
+    matches!(error, RpcError::Transport(_) | RpcError::Closed)
 }
 
 #[cfg(test)]
@@ -839,6 +913,32 @@ mod tests {
             .as_deref(),
             Some("2/4 images")
         );
+        assert_eq!(
+            budget_label(&LimitBudget {
+                kind: BudgetKind::Role {
+                    role: InputRole::new(ROLE_REFERENCE_VIDEO),
+                },
+                used: 1,
+                maximum: Some(3),
+                subjects: Vec::new(),
+                remaining: Some(2),
+            })
+            .as_deref(),
+            Some("1/3 videos")
+        );
+        assert!(
+            budget_label(&LimitBudget {
+                kind: BudgetKind::Role {
+                    role: InputRole::new(zeron_studio::ROLE_SOURCE),
+                },
+                used: 1,
+                maximum: Some(1),
+                subjects: Vec::new(),
+                remaining: Some(0),
+            })
+            .is_none(),
+            "source/last_frame must not duplicate the images counter"
+        );
         assert!(
             budget_label(&LimitBudget {
                 kind: BudgetKind::PromptChars,
@@ -849,6 +949,81 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn make_video_closes_only_when_already_on_the_thread() {
+        let conversation = StudioConversationId::new();
+        assert!(make_video_already_on_thread(
+            Some(conversation),
+            Some(conversation)
+        ));
+        assert!(!make_video_already_on_thread(None, Some(conversation)));
+        assert!(!make_video_already_on_thread(
+            Some(StudioConversationId::new()),
+            Some(conversation)
+        ));
+    }
+
+    #[test]
+    fn import_stalls_when_next_offset_does_not_advance() {
+        assert!(import_next_offset(12, 12).is_err());
+        assert!(import_next_offset(12, 8).is_err());
+        assert_eq!(import_next_offset(12, 24).unwrap(), 24);
+    }
+
+    #[test]
+    fn import_errors_are_friendly_for_size_and_offset() {
+        assert_eq!(
+            friendly_import_error("bad params: studio asset exceeds 64 MiB", "clip.mp4"),
+            "clip.mp4 is too large (64 MiB max)."
+        );
+        assert_eq!(
+            friendly_import_error(
+                "bad params: import offset must equal nextOffset",
+                "still.png"
+            ),
+            "still.png could not be uploaded."
+        );
+        assert!(!import_error_is_retryable(&RpcError::BadParams(
+            "studio asset exceeds 64 MiB".into()
+        )));
+        assert!(import_error_is_retryable(&RpcError::Closed));
+        assert!(import_error_is_retryable(&RpcError::Transport(
+            "reset".into()
+        )));
+    }
+
+    #[test]
+    fn stage_sniffs_bytes_then_accepts_mime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ref.bin");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nrest").unwrap();
+        let accept = TrayAccept {
+            mime_types: vec!["image/png".into()],
+        };
+        let staged = stage_studio_file(&path, &accept).unwrap();
+        assert_eq!(staged.mime, "image/png");
+        assert_eq!(staged.kind, ComposerMediaKind::Image);
+
+        let video_only = TrayAccept {
+            mime_types: vec!["video/mp4".into()],
+        };
+        let rejected = stage_studio_file(&path, &video_only).err().expect("reject");
+        assert!(rejected.contains("not accepted"), "{rejected}");
+    }
+
+    #[test]
+    fn stage_falls_back_to_extension_when_sniff_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.mp4");
+        std::fs::write(&path, b"not a real container").unwrap();
+        let accept = TrayAccept {
+            mime_types: vec!["video/mp4".into()],
+        };
+        let staged = stage_studio_file(&path, &accept).unwrap();
+        assert_eq!(staged.mime, "video/mp4");
+        assert_eq!(staged.kind, ComposerMediaKind::Video);
     }
 
     #[test]
