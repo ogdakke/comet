@@ -2682,7 +2682,12 @@ impl StudioPage {
                                 } else {
                                     ARTIFACT_FILMSTRIP_HEIGHT
                                 },
-                            ),
+                            )
+                            // Same band as the filmstrip / edit composer; a
+                            // steeper ease-out so the image stays solid and
+                            // only dissolves in the last stretch above the
+                            // chrome — quadratic lingered half-faded.
+                            .ease(crate::edge_fade::EdgeFadeEase::Exponential),
                         )
                         .child(
                             div()

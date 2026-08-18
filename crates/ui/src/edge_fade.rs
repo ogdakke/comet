@@ -10,6 +10,8 @@ use gpui::{
     LayoutId, Pixels, ScrollHandle, Window, px,
 };
 
+pub use gpui::EdgeFadeEase;
+
 /// Fade the child's content at its own edges: `top`/`bottom` select which
 /// edges (pass the "is there hidden overflow" flags), `band` is the ramp
 /// height in px. Horizontal edges via [`EdgeFaded::fade_left`] /
@@ -26,6 +28,7 @@ pub fn edge_faded(band: f32, top: bool, bottom: bool, child: impl IntoElement) -
         right: false,
         scroll_y: None,
         scroll_x: None,
+        ease: EdgeFadeEase::Quadratic,
         child: child.into_any_element(),
     }
 }
@@ -41,6 +44,7 @@ pub struct EdgeFaded {
     right: bool,
     scroll_y: Option<ScrollHandle>,
     scroll_x: Option<ScrollHandle>,
+    ease: EdgeFadeEase,
     child: AnyElement,
 }
 
@@ -95,6 +99,14 @@ impl EdgeFaded {
     /// chrome (titlebar TEXT) vanishes before it can overlap.
     pub fn inset_top(mut self, px: f32) -> Self {
         self.inset_top = px;
+        self
+    }
+
+    /// Override the 0..1 distance-to-opacity curve. Default is
+    /// [`EdgeFadeEase::Quadratic`] (`t²`). [`EdgeFadeEase::Exponential`]
+    /// holds the edge then snaps toward full opacity inward.
+    pub fn ease(mut self, ease: EdgeFadeEase) -> Self {
+        self.ease = ease;
         self
     }
 }
@@ -170,6 +182,7 @@ impl Element for EdgeFaded {
                 bottom,
                 left,
                 right,
+                ease: self.ease,
             }
         });
         window.with_edge_fade(fade, |window| self.child.paint(window, cx));
