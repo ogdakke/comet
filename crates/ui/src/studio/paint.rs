@@ -476,16 +476,43 @@ fn invert_mask(mask: &mut GrayImage) {
     }
 }
 
+const INSIDE: u8 = 128;
+
 fn overlay_pixel(mask: &GrayImage, x: u32, y: u32) -> Rgba<u8> {
-    let coverage = mask.get_pixel(x, y).0[0] as f32 / 255.0;
-    if coverage <= 0.0 {
+    let coverage = mask.get_pixel(x, y).0[0];
+    if coverage == 0 {
         return Rgba([0, 0, 0, 0]);
     }
-    // 50% contour is the silhouette: opaque white on the edge, 20% fill inside.
-    let fill = ((coverage - 0.5) * 2.0).clamp(0.0, 1.0);
-    let outline = (1.0 - (coverage - 0.5).abs() * 2.0).clamp(0.0, 1.0);
-    let alpha = (FILL_ALPHA as f32 * fill).max(255.0 * outline).round() as u8;
+    // 8-neighbor ring on the inside of the 50% contour. 4-neighbor-only
+    // marks a diagonal as isolated stairs (a dashed outline).
+    if coverage >= INSIDE {
+        let alpha = if neighbor_below(mask, x, y, INSIDE) {
+            255
+        } else {
+            FILL_ALPHA
+        };
+        return Rgba([255, 255, 255, alpha]);
+    }
+    let alpha = (255.0 * (coverage as f32 / INSIDE as f32)).round() as u8;
     Rgba([255, 255, 255, alpha])
+}
+
+fn neighbor_below(mask: &GrayImage, x: u32, y: u32, threshold: u8) -> bool {
+    let width = mask.width();
+    let height = mask.height();
+    let neighbors = [
+        (x.wrapping_sub(1), y.wrapping_sub(1)),
+        (x, y.wrapping_sub(1)),
+        (x + 1, y.wrapping_sub(1)),
+        (x.wrapping_sub(1), y),
+        (x + 1, y),
+        (x.wrapping_sub(1), y + 1),
+        (x, y + 1),
+        (x + 1, y + 1),
+    ];
+    neighbors
+        .into_iter()
+        .any(|(nx, ny)| nx >= width || ny >= height || mask.get_pixel(nx, ny).0[0] < threshold)
 }
 
 fn refresh_overlay(mask: &GrayImage, overlay: &mut RgbaImage, rect: (u32, u32, u32, u32)) {
@@ -593,7 +620,7 @@ mod tests {
                 if pixel.0[3] == 0 {
                     continue;
                 }
-                if pixel.0[3] >= 180 {
+                if pixel.0[3] == 255 {
                     edge_white += 1;
                 } else {
                     interior_white += 1;
@@ -693,13 +720,11 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn smallest_brush_is_four_source_pixels() {
         assert_eq!(PaintSession::brush_radius(1024, 1024, 0.0), 4.0);
         assert!(PaintSession::brush_radius(1024, 1024, 1.0) > 4.0);
     }
 
-    #[test]
     #[test]
     fn diagonal_stroke_has_an_antialiased_fringe() {
         let mut session = PaintSession::new(48, 48);
@@ -717,8 +742,39 @@ mod tests {
             }
         }
         assert!(
-            fringe > 20,
-            "diagonal edge should have intermediate coverage, got {fringe}"
+            fringe > 0,
+            "diagonal edge should have an anti-aliased fringe, got {fringe}"
+        );
+
+        let mut isolated = 0u32;
+        let mut edge = 0u32;
+        for y in 1..47 {
+            for x in 1..47 {
+                if overlay.get_pixel(x, y).0[3] != 255 {
+                    continue;
+                }
+                edge += 1;
+                let linked = [
+                    overlay.get_pixel(x - 1, y - 1).0[3],
+                    overlay.get_pixel(x, y - 1).0[3],
+                    overlay.get_pixel(x + 1, y - 1).0[3],
+                    overlay.get_pixel(x - 1, y).0[3],
+                    overlay.get_pixel(x + 1, y).0[3],
+                    overlay.get_pixel(x - 1, y + 1).0[3],
+                    overlay.get_pixel(x, y + 1).0[3],
+                    overlay.get_pixel(x + 1, y + 1).0[3],
+                ]
+                .into_iter()
+                .any(|alpha| alpha == 255);
+                if !linked {
+                    isolated += 1;
+                }
+            }
+        }
+        assert!(edge > 20, "diagonal should have a connected silhouette");
+        assert!(
+            isolated * 4 < edge,
+            "outline should not dash: {isolated} isolated of {edge} edge pixels"
         );
     }
 

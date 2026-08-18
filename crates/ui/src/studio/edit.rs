@@ -403,7 +403,7 @@ impl StudioPage {
         let Some(image) = self.pointer_to_image(position) else {
             return;
         };
-        let min_distance = self.screen_to_image_distance(1.4);
+        let min_distance = self.screen_to_image_distance(0.75);
         let Some(paint) = self.edit_paint.as_mut() else {
             return;
         };
