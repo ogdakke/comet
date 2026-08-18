@@ -81,7 +81,8 @@ use crate::registry::HarnessRegistry;
 use crate::repos::{Repos, home_dir};
 use crate::sessions::SessionsEngine;
 use crate::studio::{
-    PreparedStudioRun, StoredStudioRun, StudioProviderRegistry, StudioStore, StudioStoreError,
+    CompleteRun, PreparedStudioRun, StoredStudioRun, StudioProviderRegistry, StudioStore,
+    StudioStoreError,
 };
 use crate::studio_credentials::StudioCredentials;
 use crate::terminals::Terminals;
@@ -633,7 +634,7 @@ impl EngineRpc {
                     zeron_studio::ControlValue::Boolean { value: safe_mode },
                 );
             }
-            let quote = self.resolve_studio_quote(&generation, &model).await;
+            let quote = self.resolve_studio_quote(&generation, &model).await?;
             prepared.push(PreparedStudioRun {
                 model,
                 request: generation,
@@ -647,21 +648,50 @@ impl EngineRpc {
         &self,
         request: &zeron_studio::GenerationRequest,
         model: &zeron_studio::MediaModel,
-    ) -> Option<zeron_studio::Quote> {
-        let reference_video_total = self
-            .studio
-            .reference_video_total_duration(request)
-            .ok()
-            .flatten();
+    ) -> Result<Option<zeron_studio::Quote>, RpcError> {
+        let has_reference_video = request
+            .inputs
+            .iter()
+            .any(|input| input.role.as_str() == zeron_studio::ROLE_REFERENCE_VIDEO);
+        if has_reference_video {
+            let total = self
+                .studio
+                .reference_video_total_duration(request)
+                .map_err(|error| RpcError::Failed(error.to_string()))?
+                .ok_or_else(|| {
+                    RpcError::Failed(
+                        "video quote requires reference_video_total_duration when reference clips are present"
+                            .into(),
+                    )
+                })?;
+            let provider = self
+                .studio_providers
+                .get(&request.provider_id)
+                .map_err(|error| RpcError::Failed(error.to_string()))?
+                .ok_or_else(|| RpcError::Failed("unknown studio provider".into()))?;
+            let secret = self
+                .studio_credentials
+                .secret(&request.provider_id)
+                .await
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+            let quote = provider
+                .quote(&secret, request, Some(total))
+                .await
+                .map_err(|error| RpcError::Failed(error.to_string()))?
+                .ok_or_else(|| {
+                    RpcError::Failed(
+                        "video quote is required when reference clips are present".into(),
+                    )
+                })?;
+            return Ok(Some(quote));
+        }
         if let Ok(Some(provider)) = self.studio_providers.get(&request.provider_id)
             && let Ok(secret) = self.studio_credentials.secret(&request.provider_id).await
-            && let Ok(Some(quote)) = provider
-                .quote(&secret, request, reference_video_total)
-                .await
+            && let Ok(Some(quote)) = provider.quote(&secret, request, None).await
         {
-            return Some(quote);
+            return Ok(Some(quote));
         }
-        model.estimate_cost(&request.controls, request.output_count)
+        Ok(model.estimate_cost(&request.controls, request.output_count))
     }
 
     fn local_importer(&self) -> Result<&crate::local_import::LocalImporter, RpcError> {
@@ -2690,11 +2720,14 @@ async fn execute_studio_run_with_policy(
     let request = apply_venice_safe_mode_for_submit(&credentials, run.request.clone());
     match provider.submit(&secret, &request, &context).await {
         Ok(zeron_studio::Submission::Completed { artifacts }) => {
-            if let Err(error) = store.complete_run(&run, &artifacts) {
-                let message = error.to_string();
-                fail_studio_run(&store, &run, &message, false)
-            } else {
-                Ok(())
+            match store.complete_run(&run, &artifacts) {
+                Ok(CompleteRun::Published | CompleteRun::Failed | CompleteRun::AlreadyTerminal) => {
+                    Ok(())
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    fail_studio_run(&store, &run, &message, false)
+                }
             }
         }
         Ok(zeron_studio::Submission::Queued { remote_job }) => {
@@ -2708,7 +2741,7 @@ async fn execute_studio_run_with_policy(
             }
             if let Err(error) = store.mark_queued(&run, &remote_job) {
                 let message = error.to_string();
-                return fail_studio_run(&store, &run, &message, false);
+                return fail_studio_run(&store, &run, &message, true);
             }
             poll_queued_video_job(
                 &store,
@@ -2792,6 +2825,21 @@ impl VideoPollPolicy {
     fn timed_out(self, started: Instant) -> bool {
         started.elapsed() >= self.timeout
     }
+
+    fn remaining(self, started: Instant) -> Duration {
+        self.timeout.saturating_sub(started.elapsed())
+    }
+
+    fn sleep_for(self, started: Instant, delay: Duration) -> Option<Duration> {
+        let remaining = self.remaining(started);
+        if remaining.is_zero() {
+            None
+        } else if delay.is_zero() {
+            Some(Duration::ZERO)
+        } else {
+            Some(delay.min(remaining))
+        }
+    }
 }
 
 fn submit_operation_allowed(operation: zeron_studio::MediaOperation) -> bool {
@@ -2851,11 +2899,11 @@ async fn poll_queued_video_job(
     let mut delay = policy.first_tick;
     let mut transient_n = 0u32;
     loop {
-        if policy.timed_out(started) {
+        let Some(sleep_for) = policy.sleep_for(started, delay) else {
             return fail_studio_run(store, run, "video job timed out after 45 minutes", false);
-        }
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
+        };
+        if !sleep_for.is_zero() {
+            tokio::time::sleep(sleep_for).await;
             if policy.timed_out(started) {
                 return fail_studio_run(store, run, "video job timed out after 45 minutes", false);
             }
@@ -2876,19 +2924,24 @@ async fn poll_queued_video_job(
                     let message = error.to_string();
                     return fail_studio_run(store, run, &message, false);
                 }
-                if let Err(error) = store.complete_run(run, &artifacts) {
-                    let message = error.to_string();
-                    return fail_studio_run(store, run, &message, false);
+                match store.complete_run(run, &artifacts) {
+                    Ok(CompleteRun::Published) => {
+                        if let Err(error) = provider.complete(secret, remote_job).await {
+                            tracing::warn!(
+                                run_id = %run.run_id.0,
+                                attempt_id = %run.attempt_id.0,
+                                error = %error,
+                                "studio video complete failed"
+                            );
+                        }
+                        return Ok(());
+                    }
+                    Ok(CompleteRun::Failed | CompleteRun::AlreadyTerminal) => return Ok(()),
+                    Err(error) => {
+                        let message = error.to_string();
+                        return fail_studio_run(store, run, &message, false);
+                    }
                 }
-                if let Err(error) = provider.complete(secret, remote_job).await {
-                    tracing::warn!(
-                        run_id = %run.run_id.0,
-                        attempt_id = %run.attempt_id.0,
-                        error = %error,
-                        "studio video complete failed"
-                    );
-                }
-                return Ok(());
             }
             Ok(zeron_studio::PollResult::Failed { error })
                 if error.kind == zeron_studio::ProviderErrorKind::Transient =>
@@ -3016,6 +3069,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn video_poll_sleep_is_capped_to_remaining_timeout() {
+        let policy = VideoPollPolicy {
+            first_tick: Duration::from_secs(5),
+            timeout: Duration::from_secs(10),
+            base_tick: Duration::from_secs(5),
+            max_backoff: Duration::from_secs(30),
+        };
+        let started = Instant::now() - Duration::from_secs(8);
+        let sleep = policy
+            .sleep_for(started, Duration::from_secs(3600))
+            .expect("time remains inside the cap");
+        assert!(sleep <= Duration::from_secs(2));
+        assert!(sleep > Duration::ZERO);
+        let expired = Instant::now() - Duration::from_secs(10);
+        assert_eq!(policy.sleep_for(expired, Duration::from_secs(1)), None);
+    }
+
     #[derive(Default)]
     struct MemorySecrets(
         std::sync::Mutex<std::collections::BTreeMap<zeron_studio::ProviderId, String>>,
@@ -3099,6 +3170,18 @@ mod tests {
             width: None,
             height: None,
             duration_seconds: Some(6.0),
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    fn png_artifact() -> zeron_studio::ProviderArtifact {
+        zeron_studio::ProviderArtifact {
+            media_kind: zeron_studio::MediaKind::Image,
+            mime_type: "image/png".into(),
+            bytes: b"\x89PNG\r\n\x1a\ngenerated image".to_vec(),
+            width: Some(8),
+            height: Some(8),
+            duration_seconds: None,
             metadata: serde_json::json!({}),
         }
     }
@@ -3232,5 +3315,32 @@ mod tests {
             "{:?}",
             view.turns[0].runs[0].error
         );
+    }
+
+    #[tokio::test]
+    async fn failed_persist_does_not_complete_the_remote_job() {
+        let provider = std::sync::Arc::new(zeron_studio::FakeMediaProvider::new(
+            "fake",
+            vec![video_model()],
+            zeron_studio::FakeSubmissionMode::Queue {
+                polls_before_completion: 0,
+                artifacts: vec![png_artifact()],
+            },
+        ));
+        let (_root, store, providers, credentials, run, conversation_id) =
+            video_run_harness(provider.clone()).await;
+        execute_studio_run_with_policy(
+            store.clone(),
+            providers,
+            credentials,
+            run,
+            instant_policy(),
+        )
+        .await
+        .unwrap();
+        let view = store.conversation_view(conversation_id).unwrap();
+        assert_eq!(view.turns[0].runs[0].state, StudioRunState::Failed);
+        assert!(view.turns[0].runs[0].artifacts.is_empty());
+        assert_eq!(provider.complete_call_count(), 0);
     }
 }

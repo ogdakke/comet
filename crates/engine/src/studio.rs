@@ -351,6 +351,15 @@ pub enum StudioStoreError {
     RunNotFound,
 }
 
+/// Outcome of [`StudioStore::complete_run`]. Internal `fail_run` is `Failed`,
+/// not `Ok` — callers must not treat that as a published artifact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompleteRun {
+    Published,
+    Failed,
+    AlreadyTerminal,
+}
+
 #[derive(Clone)]
 pub struct PreparedStudioRun {
     pub model: MediaModel,
@@ -1500,6 +1509,9 @@ impl StudioStore {
 
     /// First writer of `remote_job_id`. Persist provider metadata (`model`, `download_url`)
     /// and move the attempt + run to `queued`.
+    ///
+    /// The remote id is written even if the state CAS fails so a later
+    /// `submission_unknown` still has a queue id to resume or retry against.
     pub fn mark_queued(
         &self,
         run: &StoredStudioRun,
@@ -1510,13 +1522,12 @@ impl StudioStore {
         let now = chrono::Utc::now().timestamp_millis();
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        let changed = transaction.execute(
+        let persisted = transaction.execute(
             "UPDATE studio_attempts
-             SET state = 'queued',
-                 remote_job_id = ?3,
+             SET remote_job_id = ?3,
                  response_metadata_json = ?4,
                  last_polled_at = ?5
-             WHERE id = ?1 AND run_id = ?2 AND state IN ('submitting', 'queued')",
+             WHERE id = ?1 AND run_id = ?2",
             rusqlite::params![
                 run.attempt_id.0.to_string(),
                 run.run_id.0.to_string(),
@@ -1525,8 +1536,20 @@ impl StudioStore {
                 now
             ],
         )?;
-        if changed != 1 {
+        if persisted != 1 {
             return Err(StudioStoreError::RunNotFound);
+        }
+        let queued = transaction.execute(
+            "UPDATE studio_attempts SET state = 'queued'
+             WHERE id = ?1 AND run_id = ?2 AND state IN ('submitting', 'queued')",
+            rusqlite::params![run.attempt_id.0.to_string(), run.run_id.0.to_string()],
+        )?;
+        if queued != 1 {
+            transaction.commit()?;
+            self.notify_change();
+            return Err(StudioStoreError::InvalidValue(
+                "studio attempt could not be marked queued".into(),
+            ));
         }
         transaction.execute(
             "UPDATE studio_runs SET state = 'queued', progress = NULL, updated_at = ?2 WHERE id = ?1",
@@ -1658,9 +1681,9 @@ impl StudioStore {
         &self,
         run: &StoredStudioRun,
         artifacts: &[ProviderArtifact],
-    ) -> Result<(), StudioStoreError> {
+    ) -> Result<CompleteRun, StudioStoreError> {
         if artifacts.len() != run.request.output_count as usize {
-            return self.fail_run(
+            self.fail_run(
                 run,
                 &format!(
                     "provider returned {} artifacts; {} were requested",
@@ -1668,17 +1691,19 @@ impl StudioStore {
                     run.request.output_count
                 ),
                 false,
-            );
+            )?;
+            return Ok(CompleteRun::Failed);
         }
         let model = self.run_model(run.run_id)?;
         let mut published = Vec::with_capacity(artifacts.len());
         for artifact in artifacts {
             let Some(mime_type) = model.accepted_output_mime(&artifact.bytes) else {
-                return self.fail_run(
+                self.fail_run(
                     run,
                     "provider artifact is not a supported format for this model",
                     false,
-                );
+                )?;
+                return Ok(CompleteRun::Failed);
             };
             let id = StudioArtifactId::new();
             let extension = extension_for_mime(&mime_type).ok_or_else(|| {
@@ -1707,6 +1732,14 @@ impl StudioStore {
             let mut connection = self.connection()?;
             let transaction = connection.transaction()?;
             let now = chrono::Utc::now().timestamp_millis();
+            let claimed = transaction.execute(
+                "UPDATE studio_attempts SET state = 'succeeded', completed_at = ?2
+                 WHERE id = ?1 AND state IN ('prepared', 'submitting', 'queued', 'running')",
+                rusqlite::params![run.attempt_id.0.to_string(), now],
+            )?;
+            if claimed != 1 {
+                return Ok(CompleteRun::AlreadyTerminal);
+            }
             for (position, (id, path, _, artifact, mime_type, preview)) in
                 published.iter().enumerate()
             {
@@ -1725,10 +1758,6 @@ impl StudioStore {
                 )?;
             }
             transaction.execute(
-                "UPDATE studio_attempts SET state = 'succeeded', completed_at = ?2 WHERE id = ?1",
-                rusqlite::params![run.attempt_id.0.to_string(), now],
-            )?;
-            transaction.execute(
                 "UPDATE studio_runs SET state = 'succeeded', progress = 1.0, updated_at = ?2 WHERE id = ?1",
                 rusqlite::params![run.run_id.0.to_string(), now],
             )?;
@@ -1738,16 +1767,17 @@ impl StudioStore {
             )?;
             recompute_batch(&transaction, run.run_id, now)?;
             transaction.commit()?;
-            Ok::<(), StudioStoreError>(())
+            Ok(CompleteRun::Published)
         })();
-        if result.is_err() {
-            for (id, _, extension, _, _, _) in &published {
-                let _ = self.artifacts.delete(*id, extension);
-                let _ = self.artifacts.delete_preview(*id);
+        match &result {
+            Ok(CompleteRun::Published) => self.notify_change(),
+            Ok(CompleteRun::AlreadyTerminal) | Err(_) => {
+                for (id, _, extension, _, _, _) in &published {
+                    let _ = self.artifacts.delete(*id, extension);
+                    let _ = self.artifacts.delete_preview(*id);
+                }
             }
-        }
-        if result.is_ok() {
-            self.notify_change();
+            Ok(CompleteRun::Failed) => {}
         }
         result
     }
@@ -1767,10 +1797,14 @@ impl StudioStore {
             "failed"
         };
         let error = serde_json::json!({ "message": message }).to_string();
-        transaction.execute(
-            "UPDATE studio_attempts SET state = ?2, error_json = ?3, completed_at = CASE WHEN ?2 = 'failed' THEN ?4 ELSE NULL END WHERE id = ?1",
+        let claimed = transaction.execute(
+            "UPDATE studio_attempts SET state = ?2, error_json = ?3, completed_at = CASE WHEN ?2 = 'failed' THEN ?4 ELSE NULL END
+             WHERE id = ?1 AND state IN ('prepared', 'submitting', 'queued', 'running')",
             rusqlite::params![run.attempt_id.0.to_string(), attempt_state, error, now],
         )?;
+        if claimed != 1 {
+            return Ok(());
+        }
         transaction.execute(
             "UPDATE studio_runs SET state = 'failed', error_json = ?2, updated_at = ?3 WHERE id = ?1",
             rusqlite::params![run.run_id.0.to_string(), error, now],

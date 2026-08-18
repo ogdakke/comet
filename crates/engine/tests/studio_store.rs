@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 use zeron_engine::studio::PreparedStudioRun;
 use zeron_engine::{
-    EngineCore, EngineProfile, HarnessId, StudioCredentialError, StudioCredentials,
+    CompleteRun, EngineCore, EngineProfile, HarnessId, StudioCredentialError, StudioCredentials,
     StudioProviderRegistry, StudioSecretBackend, StudioStore, default_registry,
 };
 use zeron_proto::{
@@ -404,6 +404,79 @@ fn mark_queued_is_the_first_writer_of_remote_job_id() {
     let view = store.conversation_view(conversation.id).unwrap();
     assert_eq!(view.turns[0].runs[0].state, StudioRunState::Downloading);
     assert!((view.turns[0].runs[0].progress.unwrap() - 0.9).abs() < f32::EPSILON);
+}
+
+#[test]
+fn mark_queued_persists_remote_id_when_state_cas_fails() {
+    let root = tempdir().unwrap();
+    let model = seedance_t2v_model("fake");
+    let store = StudioStore::open(root.path(), 1024).unwrap();
+    let conversation = store.create_conversation("Queued id", None).unwrap();
+    let runs = store
+        .create_turn(
+            conversation.id,
+            "a comet",
+            None,
+            &[video_prepared_run(&model, "a comet")],
+            "device-a",
+        )
+        .unwrap();
+    let error = store
+        .mark_queued(
+            &runs[0],
+            &RemoteJob {
+                id: "queue-orphan".into(),
+                metadata: serde_json::json!({ "model": "seedance-t2v" }),
+            },
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("marked queued"), "{error}");
+    let (remote_job_id, attempt_state): (String, String) = store
+        .connection()
+        .unwrap()
+        .query_row(
+            "SELECT remote_job_id, state FROM studio_attempts WHERE id = ?1",
+            [runs[0].attempt_id.0.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(remote_job_id, "queue-orphan");
+    assert_eq!(attempt_state, "prepared");
+    store
+        .fail_run(&runs[0], "could not persist queued state", true)
+        .unwrap();
+    assert!(store.prepare_retry(runs[0].run_id, false).is_err());
+    assert!(store.prepare_retry(runs[0].run_id, true).is_ok());
+}
+
+#[test]
+fn complete_run_and_fail_run_cas_ignore_terminal_attempts() {
+    let root = tempdir().unwrap();
+    let store = StudioStore::open(root.path(), 1024 * 1024).unwrap();
+    let conversation = store.create_conversation("cas", None).unwrap();
+    let stored = store
+        .create_turn(
+            conversation.id,
+            "a comet",
+            None,
+            &[prepared_run(&image_model("fake"), "a comet")],
+            "device-a",
+        )
+        .unwrap();
+    assert_eq!(
+        store.complete_run(&stored[0], &[png_artifact()]).unwrap(),
+        CompleteRun::Published
+    );
+    assert_eq!(
+        store.complete_run(&stored[0], &[png_artifact()]).unwrap(),
+        CompleteRun::AlreadyTerminal
+    );
+    store
+        .fail_run(&stored[0], "should not overwrite success", false)
+        .unwrap();
+    let view = store.conversation_view(conversation.id).unwrap();
+    assert_eq!(view.turns[0].runs[0].state, StudioRunState::Succeeded);
+    assert_eq!(view.turns[0].runs[0].artifacts.len(), 1);
 }
 
 #[test]
@@ -3921,5 +3994,72 @@ async fn quote_studio_batch_passes_reference_video_total_duration() {
     .unwrap();
     assert!((quoted.runs[0].quote.clone().unwrap().amount - 2.5).abs() < f64::EPSILON);
     assert_eq!(provider.last_quote_reference_video_total(), Some(Some(4.0)));
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn quote_studio_batch_rejects_unproved_reference_video_duration() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(
+        FakeMediaProvider::new(
+            "fake",
+            vec![seedance_r2v_model("fake")],
+            FakeSubmissionMode::Complete(Vec::new()),
+        )
+        .with_quote(Quote::provider("USD", 0.01)),
+    );
+    let (engine, client) = studio_client_with_fake(root.path(), provider.clone()).await;
+    let bytes = ftyp_mp4();
+    let hash = format!("{:x}", Sha256::digest(&bytes));
+    let asset_id = StudioAssetId::new();
+    let imported: ImportStudioAssetResponse = serde_json::from_value(
+        client
+            .call(
+                methods::IMPORT_STUDIO_ASSET,
+                serde_json::json!({
+                    "assetId": asset_id,
+                    "offset": 0,
+                    "data": BASE64.encode(&bytes),
+                    "last": true,
+                    "expectedHash": hash
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let ImportStudioAssetResponse::Complete(attachment) = imported else {
+        panic!("expected complete video import");
+    };
+    assert_eq!(attachment.duration_seconds, None);
+    let error = client
+        .call(
+            methods::QUOTE_STUDIO_BATCH,
+            serde_json::json!({
+                "prompt": "a comet",
+                "runs": [{
+                    "providerId": "fake",
+                    "modelId": "seedance-r2v",
+                    "operation": "reference_to_video",
+                    "outputCount": 1,
+                    "controls": { "duration": { "type": "duration_seconds", "value": 6.0 } },
+                    "inputs": [{
+                        "role": "reference_video",
+                        "ordinal": 0,
+                        "source": { "source": "asset", "asset_id": asset_id },
+                        "content_hash": hash
+                    }],
+                    "manifestVersion": "fixture-v1",
+                    "displayAspectRatio": [16, 9]
+                }]
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("reference_video_total_duration"),
+        "{error}"
+    );
+    assert_eq!(provider.last_quote_reference_video_total(), None);
     engine.shutdown().await;
 }

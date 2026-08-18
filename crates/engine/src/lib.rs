@@ -55,8 +55,8 @@ pub use run_journal::{JournalError, RunJournal};
 pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
 pub use spaces::SpacesSync;
 pub use studio::{
-    ArtifactStore, StudioProviderDescriptor, StudioProviderRegistry, StudioRegistryError,
-    StudioStore, StudioStoreError,
+    ArtifactStore, CompleteRun, StudioProviderDescriptor, StudioProviderRegistry,
+    StudioRegistryError, StudioStore, StudioStoreError,
 };
 pub use studio_credentials::{
     StudioCredentialError, StudioCredentials, StudioSecretBackend, SystemStudioSecretBackend,
