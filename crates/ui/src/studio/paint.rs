@@ -491,6 +491,7 @@ fn refresh_overlay(mask: &GrayImage, overlay: &mut RgbaImage, rect: (u32, u32, u
     }
 }
 
+#[cfg(test)]
 fn overlay_rgba(mask: &GrayImage) -> RgbaImage {
     let mut rgba = RgbaImage::new(mask.width(), mask.height());
     refresh_overlay(mask, &mut rgba, (0, 0, mask.width() - 1, mask.height() - 1));
