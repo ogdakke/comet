@@ -40,3 +40,9 @@ objc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints.rust]
+# objc 0.2's `msg_send!`/`class!` probe `feature = "cargo-clippy"`; that
+# value is not a zeron-ui Cargo feature, so rustc's check-cfg would otherwise
+# warn on every AppKit call site.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }

@@ -215,6 +215,7 @@ pub(super) fn conversation_image_count(turns: &[StudioTurnView]) -> u32 {
         .count() as u32
 }
 
+#[cfg(test)]
 pub(super) fn turn_index_for_artifact(
     turns: &[StudioTurnView],
     artifact_id: StudioArtifactId,
@@ -252,6 +253,7 @@ pub(super) struct ArtifactFeedTarget {
 
 /// Turn row and y-offset of `artifact_id` inside that turn, so the feed can
 /// land on the tile instead of the prompt.
+#[cfg(test)]
 pub(super) fn artifact_feed_target(
     turns: &[StudioTurnView],
     artifact_id: StudioArtifactId,
@@ -272,6 +274,7 @@ pub(super) fn artifact_feed_target(
     )
 }
 
+#[cfg(test)]
 fn lineage_view_from_turns(turns: &[StudioTurnView]) -> zeron_proto::StudioConversationView {
     zeron_proto::StudioConversationView {
         conversation: zeron_proto::StudioConversationSummary {
@@ -666,6 +669,7 @@ pub(super) fn show_more_action(
 /// Tiles to paint for a run. In-flight and failed runs keep a slot for every
 /// requested output; a succeeded run only shows artifacts that still exist so
 /// a delete cannot leave a "Loading image" hole.
+#[cfg(test)]
 fn feed_output_slots(run: &StudioRunView) -> Vec<(usize, Option<StudioArtifactId>)> {
     if run.state == StudioRunState::Succeeded {
         run.artifacts

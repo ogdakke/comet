@@ -3350,6 +3350,7 @@ impl Render for Composer {
 mod tests {
     use super::*;
 
+    #[test]
     fn mention_token_requires_a_token_boundary_and_tracks_full_token() {
         assert_eq!(
             mention_token("Fix @src/com", 12),

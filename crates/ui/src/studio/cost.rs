@@ -112,7 +112,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn remaining_after_spend_clamps_at_zero() {
         let remaining = remaining_after_spend(
             &Quote::catalog("USD", 0.40),

@@ -218,6 +218,7 @@ impl PaintSession {
         self.replace_gpu(None);
     }
 
+    #[cfg(test)]
     pub(super) fn mask_png(&self) -> Option<Vec<u8>> {
         self.mask_png_sized(self.width, self.height)
     }

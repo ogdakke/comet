@@ -3,7 +3,9 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-use zeron_proto::{StudioConversationView, StudioRunState, StudioRunView, StudioTurnView};
+#[cfg(test)]
+use zeron_proto::StudioTurnView;
+use zeron_proto::{StudioConversationView, StudioRunState, StudioRunView};
 #[cfg(test)]
 use zeron_studio::MediaOperation;
 use zeron_studio::{
@@ -453,6 +455,7 @@ impl super::page::StudioPage {
     }
 }
 
+#[cfg(test)]
 pub(super) fn lineage_tiles_for_turn(
     view: &StudioConversationView,
     turn_id: StudioTurnId,
@@ -460,6 +463,7 @@ pub(super) fn lineage_tiles_for_turn(
     LineageIndex::build(view).tiles_for_root(turn_id).to_vec()
 }
 
+#[cfg(test)]
 pub(super) fn turn_has_root_outputs(view: &StudioConversationView, turn_id: StudioTurnId) -> bool {
     LineageIndex::build(view)
         .root_turn_ids
@@ -467,6 +471,7 @@ pub(super) fn turn_has_root_outputs(view: &StudioConversationView, turn_id: Stud
         .any(|&id| id == turn_id)
 }
 
+#[cfg(test)]
 pub(super) fn visible_root_turns(view: &StudioConversationView) -> Vec<StudioTurnView> {
     let index = LineageIndex::build(view);
     index
