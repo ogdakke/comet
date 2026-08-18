@@ -2420,7 +2420,11 @@ impl StudioPage {
             .border_color(theme.border)
             .bg(inspector_bg)
             .px(px(INSPECTOR_PAD_X))
-            .pt(px(INSPECTOR_PAD_X))
+            .pt(px(if editing {
+                Theme::TITLEBAR_TOP_PAD
+            } else {
+                INSPECTOR_PAD_X
+            }))
             .pb(px(16.0));
         let inspector = if editing {
             inspector.child(self.render_precise_edit_sidebar(theme, cx))

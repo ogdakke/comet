@@ -613,8 +613,8 @@ impl StudioPage {
                     let fade = format!("studio-edit-model-{}", id.as_str());
                     let mut row = popover::menu_row_nav(theme, selected, highlighted, fade.clone())
                         .id(SharedString::from(fade))
-                        .on_hover(cx.listener(move |page, hovered: &bool, _, cx| {
-                            if *hovered && page.edit_model_picker_active != Some(index) {
+                        .on_mouse_move(cx.listener(move |page, _, _, cx| {
+                            if page.edit_model_picker_active != Some(index) {
                                 page.edit_model_picker_active = Some(index);
                                 cx.notify();
                             }
@@ -720,19 +720,19 @@ impl StudioPage {
             .child(
                 div()
                     .w_full()
-                    .h(px(32.0))
+                    .h(px(Theme::TITLEBAR_HEIGHT))
                     .flex()
                     .flex_row()
                     .items_center()
                     .child(
                         div()
                             .id("studio-precise-edit-close")
-                            .size(px(28.0))
+                            .size(px(24.0))
                             .flex_none()
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(8.0))
+                            .rounded(px(6.0))
                             .cursor_pointer()
                             .hover(|style| style.bg(crate::theme::wash(0.10)))
                             .on_click(cx.listener(|page, _, _, cx| page.exit_edit_mode(cx)))
@@ -753,7 +753,7 @@ impl StudioPage {
                             .text_color(theme.text)
                             .child("Precise Edit"),
                     )
-                    .child(div().size(px(28.0)).flex_none()),
+                    .child(div().size(px(24.0)).flex_none()),
             )
             .child(
                 div()
