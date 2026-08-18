@@ -1,9 +1,13 @@
 //! Per-model draft settings and control chrome.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use zeron_proto::StudioTurnView;
-use zeron_studio::{ControlId, ControlValue, MediaModel, ModelId};
+use zeron_studio::{
+    AttachmentOrigin, ComposerAttachment, ComposerMediaKind, ComposerMode, ComposerSnapshot,
+    ControlId, ControlValue, GenerationInputSource, MediaKind, MediaModel, MediaOperation, ModelId,
+    SelectedModelRef, StudioAssetId,
+};
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,6 +62,7 @@ pub(super) fn overlay_draft(
 
 /// Select remembered models that still exist in the catalog. Leaves an already
 /// populated selection alone.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn apply_remembered_selection(
     selected: &mut BTreeSet<ModelId>,
     catalog: &[MediaModel],
@@ -73,6 +78,7 @@ pub(super) fn apply_remembered_selection(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn select_first_model(selected: &mut BTreeSet<ModelId>, catalog: &[MediaModel]) {
     if selected.is_empty()
         && let Some(model) = catalog.first()
@@ -83,21 +89,28 @@ pub(super) fn select_first_model(selected: &mut BTreeSet<ModelId>, catalog: &[Me
 
 /// Restore the last turn's models and settings. Unknown catalog models are
 /// skipped so a vanished model cannot empty the composer.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn apply_turn_models(
     selected: &mut BTreeSet<ModelId>,
     drafts: &mut HashMap<ModelId, DraftRunConfig>,
     catalog: &[MediaModel],
     turn: &StudioTurnView,
 ) -> bool {
+    let Some(snapshot) = snapshot_from_committed_turn(turn, catalog) else {
+        return false;
+    };
     let mut next_selected = BTreeSet::new();
-    for run in &turn.runs {
-        let Some(model) = catalog.iter().find(|model| model.id == run.model.id) else {
+    for selected_ref in &snapshot.selected {
+        let Some(model) = catalog
+            .iter()
+            .find(|model| model.id == selected_ref.model_id)
+        else {
             continue;
         };
         next_selected.insert(model.id.clone());
         drafts.insert(
             model.id.clone(),
-            overlay_draft(model, run.output_count, &run.controls),
+            overlay_draft(model, selected_ref.output_count, &selected_ref.controls),
         );
     }
     if next_selected.is_empty() {
@@ -105,6 +118,186 @@ pub(super) fn apply_turn_models(
     }
     *selected = next_selected;
     true
+}
+
+/// Rebuild a live snapshot from a turn that already passed evaluate+send.
+/// Vanished / Hidden / wrong-kind chips are omitted so restore cannot empty
+/// the composer onto a stale Hidden row.
+pub(super) fn snapshot_from_committed_turn(
+    turn: &StudioTurnView,
+    catalog: &[MediaModel],
+) -> Option<ComposerSnapshot> {
+    if turn.runs.is_empty() {
+        return None;
+    }
+    let video = turn
+        .runs
+        .iter()
+        .all(|run| run.model.output_kind == MediaKind::Video);
+    let mode = if video {
+        ComposerMode::Video
+    } else {
+        ComposerMode::Image
+    };
+    let mut selected = Vec::new();
+    for run in &turn.runs {
+        let Some(model) = catalog.iter().find(|model| model.id == run.model.id) else {
+            continue;
+        };
+        if !model.is_picker_visible() || !model_matches_composer_mode(model, mode) {
+            continue;
+        }
+        let draft = overlay_draft(model, run.output_count, &run.controls);
+        selected.push(SelectedModelRef {
+            provider_id: model.provider_id.clone(),
+            model_id: model.id.clone(),
+            output_count: if video { 1 } else { draft.output_count },
+            controls: draft.controls,
+        });
+    }
+    if selected.is_empty() {
+        return None;
+    }
+    let duration = video.then(|| duration_from_runs(turn)).flatten();
+    Some(ComposerSnapshot {
+        mode,
+        prompt: turn.prompt.clone(),
+        duration,
+        attachments: attachments_from_committed_turn(turn),
+        selected,
+        source_turn_id: Some(turn.id),
+        ..ComposerSnapshot::default()
+    })
+}
+
+fn model_matches_composer_mode(model: &MediaModel, mode: ComposerMode) -> bool {
+    match mode {
+        ComposerMode::Image => {
+            model.output_kind == MediaKind::Image
+                && !matches!(
+                    model.operation,
+                    MediaOperation::ImageEdit | MediaOperation::Upscale
+                )
+        }
+        ComposerMode::Video => model.output_kind == MediaKind::Video,
+    }
+}
+
+fn duration_from_runs(turn: &StudioTurnView) -> Option<ControlValue> {
+    turn.runs.iter().find_map(|run| {
+        run.controls
+            .iter()
+            .find(|(id, value)| {
+                id.as_str() == "duration"
+                    && matches!(
+                        value,
+                        ControlValue::DurationSeconds { .. } | ControlValue::DurationAuto
+                    )
+            })
+            .map(|(_, value)| value.clone())
+    })
+}
+
+fn attachments_from_committed_turn(turn: &StudioTurnView) -> Vec<ComposerAttachment> {
+    let mut inputs: Vec<_> = turn.runs.iter().flat_map(|run| run.inputs.iter()).collect();
+    inputs.sort_by_key(|input| (input.role.as_str().to_owned(), input.ordinal));
+    let mut seen = HashSet::new();
+    let mut attachments = Vec::new();
+    for input in inputs {
+        let key = match &input.source {
+            GenerationInputSource::Asset { asset_id } => ("asset", asset_id.0),
+            GenerationInputSource::Artifact { artifact_id } => ("artifact", artifact_id.0),
+        };
+        if !seen.insert(key) {
+            continue;
+        }
+        let (id, origin) = match &input.source {
+            GenerationInputSource::Asset { asset_id } => (*asset_id, AttachmentOrigin::Asset),
+            GenerationInputSource::Artifact { artifact_id } => (
+                StudioAssetId(artifact_id.0),
+                AttachmentOrigin::Artifact {
+                    artifact_id: *artifact_id,
+                },
+            ),
+        };
+        let artifact = turn
+            .runs
+            .iter()
+            .flat_map(|run| run.artifacts.iter())
+            .find(|artifact| match &input.source {
+                GenerationInputSource::Artifact { artifact_id } => artifact.id == *artifact_id,
+                GenerationInputSource::Asset { .. } => {
+                    !input.content_hash.is_empty() && artifact.content_hash == input.content_hash
+                }
+            });
+        attachments.push(ComposerAttachment {
+            id,
+            kind: attachment_kind(input.role.as_str(), artifact.map(|item| item.media_kind)),
+            pending: false,
+            origin,
+            mime_type: artifact
+                .map(|item| item.mime_type.clone())
+                .unwrap_or_default(),
+            byte_size: artifact.map(|item| item.size_bytes).unwrap_or(0),
+            width: artifact.and_then(|item| item.width),
+            height: artifact.and_then(|item| item.height),
+            duration_seconds: artifact.and_then(|item| item.duration_seconds),
+            content_hash: input.content_hash.clone(),
+            role_hint: Some(input.role.clone()),
+        });
+    }
+    attachments
+}
+
+fn attachment_kind(role: &str, media_kind: Option<MediaKind>) -> ComposerMediaKind {
+    match role {
+        zeron_studio::ROLE_REFERENCE_VIDEO => ComposerMediaKind::Video,
+        zeron_studio::ROLE_REFERENCE_AUDIO | zeron_studio::ROLE_AUDIO => ComposerMediaKind::Audio,
+        _ => match media_kind {
+            Some(MediaKind::Video) => ComposerMediaKind::Video,
+            _ => ComposerMediaKind::Image,
+        },
+    }
+}
+
+pub(super) fn restore_refs(
+    ids: &[ModelId],
+    catalog: &[MediaModel],
+    drafts: &HashMap<ModelId, DraftRunConfig>,
+    fallback_provider: Option<&zeron_studio::ProviderId>,
+    mode: ComposerMode,
+) -> Vec<SelectedModelRef> {
+    ids.iter()
+        .map(|id| {
+            if let Some(model) = catalog.iter().find(|model| model.id == *id) {
+                let draft = drafts
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| DraftRunConfig::from_model(model));
+                SelectedModelRef {
+                    provider_id: model.provider_id.clone(),
+                    model_id: model.id.clone(),
+                    output_count: match mode {
+                        ComposerMode::Video => 1,
+                        ComposerMode::Image => draft.output_count,
+                    },
+                    controls: draft.controls,
+                }
+            } else {
+                SelectedModelRef {
+                    provider_id: fallback_provider
+                        .cloned()
+                        .unwrap_or_else(|| zeron_studio::ProviderId::new("venice")),
+                    model_id: id.clone(),
+                    output_count: 1,
+                    controls: drafts
+                        .get(id)
+                        .map(|draft| draft.controls.clone())
+                        .unwrap_or_default(),
+                }
+            }
+        })
+        .collect()
 }
 
 pub(super) fn apply_remembered_drafts(
@@ -178,18 +371,33 @@ pub(super) fn control_value_label(value: &zeron_studio::ControlValue) -> String 
 mod tests {
     use super::*;
     use chrono::Utc;
-    use zeron_proto::{StudioRunState, StudioRunView};
-    use zeron_studio::{ControlChoice, ControlKind, ModelControl};
+    use zeron_proto::{StudioArtifactView, StudioRunState, StudioRunView};
+    use zeron_studio::{
+        ControlChoice, ControlKind, GenerationInput, ModelControl, StudioArtifactId, StudioAssetId,
+    };
 
     fn test_model(id: &str, controls: Vec<ModelControl>) -> MediaModel {
+        test_model_kind(id, MediaOperation::TextToImage, MediaKind::Image, controls)
+    }
+
+    fn test_model_kind(
+        id: &str,
+        operation: MediaOperation,
+        output_kind: MediaKind,
+        controls: Vec<ModelControl>,
+    ) -> MediaModel {
         MediaModel {
             provider_id: "venice".into(),
             id: id.into(),
             display_name: id.into(),
             description: None,
-            operation: zeron_studio::MediaOperation::TextToImage,
-            output_kind: zeron_studio::MediaKind::Image,
-            output_mime_types: vec!["image/png".into()],
+            operation,
+            output_kind,
+            output_mime_types: vec![if output_kind == MediaKind::Video {
+                "video/mp4".into()
+            } else {
+                "image/png".into()
+            }],
             input_constraints: Vec::new(),
             prompt_maximum_chars: None,
             negative_prompt_maximum_chars: None,
@@ -389,6 +597,19 @@ mod tests {
     }
 
     #[test]
+    fn image_empty_set_still_selects_the_first_catalog_row() {
+        let catalog = vec![
+            test_model("default-first", Vec::new()),
+            test_model("flux", Vec::new()),
+        ];
+        let mut selected = BTreeSet::new();
+        select_first_model(&mut selected, &catalog);
+        assert_eq!(selected, BTreeSet::from([ModelId::new("default-first")]));
+        select_first_model(&mut selected, &catalog);
+        assert_eq!(selected, BTreeSet::from([ModelId::new("default-first")]));
+    }
+
+    #[test]
     fn remembered_drafts_seed_uninitialized_models() {
         let flux = test_model("flux", vec![aspect_control((1, 1), &[(16, 9)])]);
         let mut drafts = HashMap::new();
@@ -419,5 +640,77 @@ mod tests {
             )]),
         );
         assert_eq!(drafts[&ModelId::new("flux")].output_count, 3);
+    }
+
+    #[test]
+    fn committed_video_turn_restores_mode_duration_and_tray() {
+        let asset_id = StudioAssetId::new();
+        let artifact_id = StudioArtifactId::new();
+        let mut r2v = test_model_kind(
+            "seedance-r2v",
+            MediaOperation::ReferenceToVideo,
+            MediaKind::Video,
+            Vec::new(),
+        );
+        r2v.video.adapter_family = zeron_studio::AdapterFamily::Seedance;
+        let mut run = test_run(
+            r2v.clone(),
+            2,
+            BTreeMap::from([(
+                ControlId::new("duration"),
+                ControlValue::DurationSeconds { value: 8.0 },
+            )]),
+        );
+        run.inputs = vec![
+            GenerationInput {
+                role: zeron_studio::InputRole::new(zeron_studio::ROLE_REFERENCE),
+                ordinal: 0,
+                source: GenerationInputSource::Asset { asset_id },
+                content_hash: "abc".into(),
+            },
+            GenerationInput {
+                role: zeron_studio::InputRole::new(zeron_studio::ROLE_REFERENCE),
+                ordinal: 1,
+                source: GenerationInputSource::Artifact { artifact_id },
+                content_hash: "def".into(),
+            },
+        ];
+        run.artifacts = vec![StudioArtifactView {
+            id: artifact_id,
+            output_position: 0,
+            media_kind: MediaKind::Image,
+            mime_type: "image/png".into(),
+            size_bytes: 12,
+            width: Some(64),
+            height: Some(64),
+            duration_seconds: None,
+            metadata: serde_json::json!({}),
+            created_at: Utc::now(),
+            thumbhash: None,
+            content_hash: "def".into(),
+        }];
+        let turn = test_turn(vec![run]);
+        let snapshot = snapshot_from_committed_turn(&turn, &[r2v]).unwrap();
+        assert_eq!(snapshot.mode, ComposerMode::Video);
+        assert_eq!(
+            snapshot.duration,
+            Some(ControlValue::DurationSeconds { value: 8.0 })
+        );
+        assert_eq!(snapshot.selected.len(), 1);
+        assert_eq!(snapshot.selected[0].output_count, 1);
+        assert_eq!(snapshot.attachments.len(), 2);
+        assert_eq!(snapshot.attachments[0].id, asset_id);
+        assert_eq!(
+            snapshot.attachments[0]
+                .role_hint
+                .as_ref()
+                .map(|role| role.as_str()),
+            Some(zeron_studio::ROLE_REFERENCE)
+        );
+        assert!(matches!(
+            snapshot.attachments[1].origin,
+            AttachmentOrigin::Artifact { artifact_id: id } if id == artifact_id
+        ));
+        assert_eq!(snapshot.source_turn_id, Some(turn.id));
     }
 }

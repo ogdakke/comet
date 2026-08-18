@@ -10,9 +10,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use zeron_studio::ModelId;
+use zeron_studio::{ComposerMode, ControlValue, ModelId};
 
 use super::draft::{DraftRunConfig, RememberedDraft};
+
+fn default_composer_mode() -> ComposerMode {
+    ComposerMode::Image
+}
 
 const FILE_NAME: &str = "studio-defaults.json";
 
@@ -34,11 +38,19 @@ impl Default for UpscaleDefaults {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(super) struct StudioDefaults {
+    pub(super) selected_image_model_ids: Vec<ModelId>,
+    pub(super) selected_video_model_ids: Vec<ModelId>,
+    /// Pre-video single list. Load maps this onto the image list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) selected_model_ids: Vec<ModelId>,
     pub(super) drafts: BTreeMap<ModelId, RememberedDraft>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) video_duration: Option<ControlValue>,
+    #[serde(default = "default_composer_mode")]
+    pub(super) last_mode: ComposerMode,
     /// Starred models in the picker, in starring order.
     pub(super) favorites: Vec<ModelId>,
     /// Last-used settings for the artifact viewer's upscale action.
@@ -49,9 +61,25 @@ pub(super) struct StudioDefaults {
     pub(super) last_edit_model_id: Option<ModelId>,
 }
 
+impl Default for StudioDefaults {
+    fn default() -> Self {
+        Self {
+            selected_image_model_ids: Vec::new(),
+            selected_video_model_ids: Vec::new(),
+            selected_model_ids: Vec::new(),
+            drafts: BTreeMap::new(),
+            video_duration: None,
+            last_mode: ComposerMode::Image,
+            favorites: Vec::new(),
+            upscale: UpscaleDefaults::default(),
+            last_edit_model_id: None,
+        }
+    }
+}
+
 impl StudioDefaults {
     pub(super) fn load(data_dir: &Path) -> Self {
-        match std::fs::read_to_string(Self::path(data_dir)) {
+        let mut defaults = match std::fs::read_to_string(Self::path(data_dir)) {
             Ok(text) => match serde_json::from_str::<StudioDefaults>(&text) {
                 Ok(defaults) => defaults,
                 Err(err) => {
@@ -60,6 +88,21 @@ impl StudioDefaults {
                 }
             },
             Err(_) => Self::default(),
+        };
+        defaults.migrate_legacy_selection();
+        defaults
+    }
+
+    fn migrate_legacy_selection(&mut self) {
+        if self.selected_image_model_ids.is_empty() && !self.selected_model_ids.is_empty() {
+            self.selected_image_model_ids = self.selected_model_ids.clone();
+        }
+    }
+
+    pub(super) fn selected_ids_for(&self, mode: ComposerMode) -> &[ModelId] {
+        match mode {
+            ComposerMode::Image => &self.selected_image_model_ids,
+            ComposerMode::Video => &self.selected_video_model_ids,
         }
     }
 
@@ -78,13 +121,19 @@ impl StudioDefaults {
     }
 
     pub(super) fn capture(
-        selected: &BTreeSet<ModelId>,
+        image_ids: &BTreeSet<ModelId>,
+        video_ids: &BTreeSet<ModelId>,
         drafts: &HashMap<ModelId, DraftRunConfig>,
         favorites: &[ModelId],
         upscale: &UpscaleDefaults,
+        video_duration: Option<ControlValue>,
+        last_mode: ComposerMode,
+        last_edit_model_id: Option<ModelId>,
     ) -> Self {
         Self {
-            selected_model_ids: selected.iter().cloned().collect(),
+            selected_image_model_ids: image_ids.iter().cloned().collect(),
+            selected_video_model_ids: video_ids.iter().cloned().collect(),
+            selected_model_ids: Vec::new(),
             drafts: drafts
                 .iter()
                 .map(|(id, draft)| {
@@ -97,9 +146,11 @@ impl StudioDefaults {
                     )
                 })
                 .collect(),
+            video_duration,
+            last_mode,
             favorites: favorites.to_vec(),
             upscale: upscale.clone(),
-            last_edit_model_id: None,
+            last_edit_model_id,
         }
     }
 
@@ -146,17 +197,23 @@ mod tests {
         );
         let defaults = StudioDefaults::capture(
             &selected,
+            &BTreeSet::new(),
             &drafts,
             &[ModelId::new("flux")],
             &UpscaleDefaults::default(),
+            None,
+            ComposerMode::Image,
+            None,
         );
         defaults.save(dir.path()).unwrap();
         assert_eq!(StudioDefaults::load(dir.path()), defaults);
         assert_eq!(
-            defaults.selected_model_ids,
+            defaults.selected_image_model_ids,
             vec![ModelId::new("flux"), ModelId::new("kling")]
         );
+        assert!(defaults.selected_video_model_ids.is_empty());
         assert_eq!(defaults.favorites, vec![ModelId::new("flux")]);
+        assert_eq!(defaults.last_mode, ComposerMode::Image);
     }
 
     #[test]
@@ -197,8 +254,43 @@ mod tests {
         )
         .unwrap();
         let loaded = StudioDefaults::load(dir.path());
+        assert_eq!(loaded.selected_image_model_ids, vec![ModelId::new("flux")]);
+        assert!(loaded.selected_video_model_ids.is_empty());
         assert_eq!(loaded.selected_model_ids, vec![ModelId::new("flux")]);
         assert!(loaded.favorites.is_empty());
         assert_eq!(loaded.upscale, UpscaleDefaults::default());
+        assert_eq!(loaded.last_mode, ComposerMode::Image);
+    }
+
+    #[test]
+    fn per_mode_lists_and_video_duration_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut image = BTreeSet::new();
+        image.insert(ModelId::new("flux"));
+        let mut video = BTreeSet::new();
+        video.insert(ModelId::new("seedance-t2v"));
+        let defaults = StudioDefaults::capture(
+            &image,
+            &video,
+            &HashMap::new(),
+            &[],
+            &UpscaleDefaults::default(),
+            Some(ControlValue::DurationSeconds { value: 6.0 }),
+            ComposerMode::Video,
+            None,
+        );
+        defaults.save(dir.path()).unwrap();
+        let loaded = StudioDefaults::load(dir.path());
+        assert_eq!(loaded.selected_image_model_ids, vec![ModelId::new("flux")]);
+        assert_eq!(
+            loaded.selected_video_model_ids,
+            vec![ModelId::new("seedance-t2v")]
+        );
+        assert_eq!(
+            loaded.video_duration,
+            Some(ControlValue::DurationSeconds { value: 6.0 })
+        );
+        assert_eq!(loaded.last_mode, ComposerMode::Video);
+        assert!(loaded.selected_model_ids.is_empty());
     }
 }

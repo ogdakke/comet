@@ -13,6 +13,7 @@
 
 mod artifact;
 mod composer;
+mod conflict;
 mod cost;
 mod defaults;
 mod draft;

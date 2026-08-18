@@ -6,14 +6,21 @@ use gpui::{
     AnyElement, Context, Focusable as _, KeyDownEvent, Point, SharedString, Window, div,
     prelude::*, px,
 };
-use zeron_studio::{MediaModel, ModelFeature, ModelId};
+use zeron_rpc::{RpcError, methods};
+use zeron_studio::{
+    ComposerEvent, ComposerMode, ComposerView, ControlValue, MediaKind, MediaModel, ModelFeature,
+    ModelId, SelectedModelRef, StudioValidationError, apply_event, popup_conflict,
+};
 
 use crate::motion;
 use crate::popover;
 use crate::theme::Theme;
 
-use super::draft::{DraftRunConfig, control_value_label, draft_aspect};
+use super::draft::{DraftRunConfig, control_value_label, draft_aspect, restore_refs};
 use super::page::StudioPage;
+
+const IMAGE_PROMPT_PLACEHOLDER: &str = "Describe the image you want to create";
+const VIDEO_PROMPT_PLACEHOLDER: &str = "Describe the video you want to create";
 
 const COMPACT_ACTIONS_INSET: f32 = 205.0;
 
@@ -56,6 +63,302 @@ fn visible_model_indices(
 }
 
 impl StudioPage {
+    pub(super) fn apply_composer_event(
+        &mut self,
+        event: ComposerEvent,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        self.sync_prompt_into_composer(cx);
+        let (snapshot, view) = apply_event(self.composer.clone(), &self.models, event.clone());
+        self.composer = snapshot;
+        self.sync_from_composer_view(&view, &event);
+        self.honor_composer_flags(&event, window, cx);
+        self.persist_composer_defaults(cx);
+        self.sync_prompt_placeholder(cx);
+        cx.notify();
+    }
+
+    pub(super) fn reevaluate_composer(&mut self, last_event: Option<&ComposerEvent>) {
+        let event = last_event.cloned().unwrap_or(ComposerEvent::Send);
+        let view = zeron_studio::evaluate_composer(&self.composer, &self.models);
+        self.sync_from_composer_view(&view, &event);
+    }
+
+    pub(super) fn sync_prompt_into_composer(&mut self, cx: &Context<Self>) {
+        self.composer.prompt = self.prompt.read(cx).text().to_owned();
+        self.composer.conversation_id = self.selected_conversation;
+        self.composer.source_turn_id = self.source_turn;
+    }
+
+    pub(super) fn on_prompt_edited(&mut self, cx: &mut Context<Self>) {
+        let text = self.prompt.read(cx).text().to_owned();
+        let (snapshot, view) = apply_event(
+            {
+                let mut snapshot = self.composer.clone();
+                snapshot.conversation_id = self.selected_conversation;
+                snapshot.source_turn_id = self.source_turn;
+                snapshot
+            },
+            &self.models,
+            ComposerEvent::SetPrompt { text },
+        );
+        self.composer = snapshot;
+        self.sync_from_composer_view(
+            &view,
+            &ComposerEvent::SetPrompt {
+                text: self.composer.prompt.clone(),
+            },
+        );
+        self.refresh_draft_quotes(cx);
+        cx.notify();
+    }
+
+    pub(super) fn sync_from_composer_view(
+        &mut self,
+        view: &ComposerView,
+        last_event: &ComposerEvent,
+    ) {
+        self.composer_view = view.clone();
+        self.selected_models = self
+            .composer
+            .selected
+            .iter()
+            .map(|selected| selected.model_id.clone())
+            .collect();
+        for selected in &self.composer.selected {
+            if let Some(model) = self
+                .models
+                .iter()
+                .find(|model| model.id == selected.model_id)
+            {
+                self.draft_runs.insert(
+                    selected.model_id.clone(),
+                    super::draft::overlay_draft(model, selected.output_count, &selected.controls),
+                );
+            } else {
+                self.draft_runs.insert(
+                    selected.model_id.clone(),
+                    DraftRunConfig {
+                        output_count: selected.output_count,
+                        controls: selected.controls.clone(),
+                    },
+                );
+            }
+        }
+        if let Some(id) = self.popup_conflict.as_ref() {
+            if !view
+                .conflicts
+                .iter()
+                .any(|conflict| &conflict.id == id && conflict.blocks_send())
+            {
+                self.popup_conflict = popup_conflict(view, last_event);
+                self.conflict_more_open = false;
+            }
+        } else {
+            self.popup_conflict = popup_conflict(view, last_event);
+            if self.popup_conflict.is_some() {
+                self.conflict_more_open = false;
+            }
+        }
+    }
+
+    fn honor_composer_flags(
+        &mut self,
+        event: &ComposerEvent,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        let selection_event = matches!(
+            event,
+            ComposerEvent::SetMode { .. }
+                | ComposerEvent::DeselectModel { .. }
+                | ComposerEvent::ReplaceModels { .. }
+                | ComposerEvent::RestoreDraft { .. }
+                | ComposerEvent::Resolve { .. }
+                | ComposerEvent::CatalogUpdated { .. }
+        );
+        if self.composer_view.open_picker && selection_event && !self.model_picker.is_open() {
+            if let Some(window) = window {
+                self.toggle_model_picker(window, cx);
+            } else {
+                self.model_picker.open(());
+            }
+        }
+        if self.composer_view.refresh_catalog {
+            self.refresh_studio_catalog(true, cx);
+        }
+    }
+
+    pub(super) fn set_composer_mode(
+        &mut self,
+        mode: ComposerMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.composer.mode == mode {
+            return;
+        }
+        self.persist_composer_defaults(cx);
+        if mode == ComposerMode::Video {
+            self.composer.duration = self.remembered.video_duration.clone();
+        }
+        let restore = self.restore_refs_for(mode);
+        self.apply_composer_event(ComposerEvent::SetMode { mode, restore }, Some(window), cx);
+    }
+
+    pub(super) fn set_composer_duration(&mut self, value: ControlValue, cx: &mut Context<Self>) {
+        if !self
+            .composer_view
+            .globals
+            .duration_choices
+            .iter()
+            .any(|choice| choice.value == value)
+        {
+            return;
+        }
+        self.apply_composer_event(ComposerEvent::SetDuration { value }, None, cx);
+    }
+
+    pub(super) fn restore_refs_for(&self, mode: ComposerMode) -> Vec<SelectedModelRef> {
+        let fallback = self
+            .providers
+            .iter()
+            .find(|provider| provider.configured)
+            .map(|provider| provider.provider_id.clone());
+        restore_refs(
+            self.remembered.selected_ids_for(mode),
+            &self.models,
+            &self.draft_runs,
+            fallback.as_ref(),
+            mode,
+        )
+    }
+
+    pub(super) fn remembered_mode_lists(
+        &self,
+    ) -> (
+        std::collections::BTreeSet<ModelId>,
+        std::collections::BTreeSet<ModelId>,
+    ) {
+        let current = self.selected_models.clone();
+        match self.composer.mode {
+            ComposerMode::Image => (
+                current,
+                self.remembered
+                    .selected_video_model_ids
+                    .iter()
+                    .cloned()
+                    .collect(),
+            ),
+            ComposerMode::Video => (
+                self.remembered
+                    .selected_image_model_ids
+                    .iter()
+                    .cloned()
+                    .collect(),
+                current,
+            ),
+        }
+    }
+
+    pub(super) fn sync_prompt_placeholder(&mut self, cx: &mut Context<Self>) {
+        let placeholder = match self.composer.mode {
+            ComposerMode::Image => IMAGE_PROMPT_PLACEHOLDER,
+            ComposerMode::Video => VIDEO_PROMPT_PLACEHOLDER,
+        };
+        self.prompt
+            .update(cx, |input, cx| input.set_placeholder(placeholder, cx));
+    }
+
+    pub(super) fn apply_studio_rpc_error(&mut self, error: RpcError) {
+        if let RpcError::FailedStructured { message, payload } = &error
+            && let Ok(validation) = serde_json::from_value::<StudioValidationError>(payload.clone())
+            && !validation.conflicts.is_empty()
+        {
+            self.composer_view.conflicts = validation.conflicts;
+            self.popup_conflict = self
+                .composer_view
+                .conflicts
+                .iter()
+                .find(|conflict| conflict.blocks_send())
+                .or(self.composer_view.conflicts.first())
+                .map(|conflict| conflict.id.clone());
+            self.conflict_more_open = false;
+            if self.popup_conflict.is_none() {
+                self.error = Some(message.clone().into());
+            }
+            return;
+        }
+        self.error = Some(error.to_string().into());
+    }
+
+    pub(super) fn refresh_studio_catalog(&mut self, refresh: bool, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        let Some(provider_id) = self
+            .providers
+            .iter()
+            .find(|provider| provider.configured)
+            .map(|provider| provider.provider_id.clone())
+        else {
+            return;
+        };
+        self.catalog_refresh_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::LIST_STUDIO_MODELS,
+                    serde_json::json!({ "providerId": provider_id, "refresh": refresh }),
+                )
+                .await;
+            this.update(cx, |page, cx| {
+                if let Ok(value) = result
+                    && let Ok(response) =
+                        serde_json::from_value::<zeron_proto::ListStudioModelsResponse>(value)
+                {
+                    page.apply_models(response.models);
+                    page.apply_composer_event(
+                        ComposerEvent::CatalogUpdated {
+                            fetched_at: response.fetched_at,
+                        },
+                        None,
+                        cx,
+                    );
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn toggle_selected_model(&mut self, id: ModelId, cx: &mut Context<Self>) {
+        if self.selected_models.contains(&id) {
+            self.apply_composer_event(ComposerEvent::DeselectModel { model_id: id }, None, cx);
+            return;
+        }
+        let provider_id = self
+            .models
+            .iter()
+            .find(|model| model.id == id)
+            .map(|model| model.provider_id.clone())
+            .or_else(|| {
+                self.providers
+                    .iter()
+                    .find(|provider| provider.configured)
+                    .map(|provider| provider.provider_id.clone())
+            })
+            .unwrap_or_else(|| zeron_studio::ProviderId::new("venice"));
+        self.apply_composer_event(
+            ComposerEvent::SelectModel {
+                provider_id,
+                model_id: id,
+            },
+            None,
+            cx,
+        );
+    }
+
     fn close_model_config_menu(&mut self, cx: &mut Context<Self>) {
         if self.model_config_menu.begin_close() {
             popover::reap_popup(cx, |page: &mut Self| &mut page.model_config_menu);
@@ -80,12 +383,15 @@ impl StudioPage {
         value: zeron_studio::ControlValue,
         cx: &mut Context<Self>,
     ) {
-        let Some(draft) = self.draft_runs.get_mut(model_id) else {
-            return;
-        };
-        draft.controls.insert(control_id.clone(), value);
-        self.persist_composer_defaults(cx);
-        cx.notify();
+        self.apply_composer_event(
+            ComposerEvent::SetModelControl {
+                model_id: model_id.clone(),
+                control_id: control_id.clone(),
+                value,
+            },
+            None,
+            cx,
+        );
     }
 
     pub(super) fn close_model_picker(&mut self, cx: &mut Context<Self>) {
@@ -119,6 +425,10 @@ impl StudioPage {
     }
 
     pub(super) fn filtered_model_indices(&self, cx: &gpui::App) -> Vec<usize> {
+        let kind = match self.composer.mode {
+            ComposerMode::Image => MediaKind::Image,
+            ComposerMode::Video => MediaKind::Video,
+        };
         visible_model_indices(
             &self.models,
             self.model_search.read(cx).text(),
@@ -126,6 +436,9 @@ impl StudioPage {
             &self.remembered.favorites,
             &self.model_picker_filters,
         )
+        .into_iter()
+        .filter(|&index| self.models[index].output_kind == kind)
+        .collect()
     }
 
     pub(super) fn toggle_model_favorite(&mut self, id: &ModelId, cx: &mut Context<Self>) {
@@ -169,11 +482,7 @@ impl StudioPage {
             return;
         };
         let id = self.models[model_index].id.clone();
-        if !self.selected_models.remove(&id) {
-            self.selected_models.insert(id);
-        }
-        self.persist_composer_defaults(cx);
-        cx.notify();
+        self.toggle_selected_model(id, cx);
     }
 
     pub(super) fn on_model_picker_key_down(
@@ -276,14 +585,21 @@ impl StudioPage {
         maximum: u32,
         cx: &mut Context<Self>,
     ) {
-        if let Some(draft) = self.draft_runs.get_mut(model_id) {
-            draft.output_count =
-                (draft.output_count as i32 + delta).clamp(1, maximum as i32) as u32;
-        } else {
+        if self.composer.mode == ComposerMode::Video {
             return;
         }
-        self.persist_composer_defaults(cx);
-        cx.notify();
+        let Some(draft) = self.draft_runs.get(model_id) else {
+            return;
+        };
+        let next = (draft.output_count as i32 + delta).clamp(1, maximum as i32) as u32;
+        self.apply_composer_event(
+            ComposerEvent::SetOutputCount {
+                model_id: model_id.clone(),
+                output_count: next,
+            },
+            None,
+            cx,
+        );
     }
 
     fn adjust_numeric_control(
@@ -453,38 +769,41 @@ impl StudioPage {
         let minus_id = model_id.clone();
         let plus_id = model_id.clone();
         let mut controls = div().flex().flex_col().gap(px(12.0));
+        let video_mode = self.composer.mode == ComposerMode::Video;
 
-        controls = controls.child(
-            config_section("Amount", theme).child(
-                div()
-                    .w(px(92.0))
-                    .h(px(32.0))
-                    .flex()
-                    .items_center()
-                    .rounded(px(8.0))
-                    .bg(crate::theme::wash(0.06))
-                    .child(config_step_button(
-                        format!("studio-output-minus-{}", model.id.as_str()),
-                        "−",
-                        move |page, cx| page.adjust_output_count(&minus_id, -1, maximum, cx),
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .min_w(px(28.0))
-                            .text_center()
-                            .text_size(px(11.5))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .child(SharedString::from(count.to_string())),
-                    )
-                    .child(config_step_button(
-                        format!("studio-output-plus-{}", model.id.as_str()),
-                        "+",
-                        move |page, cx| page.adjust_output_count(&plus_id, 1, maximum, cx),
-                        cx,
-                    )),
-            ),
-        );
+        if !video_mode {
+            controls = controls.child(
+                config_section("Amount", theme).child(
+                    div()
+                        .w(px(92.0))
+                        .h(px(32.0))
+                        .flex()
+                        .items_center()
+                        .rounded(px(8.0))
+                        .bg(crate::theme::wash(0.06))
+                        .child(config_step_button(
+                            format!("studio-output-minus-{}", model.id.as_str()),
+                            "−",
+                            move |page, cx| page.adjust_output_count(&minus_id, -1, maximum, cx),
+                            cx,
+                        ))
+                        .child(
+                            div()
+                                .min_w(px(28.0))
+                                .text_center()
+                                .text_size(px(11.5))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .child(SharedString::from(count.to_string())),
+                        )
+                        .child(config_step_button(
+                            format!("studio-output-plus-{}", model.id.as_str()),
+                            "+",
+                            move |page, cx| page.adjust_output_count(&plus_id, 1, maximum, cx),
+                            cx,
+                        )),
+                ),
+            );
+        }
 
         if let Some(aspect) = model
             .controls
@@ -529,7 +848,13 @@ impl StudioPage {
             // `steps` is submitted at the catalog default and is not a user knob.
             if matches!(
                 control.id.as_str(),
-                "aspect_ratio" | "resolution" | "reasoning" | "steps" | "format" | "safe_mode"
+                "aspect_ratio"
+                    | "resolution"
+                    | "reasoning"
+                    | "steps"
+                    | "format"
+                    | "safe_mode"
+                    | "duration"
             ) {
                 continue;
             }
@@ -639,10 +964,12 @@ impl StudioPage {
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .child(SharedString::from(model.display_name)),
             )
-            .child(config_readout(
-                SharedString::from(format!("{amount}×")),
-                theme,
-            ))
+            .when(self.composer.mode != ComposerMode::Video, |chip| {
+                chip.child(config_readout(
+                    SharedString::from(format!("{amount}×")),
+                    theme,
+                ))
+            })
             .child(config_readout(SharedString::from(aspect_label), theme))
             .child(config_readout(SharedString::from(resolution_label), theme))
             .child(
@@ -658,9 +985,14 @@ impl StudioPage {
                     .justify_center()
                     .on_click(cx.listener(move |page, _, _, cx| {
                         cx.stop_propagation();
-                        page.selected_models.remove(&remove_id);
                         page.close_model_config_menu(cx);
-                        page.persist_composer_defaults(cx);
+                        page.apply_composer_event(
+                            ComposerEvent::DeselectModel {
+                                model_id: remove_id.clone(),
+                            },
+                            None,
+                            cx,
+                        );
                     }))
                     .child(
                         crate::icons::icon(crate::icons::CLOSE)
@@ -720,11 +1052,7 @@ impl StudioPage {
                         }
                     }))
                     .on_click(cx.listener(move |page, _, _, cx| {
-                        if !page.selected_models.remove(&id) {
-                            page.selected_models.insert(id.clone());
-                        }
-                        page.persist_composer_defaults(cx);
-                        cx.notify();
+                        page.toggle_selected_model(id.clone(), cx);
                     }))
                     .child({
                         let mut copy = div()
@@ -963,8 +1291,8 @@ impl StudioPage {
             &self.live_quotes,
         );
         let blocked = self.busy
-            || self.selected_models.is_empty()
-            || self.prompt.read(cx).text().trim().is_empty();
+            || self.prompt.read(cx).text().trim().is_empty()
+            || !self.composer_view.send.enabled;
         let (content_height, text_width, layout_width, has_newline) = {
             let input = self.prompt.read(cx);
             (
@@ -1183,7 +1511,9 @@ impl StudioPage {
                         .children(model_configs),
                 )
             })
-            .child(body);
+            .child(self.render_mode_bar(theme, cx))
+            .child(body)
+            .children(self.render_conflict_popup(theme, cx));
 
         div()
             .absolute()
@@ -1197,6 +1527,88 @@ impl StudioPage {
             .children(self.render_generate_more_pill(theme, cx))
             .child(crate::frost::frosted(26.0, 16.0, composer))
             .into_any_element()
+    }
+
+    fn render_mode_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let video = self.composer.mode == ComposerMode::Video;
+        let mut row = div()
+            .id("studio-mode-bar")
+            .w_full()
+            .px(px(6.0))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(self.render_mode_segment(theme, cx));
+        if video {
+            row = row.child(self.render_duration_pills(theme, cx));
+        }
+        row
+    }
+
+    fn render_mode_segment(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("studio-mode-segment")
+            .h(px(28.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(crate::theme::wash(0.035))
+            .p(px(2.0))
+            .child(mode_segment_chip(
+                "studio-mode-image",
+                "Image",
+                self.composer.mode == ComposerMode::Image,
+                theme,
+                ComposerMode::Image,
+                cx,
+            ))
+            .child(mode_segment_chip(
+                "studio-mode-video",
+                "Video",
+                self.composer.mode == ComposerMode::Video,
+                theme,
+                ComposerMode::Video,
+                cx,
+            ))
+    }
+
+    fn render_duration_pills(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let current = self.composer_view.globals.duration.as_ref();
+        let mut pills = div()
+            .id("studio-duration-pills")
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .overflow_x_scroll();
+        for choice in &self.composer_view.globals.duration_choices {
+            let active = current == Some(&choice.value);
+            let value = choice.value.clone();
+            pills = pills.child(
+                config_choice(
+                    SharedString::from(format!("studio-duration-{}", choice.label)),
+                    choice.label.clone(),
+                    active,
+                    theme,
+                )
+                .on_click(cx.listener(move |page, _, _, cx| {
+                    page.set_composer_duration(value.clone(), cx);
+                })),
+            );
+        }
+        pills
     }
 
     /// "Generate more" chip — same chrome as the agent-chat jump-to-bottom
@@ -1252,6 +1664,41 @@ impl StudioPage {
             .into_any_element(),
         )
     }
+}
+
+fn mode_segment_chip(
+    id: impl Into<SharedString>,
+    label: &'static str,
+    active: bool,
+    theme: &Theme,
+    mode: ComposerMode,
+    cx: &mut gpui::Context<StudioPage>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id.into())
+        .h(px(24.0))
+        .px(px(10.0))
+        .flex()
+        .items_center()
+        .rounded(px(6.0))
+        .bg(if active {
+            crate::theme::card_selected_bg()
+        } else {
+            gpui::transparent_black()
+        })
+        .text_size(px(11.0))
+        .font_weight(if active {
+            gpui::FontWeight::SEMIBOLD
+        } else {
+            gpui::FontWeight::MEDIUM
+        })
+        .text_color(if active { theme.text } else { theme.text_muted })
+        .cursor_pointer()
+        .hover(|style| style.bg(crate::theme::wash(0.08)))
+        .on_click(cx.listener(move |page, _, window, cx| {
+            page.set_composer_mode(mode, window, cx);
+        }))
+        .child(label)
 }
 
 fn config_section(label: impl Into<SharedString>, theme: &Theme) -> gpui::Div {
