@@ -1057,6 +1057,12 @@ impl StudioPage {
         self.close_image_menu(cx);
         self.close_upscale_settings_menu(cx);
         self.lightbox_frames = frames;
+        if !self.lightbox_frames.iter().any(|frame| frame.key == key) {
+            let recovered = self.surface_artifact_frames();
+            if recovered.iter().any(|frame| frame.key == key) {
+                self.lightbox_frames = recovered;
+            }
+        }
         if let Some(index) = self
             .lightbox_frames
             .iter()
@@ -3234,6 +3240,130 @@ mod tests {
                 &frames
             ),
             Some(frames[0].key)
+        );
+    }
+
+    #[test]
+    fn conversation_frames_include_an_upscale_from_its_own_turn() {
+        use chrono::Utc;
+        use std::collections::BTreeMap;
+        use zeron_studio::{GenerationInput, GenerationInputSource};
+        let source_id = StudioArtifactId::new();
+        let upscale_id = StudioArtifactId::new();
+        let generate_turn = StudioTurnId::new();
+        let upscale_turn = StudioTurnId::new();
+        let artifact = |id: StudioArtifactId| zeron_proto::StudioArtifactView {
+            id,
+            output_position: 0,
+            media_kind: MediaKind::Image,
+            mime_type: "image/png".into(),
+            size_bytes: 1,
+            width: Some(1),
+            height: Some(1),
+            duration_seconds: None,
+            metadata: serde_json::Value::Null,
+            created_at: Utc::now(),
+            thumbhash: None,
+            content_hash: String::new(),
+        };
+        let model =
+            |operation: zeron_studio::MediaOperation, name: &str| zeron_studio::MediaModel {
+                provider_id: "venice".into(),
+                id: name.into(),
+                display_name: name.into(),
+                description: None,
+                operation,
+                output_kind: MediaKind::Image,
+                output_mime_types: vec!["image/png".into()],
+                input_constraints: Vec::new(),
+                prompt_maximum_chars: None,
+                negative_prompt_maximum_chars: None,
+                maximum_output_count: 4,
+                controls: Vec::new(),
+                pricing: None,
+                features: Vec::new(),
+                manifest_version: "test".into(),
+                fetched_at: Utc::now(),
+            };
+        let view = StudioConversationView {
+            conversation: zeron_proto::StudioConversationSummary {
+                id: StudioConversationId::new(),
+                title: "one".into(),
+                turn_count: 2,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                archived: false,
+                forked_from_turn_id: None,
+                creating: false,
+                done: false,
+            },
+            turns: vec![
+                zeron_proto::StudioTurnView {
+                    id: generate_turn,
+                    position: 0,
+                    prompt: "a fox".into(),
+                    source_turn_id: None,
+                    batch_id: zeron_studio::StudioBatchId::new(),
+                    created_at: Utc::now(),
+                    runs: vec![zeron_proto::StudioRunView {
+                        id: StudioRunId::new(),
+                        position: 0,
+                        provider_id: "venice".into(),
+                        model: model(zeron_studio::MediaOperation::TextToImage, "flux"),
+                        controls: BTreeMap::new(),
+                        output_count: 1,
+                        display_aspect_ratio: (1, 1),
+                        state: StudioRunState::Succeeded,
+                        progress: None,
+                        error: None,
+                        quote: None,
+                        prompt: None,
+                        inputs: Vec::new(),
+                        artifacts: vec![artifact(source_id)],
+                    }],
+                },
+                zeron_proto::StudioTurnView {
+                    id: upscale_turn,
+                    position: 1,
+                    prompt: String::new(),
+                    source_turn_id: Some(generate_turn),
+                    batch_id: zeron_studio::StudioBatchId::new(),
+                    created_at: Utc::now(),
+                    runs: vec![zeron_proto::StudioRunView {
+                        id: StudioRunId::new(),
+                        position: 0,
+                        provider_id: "venice".into(),
+                        model: model(zeron_studio::MediaOperation::Upscale, "upscale"),
+                        controls: BTreeMap::new(),
+                        output_count: 1,
+                        display_aspect_ratio: (1, 1),
+                        state: StudioRunState::Succeeded,
+                        progress: None,
+                        error: None,
+                        quote: None,
+                        prompt: None,
+                        inputs: vec![GenerationInput {
+                            role: "source".into(),
+                            ordinal: 0,
+                            source: GenerationInputSource::Artifact {
+                                artifact_id: source_id,
+                            },
+                            content_hash: String::new(),
+                        }],
+                        artifacts: vec![artifact(upscale_id)],
+                    }],
+                },
+            ],
+        };
+        let frames = frames_from_conversation(&view);
+        let ids: Vec<_> = frames
+            .iter()
+            .filter_map(ArtifactFrame::artifact_id)
+            .collect();
+        assert_eq!(ids, vec![source_id, upscale_id]);
+        assert_eq!(
+            resolve_frame_key(ArtifactFrameKey::Ready(upscale_id), &frames),
+            Some(ArtifactFrameKey::Ready(upscale_id))
         );
     }
 

@@ -135,6 +135,8 @@ impl StudioPage {
             self.watch_task = None;
             self.composer_seeded_for = None;
             self.expanded_prompts.clear();
+            self.lineage = super::lineage::LineageIndex::default();
+            self.lineage_key = None;
             self.reset_feed_list();
             cx.emit(StudioEvent::SidebarChanged);
         }
@@ -331,6 +333,9 @@ impl StudioPage {
         {
             return Some(hash);
         }
+        if let Some(hash) = self.lineage.thumbhash(id) {
+            return Some(hash);
+        }
         self.conversation.as_ref().and_then(|view| {
             view.turns
                 .iter()
@@ -360,6 +365,13 @@ impl StudioPage {
                 return Some(size);
             }
         }
+        if let Some(size) = self
+            .lineage
+            .pixel_size(id)
+            .or_else(|| self.lineage.aspect(id))
+        {
+            return Some(size);
+        }
         self.conversation.as_ref().and_then(|view| {
             view.turns
                 .iter()
@@ -370,10 +382,8 @@ impl StudioPage {
                         .find(|artifact| artifact.id == id)
                         .and_then(|artifact| {
                             nonzero(artifact.width, artifact.height).or_else(|| {
-                                super::lineage::artifact_display_aspect(view, id).or_else(|| {
-                                    let (width, height) = run.display_aspect_ratio;
-                                    (width > 0 && height > 0).then_some((width, height))
-                                })
+                                let (width, height) = run.display_aspect_ratio;
+                                (width > 0 && height > 0).then_some((width, height))
                             })
                         })
                 })

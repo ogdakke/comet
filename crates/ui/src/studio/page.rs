@@ -30,12 +30,13 @@ use super::draft::{
     draft_aspect, select_first_model,
 };
 use super::feed::{
-    ARTIFACT_FOCUS_FADE, ARTIFACT_FOCUS_HOLD, FeedLayoutSig, artifact_feed_target,
-    artifact_focus_alpha, conversation_image_count, new_feed_list,
+    ARTIFACT_FOCUS_FADE, ARTIFACT_FOCUS_HOLD, FeedLayoutSig, artifact_focus_alpha,
+    conversation_image_count, new_feed_list,
 };
 use super::gallery::new_gallery_list;
 use super::image_menu::ImageMenu;
 use super::images::StudioImages;
+use super::lineage::{LineageIndex, LineageKey};
 use super::upscale::UpscaleJob;
 
 pub struct StudioPage {
@@ -82,6 +83,14 @@ pub struct StudioPage {
     /// Thread tiles whose originals should become 1280px display frames.
     pub(super) feed_viewport_fulls: HashSet<StudioArtifactId>,
     pub(super) feed_layout_sig: Option<FeedLayoutSig>,
+    /// One walk of the open conversation. Rebuilt when the watch snapshot
+    /// changes, never on scroll.
+    pub(super) lineage: LineageIndex,
+    pub(super) lineage_key: Option<LineageKey>,
+    /// Last list-viewport band used to skip off-screen tiles inside a turn.
+    pub(super) feed_cull_top: f32,
+    pub(super) feed_cull_bottom: f32,
+    pub(super) feed_item_tops: Vec<Option<f32>>,
     pub(super) scroll_after_turn_count: Option<usize>,
     pub(super) scroll_after_extend: Option<zeron_studio::StudioTurnId>,
     pub(super) scroll_to_artifact: Option<StudioArtifactId>,
@@ -250,6 +259,11 @@ impl StudioPage {
             feed_visible_rows: 0..0,
             feed_viewport_fulls: HashSet::new(),
             feed_layout_sig: None,
+            lineage: LineageIndex::default(),
+            lineage_key: None,
+            feed_cull_top: 0.0,
+            feed_cull_bottom: 0.0,
+            feed_item_tops: Vec::new(),
             scroll_after_turn_count: None,
             scroll_after_extend: None,
             scroll_to_artifact: None,
@@ -622,6 +636,8 @@ impl StudioPage {
         // on the image once the watch snapshot arrives.
         self.rail_hover = None;
         self.reset_feed_list();
+        self.lineage = LineageIndex::default();
+        self.lineage_key = None;
         cx.emit(StudioEvent::SidebarChanged);
         self.mark_conversation_seen(id, cx);
         self.watch_task = Some(cx.spawn(async move |this, cx| {
@@ -661,6 +677,7 @@ impl StudioPage {
                         page.observe_upscale_view(&view, cx);
                         page.apply_conversation_summary(view.conversation.clone(), cx);
                         page.conversation = Some(view.clone());
+                        page.sync_lineage();
                         if let Some(source_id) = page.pending_edit_source {
                             page.select_pending_derived(&view, source_id, cx);
                         } else if page.selected_frame.is_some() {
@@ -710,17 +727,29 @@ impl StudioPage {
         let Some(artifact_id) = self.scroll_to_artifact else {
             return false;
         };
+        if self.conversation.is_none() {
+            return false;
+        }
+        self.sync_lineage();
+        let (content_width, tile_width, gap, columns) = self.feed_target_metrics();
+        let expanded = self
+            .lineage
+            .tiles()
+            .iter()
+            .find(|tile| tile.artifact_id == Some(artifact_id))
+            .is_some_and(|tile| self.expanded_prompts.contains(&tile.root_turn_id));
         let Some(view) = self.conversation.as_ref() else {
             return false;
         };
-        let (content_width, tile_width, gap, columns) = self.feed_target_metrics();
-        let target = artifact_feed_target(
+        let target = super::feed::artifact_feed_target_in_lineage(
+            &self.lineage,
             &view.turns,
             artifact_id,
             content_width,
             tile_width,
             gap,
             columns,
+            expanded,
         );
         self.scroll_to_artifact = None;
         match target {
@@ -1145,7 +1174,7 @@ impl StudioPage {
         if !self.expanded_prompts.remove(&turn_id) {
             self.expanded_prompts.insert(turn_id);
         }
-        if let Some(ix) = self.feed_turns().iter().position(|turn| turn.id == turn_id) {
+        if let Some(ix) = self.feed_index_of_turn(turn_id) {
             self.feed_list.remeasure_items(ix..ix + 1);
         }
         cx.notify();
@@ -1522,6 +1551,7 @@ impl Focusable for StudioPage {
 
 impl Render for StudioPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_lineage();
         if self.lightbox_motion_pending() && crate::motion::reduced_motion(cx) {
             self.finish_lightbox_snap_immediate(cx);
         } else if self.lightbox_motion_pending() && !self.lightbox_swipe_scheduled {
