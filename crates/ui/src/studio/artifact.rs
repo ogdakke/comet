@@ -1525,6 +1525,7 @@ impl StudioPage {
         self.close_image_menu(cx);
         self.close_upscale_settings_menu(cx);
         self.close_artifact_actions_menu(cx);
+        self.stop_video_playback();
         let previous = self.selected_artifact_id();
         if self.selected_frame.take().is_some() {
             if let Some(id) = previous {
@@ -1543,6 +1544,7 @@ impl StudioPage {
         self.close_upscale_settings_menu(cx);
         self.close_artifact_actions_menu(cx);
         self.exit_edit_mode(cx);
+        self.stop_video_playback();
         let previous = self.selected_artifact_id();
         if self.selected_frame.take().is_some() {
             if let Some(id) = previous {

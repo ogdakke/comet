@@ -471,6 +471,9 @@ impl StudioPage {
         self.warm_placeholders(ids.iter().copied());
         let mut inflight = self.loading_images.len();
         for id in ids {
+            if self.artifact_is_video(id) {
+                continue;
+            }
             if self.images.contains_thumb(&id) {
                 continue;
             }

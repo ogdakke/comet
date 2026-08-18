@@ -2097,6 +2097,9 @@ impl Shell {
     }
 
     fn close_studio(&mut self, cx: &mut Context<Self>) {
+        if let Some(page) = self.studio_page.as_ref() {
+            page.update(cx, |page, _| page.leave());
+        }
         self.route = Route::Chat;
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
         self.close_studio_menu(cx);

@@ -1246,6 +1246,9 @@ impl StudioPage {
                 let Some(id) = tile.artifact_id else {
                     continue;
                 };
+                if tile.media_kind != MediaKind::Image {
+                    continue;
+                }
                 let (aw, ah) = tile.aspect;
                 let tile_h = tile_width * ah as f32 / aw.max(1) as f32;
                 let (top, bottom) =
