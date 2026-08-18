@@ -18,7 +18,10 @@
 //! - `session/update` notifications normalize per [`normalize::map_update`].
 //! - Permission requests auto-accept with the agent's preferred allow option
 //!   (zeron sessions run unattended); question-shaped requests block on the
-//!   engine's input bridge.
+//!   engine's input bridge. Grok's `x.ai/exit_plan_mode` reverse-request is
+//!   answered the same way: live runs present Approve / Request changes /
+//!   Abandon; setup and unattended paths auto-approve so the tool does not
+//!   fail as "client disconnected".
 //! - Steering: agents advertising `_session/steering` get mid-turn injection;
 //!   others queue steers and deliver them as the next `session/prompt` at the
 //!   turn boundary. The session stays parked between turns while the
@@ -1409,12 +1412,47 @@ fn prompt_turn(
     })
 }
 
+/// Grok's plan-approval reverse-request. ACP reserves `_`-prefixed methods
+/// for extensions; Grok's `ExtRequest::new("x.ai/exit_plan_mode")` lands on
+/// the wire as `_x.ai/exit_plan_mode` (same underscore convention as
+/// `_x.ai/session/prompt_complete`). A method-not-found here is treated as a
+/// client disconnect: the tool fails red and plan mode stays active.
+const EXIT_PLAN_MODE_METHOD: &str = "x.ai/exit_plan_mode";
+const EXIT_PLAN_MODE_METHOD_META: &str = "_x.ai/exit_plan_mode";
+const EXIT_PLAN_APPROVE: &str = "Approve";
+const EXIT_PLAN_REVISE: &str = "Request changes";
+const EXIT_PLAN_ABANDON: &str = "Abandon";
+
+fn is_exit_plan_mode_method(method: &str) -> bool {
+    method == EXIT_PLAN_MODE_METHOD
+        || method == EXIT_PLAN_MODE_METHOD_META
+        || method.ends_with("/exit_plan_mode")
+}
+
+/// Unwrap Grok's plan-approval payload. The ACP SDK may send the method
+/// name at the JSON-RPC layer, or nest `{ method, params }` as ExtRequest.
+fn exit_plan_mode_params<'a>(method: &str, params: &'a Value) -> Option<&'a Value> {
+    if is_exit_plan_mode_method(method) {
+        return Some(params);
+    }
+    if let Some(inner) = params.get("method").and_then(Value::as_str)
+        && is_exit_plan_mode_method(inner)
+    {
+        return params.get("params").or(Some(params));
+    }
+    if params.get("planContent").is_some() && params.get("toolCallId").is_some() {
+        return Some(params);
+    }
+    None
+}
+
 /// Answer a server→client request. Permission requests are auto-accepted with
 /// the agent's preferred allow option — parity with the claude harness's
 /// bypassPermissions and the codex harness's approvalPolicy "never" (zeron
-/// sessions run unattended). Everything else (fs, terminal, elicitation) was
-/// declined at initialize, so a stray request gets method-not-found rather
-/// than wedging the agent.
+/// sessions run unattended). Grok's `x.ai/exit_plan_mode` is auto-approved on
+/// this unattended path (setup / discovery). Everything else (fs, terminal,
+/// elicitation) was declined at initialize, so a stray request gets
+/// method-not-found rather than wedging the agent.
 fn handle_server_request(
     client: &RpcClient,
     id: Value,
@@ -1437,8 +1475,16 @@ fn handle_server_request(
             }
             Vec::new()
         }
+        method if exit_plan_mode_params(method, params).is_some() => {
+            client.respond(&id, exit_plan_mode_response(Some(EXIT_PLAN_APPROVE)));
+            Vec::new()
+        }
         _ => {
-            tracing::debug!(target: "zeron_harness::acp", "unhandled server request: {method}");
+            tracing::warn!(
+                target: "zeron_harness::acp",
+                %method,
+                "unhandled server request"
+            );
             client.respond_error(&id, -32601, &format!("unsupported method: {method}"));
             Vec::new()
         }
@@ -1467,11 +1513,94 @@ fn is_user_question(options: &[Value]) -> bool {
     })
 }
 
+/// Grok `ExitPlanModeExtResponse`: `{ outcome, feedback? }` where outcome is
+/// `approved` / `cancelled` (keep planning) / `abandoned`.
+fn exit_plan_mode_response(label: Option<&str>) -> Value {
+    match label.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(EXIT_PLAN_APPROVE) => json!({ "outcome": "approved" }),
+        Some(EXIT_PLAN_ABANDON) => json!({ "outcome": "abandoned" }),
+        Some(EXIT_PLAN_REVISE) => json!({ "outcome": "cancelled" }),
+        // Free-text from the question wizard is revision notes.
+        Some(feedback) => json!({ "outcome": "cancelled", "feedback": feedback }),
+        None => json!({ "outcome": "cancelled" }),
+    }
+}
+
+fn plan_approval_question(params: &Value) -> UserInputQuestion {
+    const PREVIEW_LINES: usize = 12;
+    const PREVIEW_CHARS: usize = 600;
+    let raw = params
+        .get("planContent")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let question = if raw.is_empty() {
+        "The agent finished planning without writing a plan. Approve and start implementing, request changes, or abandon plan mode?".to_owned()
+    } else {
+        let mut preview: String = raw
+            .lines()
+            .take(PREVIEW_LINES)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let truncated = preview.len() < raw.len();
+        if preview.len() > PREVIEW_CHARS {
+            let mut end = PREVIEW_CHARS;
+            while end > 0 && !preview.is_char_boundary(end) {
+                end -= 1;
+            }
+            preview.truncate(end);
+            preview.push('…');
+        } else if truncated {
+            preview.push_str("\n…");
+        }
+        format!("{preview}\n\nApprove this plan and start implementing?")
+    };
+    UserInputQuestion {
+        id: new_message_id(),
+        header: "Plan approval".into(),
+        question,
+        options: vec![
+            EXIT_PLAN_APPROVE.into(),
+            EXIT_PLAN_REVISE.into(),
+            EXIT_PLAN_ABANDON.into(),
+        ],
+        multi_select: false,
+    }
+}
+
+fn ask_exit_plan_mode(
+    client: &RpcClient,
+    id: Value,
+    params: &Value,
+    request_input: &std::sync::Arc<RequestInputFn>,
+    open_questions: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> Vec<AgentEvent> {
+    let question = plan_approval_question(params);
+    let client = client.clone();
+    let request_input = std::sync::Arc::clone(request_input);
+    let open_questions = std::sync::Arc::clone(open_questions);
+    open_questions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    tokio::spawn(async move {
+        let answers = (request_input)(vec![question.clone()])
+            .await
+            .unwrap_or_default();
+        let label = answers
+            .iter()
+            .find(|a| a.question_id == question.id)
+            .and_then(|a| a.labels.first())
+            .map(String::as_str);
+        client.respond(&id, exit_plan_mode_response(label));
+        open_questions.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    Vec::new()
+}
+
 /// The live-run request handler: tool permissions auto-accept like
-/// [`handle_server_request`], but question-shaped requests block on the
-/// engine's input bridge (in a subtask so the message loop keeps flowing)
-/// and answer with the option whose name matches the chosen label. A dropped
-/// resolver degrades to `cancelled` — never a silent allow.
+/// [`handle_server_request`], but question-shaped requests (and Grok plan
+/// approval) block on the engine's input bridge (in a subtask so the
+/// message loop keeps flowing) and answer with the option whose name
+/// matches the chosen label. A dropped resolver degrades to `cancelled` —
+/// never a silent allow.
 fn handle_server_request_live(
     client: &RpcClient,
     id: Value,
@@ -1480,6 +1609,9 @@ fn handle_server_request_live(
     request_input: &std::sync::Arc<RequestInputFn>,
     open_questions: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> Vec<AgentEvent> {
+    if let Some(plan_params) = exit_plan_mode_params(method, params) {
+        return ask_exit_plan_mode(client, id, plan_params, request_input, open_questions);
+    }
     if method != "session/request_permission" {
         return handle_server_request(client, id, method, params);
     }
@@ -3120,6 +3252,76 @@ mod tests {
             config_option_sets(&codex, None, &[], &no_opts),
             vec![("mode".to_owned(), json!({ "value": "agent-full-access" }))]
         );
+    }
+
+    #[test]
+    fn exit_plan_mode_method_accepts_underscore_prefix() {
+        assert!(is_exit_plan_mode_method("x.ai/exit_plan_mode"));
+        assert!(is_exit_plan_mode_method("_x.ai/exit_plan_mode"));
+        assert!(!is_exit_plan_mode_method("session/request_permission"));
+        let nested = json!({
+            "method": "_x.ai/exit_plan_mode",
+            "params": {
+                "sessionId": "s-1",
+                "toolCallId": "call-1",
+                "planContent": "# Plan",
+            }
+        });
+        assert_eq!(
+            exit_plan_mode_params("some/wrapper", &nested)
+                .and_then(|p| p.get("planContent"))
+                .and_then(Value::as_str),
+            Some("# Plan")
+        );
+        assert!(
+            exit_plan_mode_params(
+                "mystery",
+                &json!({ "toolCallId": "c", "planContent": "hi" })
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn exit_plan_mode_response_maps_labels() {
+        assert_eq!(
+            exit_plan_mode_response(Some("Approve")),
+            json!({ "outcome": "approved" })
+        );
+        assert_eq!(
+            exit_plan_mode_response(Some("Abandon")),
+            json!({ "outcome": "abandoned" })
+        );
+        assert_eq!(
+            exit_plan_mode_response(Some("Request changes")),
+            json!({ "outcome": "cancelled" })
+        );
+        assert_eq!(
+            exit_plan_mode_response(Some("please add tests")),
+            json!({ "outcome": "cancelled", "feedback": "please add tests" })
+        );
+        assert_eq!(
+            exit_plan_mode_response(None),
+            json!({ "outcome": "cancelled" })
+        );
+    }
+
+    #[test]
+    fn plan_approval_question_previews_plan_content() {
+        let question = plan_approval_question(&json!({
+            "sessionId": "s-1",
+            "toolCallId": "call-1",
+            "planContent": "# Dummy\n\nDo nothing.",
+        }));
+        assert_eq!(question.header, "Plan approval");
+        assert!(question.question.contains("# Dummy"));
+        assert!(question.question.contains("Do nothing."));
+        assert_eq!(
+            question.options,
+            vec!["Approve", "Request changes", "Abandon"]
+        );
+        let empty = plan_approval_question(&json!({ "planContent": "   " }));
+        assert!(empty.question.contains("without writing a plan"));
     }
 
     #[test]

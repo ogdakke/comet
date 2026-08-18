@@ -165,6 +165,28 @@ case "$promptline" in
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 
+*scenario:exit-plan*)
+  # Grok plan-mode approval: the agent reverse-requests x.ai/exit_plan_mode
+  # with the plan body. A method-not-found here fails the tool (the live
+  # "Plan: Exit" red chip). The harness must answer {outcome:"approved"}.
+  emit "{\"id\":91,\"method\":\"x.ai/exit_plan_mode\",\"params\":{\"sessionId\":\"$SID\",\"toolCallId\":\"call-plan-1\",\"planContent\":\"# Dummy plan\\n\\nDo nothing.\"}}"
+  read -r ans || exit 1
+  { has "$ans" '"id":91' && has "$ans" '"outcome":"approved"'; } ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"plan approved"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
+*scenario:exit-plan-meta*)
+  # Live grok 1.0.5 prefixes extension methods with `_` (ACP reserve).
+  emit "{\"id\":92,\"method\":\"_x.ai/exit_plan_mode\",\"params\":{\"sessionId\":\"$SID\",\"toolCallId\":\"call-plan-2\",\"planContent\":\"# Dummy plan\\n\\nDo nothing.\"}}"
+  read -r ans || exit 1
+  { has "$ans" '"id":92' && has "$ans" '"outcome":"approved"'; } ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"plan approved"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
 *scenario:permission*)
   emit "{\"id\":77,\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"$SID\",\"toolCall\":{\"toolCallId\":\"t1\"},\"options\":[{\"optionId\":\"once\",\"name\":\"Allow once\",\"kind\":\"allow_once\"},{\"optionId\":\"always\",\"name\":\"Always allow\",\"kind\":\"allow_always\"},{\"optionId\":\"no\",\"name\":\"Reject\",\"kind\":\"reject_once\"}]}}"
   read -r ans || exit 1

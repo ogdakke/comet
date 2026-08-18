@@ -226,6 +226,70 @@ async fn config_options_apply_requested_model_and_effort() {
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
 #[tokio::test]
+async fn grok_exit_plan_mode_ext_method_is_answered() {
+    // Grok intercepts exit_plan_mode and reverse-requests x.ai/exit_plan_mode.
+    // method-not-found used to fail the tool ("client disconnected").
+    let (steer_tx, steer_rx) = mpsc::channel(8);
+    let token = CancellationToken::new();
+    let controls = RunControls {
+        request_input: Box::new(move |questions| {
+            let (tx, rx) = oneshot::channel();
+            let answers: Vec<UserInputAnswer> = questions
+                .iter()
+                .map(|q| UserInputAnswer {
+                    question_id: q.id.clone(),
+                    labels: vec!["Approve".into()],
+                })
+                .collect();
+            let _ = tx.send(answers);
+            rx
+        }),
+        steering: steer_rx,
+        interrupt: token.clone(),
+    };
+    let _steer = steer_tx;
+    let events = run_to_end(&harness(), request("scenario:exit-plan"), controls).await;
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "plan approved".into()
+        }),
+        "{events:?}"
+    );
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
+#[tokio::test]
+async fn grok_exit_plan_mode_accepts_underscore_ext_method() {
+    let (steer_tx, steer_rx) = mpsc::channel(8);
+    let token = CancellationToken::new();
+    let controls = RunControls {
+        request_input: Box::new(move |questions| {
+            let (tx, rx) = oneshot::channel();
+            let answers: Vec<UserInputAnswer> = questions
+                .iter()
+                .map(|q| UserInputAnswer {
+                    question_id: q.id.clone(),
+                    labels: vec!["Approve".into()],
+                })
+                .collect();
+            let _ = tx.send(answers);
+            rx
+        }),
+        steering: steer_rx,
+        interrupt: token.clone(),
+    };
+    let _steer = steer_tx;
+    let events = run_to_end(&harness(), request("scenario:exit-plan-meta"), controls).await;
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "plan approved".into()
+        }),
+        "{events:?}"
+    );
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
+#[tokio::test]
 async fn permission_requests_auto_accept_the_preferred_allow_option() {
     let (controls, _steer, _token) = controls();
     let events = run_to_end(&harness(), request("scenario:permission"), controls).await;
