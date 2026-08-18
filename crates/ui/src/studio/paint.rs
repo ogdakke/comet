@@ -70,6 +70,12 @@ impl PaintSession {
     }
 
     pub(super) fn extend_stroke(&mut self, point: (f32, f32)) {
+        self.extend_stroke_min(point, 0.75);
+    }
+
+    /// `min_distance` is in source-image pixels. Use a screen-space conversion
+    /// so a 4K photo does not record a point every sub-pixel.
+    pub(super) fn extend_stroke_min(&mut self, point: (f32, f32), min_distance: f32) {
         let Some(live) = self.live.as_mut() else {
             return;
         };
@@ -80,7 +86,8 @@ impl PaintSession {
         };
         let dx = point.0 - prev_x;
         let dy = point.1 - prev_y;
-        if dx * dx + dy * dy < 0.25 {
+        let min = min_distance.max(0.35);
+        if dx * dx + dy * dy < min * min {
             return;
         }
         live.points.push(point);
@@ -92,6 +99,10 @@ impl PaintSession {
             point.1,
             live.radius,
         );
+    }
+
+    pub(super) fn iter_strokes(&self) -> impl Iterator<Item = &Stroke> {
+        self.strokes.iter().chain(self.live.as_ref())
     }
 
     pub(super) fn end_stroke(&mut self) {

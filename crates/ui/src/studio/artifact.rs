@@ -1836,18 +1836,7 @@ impl StudioPage {
                     .left(self.lightbox_pan.x)
                     .top(self.lightbox_pan.y)
             };
-            let mut layer = layer.child(contain_layers(paint, None, px(0.0), None));
-            if self.edit_target == artifact_id
-                && let Some(mask) = &self.edit_overlay
-            {
-                layer = layer.child(div().absolute().inset_0().child(contain_layers(
-                    mask.clone(),
-                    None,
-                    px(0.0),
-                    None,
-                )));
-            }
-            layer
+            layer.child(contain_layers(paint, None, px(0.0), None))
         };
         match base {
             Some(base) => frame.child(stack(base, overlay)).into_any_element(),
@@ -2001,6 +1990,7 @@ impl StudioPage {
             }
         }
         let measure_entity = cx.weak_entity();
+        let editing = self.edit_target.is_some();
         let stage = div()
             .id("studio-artifact-stage")
             .absolute()
@@ -2080,7 +2070,8 @@ impl StudioPage {
                 .absolute()
                 .inset_0(),
             )
-            .children(slides);
+            .children(slides)
+            .when(editing, |stage| stage.child(self.render_edit_strokes()));
 
         let close_button = div()
             .id("studio-artifact-close")
@@ -2458,26 +2449,29 @@ impl StudioPage {
                                 .items_center()
                                 .child(close_button),
                         )
-                        .child(
-                            div()
-                                .absolute()
-                                .left(px(16.0))
-                                .top_0()
-                                .bottom_0()
-                                .flex()
-                                .items_center()
-                                .child(previous),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .right(px(16.0))
-                                .top_0()
-                                .bottom_0()
-                                .flex()
-                                .items_center()
-                                .child(next),
-                        )
+                        .when(!editing, |column| {
+                            column
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(px(16.0))
+                                        .top_0()
+                                        .bottom_0()
+                                        .flex()
+                                        .items_center()
+                                        .child(previous),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .right(px(16.0))
+                                        .top_0()
+                                        .bottom_0()
+                                        .flex()
+                                        .items_center()
+                                        .child(next),
+                                )
+                        })
                         .when(self.edit_target.is_some(), |stage| {
                             stage
                                 .child(self.render_brush_slider(theme, cx))

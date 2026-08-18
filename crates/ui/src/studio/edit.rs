@@ -8,12 +8,15 @@ use zeron_proto::StudioConversationView;
 use zeron_rpc::methods;
 use zeron_studio::{MediaKind, MediaModel, MediaOperation, ModelId, StudioArtifactId};
 
+use crate::composer::{COMPACT_TOTAL_HEIGHT, INPUT_LINE_HEIGHT};
 use crate::theme::Theme;
 
 use super::page::StudioPage;
 use super::paint::PaintSession;
 
-pub(super) const EDIT_COMPOSER_HEIGHT: f32 = 96.0;
+/// Fade band under the floating pill: compact chat height plus bottom inset.
+const EDIT_COMPOSER_BOTTOM: f32 = 10.0;
+pub(super) const EDIT_COMPOSER_HEIGHT: f32 = COMPACT_TOTAL_HEIGHT + EDIT_COMPOSER_BOTTOM;
 const BRUSH_TRACK_HEIGHT: f32 = 132.0;
 const DEFAULT_BRUSH_T: f32 = 0.28;
 
@@ -63,7 +66,6 @@ impl StudioPage {
             .unwrap_or((1024, 1024));
         self.edit_target = Some(artifact_id);
         self.edit_paint = Some(PaintSession::new(width, height));
-        self.edit_overlay = None;
         self.edit_brush_t = DEFAULT_BRUSH_T;
         self.edit_space_pan = false;
         self.edit_prompt.update(cx, |input, cx| {
@@ -76,7 +78,6 @@ impl StudioPage {
     pub(super) fn exit_edit_mode(&mut self, cx: &mut Context<Self>) {
         self.edit_target = None;
         self.edit_paint = None;
-        self.edit_overlay = None;
         self.edit_space_pan = false;
         self.edit_brush_drag = false;
         cx.notify();
@@ -256,14 +257,13 @@ impl StudioPage {
             return false;
         }
         let Some(image) = self.pointer_to_image(position) else {
-            return true;
+            return false;
         };
         let Some(paint) = self.edit_paint.as_mut() else {
-            return true;
+            return false;
         };
         let radius = PaintSession::brush_radius(paint.width, paint.height, self.edit_brush_t);
         paint.begin_stroke(image, radius);
-        self.sync_edit_overlay();
         cx.notify();
         true
     }
@@ -272,18 +272,17 @@ impl StudioPage {
         let Some(image) = self.pointer_to_image(position) else {
             return;
         };
+        let min_distance = self.screen_to_image_distance(1.4);
         let Some(paint) = self.edit_paint.as_mut() else {
             return;
         };
-        paint.extend_stroke(image);
-        self.sync_edit_overlay();
+        paint.extend_stroke_min(image, min_distance);
         cx.notify();
     }
 
     pub(super) fn end_edit_stroke(&mut self, cx: &mut Context<Self>) {
         if let Some(paint) = self.edit_paint.as_mut() {
             paint.end_stroke();
-            self.sync_edit_overlay();
             cx.notify();
         }
         self.edit_space_pan = false;
@@ -294,7 +293,6 @@ impl StudioPage {
             return false;
         };
         if paint.undo() {
-            self.sync_edit_overlay();
             cx.notify();
             true
         } else {
@@ -307,7 +305,6 @@ impl StudioPage {
             return false;
         };
         if paint.redo() {
-            self.sync_edit_overlay();
             cx.notify();
             true
         } else {
@@ -315,11 +312,27 @@ impl StudioPage {
         }
     }
 
-    fn sync_edit_overlay(&mut self) {
-        self.edit_overlay = self
-            .edit_paint
-            .as_ref()
-            .and_then(PaintSession::overlay_image);
+    fn screen_to_image_distance(&self, screen_px: f32) -> f32 {
+        let Some(paint) = self.edit_paint.as_ref() else {
+            return screen_px;
+        };
+        let stage = Bounds {
+            origin: self.lightbox_stage_origin,
+            size: size(
+                px(self.lightbox_stage_width.max(1.0)),
+                px(self.lightbox_stage_height.max(1.0)),
+            ),
+        };
+        let bounds = super::artifact::lightbox_image_paint_bounds(
+            stage,
+            paint.width,
+            paint.height,
+            self.lightbox_zoom,
+            self.lightbox_pan,
+            0.0,
+        );
+        let display_w = f32::from(bounds.size.width).max(1.0);
+        screen_px * (paint.width as f32 / display_w)
     }
 
     fn pointer_to_image(&self, position: Point<Pixels>) -> Option<(f32, f32)> {
@@ -349,103 +362,109 @@ impl StudioPage {
         Some((nx * paint.width as f32, ny * paint.height as f32))
     }
 
-    pub(super) fn render_edit_overlay(
-        &self,
-        theme: &Theme,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let _ = (theme, window, cx);
-        let overlay = self.edit_overlay.clone()?;
-        let paint = self.edit_paint.as_ref()?;
-        Some(
-            super::artifact::contain_layers(
-                overlay,
-                None,
-                px(0.0),
-                Some(SharedString::from(format!(
-                    "studio-edit-overlay-{}-{}",
-                    paint.width, paint.height
-                ))),
-            )
-            .into_any_element(),
+    pub(super) fn render_edit_strokes(&self) -> AnyElement {
+        let Some(paint) = self.edit_paint.as_ref() else {
+            return div().into_any_element();
+        };
+        let width = paint.width;
+        let height = paint.height;
+        let strokes: Vec<super::paint::Stroke> = paint.iter_strokes().cloned().collect();
+        let zoom = self.lightbox_zoom;
+        let pan = self.lightbox_pan;
+        canvas(
+            |_, _, _| {},
+            move |bounds, (), window, _| {
+                let image_bounds = super::artifact::lightbox_image_paint_bounds(
+                    bounds, width, height, zoom, pan, 0.0,
+                );
+                paint_vector_strokes(window, image_bounds, width, height, &strokes);
+            },
         )
+        .absolute()
+        .inset_0()
+        .into_any_element()
     }
 
     pub(super) fn render_edit_composer(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let prompt = self.edit_prompt.read(cx).text();
         let blocked = prompt.trim().is_empty() || self.busy;
+        // Compact chat pill: one 22.75px line in a 49px row. A stretched
+        // `h_full` well paints the placeholder at the top of empty space
+        // and a well with no height collapses the input to 0 (unclickable).
         let card = div()
             .id("studio-edit-composer")
             .w_full()
             .max_w(px(560.0))
+            .h(px(COMPACT_TOTAL_HEIGHT))
             .occlude()
             .rounded(px(26.0))
             .border_1()
             .border_color(theme.border)
             .bg(theme.input_glass_bg())
             .when(!theme.is_glass(), |card| card.shadow_lg())
-            .px(px(8.0))
-            .pt(px(8.0))
-            .pb(px(8.0))
             .flex()
-            .flex_col()
+            .flex_row()
+            .items_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|page, _, window, cx| {
+                    window.focus(&page.edit_prompt.focus_handle(cx), cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_click(|_, _, cx| cx.stop_propagation())
             .child(
                 div()
-                    .relative()
-                    .w_full()
-                    .min_h(px(52.0))
-                    .child(
-                        div()
-                            .id("studio-edit-prompt")
-                            .w_full()
-                            .pr(px(40.0))
-                            .child(self.edit_prompt.clone()),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .right(px(4.0))
-                            .bottom(px(4.0))
-                            .id("studio-edit-send")
-                            .size(px(28.0))
-                            .rounded_full()
-                            .bg(theme.text)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .when(blocked, |button| button.opacity(0.35))
-                            .when(!blocked, |button| {
-                                button
-                                    .cursor_pointer()
-                                    .hover(|style| style.opacity(0.85))
-                                    .on_click(cx.listener(|page, _, _, cx| page.submit_edit(cx)))
-                            })
-                            .child(
-                                crate::icons::icon(crate::icons::ARROW_UP)
-                                    .size(px(14.0))
-                                    .text_color(theme.bg),
-                            ),
-                    ),
+                    .id("studio-edit-prompt")
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(INPUT_LINE_HEIGHT))
+                    .pl(px(16.0))
+                    .pr(px(8.0))
+                    .overflow_hidden()
+                    .cursor(gpui::CursorStyle::IBeam)
+                    .child(self.edit_prompt.clone()),
+            )
+            .child(
+                div().flex_none().pr(px(8.0)).child(
+                    div()
+                        .id("studio-edit-send")
+                        .size(px(28.0))
+                        .flex_none()
+                        .rounded_full()
+                        .bg(theme.text)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(blocked, |button| button.opacity(0.35))
+                        .when(!blocked, |button| {
+                            button
+                                .cursor_pointer()
+                                .hover(|style| style.opacity(0.85))
+                                .on_click(cx.listener(|page, _, _, cx| page.submit_edit(cx)))
+                        })
+                        .child(
+                            crate::icons::icon(crate::icons::ARROW_UP)
+                                .size(px(14.0))
+                                .text_color(theme.bg),
+                        ),
+                ),
             );
         div()
             .id("studio-artifact-edit-composer")
             .absolute()
-            .bottom_0()
+            .bottom(px(EDIT_COMPOSER_BOTTOM))
             .left_0()
             .right_0()
-            .h(px(EDIT_COMPOSER_HEIGHT))
             .flex()
             .justify_center()
-            .items_end()
-            .pb(px(12.0))
-            .occlude()
             .child(crate::frost::frosted(26.0, 16.0, card))
             .into_any_element()
     }
 
     pub(super) fn render_brush_slider(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let t = self.edit_brush_t;
+        let ink = theme.text;
         let entity = cx.weak_entity();
         div()
             .id("studio-edit-brush")
@@ -460,7 +479,7 @@ impl StudioPage {
             .justify_center()
             .gap(px(8.0))
             .occlude()
-            .child(brush_legend_dot(10.0, theme))
+            .child(brush_legend_dot(11.0, theme))
             .child(
                 div()
                     .relative()
@@ -477,7 +496,7 @@ impl StudioPage {
                         canvas(
                             |_, _, _| {},
                             move |bounds, (), window, _| {
-                                paint_brush_track(bounds, t, window);
+                                paint_brush_track(bounds, t, ink, window);
                                 let entity_move = entity.clone();
                                 let track = bounds;
                                 window.on_mouse_event(
@@ -518,7 +537,7 @@ impl StudioPage {
                         .size_full(),
                     ),
             )
-            .child(brush_legend_dot(5.0, theme))
+            .child(brush_legend_dot(6.0, theme))
             .into_any_element()
     }
 
@@ -595,32 +614,143 @@ fn brush_legend_dot(size_px: f32, theme: &Theme) -> AnyElement {
     div()
         .size(px(size_px))
         .rounded_full()
-        .bg(theme.text.opacity(0.85))
+        .bg(theme.text)
         .into_any_element()
 }
 
-fn paint_brush_track(bounds: Bounds<Pixels>, t: f32, window: &mut Window) {
-    let theme_white = gpui::hsla(0.0, 0.0, 1.0, 0.88);
-    let track = gpui::hsla(0.0, 0.0, 1.0, 0.22);
+fn paint_brush_track(bounds: Bounds<Pixels>, t: f32, ink: gpui::Hsla, window: &mut Window) {
     let x = bounds.origin.x + bounds.size.width / 2.0;
     let top = bounds.origin.y;
     let bottom = bounds.origin.y + bounds.size.height;
-    let top_half = px(7.0);
-    let bottom_half = px(2.0);
-    let mut path = PathBuilder::fill();
-    path.move_to(point(x - top_half, top + px(6.0)));
-    path.line_to(point(x + top_half, top + px(6.0)));
-    path.line_to(point(x + bottom_half, bottom - px(6.0)));
-    path.line_to(point(x - bottom_half, bottom - px(6.0)));
-    if let Ok(path) = path.build() {
-        window.paint_path(path, track);
+    let top_half = px(8.0);
+    let bottom_half = px(2.5);
+    let mut fill = PathBuilder::fill();
+    fill.move_to(point(x - top_half, top + px(6.0)));
+    fill.line_to(point(x + top_half, top + px(6.0)));
+    fill.line_to(point(x + bottom_half, bottom - px(6.0)));
+    fill.line_to(point(x - bottom_half, bottom - px(6.0)));
+    if let Ok(path) = fill.build() {
+        window.paint_path(path, ink.opacity(0.55));
+    }
+    let mut outline = PathBuilder::stroke(px(1.5));
+    outline.move_to(point(x - top_half, top + px(6.0)));
+    outline.line_to(point(x + top_half, top + px(6.0)));
+    outline.line_to(point(x + bottom_half, bottom - px(6.0)));
+    outline.line_to(point(x - bottom_half, bottom - px(6.0)));
+    outline.line_to(point(x - top_half, top + px(6.0)));
+    if let Ok(path) = outline.build() {
+        window.paint_path(path, ink);
     }
     let thumb_y = top + px(6.0) + (bounds.size.height - px(12.0)) * (1.0 - t.clamp(0.0, 1.0));
-    window.paint_quad(gpui::fill(
+    window.paint_quad(gpui::quad(
         Bounds {
-            origin: point(x - px(7.0), thumb_y - px(5.0)),
-            size: size(px(14.0), px(10.0)),
+            origin: point(x - px(8.0), thumb_y - px(6.0)),
+            size: size(px(16.0), px(12.0)),
         },
-        theme_white,
+        px(6.0),
+        ink,
+        px(0.0),
+        gpui::transparent_black(),
+        gpui::BorderStyle::default(),
+    ));
+}
+
+fn paint_vector_strokes(
+    window: &mut Window,
+    image_bounds: Bounds<Pixels>,
+    image_width: u32,
+    image_height: u32,
+    strokes: &[super::paint::Stroke],
+) {
+    let scale_x = f32::from(image_bounds.size.width) / image_width.max(1) as f32;
+    let scale_y = f32::from(image_bounds.size.height) / image_height.max(1) as f32;
+    let to_screen = |x: f32, y: f32| {
+        point(
+            image_bounds.origin.x + px(x * scale_x),
+            image_bounds.origin.y + px(y * scale_y),
+        )
+    };
+    let fill = gpui::hsla(0.0, 0.0, 1.0, 0.22);
+    let outline = gpui::hsla(0.0, 0.0, 1.0, 0.95);
+    for stroke in strokes {
+        if stroke.points.is_empty() {
+            continue;
+        }
+        let radius_px = stroke.radius * scale_x;
+        let fill_width = (radius_px * 2.0).max(2.0);
+        let outline_width = fill_width + 3.0;
+        paint_smooth_stroke(window, stroke, to_screen, px(outline_width), outline);
+        paint_smooth_stroke(window, stroke, to_screen, px(fill_width), fill);
+        let Some(&(start_x, start_y)) = stroke.points.first() else {
+            continue;
+        };
+        let (end_x, end_y) = stroke.points.last().copied().unwrap_or((start_x, start_y));
+        paint_round_cap(
+            window,
+            to_screen(start_x, start_y),
+            outline_width * 0.5,
+            outline,
+        );
+        paint_round_cap(window, to_screen(start_x, start_y), fill_width * 0.5, fill);
+        if stroke.points.len() > 1 {
+            paint_round_cap(
+                window,
+                to_screen(end_x, end_y),
+                outline_width * 0.5,
+                outline,
+            );
+            paint_round_cap(window, to_screen(end_x, end_y), fill_width * 0.5, fill);
+        }
+    }
+}
+
+fn paint_smooth_stroke(
+    window: &mut Window,
+    stroke: &super::paint::Stroke,
+    to_screen: impl Fn(f32, f32) -> Point<Pixels>,
+    width: Pixels,
+    color: gpui::Hsla,
+) {
+    if stroke.points.len() < 2 {
+        return;
+    }
+    let mut builder = PathBuilder::stroke(width);
+    let screen: Vec<_> = stroke
+        .points
+        .iter()
+        .map(|&(x, y)| to_screen(x, y))
+        .collect();
+    if screen.len() == 2 {
+        builder.move_to(screen[0]);
+        builder.line_to(screen[1]);
+    } else {
+        builder.move_to(screen[0]);
+        for i in 0..screen.len() - 1 {
+            let p0 = screen[i.saturating_sub(1)];
+            let p1 = screen[i];
+            let p2 = screen[i + 1];
+            let p3 = screen[(i + 2).min(screen.len() - 1)];
+            let c1 = point(p1.x + (p2.x - p0.x) / 6.0, p1.y + (p2.y - p0.y) / 6.0);
+            let c2 = point(p2.x - (p3.x - p1.x) / 6.0, p2.y - (p3.y - p1.y) / 6.0);
+            builder.cubic_bezier_to(p2, c1, c2);
+        }
+    }
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, color);
+    }
+}
+
+fn paint_round_cap(window: &mut Window, center: Point<Pixels>, radius: f32, color: gpui::Hsla) {
+    let radius = radius.max(1.0);
+    window.paint_quad(gpui::quad(
+        Bounds {
+            origin: point(center.x - px(radius), center.y - px(radius)),
+            size: size(px(radius * 2.0), px(radius * 2.0)),
+        },
+        px(radius),
+        color,
+        px(0.0),
+        gpui::transparent_black(),
+        gpui::BorderStyle::default(),
     ));
 }

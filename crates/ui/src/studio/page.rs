@@ -138,7 +138,6 @@ pub struct StudioPage {
     pub(super) edit_target: Option<StudioArtifactId>,
     pub(super) edit_prompt: Entity<TextInput>,
     pub(super) edit_paint: Option<super::paint::PaintSession>,
-    pub(super) edit_overlay: Option<std::sync::Arc<gpui::Image>>,
     pub(super) edit_brush_t: f32,
     pub(super) edit_brush_drag: bool,
     pub(super) edit_space_pan: bool,
@@ -166,7 +165,12 @@ impl StudioPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
         let prompt = cx.new(|cx| TextInput::composer("Describe the image you want to create", cx));
-        let edit_prompt = cx.new(|cx| TextInput::composer("Describe the edit…", cx));
+        let edit_prompt = cx.new(|cx| {
+            let mut input = TextInput::new("Describe the edit…", cx);
+            input.set_soft_wrap(false);
+            input.set_viewport_max(Some(crate::text_input::INPUT_LINE_HEIGHT));
+            input
+        });
         let model_search = cx.new(|cx| TextInput::palette_search("Search models…", cx));
         let prompt_events = cx.subscribe(&prompt, |page: &mut Self, _, event, cx| match event {
             TextInputEvent::Submitted => page.submit(cx),
@@ -288,7 +292,6 @@ impl StudioPage {
             filmstrip_scroll_accum: 0.0,
             edit_target: None,
             edit_paint: None,
-            edit_overlay: None,
             edit_brush_t: 0.28,
             edit_brush_drag: false,
             edit_space_pan: false,
