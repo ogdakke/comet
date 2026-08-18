@@ -18,10 +18,11 @@
 //! - `session/update` notifications normalize per [`normalize::map_update`].
 //! - Permission requests auto-accept with the agent's preferred allow option
 //!   (zeron sessions run unattended); question-shaped requests block on the
-//!   engine's input bridge. Grok's `x.ai/exit_plan_mode` reverse-request is
-//!   answered the same way: live runs present Approve / Request changes /
-//!   Abandon; setup and unattended paths auto-approve so the tool does not
-//!   fail as "client disconnected".
+//!   engine's input bridge. Grok's `x.ai/exit_plan_mode` and
+//!   `x.ai/ask_user_question` reverse-requests are answered the same way
+//!   (often `_`-prefixed on the wire): live runs present the question wizard;
+//!   unattended paths approve the plan / cancel the interview so the tools
+//!   do not fail as "client disconnected".
 //! - Steering: agents advertising `_session/steering` get mid-turn injection;
 //!   others queue steers and deliver them as the next `session/prompt` at the
 //!   turn boundary. The session stays parked between turns while the
@@ -1479,6 +1480,10 @@ fn handle_server_request(
             client.respond(&id, exit_plan_mode_response(Some(EXIT_PLAN_APPROVE)));
             Vec::new()
         }
+        method if ask_user_question_params(method, params).is_some() => {
+            client.respond(&id, json!({ "outcome": "cancelled" }));
+            Vec::new()
+        }
         _ => {
             tracing::warn!(
                 target: "zeron_harness::acp",
@@ -1595,6 +1600,178 @@ fn ask_exit_plan_mode(
     Vec::new()
 }
 
+const ASK_USER_QUESTION_METHOD: &str = "x.ai/ask_user_question";
+const ASK_USER_QUESTION_METHOD_META: &str = "_x.ai/ask_user_question";
+const ASK_CHAT_ABOUT: &str = "Chat about this";
+const ASK_SKIP_INTERVIEW: &str = "Skip interview";
+
+fn is_ask_user_question_method(method: &str) -> bool {
+    method == ASK_USER_QUESTION_METHOD
+        || method == ASK_USER_QUESTION_METHOD_META
+        || method.ends_with("/ask_user_question")
+}
+
+fn ask_user_question_params<'a>(method: &str, params: &'a Value) -> Option<&'a Value> {
+    if is_ask_user_question_method(method) {
+        return Some(params);
+    }
+    if let Some(inner) = params.get("method").and_then(Value::as_str)
+        && is_ask_user_question_method(inner)
+    {
+        return params.get("params").or(Some(params));
+    }
+    if params.get("questions").and_then(Value::as_array).is_some()
+        && params.get("toolCallId").is_some()
+    {
+        return Some(params);
+    }
+    None
+}
+
+fn grok_questions_from_params(params: &Value) -> Vec<UserInputQuestion> {
+    let plan_mode = params.get("mode").and_then(Value::as_str) == Some("plan");
+    let header = if plan_mode {
+        "Plan interview"
+    } else {
+        "Agent question"
+    };
+    let mut questions: Vec<UserInputQuestion> = params
+        .get("questions")
+        .and_then(Value::as_array)
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|q| {
+            let text = q
+                .get("question")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if text.is_empty() {
+                return None;
+            }
+            let options = q
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|a| a.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|o| {
+                    o.get("label")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                })
+                .collect::<Vec<_>>();
+            let multi_select = q
+                .get("multiSelect")
+                .or_else(|| q.get("multi_select"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Some(UserInputQuestion {
+                id: text.to_owned(),
+                header: header.into(),
+                question: text.to_owned(),
+                options,
+                multi_select,
+            })
+        })
+        .collect();
+    if plan_mode && let Some(last) = questions.last_mut() {
+        if !last.options.iter().any(|o| o == ASK_CHAT_ABOUT) {
+            last.options.push(ASK_CHAT_ABOUT.into());
+        }
+        if !last.options.iter().any(|o| o == ASK_SKIP_INTERVIEW) {
+            last.options.push(ASK_SKIP_INTERVIEW.into());
+        }
+    }
+    questions
+}
+
+/// Grok `AskUserQuestionExtResponse`: internally tagged on `outcome`.
+fn ask_user_question_response(
+    questions: &[UserInputQuestion],
+    answers: &[UserInputAnswer],
+) -> Value {
+    let mut accepted = serde_json::Map::new();
+    let mut annotations = serde_json::Map::new();
+    let mut partial = serde_json::Map::new();
+    let mut special: Option<&'static str> = None;
+
+    for question in questions {
+        let labels = answers
+            .iter()
+            .find(|a| a.question_id == question.id)
+            .map(|a| a.labels.as_slice())
+            .unwrap_or(&[]);
+        if labels.iter().any(|l| l == ASK_CHAT_ABOUT) {
+            special = Some("chat_about_this");
+            continue;
+        }
+        if labels.iter().any(|l| l == ASK_SKIP_INTERVIEW) {
+            special = Some("skip_interview");
+            continue;
+        }
+        if labels.is_empty() {
+            continue;
+        }
+        let known: Vec<&str> = labels
+            .iter()
+            .filter(|l| question.options.iter().any(|o| o == *l))
+            .map(String::as_str)
+            .collect();
+        if known.is_empty() {
+            accepted.insert(question.question.clone(), json!(["Other"]));
+            annotations.insert(
+                question.question.clone(),
+                json!({ "notes": labels.join("\n") }),
+            );
+        } else {
+            accepted.insert(question.question.clone(), json!(known));
+            if let Some(first) = known.first() {
+                partial.insert(question.question.clone(), json!(first));
+            }
+        }
+    }
+
+    if let Some(outcome) = special {
+        return json!({ "outcome": outcome, "partial_answers": partial });
+    }
+    if accepted.is_empty() {
+        return json!({ "outcome": "cancelled" });
+    }
+    let mut resp = json!({ "outcome": "accepted", "answers": accepted });
+    if !annotations.is_empty() {
+        resp["annotations"] = Value::Object(annotations);
+    }
+    resp
+}
+
+fn ask_user_question(
+    client: &RpcClient,
+    id: Value,
+    params: &Value,
+    request_input: &std::sync::Arc<RequestInputFn>,
+    open_questions: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> Vec<AgentEvent> {
+    let questions = grok_questions_from_params(params);
+    if questions.is_empty() {
+        client.respond(&id, json!({ "outcome": "cancelled" }));
+        return Vec::new();
+    }
+    let client = client.clone();
+    let request_input = std::sync::Arc::clone(request_input);
+    let open_questions = std::sync::Arc::clone(open_questions);
+    open_questions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    tokio::spawn(async move {
+        let answers = (request_input)(questions.clone()).await.unwrap_or_default();
+        client.respond(&id, ask_user_question_response(&questions, &answers));
+        open_questions.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    Vec::new()
+}
+
 /// The live-run request handler: tool permissions auto-accept like
 /// [`handle_server_request`], but question-shaped requests (and Grok plan
 /// approval) block on the engine's input bridge (in a subtask so the
@@ -1611,6 +1788,9 @@ fn handle_server_request_live(
 ) -> Vec<AgentEvent> {
     if let Some(plan_params) = exit_plan_mode_params(method, params) {
         return ask_exit_plan_mode(client, id, plan_params, request_input, open_questions);
+    }
+    if let Some(q_params) = ask_user_question_params(method, params) {
+        return ask_user_question(client, id, q_params, request_input, open_questions);
     }
     if method != "session/request_permission" {
         return handle_server_request(client, id, method, params);
@@ -3251,6 +3431,94 @@ mod tests {
         assert_eq!(
             config_option_sets(&codex, None, &[], &no_opts),
             vec![("mode".to_owned(), json!({ "value": "agent-full-access" }))]
+        );
+    }
+
+    #[test]
+    fn ask_user_question_response_maps_picks_and_freeform() {
+        let questions = grok_questions_from_params(&json!({
+            "sessionId": "s-1",
+            "toolCallId": "tc-1",
+            "mode": "plan",
+            "questions": [
+                {
+                    "question": "Which dummy flavor should this test plan use?",
+                    "options": [
+                        { "label": "Keep it tiny" },
+                        { "label": "Make it look real" },
+                    ],
+                },
+                {
+                    "question": "How many follow-up questions?",
+                    "options": [{ "label": "None" }, { "label": "One more" }],
+                },
+            ],
+        }));
+        assert_eq!(questions.len(), 2);
+        assert_eq!(questions[0].header, "Plan interview");
+        assert!(questions[1].options.iter().any(|o| o == "Chat about this"));
+        assert!(questions[1].options.iter().any(|o| o == "Skip interview"));
+
+        let accepted = ask_user_question_response(
+            &questions,
+            &[
+                UserInputAnswer {
+                    question_id: questions[0].id.clone(),
+                    labels: vec!["Keep it tiny".into()],
+                },
+                UserInputAnswer {
+                    question_id: questions[1].id.clone(),
+                    labels: vec!["None".into()],
+                },
+            ],
+        );
+        assert_eq!(accepted["outcome"], "accepted");
+        assert_eq!(
+            accepted["answers"]["Which dummy flavor should this test plan use?"],
+            json!(["Keep it tiny"])
+        );
+
+        let notes = ask_user_question_response(
+            &questions[..1],
+            &[UserInputAnswer {
+                question_id: questions[0].id.clone(),
+                labels: vec!["something custom".into()],
+            }],
+        );
+        assert_eq!(notes["outcome"], "accepted");
+        assert_eq!(
+            notes["answers"]["Which dummy flavor should this test plan use?"],
+            json!(["Other"])
+        );
+        assert_eq!(
+            notes["annotations"]["Which dummy flavor should this test plan use?"]["notes"],
+            "something custom"
+        );
+
+        let skip = ask_user_question_response(
+            &questions,
+            &[
+                UserInputAnswer {
+                    question_id: questions[0].id.clone(),
+                    labels: vec!["Keep it tiny".into()],
+                },
+                UserInputAnswer {
+                    question_id: questions[1].id.clone(),
+                    labels: vec!["Skip interview".into()],
+                },
+            ],
+        );
+        assert_eq!(skip["outcome"], "skip_interview");
+        assert_eq!(
+            skip["partial_answers"]["Which dummy flavor should this test plan use?"],
+            "Keep it tiny"
+        );
+        assert!(
+            ask_user_question_params(
+                "_x.ai/ask_user_question",
+                &json!({ "questions": [], "toolCallId": "t" })
+            )
+            .is_some()
         );
     }
 

@@ -187,6 +187,17 @@ case "$promptline" in
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 
+*scenario:ask-user*)
+  # Grok ask_user_question reverse-request. method-not-found used to fail
+  # the tool ("Failed to reach the client … unsupported method").
+  emit "{\"id\":93,\"method\":\"_x.ai/ask_user_question\",\"params\":{\"sessionId\":\"$SID\",\"toolCallId\":\"call-q-1\",\"mode\":\"plan\",\"questions\":[{\"question\":\"Which dummy flavor should this test plan use?\",\"options\":[{\"label\":\"Keep it tiny\",\"description\":\"short\"},{\"label\":\"Make it look real\",\"description\":\"long\"}]}]}}"
+  read -r ans || exit 1
+  { has "$ans" '"id":93' && has "$ans" '"outcome":"accepted"' && has "$ans" 'Keep it tiny'; } ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"questions answered"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
 *scenario:permission*)
   emit "{\"id\":77,\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"$SID\",\"toolCall\":{\"toolCallId\":\"t1\"},\"options\":[{\"optionId\":\"once\",\"name\":\"Allow once\",\"kind\":\"allow_once\"},{\"optionId\":\"always\",\"name\":\"Always allow\",\"kind\":\"allow_always\"},{\"optionId\":\"no\",\"name\":\"Reject\",\"kind\":\"reject_once\"}]}}"
   read -r ans || exit 1
