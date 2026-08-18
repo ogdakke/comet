@@ -84,15 +84,8 @@ impl VeniceMediaProvider {
     async fn merged_models(&self, secret: &Secret) -> ProviderResult<Vec<crate::MediaModel>> {
         let image = self.models_of_type(secret, "image").await;
         let upscale = self.models_of_type(secret, "upscale").await;
-        match (image, upscale) {
-            (Ok(mut image), Ok(upscale)) => {
-                image.extend(upscale);
-                Ok(image)
-            }
-            (Ok(image), Err(_)) => Ok(image),
-            (Err(_), Ok(upscale)) => Ok(upscale),
-            (Err(error), Err(_)) => Err(error),
-        }
+        let inpaint = self.models_of_type(secret, "inpaint").await;
+        merge_catalog_fetches([image, upscale, inpaint])
     }
 
     async fn billing_balance(&self, secret: &Secret) -> ProviderResult<AccountBalance> {
@@ -207,6 +200,68 @@ impl VeniceMediaProvider {
             artifacts: vec![artifact],
         })
     }
+
+    async fn submit_image_edit(
+        &self,
+        secret: &Secret,
+        request: &GenerationRequest,
+        context: &SubmitContext,
+    ) -> ProviderResult<Submission> {
+        let masked = context
+            .inputs
+            .iter()
+            .any(|input| input.role.as_str() == "mask");
+        let (path, payload) = if masked {
+            ("/image/multi-edit", multi_edit_payload(request, context)?)
+        } else {
+            ("/image/edit", edit_payload(request, context)?)
+        };
+        let response = self
+            .authenticated(reqwest::Method::POST, path, secret)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(network_error)?;
+        let content_type = response_content_type(&response);
+        let moderation = ModerationFlags::from_headers(response.headers());
+        let response = require_success(response).await?;
+        let bytes = read_limited(response, MAX_IMAGE_RESPONSE_BYTES).await?;
+        if !content_type.starts_with("image/") {
+            return Err(ProviderError::new(
+                ProviderErrorKind::MalformedResponse,
+                format!("Venice returned {content_type} for an image edit request"),
+            ));
+        }
+        Ok(Submission::Completed {
+            artifacts: vec![image_artifact(bytes, moderation.metadata(None))?],
+        })
+    }
+}
+
+fn merge_catalog_fetches(
+    results: [ProviderResult<Vec<crate::MediaModel>>; 3],
+) -> ProviderResult<Vec<crate::MediaModel>> {
+    let mut models = Vec::new();
+    let mut first_error = None;
+    for result in results {
+        match result {
+            Ok(chunk) => models.extend(chunk),
+            Err(error) => {
+                if models.is_empty() && first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    if models.is_empty() {
+        return Err(first_error.unwrap_or_else(|| {
+            ProviderError::new(
+                ProviderErrorKind::Other,
+                "Venice returned no image, upscale, or inpaint models",
+            )
+        }));
+    }
+    Ok(models)
 }
 
 #[async_trait]
@@ -285,9 +340,12 @@ impl MediaProvider for VeniceMediaProvider {
                 self.submit_text_to_image(secret, request).await
             }
             crate::MediaOperation::Upscale => self.submit_upscale(secret, request, _context).await,
+            crate::MediaOperation::ImageEdit => {
+                self.submit_image_edit(secret, request, _context).await
+            }
             _ => Err(ProviderError::new(
                 ProviderErrorKind::Unsupported,
-                "this Venice adapter slice supports text-to-image without inputs and image upscale",
+                "this Venice adapter slice supports text-to-image without inputs, image edit, and image upscale",
             )),
         }
     }
@@ -419,8 +477,9 @@ fn image_payload(request: &GenerationRequest, binary: bool) -> ProviderResult<se
     Ok(payload.into())
 }
 
-const UPSCALE_MIN_PIXELS: u64 = 65_536;
-const UPSCALE_MAX_INPUT_BYTES: u64 = 25 * 1024 * 1024;
+const IMAGE_INPUT_MIN_PIXELS: u64 = 65_536;
+const IMAGE_INPUT_MAX_PIXELS: u64 = 33_177_600;
+const IMAGE_INPUT_MAX_BYTES: u64 = 25 * 1024 * 1024;
 
 fn upscale_payload(
     request: &GenerationRequest,
@@ -448,14 +507,14 @@ fn upscale_payload(
             format!("could not read upscale source: {error}"),
         )
     })?;
-    if bytes.len() as u64 > UPSCALE_MAX_INPUT_BYTES {
+    if bytes.len() as u64 > IMAGE_INPUT_MAX_BYTES {
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidRequest,
             "upscale source exceeds Venice's 25MB limit",
         ));
     }
     let scale = upscale_scale(request)?;
-    enforce_upscale_source_floor(&bytes)?;
+    enforce_image_input_bounds(&bytes)?;
     let mut payload = serde_json::Map::from_iter([(
         "image".into(),
         serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(bytes)),
@@ -489,30 +548,219 @@ fn upscale_scale(request: &GenerationRequest) -> ProviderResult<i64> {
     }
 }
 
-fn enforce_upscale_source_floor(bytes: &[u8]) -> ProviderResult<()> {
+fn enforce_image_input_bounds(bytes: &[u8]) -> ProviderResult<()> {
     let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|error| {
             ProviderError::new(
                 ProviderErrorKind::InvalidRequest,
-                format!("could not inspect upscale source: {error}"),
+                format!("could not inspect image input: {error}"),
             )
         })?
         .into_dimensions()
         .map_err(|error| {
             ProviderError::new(
                 ProviderErrorKind::InvalidRequest,
-                format!("could not read upscale source dimensions: {error}"),
+                format!("could not read image input dimensions: {error}"),
             )
         })?;
     let area = u64::from(width).saturating_mul(u64::from(height));
-    if area < UPSCALE_MIN_PIXELS {
+    if area < IMAGE_INPUT_MIN_PIXELS {
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidRequest,
-            format!("upscale source must be at least {UPSCALE_MIN_PIXELS} pixels"),
+            format!("image input must be at least {IMAGE_INPUT_MIN_PIXELS} pixels"),
+        ));
+    }
+    if area > IMAGE_INPUT_MAX_PIXELS {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            format!("image input must be at most {IMAGE_INPUT_MAX_PIXELS} pixels"),
         ));
     }
     Ok(())
+}
+
+fn edit_payload(
+    request: &GenerationRequest,
+    context: &SubmitContext,
+) -> ProviderResult<serde_json::Value> {
+    require_single_edit_output(request)?;
+    if context
+        .inputs
+        .iter()
+        .any(|input| input.role.as_str() != "source")
+    {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "prompt-only Venice edit accepts only a source image",
+        ));
+    }
+    let source = read_role_image(context, "source", 0, "edit source")?;
+    let mut payload = serde_json::Map::from_iter([
+        (
+            "model".into(),
+            serde_json::Value::String(request.model_id.as_str().into()),
+        ),
+        (
+            "prompt".into(),
+            serde_json::Value::String(request.prompt.clone()),
+        ),
+        (
+            "image".into(),
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(source)),
+        ),
+        ("safe_mode".into(), serde_json::Value::Bool(false)),
+    ]);
+    apply_edit_controls(&mut payload, request)?;
+    Ok(payload.into())
+}
+
+fn multi_edit_payload(
+    request: &GenerationRequest,
+    context: &SubmitContext,
+) -> ProviderResult<serde_json::Value> {
+    require_single_edit_output(request)?;
+    let source = read_role_image(context, "source", 0, "edit source")?;
+    let mut images = vec![base64::engine::general_purpose::STANDARD.encode(source)];
+    let mut masks: Vec<_> = context
+        .inputs
+        .iter()
+        .filter(|input| input.role.as_str() == "mask")
+        .collect();
+    if masks.is_empty() {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "Venice multi-edit requires at least one mask layer",
+        ));
+    }
+    masks.sort_by_key(|input| input.ordinal);
+    for mask in masks {
+        let bytes = read_resolved_image(mask, "edit mask")?;
+        images.push(base64::engine::general_purpose::STANDARD.encode(bytes));
+    }
+    if context
+        .inputs
+        .iter()
+        .any(|input| !matches!(input.role.as_str(), "source" | "mask"))
+    {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "Venice image edit only accepts source and mask inputs",
+        ));
+    }
+    let mut payload = serde_json::Map::from_iter([
+        (
+            "modelId".into(),
+            serde_json::Value::String(request.model_id.as_str().into()),
+        ),
+        (
+            "prompt".into(),
+            serde_json::Value::String(request.prompt.clone()),
+        ),
+        (
+            "images".into(),
+            serde_json::Value::Array(images.into_iter().map(serde_json::Value::String).collect()),
+        ),
+        ("safe_mode".into(), serde_json::Value::Bool(false)),
+    ]);
+    apply_edit_controls(&mut payload, request)?;
+    Ok(payload.into())
+}
+
+fn require_single_edit_output(request: &GenerationRequest) -> ProviderResult<()> {
+    if request.output_count != 1 {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "Venice image edit returns exactly one image",
+        ));
+    }
+    if request.prompt.trim().is_empty() {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "Venice image edit requires a prompt",
+        ));
+    }
+    Ok(())
+}
+
+fn apply_edit_controls(
+    payload: &mut serde_json::Map<String, serde_json::Value>,
+    request: &GenerationRequest,
+) -> ProviderResult<()> {
+    for (id, value) in &request.controls {
+        match (id.as_str(), value) {
+            ("format", ControlValue::Enum { value }) => {
+                payload.insert("output_format".into(), value.clone().into());
+            }
+            ("quality", ControlValue::Enum { value }) => {
+                payload.insert("quality".into(), value.clone().into());
+            }
+            ("resolution", ControlValue::Resolution { value }) => {
+                payload.insert("resolution".into(), value.clone().into());
+            }
+            ("aspect_ratio", ControlValue::AspectRatio { width, height }) => {
+                payload.insert("aspect_ratio".into(), format!("{width}:{height}").into());
+            }
+            ("aspect_ratio", ControlValue::AspectRatioAuto) => {
+                payload.insert("aspect_ratio".into(), "auto".into());
+            }
+            ("reasoning", ControlValue::Boolean { value }) => {
+                payload.insert(
+                    "disable_prompt_optimization_thinking".into(),
+                    (!*value).into(),
+                );
+            }
+            (
+                "safe_mode" | "enhance_prompt" | "disable_prompt_optimization_thinking",
+                ControlValue::Boolean { value },
+            ) => {
+                payload.insert(id.as_str().into(), (*value).into());
+            }
+            (unknown, _) => {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    format!("unsupported Venice image edit control {unknown}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_role_image(
+    context: &SubmitContext,
+    role: &str,
+    ordinal: u32,
+    label: &str,
+) -> ProviderResult<Vec<u8>> {
+    let input = context
+        .inputs
+        .iter()
+        .find(|input| input.role.as_str() == role && input.ordinal == ordinal)
+        .ok_or_else(|| {
+            ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                format!("Venice {label} is required"),
+            )
+        })?;
+    read_resolved_image(input, label)
+}
+
+fn read_resolved_image(input: &crate::ResolvedInput, label: &str) -> ProviderResult<Vec<u8>> {
+    let bytes = std::fs::read(&input.path).map_err(|error| {
+        ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            format!("could not read {label}: {error}"),
+        )
+    })?;
+    if bytes.len() as u64 > IMAGE_INPUT_MAX_BYTES {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            format!("{label} exceeds Venice's 25MB limit"),
+        ));
+    }
+    enforce_image_input_bounds(&bytes)?;
+    Ok(bytes)
 }
 
 fn response_content_type(response: &Response) -> String {
@@ -1132,31 +1380,227 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    fn edit_request() -> GenerationRequest {
+        GenerationRequest {
+            provider_id: VENICE_PROVIDER_ID.into(),
+            model_id: "firered-image-edit".into(),
+            operation: crate::MediaOperation::ImageEdit,
+            prompt: "change the sky to sunrise".into(),
+            negative_prompt: None,
+            output_count: 1,
+            controls: BTreeMap::from([
+                ("aspect_ratio".into(), ControlValue::AspectRatioAuto),
+                (
+                    "format".into(),
+                    ControlValue::Enum {
+                        value: "png".into(),
+                    },
+                ),
+            ]),
+            inputs: Vec::new(),
+            manifest_version: "v1".into(),
+            display_aspect_ratio: (1, 1),
+        }
+    }
+
+    fn mask_input(bytes: &[u8]) -> (std::path::PathBuf, crate::ResolvedInput) {
+        let path = std::env::temp_dir().join(format!("zeron-mask-{}.png", uuid::Uuid::new_v4()));
+        std::fs::write(&path, bytes).unwrap();
+        let input = crate::ResolvedInput {
+            role: crate::InputRole::from("mask"),
+            ordinal: 0,
+            path: path.clone(),
+            mime_type: "image/png".into(),
+            content_hash: "mask-hash".into(),
+            size_bytes: bytes.len() as u64,
+        };
+        (path, input)
+    }
+
+    #[test]
+    fn edit_payload_is_prompt_only_and_uses_model() {
+        let png = solid_png(256, 256);
+        let (path, input) = source_input(&png);
+        let context = SubmitContext {
+            idempotency_key: "key".into(),
+            inputs: vec![input],
+        };
+        let value = edit_payload(&edit_request(), &context).unwrap();
+        assert_eq!(value["model"], "firered-image-edit");
+        assert!(value.get("modelId").is_none());
+        assert_eq!(value["prompt"], "change the sky to sunrise");
+        assert_eq!(value["aspect_ratio"], "auto");
+        assert_eq!(value["output_format"], "png");
+        assert_eq!(value["safe_mode"], false);
+        assert!(value.get("images").is_none());
+        let encoded = value["image"].as_str().unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap(),
+            png
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn multi_edit_payload_sends_source_then_mask_and_uses_model_id() {
+        let source = solid_png(256, 256);
+        let mask = solid_png(256, 256);
+        let (source_path, source_input) = source_input(&source);
+        let (mask_path, mask_input) = mask_input(&mask);
+        let context = SubmitContext {
+            idempotency_key: "key".into(),
+            inputs: vec![source_input, mask_input],
+        };
+        let value = multi_edit_payload(&edit_request(), &context).unwrap();
+        assert_eq!(value["modelId"], "firered-image-edit");
+        assert!(value.get("model").is_none());
+        assert_eq!(value["images"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(value["images"][0].as_str().unwrap())
+                .unwrap(),
+            source
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(value["images"][1].as_str().unwrap())
+                .unwrap(),
+            mask
+        );
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(mask_path);
+    }
+
+    #[test]
+    fn edit_payload_requires_a_prompt() {
+        let png = solid_png(256, 256);
+        let (path, input) = source_input(&png);
+        let mut request = edit_request();
+        request.prompt.clear();
+        let context = SubmitContext {
+            idempotency_key: "key".into(),
+            inputs: vec![input],
+        };
+        assert_eq!(
+            edit_payload(&request, &context).unwrap_err().kind,
+            ProviderErrorKind::InvalidRequest
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     #[tokio::test]
-    async fn list_models_fetches_image_and_upscale_catalogs() {
+    async fn prompt_only_edit_hits_image_edit() {
+        let png = solid_png(256, 256);
+        let (path, input) = source_input(&png);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = solid_png(256, 256);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut incoming = vec![0_u8; 65536];
+            let _ = stream.read(&mut incoming).await;
+            let incoming = String::from_utf8_lossy(&incoming);
+            assert!(incoming.contains("POST /image/edit"));
+            assert!(!incoming.contains("POST /image/multi-edit"));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+        });
+        let provider = VeniceMediaProvider::with_base_url(format!("http://{addr}"));
+        let submission = provider
+            .submit(
+                &Secret::new("token"),
+                &edit_request(),
+                &SubmitContext {
+                    idempotency_key: "key".into(),
+                    inputs: vec![input],
+                },
+            )
+            .await
+            .unwrap();
+        let Submission::Completed { artifacts } = submission else {
+            panic!("expected completed edit");
+        };
+        assert_eq!(artifacts.len(), 1);
+        server.await.unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn masked_edit_hits_image_multi_edit() {
+        let source = solid_png(256, 256);
+        let mask = solid_png(256, 256);
+        let (source_path, source_input) = source_input(&source);
+        let (mask_path, mask_input) = mask_input(&mask);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = solid_png(256, 256);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut incoming = vec![0_u8; 131072];
+            let _ = stream.read(&mut incoming).await;
+            let incoming = String::from_utf8_lossy(&incoming);
+            assert!(incoming.contains("POST /image/multi-edit"));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+        });
+        let provider = VeniceMediaProvider::with_base_url(format!("http://{addr}"));
+        let submission = provider
+            .submit(
+                &Secret::new("token"),
+                &edit_request(),
+                &SubmitContext {
+                    idempotency_key: "key".into(),
+                    inputs: vec![source_input, mask_input],
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(submission, Submission::Completed { .. }));
+        server.await.unwrap();
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(mask_path);
+    }
+
+    #[tokio::test]
+    async fn list_models_fetches_image_upscale_and_inpaint_catalogs() {
         let image = include_bytes!("../tests/fixtures/venice/image-model.json");
         let upscale = include_bytes!("../tests/fixtures/venice/upscale-model.json");
+        let inpaint = include_bytes!("../tests/fixtures/venice/inpaint-model.json");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_server = seen.clone();
         let server = tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut incoming = vec![0_u8; 4096];
                 let n = stream.read(&mut incoming).await.unwrap_or(0);
                 let request = String::from_utf8_lossy(&incoming[..n]);
                 let media_type = if request.contains("type=upscale") {
                     "upscale"
+                } else if request.contains("type=inpaint") {
+                    "inpaint"
                 } else {
                     "image"
                 };
                 seen_server.lock().unwrap().push(media_type.to_owned());
-                let body: &[u8] = if media_type == "upscale" {
-                    upscale
-                } else {
-                    image
+                let body: &[u8] = match media_type {
+                    "upscale" => upscale,
+                    "inpaint" => inpaint,
+                    _ => image,
                 };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1170,7 +1614,7 @@ mod tests {
         let models = provider.list_models(&Secret::new("token")).await.unwrap();
         let mut types: Vec<_> = seen.lock().unwrap().clone();
         types.sort();
-        assert_eq!(types, ["image", "upscale"]);
+        assert_eq!(types, ["image", "inpaint", "upscale"]);
         assert!(
             models
                 .iter()
@@ -1180,6 +1624,11 @@ mod tests {
             models
                 .iter()
                 .any(|model| model.operation == crate::MediaOperation::Upscale)
+        );
+        assert!(
+            models
+                .iter()
+                .any(|model| model.operation == crate::MediaOperation::ImageEdit)
         );
         server.await.unwrap();
     }

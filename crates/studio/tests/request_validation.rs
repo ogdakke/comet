@@ -212,3 +212,91 @@ fn upscale_rejects_more_than_one_output() {
         Err(RequestValidationError::InvalidOutputCount { .. })
     ));
 }
+
+fn edit_model() -> MediaModel {
+    MediaModel {
+        provider_id: "fake".into(),
+        id: "image-edit".into(),
+        display_name: "Edit".to_owned(),
+        description: None,
+        operation: MediaOperation::ImageEdit,
+        output_kind: MediaKind::Image,
+        output_mime_types: vec!["image/png".to_owned()],
+        input_constraints: vec![
+            InputConstraint {
+                role: "source".into(),
+                minimum_count: 1,
+                maximum_count: 1,
+                mime: MimeConstraint {
+                    accepted: vec!["image/png".to_owned()],
+                    maximum_bytes: Some(25 * 1024 * 1024),
+                    maximum_width: None,
+                    maximum_height: None,
+                },
+            },
+            InputConstraint {
+                role: "mask".into(),
+                minimum_count: 0,
+                maximum_count: 2,
+                mime: MimeConstraint {
+                    accepted: vec!["image/png".to_owned()],
+                    maximum_bytes: Some(25 * 1024 * 1024),
+                    maximum_width: None,
+                    maximum_height: None,
+                },
+            },
+        ],
+        prompt_maximum_chars: Some(5000),
+        negative_prompt_maximum_chars: None,
+        maximum_output_count: 1,
+        controls: Vec::new(),
+        pricing: None,
+        features: Vec::new(),
+        manifest_version: "fixture-v1".to_owned(),
+        fetched_at: Utc::now(),
+    }
+}
+
+fn edit_request() -> GenerationRequest {
+    GenerationRequest {
+        provider_id: "fake".into(),
+        model_id: "image-edit".into(),
+        operation: MediaOperation::ImageEdit,
+        prompt: "change the sky".to_owned(),
+        negative_prompt: None,
+        output_count: 1,
+        controls: BTreeMap::new(),
+        inputs: vec![source_input()],
+        manifest_version: "fixture-v1".to_owned(),
+        display_aspect_ratio: (1, 1),
+    }
+}
+
+#[test]
+fn image_edit_accepts_a_source_without_a_mask() {
+    edit_request().validate_against(&edit_model()).unwrap();
+}
+
+#[test]
+fn image_edit_accepts_an_optional_mask() {
+    let mut request = edit_request();
+    request.inputs.push(GenerationInput {
+        role: "mask".into(),
+        ordinal: 0,
+        source: GenerationInputSource::Asset {
+            asset_id: zeron_studio::StudioAssetId::new(),
+        },
+        content_hash: "mask".to_owned(),
+    });
+    request.validate_against(&edit_model()).unwrap();
+}
+
+#[test]
+fn image_edit_rejects_a_missing_source() {
+    let mut request = edit_request();
+    request.inputs.clear();
+    assert!(matches!(
+        request.validate_against(&edit_model()),
+        Err(RequestValidationError::InvalidInputCount { .. })
+    ));
+}

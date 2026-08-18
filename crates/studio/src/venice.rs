@@ -126,7 +126,12 @@ pub fn normalize_model_catalog(
     Ok(response
         .data
         .into_iter()
-        .filter(|model| matches!(model.media_type.as_str(), "image" | "video" | "upscale"))
+        .filter(|model| {
+            matches!(
+                model.media_type.as_str(),
+                "image" | "video" | "upscale" | "inpaint"
+            )
+        })
         .filter_map(|model| normalize_model(model, fetched_at).ok())
         .collect())
 }
@@ -139,6 +144,7 @@ fn normalize_model(
         "image" => normalize_image(model, fetched_at),
         "video" => normalize_video(model, fetched_at),
         "upscale" => normalize_upscale(model, fetched_at),
+        "inpaint" => normalize_inpaint(model, fetched_at),
         _ => unreachable!("caller filters non-media model types"),
     }
 }
@@ -208,7 +214,7 @@ fn normalize_image(
         choices: Vec::new(),
         visible_when: Vec::new(),
     });
-    let formats = image_format_choices(&model.id, &constraints);
+    let formats = image_format_choices(&model.id, &constraints.formats);
     if !formats.is_empty() {
         let default = constraints
             .default_format
@@ -273,6 +279,11 @@ fn normalize_image(
 }
 
 const UPSCALE_MAX_INPUT_BYTES: u64 = 25 * 1024 * 1024;
+/// Venice `/image/edit` and `/image/multi-edit` share this upload cap.
+const INPAINT_MAX_INPUT_BYTES: u64 = 25 * 1024 * 1024;
+/// When `combineImages` is true but `maxInputImages` is omitted, the
+/// multi-edit guide documents a 1–3 image envelope (source + up to two layers).
+const DEFAULT_INPAINT_INPUT_IMAGES: u32 = 3;
 
 fn normalize_upscale(
     model: CatalogModel,
@@ -347,6 +358,159 @@ fn normalize_upscale(
         maximum_output_count: 1,
         controls,
         pricing: upscale_pricing_metadata(model.model_spec.pricing.as_ref()),
+        features,
+        manifest_version: String::new(),
+        fetched_at,
+    })
+}
+
+/// Venice `GET /models?type=inpaint` rows. They do **not** carry generate
+/// `steps`. Extra multi-edit images are "edit layers/masks": we send a
+/// source-resolution PNG with opaque white = region to edit and black = keep.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InpaintConstraints {
+    prompt_character_limit: u32,
+    #[serde(default)]
+    aspect_ratios: Vec<String>,
+    default_aspect_ratio: Option<String>,
+    #[serde(default)]
+    combine_images: bool,
+    max_input_images: Option<u32>,
+    #[serde(default)]
+    resolutions: Vec<String>,
+    default_resolution: Option<String>,
+    #[serde(default)]
+    qualities: Vec<String>,
+    default_quality: Option<String>,
+    #[serde(default)]
+    formats: Vec<String>,
+    default_format: Option<String>,
+}
+
+fn normalize_inpaint(
+    model: CatalogModel,
+    fetched_at: DateTime<Utc>,
+) -> Result<MediaModel, VeniceCatalogError> {
+    if model.id.trim().is_empty() {
+        return Err(VeniceCatalogError::MissingField {
+            model_id: model.id,
+            field: "id",
+        });
+    }
+    let features = model_features(&model.model_spec);
+    let constraints: InpaintConstraints = serde_json::from_value(model.model_spec.constraints)?;
+    let mut source = input_constraint("source", &["image/jpeg", "image/png", "image/webp"]);
+    source.mime.maximum_bytes = Some(INPAINT_MAX_INPUT_BYTES);
+    let mut input_constraints = vec![source];
+    if constraints.combine_images {
+        let extra = constraints
+            .max_input_images
+            .unwrap_or(DEFAULT_INPAINT_INPUT_IMAGES)
+            .saturating_sub(1)
+            .max(1);
+        let mut mask = input_constraint("mask", &["image/jpeg", "image/png", "image/webp"]);
+        mask.minimum_count = 0;
+        mask.maximum_count = extra;
+        mask.mime.maximum_bytes = Some(INPAINT_MAX_INPUT_BYTES);
+        input_constraints.push(mask);
+    }
+
+    let mut controls = Vec::new();
+    if let Some(control) = aspect_ratio_control(
+        &constraints.aspect_ratios,
+        constraints.default_aspect_ratio.as_deref(),
+    ) {
+        controls.push(control);
+    }
+    if !constraints.resolutions.is_empty() {
+        controls.push(choice_control(
+            "resolution",
+            "Resolution",
+            ControlKind::Resolution,
+            &constraints.resolutions,
+            constraints.default_resolution.as_deref(),
+        ));
+    }
+    if !constraints.qualities.is_empty() {
+        controls.push(choice_control(
+            "quality",
+            "Quality",
+            ControlKind::Enum,
+            &constraints.qualities,
+            constraints.default_quality.as_deref(),
+        ));
+    }
+    if model.model_spec.supports_optimize_prompt_thinking {
+        controls.push(ModelControl {
+            id: ControlId::from("reasoning"),
+            label: "Reasoning".to_owned(),
+            description: Some("Use provider-supported prompt optimization reasoning".to_owned()),
+            kind: ControlKind::Boolean,
+            required: false,
+            default: Some(ControlValue::Boolean { value: true }),
+            minimum: None,
+            maximum: None,
+            step: None,
+            choices: Vec::new(),
+            visible_when: Vec::new(),
+        });
+    }
+    let formats = image_format_choices(&model.id, &constraints.formats);
+    if !formats.is_empty() {
+        let default = constraints
+            .default_format
+            .as_deref()
+            .and_then(normalize_image_format)
+            .filter(|value| formats.iter().any(|choice| choice == value))
+            .or_else(|| {
+                formats
+                    .iter()
+                    .find(|value| value.as_str() == "webp")
+                    .cloned()
+            })
+            .or_else(|| formats.first().cloned());
+        controls.push(choice_control(
+            "format",
+            "Format",
+            ControlKind::Enum,
+            &formats,
+            default.as_deref(),
+        ));
+    }
+    controls.push(ModelControl {
+        id: ControlId::from("safe_mode"),
+        label: "Safe mode".to_owned(),
+        description: Some(
+            "Blur images Venice classifies as adult content. Off by default.".to_owned(),
+        ),
+        kind: ControlKind::Boolean,
+        required: false,
+        default: Some(ControlValue::Boolean { value: false }),
+        minimum: None,
+        maximum: None,
+        step: None,
+        choices: Vec::new(),
+        visible_when: Vec::new(),
+    });
+
+    finish_manifest(MediaModel {
+        provider_id: ProviderId::from(VENICE_PROVIDER_ID),
+        id: ModelId::new(model.id),
+        display_name: model
+            .model_spec
+            .name
+            .unwrap_or_else(|| "Venice edit model".to_owned()),
+        description: model.model_spec.description,
+        operation: MediaOperation::ImageEdit,
+        output_kind: MediaKind::Image,
+        output_mime_types: image_output_mime_types(&formats),
+        input_constraints,
+        prompt_maximum_chars: Some(constraints.prompt_character_limit),
+        negative_prompt_maximum_chars: None,
+        maximum_output_count: 1,
+        controls,
+        pricing: inpaint_pricing_metadata(model.model_spec.pricing.as_ref()),
         features,
         manifest_version: String::new(),
         fetched_at,
@@ -597,8 +761,8 @@ fn honors_endpoint_image_format(model_id: &str) -> bool {
     !model_id.starts_with("grok-imagine")
 }
 
-fn image_format_choices(model_id: &str, constraints: &ImageConstraints) -> Vec<String> {
-    let advertised = advertised_image_formats(&constraints.formats);
+fn image_format_choices(model_id: &str, advertised: &[String]) -> Vec<String> {
+    let advertised = advertised_image_formats(advertised);
     if !advertised.is_empty() {
         return advertised;
     }
@@ -720,8 +884,44 @@ fn parse_upscale_factor(value: &str) -> Option<i64> {
         .filter(|value| *value == 2 || *value == 4)
 }
 
+fn inpaint_pricing_metadata(pricing: Option<&serde_json::Value>) -> Option<PricingMetadata> {
+    let pricing = pricing?;
+    let entries = quality_resolution_entries(pricing);
+    let amount = pricing.get("inpaint").and_then(usd_amount);
+    if entries.is_empty() && amount.is_none() {
+        return None;
+    }
+    Some(PricingMetadata {
+        currency: "USD".to_owned(),
+        unit: PricingUnit::PerRequest,
+        unit_label: String::new(),
+        amount: if entries.is_empty() { amount } else { None },
+        entries,
+        detail: None,
+    })
+}
+
 fn pricing_metadata(pricing: Option<&serde_json::Value>) -> Option<PricingMetadata> {
     let pricing = pricing?;
+    let entries = quality_resolution_entries(pricing);
+    let amount = pricing
+        .get("generation")
+        .and_then(usd_amount)
+        .or_else(|| usd_amount(pricing));
+    if entries.is_empty() && amount.is_none() {
+        return None;
+    }
+    Some(PricingMetadata {
+        currency: "USD".to_owned(),
+        unit: PricingUnit::PerOutput,
+        unit_label: String::new(),
+        amount: if entries.is_empty() { amount } else { None },
+        entries,
+        detail: None,
+    })
+}
+
+fn quality_resolution_entries(pricing: &serde_json::Value) -> Vec<PricingEntry> {
     let mut entries = Vec::new();
     if let Some(quality) = pricing.get("quality").and_then(|value| value.as_object()) {
         for (resolution, levels) in quality {
@@ -773,21 +973,7 @@ fn pricing_metadata(pricing: Option<&serde_json::Value>) -> Option<PricingMetada
             }
         }
     }
-    let amount = pricing
-        .get("generation")
-        .and_then(usd_amount)
-        .or_else(|| usd_amount(pricing));
-    if entries.is_empty() && amount.is_none() {
-        return None;
-    }
-    Some(PricingMetadata {
-        currency: "USD".to_owned(),
-        unit: PricingUnit::PerOutput,
-        unit_label: String::new(),
-        amount: if entries.is_empty() { amount } else { None },
-        entries,
-        detail: None,
-    })
+    entries
 }
 
 fn usd_amount(value: &serde_json::Value) -> Option<f64> {

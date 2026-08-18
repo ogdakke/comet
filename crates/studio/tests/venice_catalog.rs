@@ -10,6 +10,7 @@ const IMAGE: &[u8] = include_bytes!("fixtures/venice/image-model.json");
 const TEXT_TO_VIDEO: &[u8] = include_bytes!("fixtures/venice/text-to-video-model.json");
 const IMAGE_TO_VIDEO: &[u8] = include_bytes!("fixtures/venice/image-to-video-model.json");
 const UPSCALE: &[u8] = include_bytes!("fixtures/venice/upscale-model.json");
+const INPAINT: &[u8] = include_bytes!("fixtures/venice/inpaint-model.json");
 
 fn fetched_at() -> chrono::DateTime<Utc> {
     Utc.timestamp_opt(1_777_000_000, 0).unwrap()
@@ -103,6 +104,33 @@ fn real_catalog_fixtures_render_as_provider_neutral_controls() {
         .find(|control| control.id == ControlId::from("scale"))
         .unwrap();
     assert_eq!(scale.default, Some(ControlValue::Integer { value: 2 }));
+
+    let edit = normalize_model_catalog(INPAINT, fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(edit.operation, MediaOperation::ImageEdit);
+    assert_eq!(edit.maximum_output_count, 1);
+    assert_eq!(edit.prompt_maximum_chars, Some(5_000));
+    assert_eq!(edit.features, vec![ModelFeature::Private]);
+    assert_eq!(edit.input_constraints.len(), 2);
+    assert_eq!(edit.input_constraints[0].role.as_str(), "source");
+    assert_eq!(edit.input_constraints[0].minimum_count, 1);
+    assert_eq!(edit.input_constraints[0].maximum_count, 1);
+    assert_eq!(
+        edit.input_constraints[0].mime.maximum_bytes,
+        Some(25 * 1024 * 1024)
+    );
+    assert_eq!(edit.input_constraints[1].role.as_str(), "mask");
+    assert_eq!(edit.input_constraints[1].minimum_count, 0);
+    assert_eq!(edit.input_constraints[1].maximum_count, 2);
+    assert!(
+        edit.controls
+            .iter()
+            .all(|control| control.id.as_str() != "steps")
+    );
+    assert_control(&edit, "aspect_ratio", ControlKind::AspectRatio, 9);
+    assert_control(&edit, "safe_mode", ControlKind::Boolean, 0);
+    assert_control(&edit, "format", ControlKind::Enum, 3);
 }
 
 #[test]
@@ -479,6 +507,112 @@ fn upscale_catalog_quotes_scale_not_the_generation_price() {
         (defaulted.amount - 0.02).abs() < f64::EPSILON,
         "catalog default scale is 2x"
     );
+}
+
+#[test]
+fn inpaint_catalog_quotes_per_edit_not_per_output() {
+    let model = normalize_model_catalog(INPAINT, fetched_at())
+        .unwrap()
+        .remove(0);
+    let pricing = model
+        .pricing
+        .as_ref()
+        .expect("inpaint fixture advertises pricing");
+    assert_eq!(pricing.unit, PricingUnit::PerRequest);
+    assert!((pricing.amount.unwrap() - 0.04).abs() < f64::EPSILON);
+
+    let quote = model.estimate_cost(&BTreeMap::new(), 1).unwrap();
+    assert_eq!(quote.source, QuoteSource::Catalog);
+    assert!((quote.amount - 0.04).abs() < f64::EPSILON);
+}
+
+#[test]
+fn inpaint_quality_matrix_is_per_request() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(INPAINT).unwrap();
+    fixture["data"][0]["id"] = "gpt-image-2-edit".into();
+    fixture["data"][0]["model_spec"]["pricing"] = serde_json::json!({
+        "inpaint": { "usd": 0.34, "diem": 0.34 },
+        "quality": {
+            "1K": {
+                "high": { "usd": 0.34, "diem": 0.34 },
+                "low": { "usd": 0.03, "diem": 0.03 }
+            }
+        }
+    });
+    fixture["data"][0]["model_spec"]["constraints"]["defaultResolution"] = "1K".into();
+    fixture["data"][0]["model_spec"]["constraints"]["resolutions"] = serde_json::json!(["1K"]);
+    fixture["data"][0]["model_spec"]["constraints"]["defaultQuality"] = "high".into();
+    fixture["data"][0]["model_spec"]["constraints"]["qualities"] =
+        serde_json::json!(["low", "high"]);
+
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        model.pricing.as_ref().unwrap().unit,
+        PricingUnit::PerRequest
+    );
+    let high = model
+        .estimate_cost(
+            &BTreeMap::from([
+                (
+                    ControlId::from("resolution"),
+                    ControlValue::Resolution { value: "1K".into() },
+                ),
+                (
+                    ControlId::from("quality"),
+                    ControlValue::Enum {
+                        value: "high".into(),
+                    },
+                ),
+            ]),
+            1,
+        )
+        .unwrap();
+    assert!((high.amount - 0.34).abs() < f64::EPSILON);
+}
+
+#[test]
+fn inpaint_without_combine_images_has_no_mask_slot() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(INPAINT).unwrap();
+    fixture["data"][0]["id"] = "luma-uni-1-edit".into();
+    fixture["data"][0]["model_spec"]["constraints"]["combineImages"] = false.into();
+
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(model.input_constraints.len(), 1);
+    assert_eq!(model.input_constraints[0].role.as_str(), "source");
+}
+
+#[test]
+fn inpaint_max_input_images_caps_the_mask_slot() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(INPAINT).unwrap();
+    fixture["data"][0]["model_spec"]["constraints"]["maxInputImages"] = 6.into();
+
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    let mask = model
+        .input_constraints
+        .iter()
+        .find(|constraint| constraint.role.as_str() == "mask")
+        .unwrap();
+    assert_eq!(mask.maximum_count, 5);
+}
+
+#[test]
+fn a_broken_inpaint_row_does_not_fail_the_catalog() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(INPAINT).unwrap();
+    let good = fixture["data"][0].clone();
+    let mut broken = good.clone();
+    broken["id"] = "".into();
+    fixture["data"] = serde_json::json!([broken, good]);
+
+    let models =
+        normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at()).unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].id.as_str(), "firered-image-edit");
 }
 
 #[test]
