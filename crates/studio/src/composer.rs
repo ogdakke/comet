@@ -295,6 +295,30 @@ impl ComposerConflict {
     }
 }
 
+/// Structured send/quote rejection. Proto re-exports this; do not duplicate.
+pub const STUDIO_VALIDATION_CODE: &str = "studio_validation";
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudioValidationError {
+    #[serde(default = "studio_validation_code")]
+    pub code: String,
+    pub conflicts: Vec<ComposerConflict>,
+}
+
+impl StudioValidationError {
+    pub fn new(conflicts: Vec<ComposerConflict>) -> Self {
+        Self {
+            code: STUDIO_VALIDATION_CODE.to_owned(),
+            conflicts,
+        }
+    }
+}
+
+fn studio_validation_code() -> String {
+    STUDIO_VALIDATION_CODE.to_owned()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConflictSeverity {

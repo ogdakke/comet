@@ -153,6 +153,9 @@ pub mod methods {
     pub const EXTEND_STUDIO_TURN: &str = "ExtendStudioTurn";
     pub const APPEND_STUDIO_DERIVED_RUN: &str = "AppendStudioDerivedRun";
     pub const QUOTE_STUDIO_BATCH: &str = "QuoteStudioBatch";
+    pub const EVALUATE_STUDIO_COMPOSER: &str = "EvaluateStudioComposer";
+    /// Frame types only in this PR. The engine does not route this method yet.
+    pub const IMPORT_STUDIO_ASSET: &str = "ImportStudioAsset";
     pub const GET_STUDIO_PROVIDER_BALANCE: &str = "GetStudioProviderBalance";
     pub const RETRY_STUDIO_RUN: &str = "RetryStudioRun";
     pub const DELETE_STUDIO_ARTIFACT: &str = "DeleteStudioArtifact";
@@ -168,6 +171,11 @@ pub enum RpcError {
     BadParams(String),
     #[error("{0}")]
     Failed(String),
+    #[error("{message}")]
+    FailedStructured {
+        message: String,
+        payload: serde_json::Value,
+    },
     #[error("transport: {0}")]
     Transport(String),
     #[error("connection closed")]
@@ -194,6 +202,8 @@ pub struct ServerFrame {
     pub ok: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub err: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub err_payload: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -264,6 +274,13 @@ mod tests {
                 }
                 "Never" => Ok(RpcReply::Stream(futures::stream::pending().boxed())),
                 "Boom" => Err(RpcError::Failed("boom".into())),
+                "Structured" => Err(RpcError::FailedStructured {
+                    message: "composer blocked".into(),
+                    payload: serde_json::json!({
+                        "code": "studio_validation",
+                        "conflicts": []
+                    }),
+                }),
                 other => Err(RpcError::UnknownMethod(other.into())),
             }
         }
@@ -301,6 +318,42 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RpcError::Failed(m) if m == "boom"));
+
+        let structured = client
+            .call("Structured", serde_json::Value::Null)
+            .await
+            .unwrap_err();
+        match structured {
+            RpcError::FailedStructured { message, payload } => {
+                assert_eq!(message, "composer blocked");
+                assert_eq!(payload["code"], "studio_validation");
+                assert!(payload["conflicts"].as_array().is_some());
+            }
+            other => panic!("expected FailedStructured, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_frame_round_trips_err_payload() {
+        let frame = ServerFrame {
+            id: 7,
+            err: Some("composer blocked".into()),
+            err_payload: Some(serde_json::json!({ "code": "studio_validation" })),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&frame).unwrap();
+        assert_eq!(json["err"], "composer blocked");
+        assert_eq!(json["err_payload"]["code"], "studio_validation");
+        assert!(json.get("errPayload").is_none());
+        let decoded: ServerFrame = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.err.as_deref(), Some("composer blocked"));
+        assert_eq!(
+            decoded
+                .err_payload
+                .as_ref()
+                .and_then(|value| value.get("code")),
+            Some(&serde_json::json!("studio_validation"))
+        );
     }
 
     #[tokio::test]

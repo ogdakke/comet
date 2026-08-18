@@ -111,9 +111,14 @@ async fn handle_request(
             .await;
         }
         Err(err) => {
+            let (message, payload) = match err {
+                RpcError::FailedStructured { message, payload } => (message, Some(payload)),
+                other => (other.to_string(), None),
+            };
             let _ = send(ServerFrame {
                 id,
-                err: Some(err.to_string()),
+                err: Some(message),
+                err_payload: payload,
                 ..Default::default()
             })
             .await;

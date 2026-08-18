@@ -6,8 +6,16 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use zeron_studio::{
     AccountBalance, ControlId, ControlValue, GenerationInput, MediaKind, MediaModel,
-    MediaOperation, ModelId, ProviderId, Quote, StudioArtifactId, StudioBatchId,
+    MediaOperation, ModelId, ProviderId, Quote, StudioArtifactId, StudioAssetId, StudioBatchId,
     StudioConversationId, StudioRunId, StudioTurnId,
+};
+
+pub use zeron_studio::{
+    AttachmentOrigin, AttachmentTrayView, BudgetKind, ChipView, ComposerAttachment,
+    ComposerConflict, ComposerMediaKind, ComposerMode, ComposerPhase, ComposerSnapshot,
+    ComposerView, ConflictCode, ConflictId, ConflictSeverity, ConflictSubjects, GlobalControls,
+    LimitBudget, LimitHint, ResolveAction, ResolveActionView, STUDIO_VALIDATION_CODE,
+    SelectedModelRef, SendState, StudioValidationError, TrayAccept,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,9 +180,14 @@ pub struct StudioModelRunSpec {
 pub struct CreateStudioTurnRequest {
     pub conversation_id: StudioConversationId,
     pub prompt: String,
+    #[serde(default)]
     pub runs: Vec<StudioModelRunSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_turn_id: Option<StudioTurnId>,
+    /// Live composer snapshot. When present, the engine re-evaluates and
+    /// projects runs; client `runs` are ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer: Option<ComposerSnapshot>,
 }
 
 /// Append another copy of a turn's original model runs under the same prompt.
@@ -201,7 +214,51 @@ pub struct AppendStudioDerivedRunRequest {
 #[serde(rename_all = "camelCase")]
 pub struct QuoteStudioBatchRequest {
     pub prompt: String,
+    #[serde(default)]
     pub runs: Vec<StudioModelRunSpec>,
+    /// Live composer snapshot. When present, the engine re-evaluates and
+    /// projects runs; client `runs` are ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer: Option<ComposerSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvaluateStudioComposerRequest {
+    pub composer: ComposerSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<ProviderId>,
+}
+
+/// Chunked import. Handler is PR 4 — this crate only defines the frames.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportStudioAssetRequest {
+    pub asset_id: StudioAssetId,
+    pub offset: u64,
+    /// Standard base64 of this chunk's bytes.
+    pub data: String,
+    pub last: bool,
+    /// SHA-256 hex. Required when `last` is true (enforced by the handler).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_hint: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportStudioAssetChunk {
+    pub asset_id: StudioAssetId,
+    pub next_offset: u64,
+}
+
+/// Not-last: `{ assetId, nextOffset }`. Last: a committed [`ComposerAttachment`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ImportStudioAssetResponse {
+    Continue(ImportStudioAssetChunk),
+    Complete(ComposerAttachment),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

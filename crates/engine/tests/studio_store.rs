@@ -10,17 +10,18 @@ use zeron_engine::{
     StudioProviderRegistry, StudioSecretBackend, StudioStore, default_registry,
 };
 use zeron_proto::{
-    ListStudioArtifactsResponse, ListStudioConversationsResponse, ListStudioModelsResponse,
-    ListStudioProvidersResponse, ProviderValidationState, StudioArtifactChunk,
-    StudioConversationSummary, StudioConversationView, StudioProviderConnection, StudioRunState,
+    ComposerMode, ComposerSnapshot, ListStudioArtifactsResponse, ListStudioConversationsResponse,
+    ListStudioModelsResponse, ListStudioProvidersResponse, ProviderValidationState,
+    STUDIO_VALIDATION_CODE, SelectedModelRef, StudioArtifactChunk, StudioConversationSummary,
+    StudioConversationView, StudioProviderConnection, StudioRunState, StudioValidationError,
 };
-use zeron_rpc::{memory_client, methods};
+use zeron_rpc::{RpcError, memory_client, methods};
 use zeron_studio::{
-    AccountBalance, ControlKind, ControlValue, FakeMediaProvider, FakeSubmissionMode,
-    GenerationInput, GenerationInputSource, GenerationRequest, InputConstraint, MediaKind,
-    MediaModel, MediaOperation, MimeConstraint, ModelControl, PricingMetadata, PricingUnit,
-    ProviderArtifact, ProviderError, ProviderErrorKind, ProviderId, Quote, QuoteSource, Secret,
-    StudioArtifactId,
+    AccountBalance, AdapterFamily, ComposerPhase, ConflictCode, ControlKind, ControlValue,
+    FakeMediaProvider, FakeSubmissionMode, GenerationInput, GenerationInputSource,
+    GenerationRequest, InputConstraint, MediaKind, MediaModel, MediaOperation, MimeConstraint,
+    ModelControl, PricingMetadata, PricingUnit, ProviderArtifact, ProviderError, ProviderErrorKind,
+    ProviderId, Quote, QuoteSource, Secret, StudioArtifactId, VideoModelMeta,
 };
 
 #[derive(Default)]
@@ -73,6 +74,69 @@ fn image_model(provider_id: &str) -> MediaModel {
         pricing: None,
         features: Vec::new(),
         video: zeron_studio::VideoModelMeta::default(),
+        manifest_version: "fixture-v1".into(),
+        fetched_at: chrono::Utc::now(),
+    }
+}
+
+fn seedance_t2v_model(provider_id: &str) -> MediaModel {
+    MediaModel {
+        provider_id: provider_id.into(),
+        id: "seedance-t2v".into(),
+        display_name: "Seedance T2V".into(),
+        description: None,
+        operation: MediaOperation::TextToVideo,
+        output_kind: MediaKind::Video,
+        output_mime_types: vec!["video/mp4".into()],
+        input_constraints: Vec::new(),
+        prompt_maximum_chars: Some(2_500),
+        negative_prompt_maximum_chars: None,
+        maximum_output_count: 1,
+        controls: vec![ModelControl {
+            id: "duration".into(),
+            label: "Duration".into(),
+            description: None,
+            kind: ControlKind::Duration,
+            required: true,
+            default: None,
+            minimum: None,
+            maximum: None,
+            step: None,
+            choices: vec![zeron_studio::ControlChoice {
+                value: ControlValue::DurationSeconds { value: 6.0 },
+                label: "6s".into(),
+            }],
+            visible_when: Vec::new(),
+        }],
+        pricing: None,
+        features: Vec::new(),
+        video: VideoModelMeta {
+            adapter_family: AdapterFamily::Seedance,
+            generate_audio: zeron_studio::AudioCapability::Configurable { default: true },
+            ..VideoModelMeta::default()
+        },
+        manifest_version: "fixture-v1".into(),
+        fetched_at: chrono::Utc::now(),
+    }
+}
+
+fn hidden_kling_model(provider_id: &str) -> MediaModel {
+    MediaModel {
+        provider_id: provider_id.into(),
+        id: "kling-o3-pro-reference-to-video".into(),
+        display_name: "Kling O3".into(),
+        description: None,
+        operation: MediaOperation::ReferenceToVideo,
+        output_kind: MediaKind::Video,
+        output_mime_types: vec!["video/mp4".into()],
+        input_constraints: Vec::new(),
+        prompt_maximum_chars: Some(2_500),
+        negative_prompt_maximum_chars: None,
+        maximum_output_count: 1,
+        controls: Vec::new(),
+        pricing: None,
+        features: Vec::new(),
+        video: VideoModelMeta::default(),
         manifest_version: "fixture-v1".into(),
         fetched_at: chrono::Utc::now(),
     }
@@ -2753,5 +2817,291 @@ async fn upscale_rejects_hash_mismatch_deleted_artifact_and_asset_source() {
         .await
         .unwrap_err();
     assert!(deleted.to_string().contains("not found") || deleted.to_string().contains("artifact"));
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn list_studio_models_omits_hidden_adapter_family() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![
+            image_model("fake"),
+            seedance_t2v_model("fake"),
+            hidden_kling_model("fake"),
+        ],
+        FakeSubmissionMode::Complete(Vec::new()),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+
+    let all: ListStudioModelsResponse = serde_json::from_value(
+        client
+            .call(
+                methods::LIST_STUDIO_MODELS,
+                serde_json::json!({ "providerId": "fake" }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let ids: Vec<_> = all
+        .models
+        .iter()
+        .map(|model| model.id.as_str().to_owned())
+        .collect();
+    assert!(ids.contains(&"image-model".to_owned()));
+    assert!(ids.contains(&"seedance-t2v".to_owned()));
+    assert!(!ids.contains(&"kling-o3-pro-reference-to-video".to_owned()));
+
+    let video: ListStudioModelsResponse = serde_json::from_value(
+        client
+            .call(
+                methods::LIST_STUDIO_MODELS,
+                serde_json::json!({ "providerId": "fake", "mediaKind": "video" }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(video.models.len(), 1);
+    assert_eq!(video.models[0].id.as_str(), "seedance-t2v");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn evaluate_studio_composer_returns_view() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![image_model("fake")],
+        FakeSubmissionMode::Complete(Vec::new()),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+    let snapshot = ComposerSnapshot {
+        mode: ComposerMode::Image,
+        prompt: "a comet".into(),
+        selected: vec![SelectedModelRef::new("fake", "image-model")],
+        ..ComposerSnapshot::default()
+    };
+    let view: zeron_proto::ComposerView = serde_json::from_value(
+        client
+            .call(
+                methods::EVALUATE_STUDIO_COMPOSER,
+                serde_json::json!({
+                    "composer": snapshot,
+                    "providerId": "fake"
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(view.mode, ComposerMode::Image);
+    assert!(view.send.enabled);
+    assert_eq!(view.phase, ComposerPhase::Editing);
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn create_studio_turn_composer_prompt_mismatch_is_bad_params() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![image_model("fake")],
+        FakeSubmissionMode::Complete(Vec::new()),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+    let conversation = create_conversation(&client).await;
+    let snapshot = ComposerSnapshot {
+        prompt: "right prompt".into(),
+        selected: vec![SelectedModelRef::new("fake", "image-model")],
+        ..ComposerSnapshot::default()
+    };
+    let err = client
+        .call(
+            methods::CREATE_STUDIO_TURN,
+            serde_json::json!({
+                "conversationId": conversation.id,
+                "prompt": "wrong prompt",
+                "composer": snapshot
+            }),
+        )
+        .await
+        .unwrap_err();
+    // Server emits BadParams; the wire carries it as Failed(err.to_string()).
+    assert!(err.to_string().contains("composer.prompt"), "{err:?}");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn create_studio_turn_composer_blocks_send_as_structured_error() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![image_model("fake")],
+        FakeSubmissionMode::Complete(Vec::new()),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+    let conversation = create_conversation(&client).await;
+    let snapshot = ComposerSnapshot {
+        prompt: "a comet".into(),
+        ..ComposerSnapshot::default()
+    };
+    let err = client
+        .call(
+            methods::CREATE_STUDIO_TURN,
+            serde_json::json!({
+                "conversationId": conversation.id,
+                "prompt": "a comet",
+                "composer": snapshot
+            }),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        RpcError::FailedStructured { payload, .. } => {
+            let error: StudioValidationError = serde_json::from_value(payload).unwrap();
+            assert_eq!(error.code, STUDIO_VALIDATION_CODE);
+            assert!(
+                error
+                    .conflicts
+                    .iter()
+                    .any(|conflict| conflict.code == ConflictCode::EmptyModelSet)
+            );
+        }
+        other => panic!("expected FailedStructured, got {other:?}"),
+    }
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn create_studio_turn_composer_projects_image_runs() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![image_model("fake")],
+        FakeSubmissionMode::Complete(vec![png_artifact()]),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+    let conversation = create_conversation(&client).await;
+    let snapshot = ComposerSnapshot {
+        conversation_id: Some(conversation.id),
+        prompt: "a comet".into(),
+        selected: vec![SelectedModelRef::new("fake", "image-model")],
+        ..ComposerSnapshot::default()
+    };
+    let view: StudioConversationView = serde_json::from_value(
+        client
+            .call(
+                methods::CREATE_STUDIO_TURN,
+                serde_json::json!({
+                    "conversationId": conversation.id,
+                    "prompt": "a comet",
+                    "composer": snapshot
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(view.turns.len(), 1);
+    assert_eq!(view.turns[0].runs.len(), 1);
+    assert_eq!(view.turns[0].runs[0].model.id.as_str(), "image-model");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn create_studio_turn_composer_still_rejects_video_submit() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![seedance_t2v_model("fake")],
+        FakeSubmissionMode::Complete(Vec::new()),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+    let conversation = create_conversation(&client).await;
+    let snapshot = ComposerSnapshot {
+        mode: ComposerMode::Video,
+        prompt: "a comet".into(),
+        duration: Some(ControlValue::DurationSeconds { value: 6.0 }),
+        selected: vec![SelectedModelRef::new("fake", "seedance-t2v")],
+        ..ComposerSnapshot::default()
+    };
+    let err = client
+        .call(
+            methods::CREATE_STUDIO_TURN,
+            serde_json::json!({
+                "conversationId": conversation.id,
+                "prompt": "a comet",
+                "composer": snapshot
+            }),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        RpcError::Failed(message) => {
+            assert!(
+                message.contains("text-to-image") || message.contains("video"),
+                "{message}"
+            );
+        }
+        other => panic!("expected Failed video-submit gate, got {other:?}"),
+    }
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn quote_studio_batch_composer_projects_and_evaluates() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(
+        FakeMediaProvider::new(
+            "fake",
+            vec![image_model("fake")],
+            FakeSubmissionMode::Complete(Vec::new()),
+        )
+        .with_quote(Quote::provider("USD", 0.42)),
+    );
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+    let snapshot = ComposerSnapshot {
+        prompt: "a comet".into(),
+        selected: vec![SelectedModelRef::new("fake", "image-model")],
+        ..ComposerSnapshot::default()
+    };
+    let quoted: zeron_proto::QuoteStudioBatchResponse = serde_json::from_value(
+        client
+            .call(
+                methods::QUOTE_STUDIO_BATCH,
+                serde_json::json!({
+                    "prompt": "a comet",
+                    "composer": snapshot
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let quote = quoted.runs[0].quote.clone().expect("live quote");
+    assert_eq!(quote.source, QuoteSource::Provider);
+    assert!((quote.amount - 0.42).abs() < f64::EPSILON);
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn import_studio_asset_is_not_routed() {
+    let root = tempdir().unwrap();
+    let provider = std::sync::Arc::new(FakeMediaProvider::new(
+        "fake",
+        vec![image_model("fake")],
+        FakeSubmissionMode::Complete(Vec::new()),
+    ));
+    let (engine, client) = studio_client_with_fake(root.path(), provider).await;
+    let err = client
+        .call(methods::IMPORT_STUDIO_ASSET, serde_json::json!({}))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(methods::IMPORT_STUDIO_ASSET),
+        "{err:?}"
+    );
     engine.shutdown().await;
 }

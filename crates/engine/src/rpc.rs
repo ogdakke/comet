@@ -61,15 +61,15 @@ use zeron_doc::{MessagePart, SessionCommandPayload};
 use zeron_proto::{
     AppendStudioDerivedRunRequest, ArchiveStudioConversationRequest, ChatConfig,
     CreateStudioConversationRequest, CreateStudioTurnRequest, DeleteStudioArtifactRequest,
-    DeleteStudioConversationRequest, EngineInfo, ExtendStudioTurnRequest, HarnessId,
-    ListStudioArtifactsResponse, ListStudioConversationsRequest, ListStudioConversationsResponse,
-    ListStudioModelsRequest, ListStudioModelsResponse, ListStudioProvidersResponse,
-    MarkStudioConversationSeenRequest, ProviderValidationState, QuoteStudioBatchRequest,
-    QuoteStudioBatchResponse, QuoteStudioRunView, ReadStudioArtifactChunkRequest,
-    RenameStudioConversationRequest, RetryStudioRunRequest, SetStudioProviderCredentialRequest,
-    SetStudioProviderPreferencesRequest, StudioModelRunSpec, StudioProviderBalanceResponse,
-    StudioProviderConnection, StudioProviderRequest, ToolCall, WatchStudioConversationRequest,
-    WorkspaceScope,
+    DeleteStudioConversationRequest, EngineInfo, EvaluateStudioComposerRequest,
+    ExtendStudioTurnRequest, HarnessId, ListStudioArtifactsResponse,
+    ListStudioConversationsRequest, ListStudioConversationsResponse, ListStudioModelsRequest,
+    ListStudioModelsResponse, ListStudioProvidersResponse, MarkStudioConversationSeenRequest,
+    ProviderValidationState, QuoteStudioBatchRequest, QuoteStudioBatchResponse, QuoteStudioRunView,
+    ReadStudioArtifactChunkRequest, RenameStudioConversationRequest, RetryStudioRunRequest,
+    SetStudioProviderCredentialRequest, SetStudioProviderPreferencesRequest, StudioModelRunSpec,
+    StudioProviderBalanceResponse, StudioProviderConnection, StudioProviderRequest,
+    StudioValidationError, ToolCall, WatchStudioConversationRequest, WorkspaceScope,
 };
 use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
@@ -523,6 +523,45 @@ impl EngineRpc {
                 })
                 .ok_or_else(|| RpcError::Failed(error.to_string())),
         }
+    }
+
+    async fn composer_catalog(
+        &self,
+        snapshot: &zeron_studio::ComposerSnapshot,
+        provider_id: Option<&zeron_studio::ProviderId>,
+    ) -> Result<Vec<zeron_studio::MediaModel>, RpcError> {
+        let mut ids = HashSet::new();
+        if let Some(provider_id) = provider_id {
+            ids.insert(provider_id.clone());
+        }
+        for selected in &snapshot.selected {
+            ids.insert(selected.provider_id.clone());
+        }
+        let mut models = Vec::new();
+        for id in ids {
+            models.extend(self.studio_catalog(&id, false).await?.models);
+        }
+        Ok(models)
+    }
+
+    async fn prepare_studio_runs_from_composer(
+        &self,
+        prompt: &str,
+        composer: &zeron_studio::ComposerSnapshot,
+        submit: bool,
+    ) -> Result<Vec<PreparedStudioRun>, RpcError> {
+        if prompt != composer.prompt {
+            return Err(RpcError::BadParams(
+                "prompt must equal composer.prompt".into(),
+            ));
+        }
+        let catalog = self.composer_catalog(composer, None).await?;
+        let view = zeron_studio::evaluate_composer(composer, &catalog);
+        if !view.send.enabled || view.conflicts.iter().any(|conflict| conflict.blocks_send()) {
+            return Err(studio_validation_error(&view.conflicts));
+        }
+        let specs = project_composer_specs(composer, &catalog)?;
+        self.prepare_studio_runs(prompt, specs, submit).await
     }
 
     async fn prepare_studio_runs(
@@ -1294,7 +1333,18 @@ impl RpcService for EngineRpc {
                 if let Some(kind) = request.media_kind {
                     response.models.retain(|model| model.output_kind == kind);
                 }
+                response.models.retain(|model| model.is_picker_visible());
                 RpcReply::value(&response)
+            }
+            methods::EVALUATE_STUDIO_COMPOSER => {
+                let request: EvaluateStudioComposerRequest = parse_params(params)?;
+                let catalog = self
+                    .composer_catalog(&request.composer, request.provider_id.as_ref())
+                    .await?;
+                RpcReply::value(&zeron_studio::evaluate_composer(
+                    &request.composer,
+                    &catalog,
+                ))
             }
             methods::LIST_STUDIO_CONVERSATIONS => {
                 let request: ListStudioConversationsRequest = parse_params(params)?;
@@ -1416,9 +1466,13 @@ impl RpcService for EngineRpc {
             }
             methods::QUOTE_STUDIO_BATCH => {
                 let request: QuoteStudioBatchRequest = parse_params(params)?;
-                let prepared = self
-                    .prepare_studio_runs(&request.prompt, request.runs, false)
-                    .await?;
+                let prepared = if let Some(composer) = request.composer.as_ref() {
+                    self.prepare_studio_runs_from_composer(&request.prompt, composer, false)
+                        .await?
+                } else {
+                    self.prepare_studio_runs(&request.prompt, request.runs, false)
+                        .await?
+                };
                 let runs = prepared
                     .into_iter()
                     .map(|run| QuoteStudioRunView {
@@ -1454,18 +1508,22 @@ impl RpcService for EngineRpc {
             }
             methods::CREATE_STUDIO_TURN => {
                 let request: CreateStudioTurnRequest = parse_params(params)?;
-                if request
-                    .runs
-                    .iter()
-                    .any(|run| run.operation == zeron_studio::MediaOperation::ImageEdit)
-                {
-                    return Err(RpcError::Failed(
-                        "image edits must be appended to the source image's turn".into(),
-                    ));
-                }
-                let prepared = self
-                    .prepare_studio_runs(&request.prompt, request.runs, true)
-                    .await?;
+                let prepared = if let Some(composer) = request.composer.as_ref() {
+                    self.prepare_studio_runs_from_composer(&request.prompt, composer, true)
+                        .await?
+                } else {
+                    if request
+                        .runs
+                        .iter()
+                        .any(|run| run.operation == zeron_studio::MediaOperation::ImageEdit)
+                    {
+                        return Err(RpcError::Failed(
+                            "image edits must be appended to the source image's turn".into(),
+                        ));
+                    }
+                    self.prepare_studio_runs(&request.prompt, request.runs, true)
+                        .await?
+                };
                 let stored = self
                     .studio
                     .create_turn(
@@ -2365,6 +2423,104 @@ impl RpcService for EngineRpc {
             other => Err(RpcError::UnknownMethod(other.to_string())),
         }
     }
+}
+
+fn studio_validation_error(conflicts: &[zeron_studio::ComposerConflict]) -> RpcError {
+    let error = StudioValidationError::new(conflicts.to_vec());
+    let message = conflicts
+        .iter()
+        .find(|conflict| conflict.blocks_send())
+        .or(conflicts.first())
+        .map(|conflict| conflict.title.clone())
+        .unwrap_or_else(|| "studio validation failed".into());
+    let payload = serde_json::to_value(&error).unwrap_or_else(|_| {
+        serde_json::json!({
+            "code": zeron_studio::STUDIO_VALIDATION_CODE,
+            "conflicts": []
+        })
+    });
+    RpcError::FailedStructured { message, payload }
+}
+
+fn project_composer_specs(
+    snapshot: &zeron_studio::ComposerSnapshot,
+    catalog: &[zeron_studio::MediaModel],
+) -> Result<Vec<StudioModelRunSpec>, RpcError> {
+    let mut specs = Vec::with_capacity(snapshot.selected.len());
+    for selected in &snapshot.selected {
+        let model = catalog
+            .iter()
+            .find(|model| {
+                model.id == selected.model_id && model.provider_id == selected.provider_id
+            })
+            .ok_or_else(|| RpcError::Failed("studio model is unavailable".into()))?;
+        let inputs = zeron_studio::map_tray(snapshot, model)
+            .map_err(|conflict| studio_validation_error(std::slice::from_ref(&conflict)))?;
+        let mut controls = selected.controls.clone();
+        if snapshot.mode == zeron_studio::ComposerMode::Video
+            && let Some(duration) = snapshot.duration.clone()
+        {
+            controls.insert(zeron_studio::ControlId::from("duration"), duration);
+        }
+        let output_count = match snapshot.mode {
+            zeron_studio::ComposerMode::Video => 1,
+            zeron_studio::ComposerMode::Image => selected.output_count.max(1),
+        };
+        specs.push(StudioModelRunSpec {
+            provider_id: selected.provider_id.clone(),
+            model_id: selected.model_id.clone(),
+            operation: model.operation,
+            output_count,
+            display_aspect_ratio: composer_display_aspect(snapshot, &controls, &inputs),
+            controls,
+            inputs,
+            manifest_version: model.manifest_version.clone(),
+        });
+    }
+    Ok(specs)
+}
+
+fn composer_display_aspect(
+    snapshot: &zeron_studio::ComposerSnapshot,
+    controls: &std::collections::BTreeMap<zeron_studio::ControlId, zeron_studio::ControlValue>,
+    inputs: &[zeron_studio::GenerationInput],
+) -> (u32, u32) {
+    if let Some((width, height)) = controls
+        .values()
+        .find_map(|value| value.aspect_ratio_dimensions())
+        && width > 0
+        && height > 0
+    {
+        return (width, height);
+    }
+    for input in inputs {
+        if input.role.as_str() != zeron_studio::ROLE_SOURCE {
+            continue;
+        }
+        let attachment = snapshot
+            .attachments
+            .iter()
+            .find(|attachment| match &input.source {
+                zeron_studio::GenerationInputSource::Asset { asset_id } => {
+                    attachment.id == *asset_id
+                }
+                zeron_studio::GenerationInputSource::Artifact { artifact_id } => {
+                    matches!(
+                        &attachment.origin,
+                        zeron_studio::AttachmentOrigin::Artifact { artifact_id: origin }
+                            if origin == artifact_id
+                    )
+                }
+            });
+        if let Some(attachment) = attachment
+            && let (Some(width), Some(height)) = (attachment.width, attachment.height)
+            && width > 0
+            && height > 0
+        {
+            return (width, height);
+        }
+    }
+    (16, 9)
 }
 
 fn studio_provider_label(provider_id: &zeron_studio::ProviderId) -> String {
