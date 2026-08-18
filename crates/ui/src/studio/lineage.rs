@@ -31,7 +31,7 @@ struct Slot {
     output_ix: usize,
     artifact_id: Option<StudioArtifactId>,
     source_artifact_id: Option<StudioArtifactId>,
-    aspect: (u32, u32),
+    own_aspect: (u32, u32),
     state: StudioRunState,
     progress: Option<f32>,
 }
@@ -75,6 +75,24 @@ fn feed_output_slots(run: &StudioRunView) -> Vec<(usize, Option<StudioArtifactId
     }
 }
 
+fn nonzero_size(width: Option<u32>, height: Option<u32>) -> Option<(u32, u32)> {
+    match (width, height) {
+        (Some(width), Some(height)) if width > 0 && height > 0 => Some((width, height)),
+        _ => None,
+    }
+}
+
+fn slot_own_aspect(run: &StudioRunView, artifact_id: Option<StudioArtifactId>) -> (u32, u32) {
+    artifact_id
+        .and_then(|id| {
+            run.artifacts
+                .iter()
+                .find(|artifact| artifact.id == id)
+                .and_then(|artifact| nonzero_size(artifact.width, artifact.height))
+        })
+        .unwrap_or(run.display_aspect_ratio)
+}
+
 fn collect_slots(view: &StudioConversationView) -> Vec<Slot> {
     let mut slots = Vec::new();
     for turn in &view.turns {
@@ -88,7 +106,7 @@ fn collect_slots(view: &StudioConversationView) -> Vec<Slot> {
                     output_ix,
                     artifact_id,
                     source_artifact_id,
-                    aspect: run.display_aspect_ratio,
+                    own_aspect: slot_own_aspect(run, artifact_id),
                     state: run.state,
                     progress: run.progress,
                 });
@@ -98,10 +116,35 @@ fn collect_slots(view: &StudioConversationView) -> Vec<Slot> {
     slots
 }
 
+fn resolved_aspect(
+    index: usize,
+    slots: &[Slot],
+    by_artifact: &HashMap<StudioArtifactId, usize>,
+) -> (u32, u32) {
+    let mut current = index;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(current) {
+            return slots[current].own_aspect;
+        }
+        let Some(source) = slots[current].source_artifact_id else {
+            return slots[current].own_aspect;
+        };
+        let Some(&parent) = by_artifact.get(&source) else {
+            return slots[current].own_aspect;
+        };
+        current = parent;
+    }
+}
+
 pub(super) fn lineage_tiles(view: &StudioConversationView) -> Vec<LineageTile> {
     let slots = collect_slots(view);
-    let known: HashSet<StudioArtifactId> =
-        slots.iter().filter_map(|slot| slot.artifact_id).collect();
+    let by_artifact: HashMap<StudioArtifactId, usize> = slots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| slot.artifact_id.map(|id| (id, index)))
+        .collect();
+    let known: HashSet<StudioArtifactId> = by_artifact.keys().copied().collect();
     let mut children: HashMap<StudioArtifactId, Vec<usize>> = HashMap::new();
     let mut roots = Vec::new();
     for (index, slot) in slots.iter().enumerate() {
@@ -120,6 +163,7 @@ pub(super) fn lineage_tiles(view: &StudioConversationView) -> Vec<LineageTile> {
         root_turn_id: StudioTurnId,
         slots: &[Slot],
         children: &HashMap<StudioArtifactId, Vec<usize>>,
+        by_artifact: &HashMap<StudioArtifactId, usize>,
         visited: &mut HashSet<usize>,
         ordered: &mut Vec<LineageTile>,
     ) {
@@ -135,7 +179,7 @@ pub(super) fn lineage_tiles(view: &StudioConversationView) -> Vec<LineageTile> {
             artifact_id: slot.artifact_id,
             source_artifact_id: slot.source_artifact_id,
             root_turn_id,
-            aspect: slot.aspect,
+            aspect: resolved_aspect(index, slots, by_artifact),
             state: slot.state,
             progress: slot.progress,
         });
@@ -143,7 +187,15 @@ pub(super) fn lineage_tiles(view: &StudioConversationView) -> Vec<LineageTile> {
             && let Some(kids) = children.get(&artifact_id)
         {
             for &child in kids {
-                walk(child, root_turn_id, slots, children, visited, ordered);
+                walk(
+                    child,
+                    root_turn_id,
+                    slots,
+                    children,
+                    by_artifact,
+                    visited,
+                    ordered,
+                );
             }
         }
     }
@@ -155,11 +207,38 @@ pub(super) fn lineage_tiles(view: &StudioConversationView) -> Vec<LineageTile> {
             root_turn_id,
             &slots,
             &children,
+            &by_artifact,
             &mut visited,
             &mut ordered,
         );
     }
     ordered
+}
+
+/// Feed/lightbox aspect for one artifact: the original's box, walked through
+/// edit/upscale children so a 2:3 upscale is never laid out as a 1:1 tile.
+pub(super) fn artifact_display_aspect(
+    view: &StudioConversationView,
+    artifact_id: StudioArtifactId,
+) -> Option<(u32, u32)> {
+    lineage_tiles(view)
+        .into_iter()
+        .find(|tile| tile.artifact_id == Some(artifact_id))
+        .map(|tile| tile.aspect)
+}
+
+impl super::page::StudioPage {
+    pub(super) fn display_aspect_for(&self, artifact_id: StudioArtifactId) -> (u32, u32) {
+        self.conversation
+            .as_ref()
+            .and_then(|view| artifact_display_aspect(view, artifact_id))
+            .or_else(|| {
+                self.artifact_frame(artifact_id)
+                    .and_then(|frame| frame.width.zip(frame.height))
+                    .filter(|(width, height)| *width > 0 && *height > 0)
+            })
+            .unwrap_or((1, 1))
+    }
 }
 
 pub(super) fn lineage_tiles_for_turn(
@@ -410,5 +489,40 @@ mod tests {
         assert_eq!(tiles[1].artifact_id, None);
         assert_eq!(tiles[1].source_artifact_id, Some(a));
         assert_eq!(tiles[1].state, StudioRunState::Running);
+    }
+
+    #[test]
+    fn derived_tiles_use_the_source_image_aspect() {
+        let source_id = StudioArtifactId::new();
+        let upscale_id = StudioArtifactId::new();
+        let mut source = artifact(source_id);
+        source.width = None;
+        source.height = None;
+        let mut generate = run(
+            MediaOperation::TextToImage,
+            "flux",
+            vec![source],
+            None,
+            StudioRunState::Succeeded,
+            1,
+        );
+        generate.display_aspect_ratio = (2, 3);
+        let mut upscale = run(
+            MediaOperation::Upscale,
+            "upscale",
+            vec![artifact(upscale_id)],
+            Some(source_id),
+            StudioRunState::Succeeded,
+            1,
+        );
+        upscale.display_aspect_ratio = (1, 1);
+        let conversation = view(vec![turn("a comet", vec![generate, upscale])]);
+        let tiles = lineage_tiles(&conversation);
+        assert_eq!(tiles[0].aspect, (2, 3));
+        assert_eq!(tiles[1].aspect, (2, 3));
+        assert_eq!(
+            artifact_display_aspect(&conversation, upscale_id),
+            Some((2, 3))
+        );
     }
 }

@@ -778,6 +778,15 @@ fn response_content_type(response: &Response) -> String {
 
 const PERSISTABLE_IMAGE_MIMES: &[&str] = &["image/webp", "image/png", "image/jpeg"];
 
+fn image_dimensions(bytes: &[u8]) -> (Option<u32>, Option<u32>) {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(|reader| reader.into_dimensions().ok())
+        .map(|(width, height)| (Some(width), Some(height)))
+        .unwrap_or((None, None))
+}
+
 fn image_artifact(bytes: Vec<u8>, metadata: serde_json::Value) -> ProviderResult<ProviderArtifact> {
     let mime_type =
         crate::accepted_output_mime(&bytes, PERSISTABLE_IMAGE_MIMES).ok_or_else(|| {
@@ -786,12 +795,13 @@ fn image_artifact(bytes: Vec<u8>, metadata: serde_json::Value) -> ProviderResult
                 "Venice image bytes are not a supported format",
             )
         })?;
+    let (width, height) = image_dimensions(&bytes);
     Ok(ProviderArtifact {
         media_kind: MediaKind::Image,
         mime_type,
         bytes,
-        width: None,
-        height: None,
+        width,
+        height,
         duration_seconds: None,
         metadata,
     })
@@ -1128,6 +1138,13 @@ mod tests {
         let png = b"\x89PNG\r\n\x1a\nrest".to_vec();
         let artifact = image_artifact(png, serde_json::Value::Null).unwrap();
         assert_eq!(artifact.mime_type, "image/png");
+        assert_eq!(artifact.width, None);
+        assert_eq!(artifact.height, None);
+
+        let portrait = solid_png(32, 48);
+        let sized = image_artifact(portrait, serde_json::Value::Null).unwrap();
+        assert_eq!(sized.width, Some(32));
+        assert_eq!(sized.height, Some(48));
 
         assert_eq!(
             image_artifact(b"not-an-image".to_vec(), serde_json::Value::Null)

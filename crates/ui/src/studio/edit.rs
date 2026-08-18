@@ -103,11 +103,7 @@ impl StudioPage {
             self.error = Some("No edit model is available".into());
             return;
         };
-        let display_aspect_ratio = self
-            .artifact_frame(source_id)
-            .and_then(|frame| frame.width.zip(frame.height))
-            .filter(|(width, height)| *width > 0 && *height > 0)
-            .unwrap_or((1, 1));
+        let display_aspect_ratio = self.display_aspect_for(source_id);
         let mask_png_base64 = self
             .edit_paint
             .as_ref()

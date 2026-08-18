@@ -337,11 +337,7 @@ impl StudioPage {
         };
         let settings = effective_upscale_defaults(Some(&model), &self.remembered.upscale);
         let controls = upscale_controls(&model, &settings);
-        let display_aspect_ratio = self
-            .artifact_frame(artifact_id)
-            .and_then(|frame| frame.width.zip(frame.height))
-            .filter(|(width, height)| *width > 0 && *height > 0)
-            .unwrap_or((1, 1));
+        let display_aspect_ratio = self.display_aspect_for(artifact_id);
 
         self.upscale_jobs.insert(
             artifact_id,

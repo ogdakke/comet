@@ -17,9 +17,10 @@ use zeron_proto::{
 use zeron_rpc::{memory_client, methods};
 use zeron_studio::{
     AccountBalance, ControlKind, ControlValue, FakeMediaProvider, FakeSubmissionMode,
-    GenerationRequest, InputConstraint, MediaKind, MediaModel, MediaOperation, MimeConstraint,
-    ModelControl, PricingMetadata, PricingUnit, ProviderArtifact, ProviderError, ProviderErrorKind,
-    ProviderId, Quote, QuoteSource, Secret, StudioArtifactId,
+    GenerationInput, GenerationInputSource, GenerationRequest, InputConstraint, MediaKind,
+    MediaModel, MediaOperation, MimeConstraint, ModelControl, PricingMetadata, PricingUnit,
+    ProviderArtifact, ProviderError, ProviderErrorKind, ProviderId, Quote, QuoteSource, Secret,
+    StudioArtifactId,
 };
 
 #[derive(Default)]
@@ -506,6 +507,55 @@ fn complete_run_rejects_bytes_outside_the_model_formats() {
         view.turns[0].runs[0].error.as_deref(),
         Some("provider artifact is not a supported format for this model")
     );
+}
+
+#[test]
+fn bind_upscale_copies_source_run_aspect_when_artifact_has_no_pixels() {
+    let root = tempdir().unwrap();
+    let store = StudioStore::open(root.path(), 1024 * 1024).unwrap();
+    let conversation = store.create_conversation("aspect", None).unwrap();
+    let mut prepared = prepared_run(&image_model("fake"), "a comet");
+    prepared.request.display_aspect_ratio = (2, 3);
+    let stored = store
+        .create_turn(conversation.id, "a comet", None, &[prepared], "device-a")
+        .unwrap();
+    store
+        .complete_run(
+            &stored[0],
+            &[ProviderArtifact {
+                media_kind: MediaKind::Image,
+                mime_type: "image/png".into(),
+                bytes: rgb_png(32, 48),
+                width: None,
+                height: None,
+                duration_seconds: None,
+                metadata: serde_json::json!({}),
+            }],
+        )
+        .unwrap();
+    let source_id =
+        store.conversation_view(conversation.id).unwrap().turns[0].runs[0].artifacts[0].id;
+    let mut request = GenerationRequest {
+        provider_id: "fake".into(),
+        model_id: "upscaler".into(),
+        operation: MediaOperation::Upscale,
+        prompt: String::new(),
+        negative_prompt: None,
+        output_count: 1,
+        controls: BTreeMap::new(),
+        inputs: vec![GenerationInput {
+            role: "source".into(),
+            ordinal: 0,
+            source: GenerationInputSource::Artifact {
+                artifact_id: source_id,
+            },
+            content_hash: String::new(),
+        }],
+        manifest_version: "fixture-v1".into(),
+        display_aspect_ratio: (1, 1),
+    };
+    store.bind_generation_inputs(&mut request).unwrap();
+    assert_eq!(request.display_aspect_ratio, (2, 3));
 }
 
 fn prepared_run(model: &MediaModel, prompt: &str) -> PreparedStudioRun {

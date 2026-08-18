@@ -365,8 +365,10 @@ impl StudioPage {
                         .find(|artifact| artifact.id == id)
                         .and_then(|artifact| {
                             nonzero(artifact.width, artifact.height).or_else(|| {
-                                let (width, height) = run.display_aspect_ratio;
-                                (width > 0 && height > 0).then_some((width, height))
+                                super::lineage::artifact_display_aspect(view, id).or_else(|| {
+                                    let (width, height) = run.display_aspect_ratio;
+                                    (width > 0 && height > 0).then_some((width, height))
+                                })
                             })
                         })
                 })

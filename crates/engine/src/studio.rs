@@ -1660,11 +1660,15 @@ impl StudioStore {
                         request.operation,
                         MediaOperation::Upscale | MediaOperation::ImageEdit
                     ) && input.role.as_str() == "source"
-                        && let (Some(width), Some(height)) = (width, height)
-                        && width > 0
-                        && height > 0
                     {
-                        request.display_aspect_ratio = (width, height);
+                        if let (Some(width), Some(height)) = (width, height)
+                            && width > 0
+                            && height > 0
+                        {
+                            request.display_aspect_ratio = (width, height);
+                        } else if let Ok(aspect) = self.artifact_run_display_aspect(*artifact_id) {
+                            request.display_aspect_ratio = aspect;
+                        }
                     }
                 }
             }
@@ -1750,6 +1754,26 @@ impl StudioStore {
             });
         }
         Ok(resolved)
+    }
+
+    fn artifact_run_display_aspect(
+        &self,
+        artifact_id: StudioArtifactId,
+    ) -> Result<(u32, u32), StudioStoreError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT r.display_aspect_width, r.display_aspect_height
+                 FROM studio_artifacts a
+                 JOIN studio_runs r ON r.id = a.run_id
+                 WHERE a.id = ?1 AND a.deleted_at IS NULL",
+                [artifact_id.0.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StudioStoreError::ArtifactNotFound,
+                other => other.into(),
+            })
     }
 
     fn artifact_input_row(
