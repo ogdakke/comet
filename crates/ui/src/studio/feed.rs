@@ -976,7 +976,7 @@ impl StudioPage {
         }
     }
 
-    fn copy_prompt(
+    pub(super) fn copy_prompt(
         &mut self,
         turn_id: zeron_studio::StudioTurnId,
         prompt: String,

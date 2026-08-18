@@ -62,6 +62,7 @@ impl StudioPage {
         if pressed_open {
             self.close_upscale_settings_menu(cx);
         } else {
+            self.close_artifact_actions_menu(cx);
             self.upscale_settings_menu.open(artifact_id);
             cx.notify();
         }

@@ -777,6 +777,35 @@ pub(super) fn write_artifact_file(destination: PathBuf, bytes: Vec<u8>) -> Resul
     std::fs::write(destination, bytes).map_err(|error| error.to_string())
 }
 
+fn clipboard_image_from_bytes(mime: &str, bytes: Vec<u8>) -> Result<Image, String> {
+    let format = ImageFormat::from_mime_type(mime)
+        .or_else(|| zeron_studio::sniff_media_mime(&bytes).and_then(ImageFormat::from_mime_type))
+        .ok_or_else(|| "unsupported image format".to_string())?;
+    Ok(Image::from_bytes(format, bytes))
+}
+
+fn inspector_icon_action(
+    id: &'static str,
+    icon: &'static str,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .size(px(28.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(7.0))
+        .cursor_pointer()
+        .hover(|style| style.bg(crate::theme::wash(0.14)))
+        .child(
+            crate::icons::icon(icon)
+                .size(px(16.0))
+                .text_color(theme.text_muted.opacity(0.8)),
+        )
+}
+
 /// Which sharp overlay a surface may GPU-upload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StudioPaint {
@@ -974,6 +1003,199 @@ impl StudioPage {
         }));
     }
 
+    pub(super) fn copy_artifact_image(
+        &mut self,
+        artifact_id: StudioArtifactId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(image) = self.images.get_full(&artifact_id) {
+            cx.write_to_clipboard(ClipboardItem::new_image(image.as_ref()));
+            self.flash_copied_artifact(artifact_id, cx);
+            return;
+        }
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        self.action_task = Some(cx.spawn(async move |this, cx| {
+            let result = match read_artifact_bytes(&engine, artifact_id).await {
+                Ok((_, mime, bytes)) => clipboard_image_from_bytes(&mime, bytes),
+                Err(error) => Err(error),
+            };
+            this.update(cx, |page, cx| match result {
+                Ok(image) => {
+                    let image = Arc::new(image);
+                    page.images.insert_full(artifact_id, image.clone());
+                    cx.write_to_clipboard(ClipboardItem::new_image(image.as_ref()));
+                    page.flash_copied_artifact(artifact_id, cx);
+                }
+                Err(error) => {
+                    page.error = Some(error.into());
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn flash_copied_artifact(&mut self, artifact_id: StudioArtifactId, cx: &mut Context<Self>) {
+        self.copied_artifact = Some(artifact_id);
+        self.copied_artifact_clear = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1200))
+                .await;
+            this.update(cx, |page, cx| {
+                page.copied_artifact = None;
+                page.copied_artifact_clear = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    pub(super) fn close_artifact_actions_menu(&mut self, cx: &mut Context<Self>) {
+        if self.artifact_actions_menu.begin_close() {
+            crate::popover::reap_popup(cx, |page: &mut Self| &mut page.artifact_actions_menu);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn dismiss_artifact_actions_menu(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if event.keystroke.key == "escape" && self.artifact_actions_menu.is_open() {
+            self.close_artifact_actions_menu(cx);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn toggle_artifact_actions_menu(
+        &mut self,
+        artifact_id: StudioArtifactId,
+        cx: &mut Context<Self>,
+    ) {
+        let pressed_open = self.artifact_actions_menu.take_press_was_open();
+        if pressed_open {
+            self.close_artifact_actions_menu(cx);
+        } else {
+            self.close_image_menu(cx);
+            self.close_upscale_settings_menu(cx);
+            self.artifact_actions_menu.open(artifact_id);
+            cx.notify();
+        }
+    }
+
+    fn render_inspector_actions(
+        &self,
+        artifact_id: StudioArtifactId,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let copied = self.copied_artifact == Some(artifact_id);
+        let menu_open = self.artifact_actions_menu.get() == Some(&artifact_id);
+        let menu = menu_open.then(|| self.render_artifact_actions_menu(artifact_id, theme, cx));
+        let copy_id = artifact_id;
+        let download_id = artifact_id;
+        let press_id = artifact_id;
+        let toggle_id = artifact_id;
+
+        let mut more =
+            inspector_icon_action("studio-artifact-actions", crate::icons::MENU_DOTS, theme)
+                .relative()
+                .when(menu_open, |button| button.bg(crate::theme::wash(0.14)))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |page, _, _, _| {
+                        page.artifact_actions_menu
+                            .note_trigger_press_matching(|id| id == &press_id);
+                    }),
+                )
+                .on_click(cx.listener(move |page, _, _, cx| {
+                    page.toggle_artifact_actions_menu(toggle_id, cx);
+                }));
+        if let Some(menu) = menu {
+            more = more.child(menu);
+        }
+
+        div()
+            .mt(px(8.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap(px(4.0))
+            .child(
+                inspector_icon_action(
+                    "studio-copy-artifact",
+                    if copied {
+                        crate::icons::CHECK
+                    } else {
+                        crate::icons::COPY
+                    },
+                    theme,
+                )
+                .on_click(cx.listener(move |page, _, _, cx| {
+                    page.copy_artifact_image(copy_id, cx);
+                })),
+            )
+            .child(
+                inspector_icon_action(
+                    "studio-download-artifact",
+                    crate::icons::DOWNLOAD_MINIMALISTIC,
+                    theme,
+                )
+                .on_click(cx.listener(move |page, _, _, cx| {
+                    page.download_artifact(download_id, cx);
+                })),
+            )
+            .child(more)
+            .into_any_element()
+    }
+
+    fn render_artifact_actions_menu(
+        &self,
+        artifact_id: StudioArtifactId,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let delete_id = artifact_id;
+        let card = crate::popover::popover_card(theme)
+            .w(px(170.0))
+            .on_mouse_down_out(cx.listener(|page, _, _, cx| {
+                page.close_artifact_actions_menu(cx);
+            }))
+            .flex()
+            .flex_col()
+            .child(
+                crate::popover::menu_row(
+                    theme,
+                    false,
+                    format!("studio-artifact-menu-delete-{}", artifact_id.0),
+                )
+                .id("studio-artifact-menu-delete")
+                .text_color(theme.danger)
+                .on_click(cx.listener(move |page, _, _, cx| {
+                    page.close_artifact_actions_menu(cx);
+                    page.delete_artifact(delete_id, cx);
+                }))
+                .child(
+                    crate::icons::icon(crate::icons::TRASH_BIN_MINIMALISTIC)
+                        .size(px(16.0))
+                        .text_color(theme.danger),
+                )
+                .child(SharedString::from("Delete")),
+            );
+        crate::popover::anchored_menu_above_end(
+            "studio-artifact-actions-menu",
+            card.into_any_element(),
+            self.artifact_actions_menu.closing_since(),
+        )
+    }
+
     pub(super) fn selected_artifact_id(&self) -> Option<StudioArtifactId> {
         self.selected_frame.and_then(ArtifactFrameKey::artifact_id)
     }
@@ -1045,6 +1267,7 @@ impl StudioPage {
     ) {
         self.close_image_menu(cx);
         self.close_upscale_settings_menu(cx);
+        self.close_artifact_actions_menu(cx);
         self.open_frame_viewer(ArtifactFrameKey::Ready(id), frames, cx);
     }
 
@@ -1056,6 +1279,7 @@ impl StudioPage {
     ) {
         self.close_image_menu(cx);
         self.close_upscale_settings_menu(cx);
+        self.close_artifact_actions_menu(cx);
         self.lightbox_frames = frames;
         if !self.lightbox_frames.iter().any(|frame| frame.key == key) {
             let recovered = self.surface_artifact_frames();
@@ -1137,6 +1361,7 @@ impl StudioPage {
         self.lightbox_drag = None;
         if changed {
             self.close_upscale_settings_menu(cx);
+            self.close_artifact_actions_menu(cx);
             self.inspector_scroll.set_offset(Point::default());
         }
         if let Some(artifact_id) = key.artifact_id()
@@ -1250,6 +1475,7 @@ impl StudioPage {
     pub fn close_artifact(&mut self, cx: &mut Context<Self>) {
         self.close_image_menu(cx);
         self.close_upscale_settings_menu(cx);
+        self.close_artifact_actions_menu(cx);
         let previous = self.selected_artifact_id();
         if self.selected_frame.take().is_some() {
             if let Some(id) = previous {
@@ -1266,6 +1492,7 @@ impl StudioPage {
     /// pops the artifact route; [`close_artifact`] then clears viewer state.
     pub(super) fn request_close_artifact(&mut self, cx: &mut Context<Self>) {
         self.close_upscale_settings_menu(cx);
+        self.close_artifact_actions_menu(cx);
         self.exit_edit_mode(cx);
         let previous = self.selected_artifact_id();
         if self.selected_frame.take().is_some() {
@@ -2445,6 +2672,7 @@ impl StudioPage {
                         inspector
                             .when(has_prompt, |inspector| {
                                 let copy_prompt = prompt.clone();
+                                let copied = self.copied_prompt == Some(turn_id);
                                 let expanded = self.expanded_inspector_prompts.contains(&turn_id);
                                 let clampable = super::feed::prompt_exceeds_lines(
                                     &prompt,
@@ -2509,15 +2737,17 @@ impl StudioPage {
                                             .rounded(px(6.0))
                                             .cursor_pointer()
                                             .hover(|style| style.bg(crate::theme::wash(0.14)))
-                                            .on_click(move |_, _, cx| {
-                                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                                    copy_prompt.clone(),
-                                                ));
-                                            })
+                                            .on_click(cx.listener(move |page, _, _, cx| {
+                                                page.copy_prompt(turn_id, copy_prompt.clone(), cx);
+                                            }))
                                             .child(
-                                                crate::icons::icon(crate::icons::COPY)
-                                                    .size(px(14.0))
-                                                    .text_color(theme.text_muted.opacity(0.7)),
+                                                crate::icons::icon(if copied {
+                                                    crate::icons::CHECK
+                                                } else {
+                                                    crate::icons::COPY
+                                                })
+                                                .size(px(14.0))
+                                                .text_color(theme.text_muted.opacity(0.7)),
                                             ),
                                     ),
                             )
@@ -2542,63 +2772,7 @@ impl StudioPage {
                         .child(self.render_edit_action(id, theme, cx))
                         .child(div().h(px(8.0)))
                         .child(self.render_artifact_upscale_actions(id, theme, cx))
-                        .child(
-                            div()
-                                .mt(px(8.0))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .gap(px(8.0))
-                                .child(
-                                    div()
-                                        .id("studio-download-artifact")
-                                        .h(px(32.0))
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .gap(px(7.0))
-                                        .rounded(px(7.0))
-                                        .border_1()
-                                        .border_color(theme.border)
-                                        .cursor_pointer()
-                                        .hover(|style| style.bg(crate::theme::wash(0.09)))
-                                        .on_click(cx.listener(move |page, _, _, cx| {
-                                            page.download_artifact(id, cx)
-                                        }))
-                                        .child(
-                                            crate::icons::icon(crate::icons::ARROW_DOWN)
-                                                .size(px(14.0))
-                                                .text_color(theme.text_muted),
-                                        )
-                                        .child("Download"),
-                                )
-                                .child(
-                                    div()
-                                        .id("studio-delete-artifact")
-                                        .h(px(32.0))
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .gap(px(7.0))
-                                        .rounded(px(7.0))
-                                        .cursor_pointer()
-                                        .text_color(theme.danger)
-                                        .hover(|style| style.bg(theme.danger.opacity(0.08)))
-                                        .on_click(cx.listener(move |page, _, _, cx| {
-                                            page.delete_artifact(id, cx)
-                                        }))
-                                        .child(
-                                            crate::icons::icon(
-                                                crate::icons::TRASH_BIN_MINIMALISTIC,
-                                            )
-                                            .size(px(14.0))
-                                            .text_color(theme.danger),
-                                        )
-                                        .child("Delete"),
-                                ),
-                        )
+                        .child(self.render_inspector_actions(id, theme, cx))
                 })
         };
 
@@ -2622,6 +2796,10 @@ impl StudioPage {
                 )
                 .on_key_down(cx.listener(|page, event: &gpui::KeyDownEvent, window, cx| {
                     if page.dismiss_image_menu(event, cx) {
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if page.dismiss_artifact_actions_menu(event, cx) {
                         cx.stop_propagation();
                         return;
                     }
@@ -3381,6 +3559,19 @@ mod tests {
         assert!(lightbox_stage_size_changed(1200.0, 800.0, 900.0, 800.0));
         assert!(lightbox_stage_size_changed(1200.0, 800.0, 1200.0, 600.0));
         assert!(!lightbox_stage_size_changed(1200.0, 800.0, 1200.2, 800.1));
+    }
+
+    #[test]
+    fn clipboard_image_uses_mime_then_sniffs_bytes() {
+        let png = clipboard_image_from_bytes("image/png", b"\x89PNG\r\n\x1a\nrest".to_vec())
+            .expect("png mime");
+        assert_eq!(png.format, ImageFormat::Png);
+
+        let jpeg =
+            clipboard_image_from_bytes("", vec![0xff, 0xd8, 0xff, 0xe0]).expect("jpeg magic");
+        assert_eq!(jpeg.format, ImageFormat::Jpeg);
+
+        assert!(clipboard_image_from_bytes("text/plain", b"not an image".to_vec()).is_err());
     }
 
     #[test]

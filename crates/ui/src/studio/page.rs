@@ -104,6 +104,9 @@ pub struct StudioPage {
     /// Prompt copy that is showing the check flash.
     pub(super) copied_prompt: Option<zeron_studio::StudioTurnId>,
     pub(super) copied_prompt_clear: Option<Task<()>>,
+    /// Artifact image copy that is showing the check flash.
+    pub(super) copied_artifact: Option<StudioArtifactId>,
+    pub(super) copied_artifact_clear: Option<Task<()>>,
     /// Turns whose inspector prompt is fully expanded past the 10-line clamp.
     pub(super) expanded_inspector_prompts: HashSet<zeron_studio::StudioTurnId>,
     pub(super) inspector_scroll: gpui::ScrollHandle,
@@ -124,6 +127,7 @@ pub struct StudioPage {
     pub(super) gallery_anchor: Option<StudioArtifactId>,
     pub(super) image_menu: popover::Popup<ImageMenu>,
     pub(super) upscale_settings_menu: popover::Popup<StudioArtifactId>,
+    pub(super) artifact_actions_menu: popover::Popup<StudioArtifactId>,
     pub(super) upscale_jobs: HashMap<StudioArtifactId, UpscaleJob>,
     pub(super) upscale_watch_tasks: HashMap<StudioConversationId, Task<()>>,
     pub(super) selected_frame: Option<super::artifact::ArtifactFrameKey>,
@@ -275,6 +279,8 @@ impl StudioPage {
             expanded_prompts: HashSet::new(),
             copied_prompt: None,
             copied_prompt_clear: None,
+            copied_artifact: None,
+            copied_artifact_clear: None,
             expanded_inspector_prompts: HashSet::new(),
             inspector_scroll: gpui::ScrollHandle::new(),
             images: StudioImages::default(),
@@ -292,6 +298,7 @@ impl StudioPage {
             gallery_anchor: None,
             image_menu: popover::Popup::default(),
             upscale_settings_menu: popover::Popup::default(),
+            artifact_actions_menu: popover::Popup::default(),
             upscale_jobs: HashMap::new(),
             upscale_watch_tasks: HashMap::new(),
             selected_frame: None,
@@ -1636,6 +1643,8 @@ impl Render for StudioPage {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|page, event: &gpui::KeyDownEvent, window, cx| {
                 if page.dismiss_image_menu(event, cx) {
+                    cx.stop_propagation();
+                } else if page.dismiss_artifact_actions_menu(event, cx) {
                     cx.stop_propagation();
                 } else if page.dismiss_upscale_settings_menu(event, cx) {
                     cx.stop_propagation();

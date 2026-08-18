@@ -140,6 +140,10 @@ icon_assets![
     (STOP, "stop"),
     (CHECK, "check"),
     (COPY, "copy"),
+    // Solar Download Minimalistic (Linear) — inspector / save-to-disk.
+    (DOWNLOAD_MINIMALISTIC, "download-minimalistic"),
+    // Solar Menu Dots (Linear) — overflow trigger.
+    (MENU_DOTS, "menu-dots"),
     // Solar Mirror Left (Linear) — before/after compare affordance.
     (COMPARE, "compare"),
     // Hand-drawn star pair in the Solar Linear style (like the terminal/
