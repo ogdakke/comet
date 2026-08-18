@@ -193,7 +193,11 @@ impl Shell {
                     )
                     .child(header_icon_button(
                         "expand-changes",
-                        icons::EXPAND_ARROWS,
+                        if self.right_pane_expanded {
+                            icons::COLLAPSE_ARROWS
+                        } else {
+                            icons::EXPAND_ARROWS
+                        },
                         &theme,
                         cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
                     ))

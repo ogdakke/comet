@@ -11,12 +11,13 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyDownEvent, ObjectFit,
-    PathPromptOptions, Point, SharedString, StyledImage as _, Subscription, Task, Window, div, img,
-    prelude::*, px,
+    App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyDownEvent, ObjectFit,
+    PathPromptOptions, Pixels, Point, ScrollWheelEvent, SharedString, StyledImage as _,
+    Subscription, Task, Window, div, img, point, prelude::*, px,
 };
 
 use zeron_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
@@ -27,6 +28,8 @@ use zeron_proto::{
 use zeron_rpc::{RpcError, methods};
 
 use crate::attachments::{self, StagedAttachment};
+use crate::frost;
+use crate::icons;
 use crate::motion;
 use crate::pickers::Pickers;
 use crate::state::{AppState, Indicator};
@@ -75,6 +78,69 @@ pub fn init(cx: &mut App) {
 
 /// Single-select questions auto-advance after this long.
 pub const AUTO_ADVANCE_MS: u64 = 220;
+/// Compact plan/question body cap. Expand fills the conversation column.
+const WIZARD_COMPACT_BODY: f32 = 280.0;
+/// Card rounding: pill-matched while compact, panel-like in takeover.
+const WIZARD_CARD_RADIUS: f32 = 26.0;
+const WIZARD_EXPAND_RADIUS: f32 = 16.0;
+/// Inset of the expanded overlay from the conversation column / titlebar.
+const WIZARD_EXPAND_INSET: f32 = 8.0;
+const PLAN_APPROVAL_HEADER: &str = "Plan approval";
+
+/// 0 = compact card, 1 = conversation-column takeover. Tweens over
+/// [`motion::COLLAPSE`] (180ms ease-out).
+fn wizard_expand_progress(
+    expanded: bool,
+    from: f32,
+    started: Option<Instant>,
+    now: Instant,
+    reduced_motion: bool,
+) -> f32 {
+    let target = if expanded { 1.0 } else { 0.0 };
+    if reduced_motion {
+        return target;
+    }
+    let Some(at) = started else {
+        return target;
+    };
+    let total = motion::COLLAPSE
+        .total()
+        .mul_f32(motion::speed_scale())
+        .as_secs_f32();
+    if total <= 0.0 {
+        return target;
+    }
+    let raw = now.duration_since(at).as_secs_f32() / total;
+    motion::lerp(from, target, motion::COLLAPSE.progress(raw))
+}
+
+/// Lerp the wizard card from its in-flow compact bounds to a conversation-
+/// column takeover (titlebar → composer slot, inset [`WIZARD_EXPAND_INSET`]).
+fn wizard_overlay_rect(
+    t: f32,
+    compact: Bounds<Pixels>,
+    column: Bounds<Pixels>,
+) -> (f32, f32, f32, f32) {
+    let cx0 = f32::from(compact.origin.x);
+    let cy0 = f32::from(compact.origin.y);
+    let cw0 = f32::from(compact.size.width);
+    let ch0 = f32::from(compact.size.height);
+    let ex = f32::from(column.origin.x) + WIZARD_EXPAND_INSET;
+    let ey = Theme::TITLEBAR_HEIGHT + WIZARD_EXPAND_INSET;
+    let ew = (f32::from(column.size.width) - WIZARD_EXPAND_INSET * 2.0).max(0.0);
+    let slot_bottom = f32::from(column.origin.y) + f32::from(column.size.height);
+    let eh = (slot_bottom - ey).max(ch0);
+    (
+        motion::lerp(cx0, ex, t),
+        motion::lerp(cy0, ey, t),
+        motion::lerp(cw0, ew, t),
+        motion::lerp(ch0, eh, t),
+    )
+}
+
+fn is_plan_approval(header: &str) -> bool {
+    header.eq_ignore_ascii_case(PLAN_APPROVAL_HEADER)
+}
 
 /// Hysteresis slack for the expanded→compact flip: once expanded, the composer
 /// only collapses when the text is comfortably narrower than the compact
@@ -855,6 +921,17 @@ pub struct Composer {
     failure: Option<SharedString>,
     wizard: Option<Wizard>,
     wizard_focus: FocusHandle,
+    /// Plan/question card fills the conversation column (header expand).
+    wizard_expanded: bool,
+    /// 0 = compact card, 1 = page takeover; tweened over [`motion::COLLAPSE`].
+    wizard_expand_from: f32,
+    wizard_expand_at: Option<Instant>,
+    /// Conversation-column bounds (x/width/y of the composer slot).
+    last_column_bounds: Option<Bounds<Pixels>>,
+    /// In-flow wizard card bounds — compact overlay origin for the expand tween.
+    last_wizard_bounds: Option<Bounds<Pixels>>,
+    /// Plan/question body scroll — drives the edge fade and overlay thumb.
+    wizard_scroll: gpui::ScrollHandle,
     /// Requests already answered locally (suppresses the panel until the doc
     /// frame marks them resolved).
     answered_requests: HashSet<String>,
@@ -981,6 +1058,12 @@ impl Composer {
             failure: None,
             wizard: None,
             wizard_focus: cx.focus_handle(),
+            wizard_expanded: false,
+            wizard_expand_from: 0.0,
+            wizard_expand_at: None,
+            last_column_bounds: None,
+            last_wizard_bounds: None,
+            wizard_scroll: gpui::ScrollHandle::new(),
             answered_requests: HashSet::new(),
             advance_task: None,
             send_task: None,
@@ -1885,6 +1968,7 @@ impl Composer {
             self.current_key = key;
             self.failure = None;
             self.wizard = None;
+            self.reset_wizard_view();
             self.history.reset();
             // Attachments stay stashed under their chat key (the map swap IS
             // the navigation); only the transient chrome resets.
@@ -1925,6 +2009,7 @@ impl Composer {
                 if !same {
                     self.reset_mention(None, cx);
                     self.wizard = Some(Wizard::new(request_id, questions));
+                    self.reset_wizard_view();
                     self.advance_task = None;
                     // The shared input becomes the panel's free-text override.
                     self.input.update(cx, |input, cx| {
@@ -1950,6 +2035,7 @@ impl Composer {
                             && !self.answered_requests.contains(&wizard.request_id));
                     if released {
                         self.wizard = None;
+                        self.reset_wizard_view();
                         self.advance_task = None;
                         self.input.update(cx, |input, cx| {
                             input.set_placeholder("Do anything…", cx);
@@ -2505,6 +2591,7 @@ impl Composer {
             _ => {
                 // Moving on: clear the shared free-text input for the next page.
                 self.input.update(cx, |input, cx| input.set_text("", cx));
+                self.reset_wizard_scroll();
                 cx.notify();
             }
         }
@@ -2513,6 +2600,7 @@ impl Composer {
     fn wizard_back(&mut self, cx: &mut Context<Self>) {
         if let Some(wizard) = self.wizard.as_mut() {
             wizard.back();
+            self.reset_wizard_scroll();
             cx.notify();
         }
     }
@@ -2522,6 +2610,7 @@ impl Composer {
         let Some(wizard) = self.wizard.take() else {
             return;
         };
+        self.reset_wizard_view();
         self.advance_task = None;
         self.answered_requests.insert(wizard.request_id.clone());
         self.input.update(cx, |input, cx| {
@@ -2599,19 +2688,54 @@ impl Composer {
                 cx.stop_propagation();
             }
         } else if key == "escape" && (!input_focused || input_empty) {
-            self.wizard_back(cx);
+            if self.wizard_expanded || self.wizard_expand_at.is_some() {
+                self.toggle_wizard_expand(cx);
+            } else {
+                self.wizard_back(cx);
+            }
             cx.stop_propagation();
         }
     }
 
+    fn reset_wizard_view(&mut self) {
+        self.wizard_expanded = false;
+        self.wizard_expand_from = 0.0;
+        self.wizard_expand_at = None;
+        self.last_wizard_bounds = None;
+        self.reset_wizard_scroll();
+    }
+
+    fn reset_wizard_scroll(&mut self) {
+        self.wizard_scroll.set_offset(Point::default());
+    }
+
+    fn toggle_wizard_expand(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let current = wizard_expand_progress(
+            self.wizard_expanded,
+            self.wizard_expand_from,
+            self.wizard_expand_at,
+            now,
+            motion::reduced_motion(cx),
+        );
+        self.wizard_expand_from = current;
+        self.wizard_expanded = !self.wizard_expanded;
+        self.wizard_expand_at = if motion::reduced_motion(cx) {
+            None
+        } else {
+            Some(now)
+        };
+        cx.notify();
+    }
+
     // ---- render pieces ----
 
-    /// The agent-asked-a-question panel (zeron question-panel.tsx), rendered in
-    /// place of the composer: the same floating-pill chrome (`rounded-[26px]
-    /// border-white/[0.08] bg-white/[0.03] shadow-xl`), uppercase header +
-    /// "1/3" counter chip, option rows with number kbd chips, a free-text
-    /// override over a hairline, and Back / Next-Submit footer.
-    fn render_wizard(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// The agent-asked-a-question panel. Frosted overlay chrome (popover
+    /// glass: [`Theme::glass_overlay`] over [`frost::MENU_BLUR`]), scroll-
+    /// isolated from the transcript, with an expand control that tweens the
+    /// card over the conversation column — same takeover idea as the right
+    /// pane, animated over [`motion::COLLAPSE`].
+    fn render_wizard(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = Theme::of(cx).clone();
         let Some(wizard) = self.wizard.clone() else {
             return gpui::Empty.into_any_element();
@@ -2624,6 +2748,30 @@ impl Composer {
         let last = page + 1 >= wizard.questions.len();
         let typed_empty = self.input.read(cx).is_empty();
         let can_advance = wizard.page_has_pick() || !typed_empty;
+        let now = Instant::now();
+        let expand_t = wizard_expand_progress(
+            self.wizard_expanded,
+            self.wizard_expand_from,
+            self.wizard_expand_at,
+            now,
+            motion::reduced_motion(cx),
+        );
+        let target_t = if self.wizard_expanded { 1.0 } else { 0.0 };
+        if self.wizard_expand_at.is_some() {
+            if (expand_t - target_t).abs() < 0.001 {
+                self.wizard_expand_at = None;
+                self.wizard_expand_from = target_t;
+            } else {
+                window.request_animation_frame();
+            }
+        }
+        let overlaying = expand_t > 0.001
+            && self.last_wizard_bounds.is_some()
+            && self.last_column_bounds.is_some();
+        let fill_body = overlaying;
+        let radius = motion::lerp(WIZARD_CARD_RADIUS, WIZARD_EXPAND_RADIUS, expand_t);
+        let is_plan = is_plan_approval(&question.header);
+        let plan_prompt = is_plan && !question.question.contains("without writing a plan");
 
         let options = question.options.iter().enumerate().map(|(ix, label)| {
             // Selection reads on the row only while no typed override exists
@@ -2696,20 +2844,107 @@ impl Composer {
                 })
         });
 
-        div()
+        let body_tree = crate::markdown::parse_full(&question.question);
+        let mut body_opts = crate::markdown::render::RenderOptions::settled("wizard-plan".into());
+        let scroll = self.wizard_scroll.clone();
+        let headings = body_tree.clone();
+        body_opts.on_link = Some(Rc::new(move |url, window, cx| {
+            if let Some(fragment) = crate::markdown::render::markdown_fragment(url)
+                && let Some(ix) =
+                    crate::markdown::render::heading_index_for_fragment(&headings, &fragment)
+            {
+                scroll.scroll_to_top_of_item(ix);
+                window.refresh();
+                return;
+            }
+            crate::markdown::render::open_external_markdown_url(url, cx);
+        }));
+
+        let expand_icon = if self.wizard_expanded {
+            icons::COLLAPSE_ARROWS
+        } else {
+            icons::EXPAND_ARROWS
+        };
+        let header = div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted.opacity(0.6))
+                    .child(SharedString::from(crate::popover::tracked_upper(
+                        &question.header,
+                    ))),
+            )
+            .when(wizard.questions.len() > 1, |el| {
+                el.child(
+                    div()
+                        .h(px(20.0))
+                        .px(px(6.0))
+                        .flex()
+                        .items_center()
+                        .rounded(px(6.0))
+                        .bg(crate::theme::ink(0.06))
+                        .text_size(px(10.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text_muted.opacity(0.6))
+                        .child(SharedString::from(counter)),
+                )
+            })
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("wizard-expand")
+                    .size(px(28.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .bg(motion::hover_blend(
+                        "wizard-expand",
+                        crate::theme::wash(0.0),
+                        crate::theme::wash(0.11),
+                    ))
+                    .on_hover(motion::hover_listener("wizard-expand"))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_wizard_expand(cx)))
+                    .child(
+                        icons::icon(expand_icon)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted),
+                    ),
+            );
+
+        let card_bg = if theme.is_glass() {
+            theme.glass_overlay()
+        } else {
+            theme.surface_overlay
+        };
+        let card = div()
             .id("question-panel")
             .track_focus(&self.wizard_focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_wizard_key(event, window, cx)
             }))
-            .rounded(px(26.0))
+            .on_scroll_wheel(cx.listener(|_, _: &ScrollWheelEvent, _, cx| {
+                cx.stop_propagation();
+            }))
+            .occlude()
+            .rounded(px(radius))
             .border_1()
             .border_color(theme.border)
-            .bg(theme.input_glass_bg())
+            .bg(card_bg)
             .when(!theme.is_glass(), |el| el.shadow_lg())
             .flex()
             .flex_col()
             .overflow_hidden()
+            .when(fill_body, |el| el.h_full())
+            .child(crate::markdown::render::selection_occluder())
             .child(
                 div()
                     .px(px(16.0))
@@ -2717,55 +2952,63 @@ impl Composer {
                     .flex()
                     .flex_col()
                     .min_h_0()
-                    // Header: tracked uppercase + counter chip when paged.
+                    .when(fill_body, |el| el.flex_1())
+                    .child(header)
+                    // Long plans (and other tall questions) scroll here so
+                    // the option rows and free-text field stay in view.
+                    // Edge fade is paint-gated on the handle (top hidden at
+                    // rest, bottom gone once you hit the end); the thumb
+                    // sits outside the fade so it stays fully inked.
                     .child(
                         div()
-                            .flex_none()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(10.0))
-                            .child(
-                                div()
-                                    .text_size(px(10.5))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(crate::popover::tracked_upper(
-                                        &question.header,
-                                    ))),
-                            )
-                            .when(wizard.questions.len() > 1, |el| {
-                                el.child(
-                                    div()
-                                        .h(px(20.0))
-                                        .px(px(6.0))
-                                        .flex()
-                                        .items_center()
-                                        .rounded(px(6.0))
-                                        .bg(crate::theme::ink(0.06))
-                                        .text_size(px(10.0))
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .text_color(theme.text_muted.opacity(0.6))
-                                        .child(SharedString::from(counter)),
-                                )
-                            }),
-                    )
-                    // Long plan previews (and other tall questions) scroll
-                    // here so the option rows and free-text field stay in
-                    // view. 8 × 20px line-height matches the body type.
-                    .child(
-                        div()
-                            .id("wizard-question")
                             .mt(px(6.0))
                             .min_h_0()
-                            .max_h(px(160.0))
-                            .overflow_y_scroll()
-                            .text_size(px(15.0))
-                            .line_height(px(20.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .child(SharedString::from(question.question.clone())),
+                            .relative()
+                            .when(fill_body, |el| el.flex_1())
+                            .child(
+                                crate::edge_fade::edge_faded(
+                                    Theme::TRANSCRIPT_FADE_BAND,
+                                    true,
+                                    true,
+                                    div()
+                                        .id("wizard-question")
+                                        .when(fill_body, |el| el.size_full())
+                                        .when(!fill_body, |el| el.max_h(px(WIZARD_COMPACT_BODY)))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(crate::markdown::render::MD_BLOCK_GAP))
+                                        .overflow_y_scroll()
+                                        .track_scroll(&self.wizard_scroll)
+                                        .pr(px(crate::scrollbar::TRACK_WIDTH))
+                                        .children(body_tree.blocks.iter().enumerate().map(
+                                            |(ix, top)| {
+                                                crate::markdown::render::render_block(
+                                                    &top.block, ix, ix, &body_opts, &theme, window,
+                                                    None,
+                                                )
+                                            },
+                                        )),
+                                )
+                                .fade_overflow_y(&self.wizard_scroll),
+                            )
+                            .child(crate::scrollbar::overlay(
+                                "wizard-plan",
+                                &self.wizard_scroll,
+                            )),
                     )
+                    .when(plan_prompt, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .mt(px(10.0))
+                                .text_size(px(14.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child(SharedString::from(
+                                    "Approve this plan and start implementing?",
+                                )),
+                        )
+                    })
                     .when(question.multi_select, |el| {
                         el.child(
                             div()
@@ -2832,6 +3075,73 @@ impl Composer {
                             .when(!can_advance, |el| el.opacity(0.4))
                             .on_click(cx.listener(|this, _, _, cx| this.wizard_advance(cx))),
                     ),
+            );
+
+        let frosted = frost::frosted(radius, frost::MENU_BLUR, card);
+        let column_entity = cx.weak_entity();
+        let card_entity = cx.weak_entity();
+        let column_canvas = gpui::canvas(
+            move |bounds, _, cx| {
+                let _ = column_entity.update(cx, |this, _| {
+                    this.last_column_bounds = Some(bounds);
+                });
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0();
+        let card_canvas = gpui::canvas(
+            move |bounds, _, cx| {
+                let _ = card_entity.update(cx, |this, _| {
+                    this.last_wizard_bounds = Some(bounds);
+                });
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0();
+
+        if overlaying {
+            if let (Some(compact), Some(column)) =
+                (self.last_wizard_bounds, self.last_column_bounds)
+            {
+                let (x, y, w, h) = wizard_overlay_rect(expand_t, compact, column);
+                let spacer_h = f32::from(compact.size.height);
+                return div()
+                    .relative()
+                    .w_full()
+                    .child(column_canvas)
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(768.0))
+                            .mx_auto()
+                            .px(px(Theme::SPACE_LG))
+                            .child(div().h(px(spacer_h.max(1.0)))),
+                    )
+                    .child(
+                        gpui::deferred(
+                            gpui::anchored()
+                                .position(point(px(x), px(y)))
+                                .child(div().w(px(w.max(1.0))).h(px(h.max(1.0))).child(frosted)),
+                        )
+                        .priority(2),
+                    )
+                    .into_any_element();
+            }
+        }
+
+        div()
+            .relative()
+            .w_full()
+            .child(column_canvas)
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(768.0))
+                    .mx_auto()
+                    .px(px(Theme::SPACE_LG))
+                    .child(div().relative().w_full().child(card_canvas).child(frosted)),
             )
             .into_any_element()
     }
@@ -3025,7 +3335,7 @@ impl Render for Composer {
             .flex_col()
             .gap(px(Theme::SPACE_SM))
             .px(px(Theme::SPACE_LG))
-            .pb(px(Theme::SPACE_LG))
+            .when(!wizard_active, |el| el.pb(px(Theme::SPACE_LG)))
             .when_some(failure, |el, message| {
                 // zeron composer.tsx `Notice` (matches the transcript
                 // ErrorChip palette): `flex items-start gap-2 rounded-xl
@@ -3104,8 +3414,15 @@ impl Render for Composer {
         });
 
         if wizard_active {
-            let wizard = self.render_wizard(cx);
-            return container.child(motion::fade_quick("composer-wizard", div().child(wizard)));
+            let wizard = self.render_wizard(window, cx);
+            // Full-width root so the expand tween can measure the
+            // conversation column; the compact card is still max-w-3xl.
+            return div().w_full().flex().flex_col().child(container).child(
+                div()
+                    .w_full()
+                    .pb(px(Theme::SPACE_LG))
+                    .child(motion::fade_quick("composer-wizard", div().child(wizard))),
+            );
         }
 
         // New chats always use the expanded layout: the repo/branch pickers
@@ -3493,6 +3810,42 @@ mod tests {
         assert!(composer_flip(false, 500.0, 300.0, false, false));
         assert!(!composer_flip(true, 0.0, 300.0, false, false));
         assert!(composer_flip(false, 10.0, 150.0, false, false));
+    }
+
+    #[test]
+    fn wizard_expand_progress_tweens_and_snaps() {
+        let start = Instant::now();
+        assert_eq!(wizard_expand_progress(false, 0.0, None, start, false), 0.0);
+        assert_eq!(wizard_expand_progress(true, 0.0, None, start, false), 1.0);
+        assert_eq!(
+            wizard_expand_progress(true, 0.0, Some(start), start, true),
+            1.0
+        );
+        let mid = start + Duration::from_millis(motion::COLLAPSE.duration_ms / 2);
+        let half = wizard_expand_progress(true, 0.0, Some(start), mid, false);
+        assert!(half > 0.4 && half < 1.0, "eased mid-tween was {half}");
+        let done = start + Duration::from_millis(motion::COLLAPSE.duration_ms + 20);
+        assert!((wizard_expand_progress(true, 0.0, Some(start), done, false) - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn wizard_overlay_grows_from_card_to_column() {
+        let compact = Bounds::new(
+            point(px(120.0), px(400.0)),
+            gpui::size(px(600.0), px(360.0)),
+        );
+        let column = Bounds::new(point(px(80.0), px(380.0)), gpui::size(px(720.0), px(400.0)));
+        let (x0, y0, w0, h0) = wizard_overlay_rect(0.0, compact, column);
+        assert_eq!((x0, y0, w0, h0), (120.0, 400.0, 600.0, 360.0));
+        let (x1, y1, w1, h1) = wizard_overlay_rect(1.0, compact, column);
+        assert_eq!(x1, 80.0 + WIZARD_EXPAND_INSET);
+        assert_eq!(y1, Theme::TITLEBAR_HEIGHT + WIZARD_EXPAND_INSET);
+        assert_eq!(w1, 720.0 - WIZARD_EXPAND_INSET * 2.0);
+        let slot_bottom = 380.0 + 400.0;
+        assert_eq!(h1, slot_bottom - y1);
+        assert!(is_plan_approval("Plan approval"));
+        assert!(is_plan_approval("plan approval"));
+        assert!(!is_plan_approval("Question"));
     }
 
     #[test]

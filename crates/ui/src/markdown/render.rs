@@ -79,6 +79,10 @@ pub struct RenderOptions {
     /// Code-block copy-button plumbing (round 9): `None` renders no button
     /// (previews outside the transcript).
     pub copy: Option<CopyUi>,
+    /// Override for markdown link clicks. `None` opens only safe external
+    /// URLs ([`open_external_markdown_url`]) — fragment / relative dests
+    /// must not hit `App::open_url` (macOS NSWorkspace error −50).
+    pub on_link: Option<Rc<dyn Fn(&str, &mut Window, &mut gpui::App)>>,
 }
 
 /// Copy-button wiring for one row's code blocks: the handler writes the code
@@ -99,7 +103,141 @@ impl RenderOptions {
             cache: None,
             now: Instant::now(),
             copy: None,
+            on_link: None,
         }
+    }
+}
+
+/// `http` / `https` / `mailto` only. Anything else (`#heading`, `comet`,
+/// `./file.md`, `javascript:`) is not a browser URL — handing it to
+/// [`gpui::App::open_url`] makes macOS Launch Services try to launch it
+/// as an app and pop "The application can't be opened. −50".
+pub fn is_safe_external_url(url: &str) -> bool {
+    let url = url.trim();
+    let Some((scheme, rest)) = url.split_once(':') else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    if rest.starts_with("//") {
+        return scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https");
+    }
+    scheme.eq_ignore_ascii_case("mailto")
+}
+
+/// In-document dest: `#slug` or `page.md#slug`. `None` for external URLs.
+pub fn markdown_fragment(url: &str) -> Option<String> {
+    let url = url.trim();
+    if is_safe_external_url(url) {
+        return None;
+    }
+    let raw = url.strip_prefix('#').or_else(|| {
+        url.split_once('#')
+            .map(|(_, frag)| frag)
+            .filter(|frag| !frag.is_empty())
+    })?;
+    let decoded = percent_decode(raw);
+    let trimmed = decoded.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Open `url` in the system browser when it is a real external dest.
+pub fn open_external_markdown_url(url: &str, cx: &mut gpui::App) {
+    if is_safe_external_url(url) {
+        cx.open_url(url);
+    }
+}
+
+/// GFM / GitHub heading id: lowercase, drop punctuation, spaces → `-`.
+/// Duplicate headings get `-1`, `-2` via [`top_heading_slugs`].
+pub fn gfm_heading_slug(text: &str) -> String {
+    let mut out = String::new();
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !out.is_empty() && !out.ends_with('-') {
+                out.push('-');
+            }
+        } else if ch.is_alphanumeric() {
+            for c in ch.to_lowercase() {
+                out.push(c);
+            }
+        } else if ch == '_' || ch == '-' {
+            out.push(ch);
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+/// `(top-level block index, slug)` for every heading in document order.
+pub fn top_heading_slugs(tree: &BlockTree) -> Vec<(usize, String)> {
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    let mut out = Vec::new();
+    for (ix, top) in tree.blocks.iter().enumerate() {
+        let Block::Heading { runs, .. } = &top.block else {
+            continue;
+        };
+        let base = gfm_heading_slug(&inline_plain_text(runs));
+        if base.is_empty() {
+            continue;
+        }
+        let n = counts.entry(base.clone()).or_insert(0);
+        let slug = if *n == 0 { base } else { format!("{base}-{n}") };
+        *n += 1;
+        out.push((ix, slug));
+    }
+    out
+}
+
+/// Child index of the heading a `#fragment` should scroll to.
+pub fn heading_index_for_fragment(tree: &BlockTree, fragment: &str) -> Option<usize> {
+    let want = fragment.trim().trim_start_matches('#');
+    if want.is_empty() {
+        return None;
+    }
+    let slugged = gfm_heading_slug(want);
+    top_heading_slugs(tree).into_iter().find_map(|(ix, slug)| {
+        (slug.eq_ignore_ascii_case(want) || (!slugged.is_empty() && slug == slugged)).then_some(ix)
+    })
+}
+
+fn inline_plain_text(runs: &[InlineRun]) -> String {
+    let mut out = String::new();
+    for run in runs {
+        out.push_str(&run.text);
+    }
+    out
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out)
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
+}
+
+fn from_hex(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -718,10 +856,16 @@ fn flat_text_element(
     } else {
         let (ranges, urls): (Vec<_>, Vec<_>) = flat.links.iter().cloned().unzip();
         let id: SharedString = format!("{}-t{ix}", opts.row_key).into();
+        let on_link = opts.on_link.clone();
         InteractiveText::new(id, styled)
-            .on_click(ranges, move |clicked_ix, _window, cx| {
-                if let Some(url) = urls.get(clicked_ix) {
-                    cx.open_url(url);
+            .on_click(ranges, move |clicked_ix, window, cx| {
+                let Some(url) = urls.get(clicked_ix) else {
+                    return;
+                };
+                if let Some(on_link) = &on_link {
+                    on_link(url, window, cx);
+                } else {
+                    open_external_markdown_url(url, cx);
                 }
             })
             .into_any_element()
@@ -1525,6 +1669,69 @@ pub fn runs_for_syntax_line_with_plain(
 mod tests {
     use super::*;
     use crate::markdown::parser::{Block, InlineRun, InlineStyle};
+
+    #[test]
+    fn only_http_https_mailto_are_safe_external_urls() {
+        assert!(is_safe_external_url("https://example.com/a"));
+        assert!(is_safe_external_url("http://localhost:3000"));
+        assert!(is_safe_external_url("mailto:dev@example.com"));
+        assert!(!is_safe_external_url("#executive-summary"));
+        assert!(!is_safe_external_url("comet"));
+        assert!(!is_safe_external_url("./plan.md"));
+        assert!(!is_safe_external_url("javascript:alert(1)"));
+        assert!(!is_safe_external_url("file:///tmp/x"));
+        assert!(!is_safe_external_url("https:"));
+        assert!(!is_safe_external_url(""));
+    }
+
+    #[test]
+    fn markdown_fragment_reads_hash_and_relative_hashes() {
+        assert_eq!(
+            markdown_fragment("#executive-summary").as_deref(),
+            Some("executive-summary")
+        );
+        assert_eq!(
+            markdown_fragment("plan.md#decision-matrix").as_deref(),
+            Some("decision-matrix")
+        );
+        assert_eq!(
+            markdown_fragment("#file%20touch").as_deref(),
+            Some("file touch")
+        );
+        assert_eq!(markdown_fragment("https://x.test/#nope"), None);
+        assert_eq!(markdown_fragment("comet"), None);
+    }
+
+    #[test]
+    fn gfm_heading_slug_matches_toc_destinations() {
+        assert_eq!(gfm_heading_slug("Executive Summary"), "executive-summary");
+        assert_eq!(
+            gfm_heading_slug("File Touch Map (Fictional)"),
+            "file-touch-map-fictional"
+        );
+        assert_eq!(
+            gfm_heading_slug("Architecture Sketch"),
+            "architecture-sketch"
+        );
+        let tree = super::super::parse_full(
+            "## Executive Summary\n\ntext\n\n## Executive Summary\n\nmore\n",
+        );
+        assert_eq!(
+            top_heading_slugs(&tree)
+                .into_iter()
+                .map(|(_, s)| s)
+                .collect::<Vec<_>>(),
+            vec!["executive-summary", "executive-summary-1"]
+        );
+        assert_eq!(
+            heading_index_for_fragment(&tree, "executive-summary"),
+            Some(0)
+        );
+        assert_eq!(
+            heading_index_for_fragment(&tree, "executive-summary-1"),
+            Some(2)
+        );
+    }
 
     #[test]
     fn collect_block_selectables_matches_render_keys() {

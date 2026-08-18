@@ -1413,6 +1413,25 @@ fn prompt_turn(
     })
 }
 
+/// Hermes (and other agents without an authoritative turn-end
+/// notification) get a 30s quiet window; Pi and Grok do not — long silent
+/// reasoning / plan writes look finished and a false settle orphans the
+/// real `session/prompt` response. `ZERON_ACP_QUIET_SETTLE_MS` overrides
+/// (0 disables) except for Pi, which stays exempt.
+fn quiet_settle_window(prompt_complete_extension: bool, harness: HarnessId) -> Option<Duration> {
+    if prompt_complete_extension || matches!(harness, HarnessId::Pi) {
+        return None;
+    }
+    match std::env::var("ZERON_ACP_QUIET_SETTLE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(ms) => Some(Duration::from_millis(ms)),
+        None => Some(Duration::from_secs(30)),
+    }
+}
+
 /// Grok's plan-approval reverse-request. ACP reserves `_`-prefixed methods
 /// for extensions; Grok's `ExtRequest::new("x.ai/exit_plan_mode")` lands on
 /// the wire as `_x.ai/exit_plan_mode` (same underscore convention as
@@ -1532,33 +1551,17 @@ fn exit_plan_mode_response(label: Option<&str>) -> Value {
 }
 
 fn plan_approval_question(params: &Value) -> UserInputQuestion {
-    const PREVIEW_LINES: usize = 12;
-    const PREVIEW_CHARS: usize = 600;
     let raw = params
         .get("planContent")
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
+    // Full markdown — the wizard card scrolls and can expand over the
+    // conversation, so a 12-line preview left long plans unreadable.
     let question = if raw.is_empty() {
         "The agent finished planning without writing a plan. Approve and start implementing, request changes, or abandon plan mode?".to_owned()
     } else {
-        let mut preview: String = raw
-            .lines()
-            .take(PREVIEW_LINES)
-            .collect::<Vec<_>>()
-            .join("\n");
-        let truncated = preview.len() < raw.len();
-        if preview.len() > PREVIEW_CHARS {
-            let mut end = PREVIEW_CHARS;
-            while end > 0 && !preview.is_char_boundary(end) {
-                end -= 1;
-            }
-            preview.truncate(end);
-            preview.push('…');
-        } else if truncated {
-            preview.push_str("\n…");
-        }
-        format!("{preview}\n\nApprove this plan and start implementing?")
+        raw.to_owned()
     };
     UserInputQuestion {
         id: new_message_id(),
@@ -2231,21 +2234,14 @@ async fn run_session(session: Session) {
     // resolved. That "looks finished" state is indistinguishable from a
     // dropped reply — 30s of quiet falsely settled live turns mid-thought
     // (Pi 2026-08-17), producing both a premature Done and the stuck-Working
-    // orphan above. Grok settles off `_x.ai/session/prompt_complete`; Hermes
-    // uses this blanket window; the engine watchdog backstops Pi.
-    // `ZERON_ACP_QUIET_SETTLE_MS` overrides; 0 disables.
-    let quiet_settle: Option<Duration> = if matches!(harness, HarnessId::Pi) {
-        None
-    } else {
-        match std::env::var("ZERON_ACP_QUIET_SETTLE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-        {
-            Some(0) => None,
-            Some(ms) => Some(Duration::from_millis(ms)),
-            None => Some(Duration::from_secs(30)),
-        }
-    };
+    // orphan above. Grok is exempt too: it advertises
+    // `_x.ai/session/prompt_complete` as the AUTHORITATIVE turn end, and a
+    // 30s think / long plan-file write looks identical to a dropped reply
+    // (Grok 2026-08-18: timestamp landed, then the session self-continued
+    // when more output arrived). Hermes uses this blanket window; the
+    // engine watchdog backstops Pi and Grok. `ZERON_ACP_QUIET_SETTLE_MS`
+    // overrides; 0 disables.
+    let quiet_settle: Option<Duration> = quiet_settle_window(prompt_complete_extension, harness);
     let mut last_update_at = tokio::time::Instant::now();
     let mut turn_content_seen = false;
     // A steering injection makes the cost hint unsafe for the REST of the
@@ -2511,6 +2507,7 @@ async fn run_session(session: Session) {
                 }
                 Some(Incoming::Request { id, method, params }) => {
                     prompt_stall_deadline = None;
+                    last_update_at = tokio::time::Instant::now();
                     for ev in handle_server_request_live(
                         &client,
                         id,
@@ -3435,6 +3432,16 @@ mod tests {
     }
 
     #[test]
+    fn grok_and_pi_skip_the_quiet_settle_window() {
+        assert!(quiet_settle_window(true, HarnessId::Grok).is_none());
+        assert!(quiet_settle_window(false, HarnessId::Pi).is_none());
+        assert_eq!(
+            quiet_settle_window(false, HarnessId::Hermes),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
     fn ask_user_question_response_maps_picks_and_freeform() {
         let questions = grok_questions_from_params(&json!({
             "sessionId": "s-1",
@@ -3575,15 +3582,23 @@ mod tests {
     }
 
     #[test]
-    fn plan_approval_question_previews_plan_content() {
+    fn plan_approval_question_keeps_full_plan_content() {
+        let long = format!(
+            "# Dummy\n\n{}\n\n## Table of Contents\n\n{}",
+            "Do nothing.\n".repeat(20),
+            (1..=40)
+                .map(|n| format!("- step {n}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
         let question = plan_approval_question(&json!({
             "sessionId": "s-1",
             "toolCallId": "call-1",
-            "planContent": "# Dummy\n\nDo nothing.",
+            "planContent": long.clone(),
         }));
         assert_eq!(question.header, "Plan approval");
-        assert!(question.question.contains("# Dummy"));
-        assert!(question.question.contains("Do nothing."));
+        assert_eq!(question.question, long);
+        assert!(question.question.contains("- step 40"));
         assert_eq!(
             question.options,
             vec!["Approve", "Request changes", "Abandon"]
