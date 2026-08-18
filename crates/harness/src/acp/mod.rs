@@ -993,6 +993,14 @@ impl Harness for AcpHarness {
     fn supports_steering(&self) -> bool {
         true
     }
+    /// Grok's `_x.ai/session/prompt_complete` is the real turn end. The
+    /// engine's 120s / 20s self-continued quiesce would otherwise park a
+    /// long think / subagent wait (execute-plan: chime, timestamp, then
+    /// "parked session resumed") the same way the harness 30s quiet-settle
+    /// used to. Hermes / Pi keep the watchdog.
+    fn deterministic_turn_end(&self) -> bool {
+        self.spec.prompt_complete_extension
+    }
     fn steering_mode(&self) -> SteeringMode {
         self.spec.steering_mode
     }
