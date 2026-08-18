@@ -4,6 +4,7 @@
 //! consumed by the engine, RPC layer, and UI.
 
 mod catalog;
+mod composer;
 mod mime;
 mod model;
 mod provider;
@@ -15,6 +16,7 @@ pub mod venice_overlay;
 mod venice_provider;
 
 pub use catalog::{CapabilityIntersection, intersect_video_globals, picker_models};
+pub use composer::*;
 pub use fake::{FakeMediaProvider, FakeSubmissionMode};
 pub use mime::{accepted_output_mime, sniff_media_mime};
 pub use model::*;
