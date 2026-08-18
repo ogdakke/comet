@@ -4,11 +4,16 @@
 //! mask so a figure-8 has a silhouette and no crossing X.
 
 use std::io::Cursor;
+#[cfg(test)]
 use std::sync::Arc;
 
+#[cfg(test)]
 use gpui::{Image, ImageFormat};
-use image::{GrayImage, Luma, Rgba, RgbaImage};
+use image::{GrayImage, Luma};
+#[cfg(test)]
+use image::{Rgba, RgbaImage};
 
+#[cfg(test)]
 const FILL_ALPHA: u8 = 51; // 20% white
 
 #[derive(Clone, Debug, PartialEq)]
@@ -69,6 +74,7 @@ impl PaintSession {
         stamp_disk(&mut self.mask, point.0, point.1, radius.max(0.5));
     }
 
+    #[cfg(test)]
     pub(super) fn extend_stroke(&mut self, point: (f32, f32)) {
         self.extend_stroke_min(point, 0.75);
     }
@@ -131,6 +137,8 @@ impl PaintSession {
         true
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn overlay_image(&self) -> Option<Arc<Image>> {
         if !self.has_paint() {
             return None;
@@ -246,6 +254,7 @@ fn stamp_capsule(mask: &mut GrayImage, x0: f32, y0: f32, x1: f32, y1: f32, radiu
     }
 }
 
+#[cfg(test)]
 fn overlay_rgba(mask: &GrayImage) -> RgbaImage {
     let width = mask.width();
     let height = mask.height();
@@ -263,6 +272,7 @@ fn overlay_rgba(mask: &GrayImage) -> RgbaImage {
     rgba
 }
 
+#[cfg(test)]
 fn neighbor_empty(mask: &GrayImage, x: u32, y: u32) -> bool {
     let width = mask.width();
     let height = mask.height();

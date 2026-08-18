@@ -117,7 +117,7 @@ pub struct StudioPage {
     pub(super) upscale_settings_menu: popover::Popup<StudioArtifactId>,
     pub(super) upscale_jobs: HashMap<StudioArtifactId, UpscaleJob>,
     pub(super) upscale_watch_tasks: HashMap<StudioConversationId, Task<()>>,
-    pub(super) selected_artifact: Option<StudioArtifactId>,
+    pub(super) selected_frame: Option<super::artifact::ArtifactFrameKey>,
     pub(super) lightbox_frames: Vec<super::artifact::ArtifactFrame>,
     pub(super) compare_pressed: bool,
     pub(super) lightbox_zoom: f32,
@@ -272,7 +272,7 @@ impl StudioPage {
             upscale_settings_menu: popover::Popup::default(),
             upscale_jobs: HashMap::new(),
             upscale_watch_tasks: HashMap::new(),
-            selected_artifact: None,
+            selected_frame: None,
             lightbox_frames: Vec::new(),
             compare_pressed: false,
             lightbox_zoom: 1.0,
@@ -646,9 +646,9 @@ impl StudioPage {
                         page.apply_conversation_summary(view.conversation.clone(), cx);
                         page.conversation = Some(view.clone());
                         if let Some(source_id) = page.pending_edit_source {
-                            page.select_pending_edit(&view, source_id, cx);
-                        } else if page.selected_artifact.is_some() {
-                            page.refresh_lightbox_frames();
+                            page.select_pending_derived(&view, source_id, cx);
+                        } else if page.selected_frame.is_some() {
+                            page.refresh_lightbox_frames(cx);
                         }
                         page.snap_prompt_history(cx);
                         if settled {
@@ -795,9 +795,10 @@ impl StudioPage {
         if self.gallery_anchor == Some(artifact_id) {
             self.gallery_anchor = None;
         }
-        self.lightbox_frames.retain(|frame| frame.id != artifact_id);
-        if self.selected_artifact == Some(artifact_id) {
-            self.selected_artifact = None;
+        self.lightbox_frames
+            .retain(|frame| frame.artifact_id() != Some(artifact_id));
+        if self.selected_artifact_id() == Some(artifact_id) {
+            self.selected_frame = None;
             self.reset_lightbox_viewer();
         }
         if let Some(view) = self.conversation.as_mut() {

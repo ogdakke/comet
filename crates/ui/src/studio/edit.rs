@@ -1,8 +1,8 @@
 //! Lightbox image-edit mode: slim composer, brush, and derived-run submit.
 
 use gpui::{
-    AnyElement, Bounds, Context, Focusable as _, MouseButton, PathBuilder, Pixels, Point,
-    SharedString, Window, canvas, div, point, prelude::*, px, size,
+    AnyElement, Bounds, Context, Focusable as _, MouseButton, PathBuilder, Pixels, Point, Window,
+    canvas, div, point, prelude::*, px, size,
 };
 use zeron_proto::StudioConversationView;
 use zeron_rpc::methods;
@@ -21,10 +21,6 @@ const BRUSH_TRACK_HEIGHT: f32 = 132.0;
 const DEFAULT_BRUSH_T: f32 = 0.28;
 
 impl StudioPage {
-    pub(super) fn editing_artifact(&self) -> Option<StudioArtifactId> {
-        self.edit_target
-    }
-
     pub(super) fn edit_models(&self) -> impl Iterator<Item = &MediaModel> {
         self.edit_models.iter().filter(|model| {
             model.operation == MediaOperation::ImageEdit && model.output_kind == MediaKind::Image
@@ -33,19 +29,6 @@ impl StudioPage {
 
     pub(super) fn edit_is_available(&self) -> bool {
         self.edit_models().next().is_some()
-    }
-
-    pub(super) fn toggle_edit_mode(
-        &mut self,
-        artifact_id: StudioArtifactId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.edit_target == Some(artifact_id) {
-            self.exit_edit_mode(cx);
-            return;
-        }
-        self.enter_edit_mode(artifact_id, window, cx);
     }
 
     pub(super) fn enter_edit_mode(
@@ -68,6 +51,8 @@ impl StudioPage {
         self.edit_paint = Some(PaintSession::new(width, height));
         self.edit_brush_t = DEFAULT_BRUSH_T;
         self.edit_space_pan = false;
+        self.reset_lightbox_swipe();
+        self.lightbox_swipe_locked = false;
         self.edit_prompt.update(cx, |input, cx| {
             input.set_text(String::new(), cx);
         });
@@ -142,13 +127,23 @@ impl StudioPage {
                 )
                 .await;
             this.update(cx, |page, cx| {
-                if let Err(error) = result {
-                    page.pending_edit_source = None;
-                    page.error = Some(error.to_string().into());
-                } else if page.selected_conversation == Some(conversation_id)
-                    && let Some(view) = page.conversation.clone()
-                {
-                    page.select_pending_edit(&view, source_id, cx);
+                match result {
+                    Ok(value) => match serde_json::from_value::<StudioConversationView>(value) {
+                        Ok(view) => {
+                            if page.selected_conversation == Some(conversation_id) {
+                                page.conversation = Some(view.clone());
+                                page.select_pending_derived(&view, source_id, cx);
+                            }
+                        }
+                        Err(error) => {
+                            page.pending_edit_source = None;
+                            page.error = Some(format!("Edit response was invalid: {error}").into());
+                        }
+                    },
+                    Err(error) => {
+                        page.pending_edit_source = None;
+                        page.error = Some(error.to_string().into());
+                    }
                 }
                 cx.notify();
             })
@@ -157,7 +152,7 @@ impl StudioPage {
         .detach();
     }
 
-    pub(super) fn select_pending_edit(
+    pub(super) fn select_pending_derived(
         &mut self,
         view: &StudioConversationView,
         source_id: StudioArtifactId,
@@ -167,30 +162,26 @@ impl StudioPage {
             .into_iter()
             .rev()
             .find(|tile| tile.source_artifact_id == Some(source_id));
-        if let Some(tile) = child {
-            if let Some(artifact_id) = tile.artifact_id {
+        let Some(tile) = child else {
+            return;
+        };
+        self.refresh_lightbox_frames(cx);
+        let key = match tile.artifact_id {
+            Some(artifact_id) => super::artifact::ArtifactFrameKey::Ready(artifact_id),
+            None => super::artifact::ArtifactFrameKey::Loading {
+                run_id: tile.run_id,
+                output_ix: tile.output_ix,
+            },
+        };
+        if let Some(index) = self
+            .lightbox_frames
+            .iter()
+            .position(|frame| frame.key == key)
+        {
+            if tile.artifact_id.is_some() {
                 self.pending_edit_source = None;
-                if self.selected_artifact.is_some() {
-                    if let Some(index) = self
-                        .lightbox_frames
-                        .iter()
-                        .position(|frame| frame.id == artifact_id)
-                    {
-                        self.select_artifact_index(index, cx);
-                    } else {
-                        self.refresh_lightbox_frames();
-                        if let Some(index) = self
-                            .lightbox_frames
-                            .iter()
-                            .position(|frame| frame.id == artifact_id)
-                        {
-                            self.select_artifact_index(index, cx);
-                        }
-                    }
-                }
-            } else if self.selected_artifact.is_some() {
-                self.refresh_lightbox_frames();
             }
+            self.select_artifact_index(index, cx);
         }
     }
 
@@ -230,12 +221,25 @@ impl StudioPage {
         None
     }
 
-    pub(super) fn refresh_lightbox_frames(&mut self) {
-        if self.selected_artifact.is_none() {
+    pub(super) fn refresh_lightbox_frames(&mut self, cx: &mut Context<Self>) {
+        let Some(previous) = self.selected_frame else {
             return;
-        }
+        };
         if let Some(view) = &self.conversation {
             self.lightbox_frames = super::artifact::frames_from_conversation(view);
+        }
+        if let Some(resolved) = super::artifact::resolve_frame_key(previous, &self.lightbox_frames)
+        {
+            self.selected_frame = Some(resolved);
+            if previous.artifact_id().is_none()
+                && let Some(artifact_id) = resolved.artifact_id()
+                && let Some(conversation_id) = self.artifact_conversation(artifact_id)
+            {
+                cx.emit(super::StudioEvent::OpenArtifact {
+                    conversation_id,
+                    artifact_id,
+                });
+            }
         }
     }
 
@@ -666,77 +670,122 @@ fn paint_vector_strokes(
             image_bounds.origin.y + px(y * scale_y),
         )
     };
-    let fill = gpui::hsla(0.0, 0.0, 1.0, 0.22);
-    let outline = gpui::hsla(0.0, 0.0, 1.0, 0.95);
+    // Same recipe as the A8 overlay: 20% white fill, 1.5px white edge.
+    let fill = gpui::hsla(0.0, 0.0, 1.0, 0.20);
+    let outline = gpui::hsla(0.0, 0.0, 1.0, 1.0);
+    let outline_px = 1.5;
     for stroke in strokes {
         if stroke.points.is_empty() {
             continue;
         }
-        let radius_px = stroke.radius * scale_x;
-        let fill_width = (radius_px * 2.0).max(2.0);
-        let outline_width = fill_width + 3.0;
-        paint_smooth_stroke(window, stroke, to_screen, px(outline_width), outline);
-        paint_smooth_stroke(window, stroke, to_screen, px(fill_width), fill);
-        let Some(&(start_x, start_y)) = stroke.points.first() else {
-            continue;
-        };
-        let (end_x, end_y) = stroke.points.last().copied().unwrap_or((start_x, start_y));
-        paint_round_cap(
-            window,
-            to_screen(start_x, start_y),
-            outline_width * 0.5,
-            outline,
-        );
-        paint_round_cap(window, to_screen(start_x, start_y), fill_width * 0.5, fill);
-        if stroke.points.len() > 1 {
-            paint_round_cap(
-                window,
-                to_screen(end_x, end_y),
-                outline_width * 0.5,
-                outline,
-            );
-            paint_round_cap(window, to_screen(end_x, end_y), fill_width * 0.5, fill);
-        }
+        let radius_px = (stroke.radius * scale_x).max(1.0);
+        let screen: Vec<_> = stroke
+            .points
+            .iter()
+            .map(|&(x, y)| to_screen(x, y))
+            .collect();
+        paint_brush_mark(window, &screen, radius_px, fill, outline, outline_px);
     }
 }
 
-fn paint_smooth_stroke(
+fn paint_brush_mark(
     window: &mut Window,
-    stroke: &super::paint::Stroke,
-    to_screen: impl Fn(f32, f32) -> Point<Pixels>,
-    width: Pixels,
-    color: gpui::Hsla,
+    screen: &[Point<Pixels>],
+    radius: f32,
+    fill: gpui::Hsla,
+    outline: gpui::Hsla,
+    outline_px: f32,
 ) {
-    if stroke.points.len() < 2 {
+    let Some(&start) = screen.first() else {
+        return;
+    };
+    paint_round_disk(window, start, radius, fill, outline, outline_px);
+    if screen.len() == 1 {
         return;
     }
-    let mut builder = PathBuilder::stroke(width);
-    let screen: Vec<_> = stroke
-        .points
-        .iter()
-        .map(|&(x, y)| to_screen(x, y))
-        .collect();
-    if screen.len() == 2 {
-        builder.move_to(screen[0]);
-        builder.line_to(screen[1]);
-    } else {
-        builder.move_to(screen[0]);
-        for i in 0..screen.len() - 1 {
-            let p0 = screen[i.saturating_sub(1)];
-            let p1 = screen[i];
-            let p2 = screen[i + 1];
-            let p3 = screen[(i + 2).min(screen.len() - 1)];
-            let c1 = point(p1.x + (p2.x - p0.x) / 6.0, p1.y + (p2.y - p0.y) / 6.0);
-            let c2 = point(p2.x - (p3.x - p1.x) / 6.0, p2.y - (p3.y - p1.y) / 6.0);
-            builder.cubic_bezier_to(p2, c1, c2);
-        }
+    if let Some(&end) = screen.last() {
+        paint_round_disk(window, end, radius, fill, outline, outline_px);
     }
-    if let Ok(path) = builder.build() {
-        window.paint_path(path, color);
+    let samples = catmull_samples(screen);
+    let (left, right) = offset_polyline(&samples, radius);
+    if left.len() < 2 || right.len() < 2 {
+        return;
+    }
+    let mut outline_pts = left.clone();
+    outline_pts.extend(right.iter().rev().copied());
+    let mut fill_path = PathBuilder::fill();
+    fill_path.add_polygon(&outline_pts, true);
+    if let Ok(path) = fill_path.build() {
+        window.paint_path(path, fill);
+    }
+    let mut edge = PathBuilder::stroke(px(outline_px));
+    edge.add_polygon(&outline_pts, true);
+    if let Ok(path) = edge.build() {
+        window.paint_path(path, outline);
     }
 }
 
-fn paint_round_cap(window: &mut Window, center: Point<Pixels>, radius: f32, color: gpui::Hsla) {
+fn catmull_samples(screen: &[Point<Pixels>]) -> Vec<Point<Pixels>> {
+    if screen.len() < 3 {
+        return screen.to_vec();
+    }
+    let mut out = vec![screen[0]];
+    for i in 0..screen.len() - 1 {
+        let p0 = screen[i.saturating_sub(1)];
+        let p1 = screen[i];
+        let p2 = screen[i + 1];
+        let p3 = screen[(i + 2).min(screen.len() - 1)];
+        for step in 1..=4 {
+            let t = step as f32 / 4.0;
+            let c1 = point(p1.x + (p2.x - p0.x) / 6.0, p1.y + (p2.y - p0.y) / 6.0);
+            let c2 = point(p2.x - (p3.x - p1.x) / 6.0, p2.y - (p3.y - p1.y) / 6.0);
+            let u = 1.0 - t;
+            let x = f32::from(p1.x) * (u * u * u)
+                + f32::from(c1.x) * (3.0 * u * u * t)
+                + f32::from(c2.x) * (3.0 * u * t * t)
+                + f32::from(p2.x) * (t * t * t);
+            let y = f32::from(p1.y) * (u * u * u)
+                + f32::from(c1.y) * (3.0 * u * u * t)
+                + f32::from(c2.y) * (3.0 * u * t * t)
+                + f32::from(p2.y) * (t * t * t);
+            out.push(point(px(x), px(y)));
+        }
+    }
+    out
+}
+
+fn offset_polyline(
+    points: &[Point<Pixels>],
+    radius: f32,
+) -> (Vec<Point<Pixels>>, Vec<Point<Pixels>>) {
+    let mut left = Vec::with_capacity(points.len());
+    let mut right = Vec::with_capacity(points.len());
+    for i in 0..points.len() {
+        let prev = if i == 0 { points[0] } else { points[i - 1] };
+        let next = if i + 1 == points.len() {
+            points[i]
+        } else {
+            points[i + 1]
+        };
+        let dx = f32::from(next.x - prev.x);
+        let dy = f32::from(next.y - prev.y);
+        let len = (dx * dx + dy * dy).sqrt().max(0.0001);
+        let nx = -dy / len * radius;
+        let ny = dx / len * radius;
+        left.push(point(points[i].x + px(nx), points[i].y + px(ny)));
+        right.push(point(points[i].x - px(nx), points[i].y - px(ny)));
+    }
+    (left, right)
+}
+
+fn paint_round_disk(
+    window: &mut Window,
+    center: Point<Pixels>,
+    radius: f32,
+    fill: gpui::Hsla,
+    outline: gpui::Hsla,
+    outline_px: f32,
+) {
     let radius = radius.max(1.0);
     window.paint_quad(gpui::quad(
         Bounds {
@@ -744,9 +793,9 @@ fn paint_round_cap(window: &mut Window, center: Point<Pixels>, radius: f32, colo
             size: size(px(radius * 2.0), px(radius * 2.0)),
         },
         px(radius),
-        color,
-        px(0.0),
-        gpui::transparent_black(),
+        fill,
+        px(outline_px),
+        outline,
         gpui::BorderStyle::default(),
     ));
 }

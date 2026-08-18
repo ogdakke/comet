@@ -11,10 +11,11 @@ use gpui::{
     Refineable, ScrollWheelEvent, SharedString, Style, StyleRefinement, Styled, TouchPhase, Window,
     canvas, div, point, prelude::*, px, size,
 };
-use zeron_proto::{StudioConversationView, StudioGalleryItem};
+use zeron_proto::{StudioConversationView, StudioGalleryItem, StudioRunState};
 use zeron_rpc::methods;
-use zeron_studio::{MediaKind, StudioArtifactId, StudioConversationId, StudioTurnId};
+use zeron_studio::{MediaKind, StudioArtifactId, StudioConversationId, StudioRunId, StudioTurnId};
 
+use crate::shader::shader;
 use crate::state::EngineHandle;
 use crate::theme::Theme;
 
@@ -63,13 +64,34 @@ const INSPECTOR_PROMPT_LINE_HEIGHT: f32 = 18.0;
 /// Geist 12px Latin advance — scaled from the 14px chat-bubble estimate.
 const INSPECTOR_PROMPT_ADVANCE: f32 = super::feed::PROMPT_AVG_CHAR_ADVANCE * (12.0 / 14.0);
 
+/// Identity of a lightbox slot: a finished image, or an in-flight output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum ArtifactFrameKey {
+    Ready(StudioArtifactId),
+    Loading {
+        run_id: StudioRunId,
+        output_ix: usize,
+    },
+}
+
+impl ArtifactFrameKey {
+    pub(super) fn artifact_id(self) -> Option<StudioArtifactId> {
+        match self {
+            Self::Ready(id) => Some(id),
+            Self::Loading { .. } => None,
+        }
+    }
+}
+
 /// One frame the artifact viewer can show. Callers build the list;
 /// the viewer never asks where it came from.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct ArtifactFrame {
-    pub id: StudioArtifactId,
+    pub key: ArtifactFrameKey,
     pub conversation_id: StudioConversationId,
     pub turn_id: StudioTurnId,
+    pub run_id: StudioRunId,
+    pub output_ix: usize,
     pub prompt: String,
     pub model_display_name: String,
     pub mime_type: String,
@@ -77,15 +99,55 @@ pub(super) struct ArtifactFrame {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub source_artifact_id: Option<StudioArtifactId>,
+    pub state: StudioRunState,
+    pub progress: Option<f32>,
+}
+
+impl ArtifactFrame {
+    pub(super) fn artifact_id(&self) -> Option<StudioArtifactId> {
+        self.key.artifact_id()
+    }
+
+    pub(super) fn is_loading(&self) -> bool {
+        matches!(
+            self.state,
+            StudioRunState::Queued | StudioRunState::Running | StudioRunState::Downloading
+        ) && self.artifact_id().is_none()
+    }
+}
+
+fn frame_prompt(run: &zeron_proto::StudioRunView, turn: &zeron_proto::StudioTurnView) -> String {
+    run.prompt
+        .clone()
+        .filter(|prompt| !prompt.is_empty())
+        .unwrap_or_else(|| turn.prompt.clone())
+}
+
+pub(super) fn resolve_frame_key(
+    key: ArtifactFrameKey,
+    frames: &[ArtifactFrame],
+) -> Option<ArtifactFrameKey> {
+    match key {
+        ArtifactFrameKey::Ready(id) => frames
+            .iter()
+            .find(|frame| frame.artifact_id() == Some(id))
+            .map(|frame| frame.key),
+        ArtifactFrameKey::Loading { run_id, output_ix } => frames
+            .iter()
+            .find(|frame| frame.run_id == run_id && frame.output_ix == output_ix)
+            .map(|frame| frame.key),
+    }
 }
 
 pub(super) fn frames_from_gallery(items: &[StudioGalleryItem]) -> Vec<ArtifactFrame> {
     items
         .iter()
         .map(|item| ArtifactFrame {
-            id: item.id,
+            key: ArtifactFrameKey::Ready(item.id),
             conversation_id: item.conversation_id,
             turn_id: item.turn_id,
+            run_id: StudioRunId::new(),
+            output_ix: 0,
             prompt: item.prompt.clone(),
             model_display_name: item.model_display_name.clone(),
             mime_type: item.mime_type.clone(),
@@ -93,6 +155,8 @@ pub(super) fn frames_from_gallery(items: &[StudioGalleryItem]) -> Vec<ArtifactFr
             width: item.width,
             height: item.height,
             source_artifact_id: item.source_artifact_id,
+            state: StudioRunState::Succeeded,
+            progress: None,
         })
         .collect()
 }
@@ -101,31 +165,66 @@ pub(super) fn frames_from_conversation(view: &StudioConversationView) -> Vec<Art
     super::lineage::lineage_tiles(view)
         .into_iter()
         .filter_map(|tile| {
-            let artifact_id = tile.artifact_id?;
             let turn = view.turns.iter().find(|turn| turn.id == tile.turn_id)?;
             let run = turn.runs.iter().find(|run| run.id == tile.run_id)?;
-            let artifact = run
-                .artifacts
-                .iter()
-                .find(|artifact| artifact.id == artifact_id)?;
-            if artifact.media_kind != MediaKind::Image {
+            if run.model.output_kind != MediaKind::Image {
+                return None;
+            }
+            let prompt = frame_prompt(run, turn);
+            let (aw, ah) = tile.aspect;
+            if let Some(artifact_id) = tile.artifact_id {
+                let artifact = run
+                    .artifacts
+                    .iter()
+                    .find(|artifact| artifact.id == artifact_id)?;
+                if artifact.media_kind != MediaKind::Image {
+                    return None;
+                }
+                return Some(ArtifactFrame {
+                    key: ArtifactFrameKey::Ready(artifact.id),
+                    conversation_id: view.conversation.id,
+                    turn_id: turn.id,
+                    run_id: run.id,
+                    output_ix: tile.output_ix,
+                    prompt,
+                    model_display_name: run.model.display_name.clone(),
+                    mime_type: artifact.mime_type.clone(),
+                    size_bytes: artifact.size_bytes,
+                    width: artifact.width.or(Some(aw)),
+                    height: artifact.height.or(Some(ah)),
+                    source_artifact_id: tile.source_artifact_id,
+                    state: run.state,
+                    progress: run.progress,
+                });
+            }
+            if !matches!(
+                run.state,
+                StudioRunState::Queued
+                    | StudioRunState::Running
+                    | StudioRunState::Downloading
+                    | StudioRunState::Failed
+                    | StudioRunState::Cancelled
+            ) {
                 return None;
             }
             Some(ArtifactFrame {
-                id: artifact.id,
+                key: ArtifactFrameKey::Loading {
+                    run_id: run.id,
+                    output_ix: tile.output_ix,
+                },
                 conversation_id: view.conversation.id,
                 turn_id: turn.id,
-                prompt: run
-                    .prompt
-                    .clone()
-                    .filter(|prompt| !prompt.is_empty())
-                    .unwrap_or_else(|| turn.prompt.clone()),
+                run_id: run.id,
+                output_ix: tile.output_ix,
+                prompt,
                 model_display_name: run.model.display_name.clone(),
-                mime_type: artifact.mime_type.clone(),
-                size_bytes: artifact.size_bytes,
-                width: artifact.width,
-                height: artifact.height,
+                mime_type: String::new(),
+                size_bytes: 0,
+                width: (aw > 0).then_some(aw),
+                height: (ah > 0).then_some(ah),
                 source_artifact_id: tile.source_artifact_id,
+                state: run.state,
+                progress: run.progress,
             })
         })
         .collect()
@@ -133,22 +232,28 @@ pub(super) fn frames_from_conversation(view: &StudioConversationView) -> Vec<Art
 
 pub(super) fn lightbox_neighbor_ids(
     frames: &[ArtifactFrame],
-    selected: StudioArtifactId,
+    selected: ArtifactFrameKey,
 ) -> Vec<StudioArtifactId> {
-    let Some(index) = frames.iter().position(|frame| frame.id == selected) else {
+    let Some(index) = frames.iter().position(|frame| frame.key == selected) else {
         return Vec::new();
     };
     let mut ids = Vec::with_capacity(LIGHTBOX_PREFETCH * 2 + 1);
-    ids.push(frames[index].id);
+    if let Some(id) = frames[index].artifact_id() {
+        ids.push(id);
+    }
     for step in 1..=LIGHTBOX_PREFETCH {
-        if let Some(frame) = frames.get(index + step) {
-            ids.push(frame.id);
+        if let Some(id) = frames
+            .get(index + step)
+            .and_then(ArtifactFrame::artifact_id)
+        {
+            ids.push(id);
         }
-        if let Some(frame) = index
+        if let Some(id) = index
             .checked_sub(step)
             .and_then(|previous| frames.get(previous))
+            .and_then(ArtifactFrame::artifact_id)
         {
-            ids.push(frame.id);
+            ids.push(id);
         }
     }
     ids
@@ -855,14 +960,22 @@ impl StudioPage {
         }));
     }
 
-    pub(super) fn artifact_sequence(&self) -> Vec<StudioArtifactId> {
-        self.lightbox_frames.iter().map(|frame| frame.id).collect()
+    pub(super) fn selected_artifact_id(&self) -> Option<StudioArtifactId> {
+        self.selected_frame.and_then(ArtifactFrameKey::artifact_id)
+    }
+
+    pub(super) fn artifact_sequence(&self) -> Vec<ArtifactFrameKey> {
+        self.lightbox_frames.iter().map(|frame| frame.key).collect()
     }
 
     pub(super) fn artifact_frame(&self, artifact_id: StudioArtifactId) -> Option<&ArtifactFrame> {
         self.lightbox_frames
             .iter()
-            .find(|frame| frame.id == artifact_id)
+            .find(|frame| frame.artifact_id() == Some(artifact_id))
+    }
+
+    pub(super) fn frame_by_key(&self, key: ArtifactFrameKey) -> Option<&ArtifactFrame> {
+        self.lightbox_frames.iter().find(|frame| frame.key == key)
     }
 
     fn upscaled_source_for(&self, artifact_id: StudioArtifactId) -> Option<StudioArtifactId> {
@@ -871,7 +984,7 @@ impl StudioPage {
     }
 
     fn lightbox_display_artifact_id(&self) -> Option<StudioArtifactId> {
-        let selected = self.selected_artifact?;
+        let selected = self.selected_artifact_id()?;
         if self.compare_pressed {
             self.upscaled_source_for(selected).or(Some(selected))
         } else {
@@ -880,7 +993,7 @@ impl StudioPage {
     }
 
     pub(super) fn begin_artifact_compare(&mut self, cx: &mut Context<Self>) {
-        let Some(selected) = self.selected_artifact else {
+        let Some(selected) = self.selected_artifact_id() else {
             return;
         };
         let Some(source) = self.upscaled_source_for(selected) else {
@@ -918,12 +1031,27 @@ impl StudioPage {
     ) {
         self.close_image_menu(cx);
         self.close_upscale_settings_menu(cx);
+        self.open_frame_viewer(ArtifactFrameKey::Ready(id), frames, cx);
+    }
+
+    pub(super) fn open_frame_viewer(
+        &mut self,
+        key: ArtifactFrameKey,
+        frames: Vec<ArtifactFrame>,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_image_menu(cx);
+        self.close_upscale_settings_menu(cx);
         self.lightbox_frames = frames;
-        if let Some(index) = self.lightbox_frames.iter().position(|frame| frame.id == id) {
+        if let Some(index) = self
+            .lightbox_frames
+            .iter()
+            .position(|frame| frame.key == key)
+        {
             self.select_artifact_index(index, cx);
             return;
         }
-        if self.selected_artifact.take().is_some() {
+        if self.selected_frame.take().is_some() {
             self.reset_lightbox_viewer();
             cx.emit(StudioEvent::CloseArtifact);
         }
@@ -978,12 +1106,12 @@ impl StudioPage {
     }
 
     pub(super) fn adopt_artifact_index(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
-        let artifacts = self.artifact_sequence();
-        let Some(artifact_id) = artifacts.get(index).copied() else {
+        let sequence = self.artifact_sequence();
+        let Some(key) = sequence.get(index).copied() else {
             return false;
         };
-        let changed = self.selected_artifact != Some(artifact_id);
-        self.selected_artifact = Some(artifact_id);
+        let changed = self.selected_frame != Some(key);
+        self.selected_frame = Some(key);
         self.compare_pressed = false;
         self.snap_lightbox_to_fit();
         self.lightbox_drag = None;
@@ -991,7 +1119,9 @@ impl StudioPage {
             self.close_upscale_settings_menu(cx);
             self.inspector_scroll.set_offset(Point::default());
         }
-        if let Some(conversation_id) = self.artifact_conversation(artifact_id) {
+        if let Some(artifact_id) = key.artifact_id()
+            && let Some(conversation_id) = self.artifact_conversation(artifact_id)
+        {
             cx.emit(StudioEvent::OpenArtifact {
                 conversation_id,
                 artifact_id,
@@ -1005,11 +1135,11 @@ impl StudioPage {
     }
 
     pub(super) fn visible_filmstrip_ids(&self) -> Vec<StudioArtifactId> {
-        let Some(selected) = self.selected_artifact else {
+        let Some(selected) = self.selected_frame else {
             return Vec::new();
         };
         let sequence = self.artifact_sequence();
-        let Some(index) = sequence.iter().position(|id| *id == selected) else {
+        let Some(index) = sequence.iter().position(|key| *key == selected) else {
             return Vec::new();
         };
         let range = filmstrip_visible_range(
@@ -1017,7 +1147,12 @@ impl StudioPage {
             sequence.len(),
             filmstrip_viewport_width(self.lightbox_stage_width),
         );
-        sequence.get(range).unwrap_or(&[]).to_vec()
+        sequence
+            .get(range)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|key| key.artifact_id())
+            .collect()
     }
 
     pub(super) fn select_artifact_index(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
@@ -1034,10 +1169,10 @@ impl StudioPage {
         cx: &mut Context<Self>,
     ) -> bool {
         let artifacts = self.artifact_sequence();
-        let Some(selected) = self.selected_artifact else {
+        let Some(selected) = self.selected_frame else {
             return false;
         };
-        let Some(index) = artifacts.iter().position(|id| *id == selected) else {
+        let Some(index) = artifacts.iter().position(|key| *key == selected) else {
             return false;
         };
         let next = stepped_artifact_index(index, artifacts.len(), delta, wraps);
@@ -1068,11 +1203,11 @@ impl StudioPage {
         cx: &mut Context<Self>,
     ) {
         if self.artifact_frame(artifact_id).is_some() {
-            if self.selected_artifact != Some(artifact_id) {
+            if self.selected_artifact_id() != Some(artifact_id) {
                 if let Some(index) = self
                     .lightbox_frames
                     .iter()
-                    .position(|frame| frame.id == artifact_id)
+                    .position(|frame| frame.artifact_id() == Some(artifact_id))
                 {
                     self.adopt_artifact_index(index, cx);
                 }
@@ -1080,7 +1215,10 @@ impl StudioPage {
             return;
         }
         let frames = self.surface_artifact_frames();
-        if frames.iter().any(|frame| frame.id == artifact_id) {
+        if frames
+            .iter()
+            .any(|frame| frame.artifact_id() == Some(artifact_id))
+        {
             self.open_artifact_viewer(artifact_id, frames, cx);
             return;
         }
@@ -1092,8 +1230,11 @@ impl StudioPage {
     pub fn close_artifact(&mut self, cx: &mut Context<Self>) {
         self.close_image_menu(cx);
         self.close_upscale_settings_menu(cx);
-        if let Some(id) = self.selected_artifact.take() {
-            self.reveal_gallery_artifact_if_needed(id);
+        let previous = self.selected_artifact_id();
+        if self.selected_frame.take().is_some() {
+            if let Some(id) = previous {
+                self.reveal_gallery_artifact_if_needed(id);
+            }
             self.lightbox_frames.clear();
             self.reset_lightbox_viewer();
             self.request_visible_gallery_images(cx);
@@ -1106,8 +1247,11 @@ impl StudioPage {
     pub(super) fn request_close_artifact(&mut self, cx: &mut Context<Self>) {
         self.close_upscale_settings_menu(cx);
         self.exit_edit_mode(cx);
-        if let Some(id) = self.selected_artifact.take() {
-            self.reveal_gallery_artifact_if_needed(id);
+        let previous = self.selected_artifact_id();
+        if self.selected_frame.take().is_some() {
+            if let Some(id) = previous {
+                self.reveal_gallery_artifact_if_needed(id);
+            }
             cx.emit(StudioEvent::CloseArtifact);
             cx.notify();
         }
@@ -1422,8 +1566,8 @@ impl StudioPage {
         if target.abs() > 1.0 {
             let artifacts = self.artifact_sequence();
             let index = self
-                .selected_artifact
-                .and_then(|selected| artifacts.iter().position(|id| *id == selected))
+                .selected_frame
+                .and_then(|selected| artifacts.iter().position(|key| *key == selected))
                 .unwrap_or(0);
             let delta = if target < 0.0 { 1 } else { -1 };
             let next = stepped_artifact_index(index, artifacts.len(), delta, false);
@@ -1474,8 +1618,8 @@ impl StudioPage {
         let offset = self.lightbox_swipe_x;
         let artifacts = self.artifact_sequence();
         let index = self
-            .selected_artifact
-            .and_then(|selected| artifacts.iter().position(|id| *id == selected))
+            .selected_frame
+            .and_then(|selected| artifacts.iter().position(|key| *key == selected))
             .unwrap_or(0);
         let target = lightbox_paging_target(
             offset,
@@ -1550,6 +1694,10 @@ impl StudioPage {
             cx.stop_propagation();
             return;
         }
+        if self.edit_target.is_some() {
+            cx.stop_propagation();
+            return;
+        }
         if horizontal.abs() < f32::EPSILON {
             cx.stop_propagation();
             return;
@@ -1570,8 +1718,8 @@ impl StudioPage {
         self.lightbox_swipe_last_tick = Some(now);
         let artifacts = self.artifact_sequence();
         let index = self
-            .selected_artifact
-            .and_then(|selected| artifacts.iter().position(|id| *id == selected))
+            .selected_frame
+            .and_then(|selected| artifacts.iter().position(|key| *key == selected))
             .unwrap_or(0);
         self.lightbox_swipe_x = apply_lightbox_swipe_delta(
             self.lightbox_swipe_x,
@@ -1701,14 +1849,16 @@ impl StudioPage {
     }
 
     fn warm_lightbox_neighbors(&self, window: &mut Window, cx: &mut gpui::App) {
-        let Some(selected) = self.selected_artifact else {
+        let Some(selected) = self.selected_frame else {
             return;
         };
         // GPU-warm only the current slide and its immediate neighbors. Encoded
         // prefetch still walks LIGHTBOX_PREFETCH; uploading all of those
         // originals is what pushed Activity Monitor past 4GB.
         let mut ids = Vec::with_capacity(LIGHTBOX_PREFETCH * 2 + 2);
-        if let Some(source) = self.upscaled_source_for(selected) {
+        if let Some(ready) = selected.artifact_id()
+            && let Some(source) = self.upscaled_source_for(ready)
+        {
             ids.push(source);
         }
         ids.extend(lightbox_neighbor_ids(&self.lightbox_frames, selected));
@@ -1724,17 +1874,24 @@ impl StudioPage {
 
     pub(super) fn render_lightbox_slide(
         &self,
-        artifact_id: Option<StudioArtifactId>,
+        key: Option<ArtifactFrameKey>,
         page: Option<(f32, f32)>,
         theme: &Theme,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let artifact_id = key.and_then(ArtifactFrameKey::artifact_id);
+        let slot = key.and_then(|key| self.frame_by_key(key));
         let (base, overlay) = artifact_id
             .map(|id| self.display_layers(id, StudioPaint::Full, window, cx))
             .unwrap_or((None, None));
-        let slide_id = match artifact_id {
-            Some(id) => SharedString::from(format!("studio-artifact-slide-{}", id.0)),
+        let slide_id = match key {
+            Some(ArtifactFrameKey::Ready(id)) => {
+                SharedString::from(format!("studio-artifact-slide-{}", id.0))
+            }
+            Some(ArtifactFrameKey::Loading { run_id, output_ix }) => {
+                SharedString::from(format!("studio-artifact-slide-{}-{output_ix}", run_id.0))
+            }
             None => SharedString::from("studio-artifact-slide-empty"),
         };
         let frame = if let Some((left, width)) = page {
@@ -1840,14 +1997,57 @@ impl StudioPage {
         };
         match base {
             Some(base) => frame.child(stack(base, overlay)).into_any_element(),
-            None => frame
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(theme.text_faint)
-                        .child("Loading image…"),
-                )
-                .into_any_element(),
+            None => {
+                let loading = slot.and_then(|slot| {
+                    let seed = slot.run_id.0.as_u128() as u32 ^ slot.output_ix as u32;
+                    let (effect, wash) =
+                        super::feed::loading_effect(seed, slot.state, slot.progress)?;
+                    let (aw, ah) = slot
+                        .width
+                        .zip(slot.height)
+                        .filter(|(w, h)| *w > 0 && *h > 0)
+                        .unwrap_or((1, 1));
+                    let (width, height) = if measured {
+                        lightbox_contain_size(
+                            self.lightbox_stage_width,
+                            self.lightbox_stage_height,
+                            aw as f32,
+                            ah as f32,
+                        )
+                    } else {
+                        (320.0, 320.0 * ah as f32 / aw.max(1) as f32)
+                    };
+                    Some(
+                        shader(effect)
+                            .progress(wash)
+                            .flex_none()
+                            .w(px(width))
+                            .h(px(height))
+                            .rounded(px(12.0)),
+                    )
+                });
+                let failed = slot.is_some_and(|slot| slot.state == StudioRunState::Failed);
+                let show_fallback = loading.is_none() && !failed;
+                frame
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when_some(loading, |box_, fill| box_.child(fill))
+                            .when(failed, |box_| {
+                                box_.text_size(px(12.0))
+                                    .text_color(theme.text_faint)
+                                    .child("Generation failed")
+                            })
+                            .when(show_fallback, |box_| {
+                                box_.text_size(px(12.0))
+                                    .text_color(theme.text_faint)
+                                    .child("Loading image…")
+                            }),
+                    )
+                    .into_any_element()
+            }
         }
     }
 
@@ -1857,39 +2057,40 @@ impl StudioPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let id = self.selected_artifact?;
+        let key = self.selected_frame?;
+        let id = key.artifact_id();
         self.warm_lightbox_neighbors(window, cx);
         let sequence = self.artifact_sequence();
         let selected_index = sequence
             .iter()
-            .position(|candidate| *candidate == id)
+            .position(|candidate| *candidate == key)
             .unwrap_or(0);
-        let details = self.artifact_frame(id).map(|frame| {
+        let selected = self.frame_by_key(key);
+        let details = selected.map(|frame| {
             (
                 frame.turn_id,
                 frame.prompt.clone(),
                 frame.model_display_name.clone(),
                 frame.mime_type.clone(),
                 frame.size_bytes,
+                frame.is_loading() || frame.artifact_id().is_none(),
             )
         });
-        let compare_source = self
-            .compare_pressed
-            .then(|| self.upscaled_source_for(id))
-            .flatten();
+        let compare_source = id.and_then(|id| {
+            self.compare_pressed
+                .then(|| self.upscaled_source_for(id))
+                .flatten()
+        });
         let filmstrip_viewport = filmstrip_viewport_width(self.lightbox_stage_width);
         let filmstrip_range =
             filmstrip_visible_range(selected_index, sequence.len(), filmstrip_viewport);
         let thumbnails = filmstrip_range
-            .filter_map(|index| {
-                sequence
-                    .get(index)
-                    .copied()
-                    .map(|artifact_id| (index, artifact_id))
-            })
-            .map(|(index, artifact_id)| {
-                let (thumbnail, sharp) =
-                    self.display_layers(artifact_id, StudioPaint::Thumb, window, cx);
+            .filter_map(|index| sequence.get(index).copied().map(|key| (index, key)))
+            .map(|(index, thumb_key)| {
+                let artifact_id = thumb_key.artifact_id();
+                let (thumbnail, sharp) = artifact_id
+                    .map(|id| self.display_layers(id, StudioPaint::Thumb, window, cx))
+                    .unwrap_or((None, None));
                 let frame_size = filmstrip_thumb_size(index, selected_index);
                 let origin = filmstrip_thumb_origin(index, selected_index)
                     + filmstrip_offset(selected_index, filmstrip_viewport);
@@ -1919,18 +2120,20 @@ impl StudioPage {
                     .on_click(cx.listener(move |page, _, _, cx| {
                         page.select_artifact_index(index, cx);
                     }));
-                let frame = match self.artifact_menu_conversation(artifact_id) {
+                let frame = match artifact_id.and_then(|id| self.artifact_menu_conversation(id)) {
                     Some(conversation_id) => self.bind_image_menu(
                         frame,
-                        artifact_id,
+                        artifact_id.unwrap(),
                         conversation_id,
                         super::image_menu::ImageSurface::Filmstrip,
                         cx,
                     ),
                     None => frame,
                 };
-                match thumbnail {
-                    Some(thumbnail) => frame
+                if let Some(thumbnail) = thumbnail
+                    && let Some(artifact_id) = artifact_id
+                {
+                    return frame
                         .child(cover_layers(
                             thumbnail,
                             sharp,
@@ -1940,9 +2143,20 @@ impl StudioPage {
                                 artifact_id.0
                             ))),
                         ))
-                        .into_any_element(),
-                    None => frame.into_any_element(),
+                        .into_any_element();
                 }
+                if let Some(slot) = self.frame_by_key(thumb_key)
+                    && let Some((effect, wash)) = super::feed::loading_effect(
+                        slot.run_id.0.as_u128() as u32 ^ slot.output_ix as u32,
+                        slot.state,
+                        slot.progress,
+                    )
+                {
+                    return frame
+                        .child(shader(effect).progress(wash).size_full().rounded(px(7.0)))
+                        .into_any_element();
+                }
+                frame.into_any_element()
             })
             .collect::<Vec<_>>();
         let filmstrip_x = filmstrip_offset(selected_index, filmstrip_viewport);
@@ -1954,14 +2168,20 @@ impl StudioPage {
         let page_width = self.lightbox_stage_width;
         let mut slides = Vec::new();
         if let Some(compare_source) = compare_source {
-            slides.push(self.render_lightbox_slide(Some(compare_source), None, theme, window, cx));
+            slides.push(self.render_lightbox_slide(
+                Some(ArtifactFrameKey::Ready(compare_source)),
+                None,
+                theme,
+                window,
+                cx,
+            ));
         } else if !lightbox_uses_paging_slides(
             zoomed,
             page_width,
             self.lightbox_swipe_x,
             self.lightbox_snap.is_some(),
         ) {
-            slides.push(self.render_lightbox_slide(Some(id), None, theme, window, cx));
+            slides.push(self.render_lightbox_slide(Some(key), None, theme, window, cx));
         } else {
             if selected_index > 0 {
                 slides.push(self.render_lightbox_slide(
@@ -1973,15 +2193,15 @@ impl StudioPage {
                 ));
             }
             slides.push(self.render_lightbox_slide(
-                Some(id),
+                Some(key),
                 Some((self.lightbox_swipe_x, page_width)),
                 theme,
                 window,
                 cx,
             ));
-            if let Some(next_id) = sequence.get(selected_index + 1).copied() {
+            if let Some(next_key) = sequence.get(selected_index + 1).copied() {
                 slides.push(self.render_lightbox_slide(
-                    Some(next_id),
+                    Some(next_key),
                     Some((self.lightbox_swipe_x + page_width, page_width)),
                     theme,
                     window,
@@ -2093,7 +2313,7 @@ impl StudioPage {
                     .text_color(theme.text_muted.opacity(0.7)),
             );
 
-        let compare_button = self.upscaled_source_for(id).map(|_| {
+        let compare_button = id.and_then(|id| self.upscaled_source_for(id)).map(|_| {
             div()
                 .id("studio-artifact-compare")
                 .size(px(28.0))
@@ -2188,7 +2408,7 @@ impl StudioPage {
             .pb(px(16.0))
             .when_some(
                 details,
-                |inspector, (turn_id, prompt, model, mime, size)| {
+                |inspector, (turn_id, prompt, model, mime, size, pending)| {
                     let has_prompt = !prompt.trim().is_empty();
                     inspector
                         .when(has_prompt, |inspector| {
@@ -2276,72 +2496,76 @@ impl StudioPage {
                                 .when(has_prompt, |meta| meta.mt(px(14.0)))
                                 .text_size(px(11.0))
                                 .text_color(theme.text_muted)
-                                .child(SharedString::from(format!(
-                                    "{model} · {mime} · {:.1} KB",
-                                    size as f64 / 1024.0
-                                ))),
+                                .child(SharedString::from(if pending || mime.is_empty() {
+                                    model
+                                } else {
+                                    format!("{model} · {mime} · {:.1} KB", size as f64 / 1024.0)
+                                })),
                         )
                 },
             )
             .child(div().flex_1())
-            .child(self.render_edit_action(id, theme, cx))
-            .child(div().h(px(8.0)))
-            .child(self.render_artifact_upscale_actions(id, theme, cx))
-            .child(
-                div()
-                    .mt(px(8.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
+            .when_some(id, |inspector, id| {
+                inspector
+                    .child(self.render_edit_action(id, theme, cx))
+                    .child(div().h(px(8.0)))
+                    .child(self.render_artifact_upscale_actions(id, theme, cx))
                     .child(
                         div()
-                            .id("studio-download-artifact")
-                            .h(px(32.0))
-                            .flex_1()
+                            .mt(px(8.0))
+                            .flex_none()
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .gap(px(7.0))
-                            .rounded(px(7.0))
-                            .border_1()
-                            .border_color(theme.border)
-                            .cursor_pointer()
-                            .hover(|style| style.bg(crate::theme::wash(0.09)))
-                            .on_click(
-                                cx.listener(move |page, _, _, cx| page.download_artifact(id, cx)),
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .id("studio-download-artifact")
+                                    .h(px(32.0))
+                                    .flex_1()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap(px(7.0))
+                                    .rounded(px(7.0))
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(crate::theme::wash(0.09)))
+                                    .on_click(cx.listener(move |page, _, _, cx| {
+                                        page.download_artifact(id, cx)
+                                    }))
+                                    .child(
+                                        crate::icons::icon(crate::icons::ARROW_DOWN)
+                                            .size(px(14.0))
+                                            .text_color(theme.text_muted),
+                                    )
+                                    .child("Download"),
                             )
                             .child(
-                                crate::icons::icon(crate::icons::ARROW_DOWN)
-                                    .size(px(14.0))
-                                    .text_color(theme.text_muted),
-                            )
-                            .child("Download"),
+                                div()
+                                    .id("studio-delete-artifact")
+                                    .h(px(32.0))
+                                    .flex_1()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap(px(7.0))
+                                    .rounded(px(7.0))
+                                    .cursor_pointer()
+                                    .text_color(theme.danger)
+                                    .hover(|style| style.bg(theme.danger.opacity(0.08)))
+                                    .on_click(cx.listener(move |page, _, _, cx| {
+                                        page.delete_artifact(id, cx)
+                                    }))
+                                    .child(
+                                        crate::icons::icon(crate::icons::TRASH_BIN_MINIMALISTIC)
+                                            .size(px(14.0))
+                                            .text_color(theme.danger),
+                                    )
+                                    .child("Delete"),
+                            ),
                     )
-                    .child(
-                        div()
-                            .id("studio-delete-artifact")
-                            .h(px(32.0))
-                            .flex_1()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .gap(px(7.0))
-                            .rounded(px(7.0))
-                            .cursor_pointer()
-                            .text_color(theme.danger)
-                            .hover(|style| style.bg(theme.danger.opacity(0.08)))
-                            .on_click(
-                                cx.listener(move |page, _, _, cx| page.delete_artifact(id, cx)),
-                            )
-                            .child(
-                                crate::icons::icon(crate::icons::TRASH_BIN_MINIMALISTIC)
-                                    .size(px(14.0))
-                                    .text_color(theme.danger),
-                            )
-                            .child("Delete"),
-                    ),
-            );
+            });
 
         Some(
             div()
@@ -2752,9 +2976,11 @@ mod tests {
 
     fn test_frame(conversation: StudioConversationId, id: StudioArtifactId) -> ArtifactFrame {
         ArtifactFrame {
-            id,
+            key: ArtifactFrameKey::Ready(id),
             conversation_id: conversation,
             turn_id: StudioTurnId::new(),
+            run_id: StudioRunId::new(),
+            output_ix: 0,
             prompt: "prompt".into(),
             model_display_name: "model".into(),
             mime_type: "image/png".into(),
@@ -2762,6 +2988,8 @@ mod tests {
             width: Some(1),
             height: Some(1),
             source_artifact_id: None,
+            state: StudioRunState::Succeeded,
+            progress: None,
         }
     }
 
@@ -2774,8 +3002,14 @@ mod tests {
             .copied()
             .map(|id| test_frame(conversation, id))
             .collect();
-        assert_eq!(frames.iter().map(|frame| frame.id).collect::<Vec<_>>(), ids);
-        let neighbors = lightbox_neighbor_ids(&frames, ids[1]);
+        assert_eq!(
+            frames
+                .iter()
+                .filter_map(ArtifactFrame::artifact_id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        let neighbors = lightbox_neighbor_ids(&frames, ArtifactFrameKey::Ready(ids[1]));
         assert_eq!(neighbors[0], ids[1]);
         assert!(neighbors.contains(&ids[0]));
         assert!(neighbors.contains(&ids[2]));
@@ -2860,7 +3094,92 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].conversation_id, conversation_id);
         assert_ne!(frames[0].conversation_id, other);
-        assert_eq!(frames[0].id, artifact.id);
+        assert_eq!(frames[0].artifact_id(), Some(artifact.id));
+    }
+
+    #[test]
+    fn conversation_frames_include_in_flight_slots() {
+        use chrono::Utc;
+        use std::collections::BTreeMap;
+        let conversation_id = StudioConversationId::new();
+        let run_id = StudioRunId::new();
+        let view = StudioConversationView {
+            conversation: zeron_proto::StudioConversationSummary {
+                id: conversation_id,
+                title: "one".into(),
+                turn_count: 1,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                archived: false,
+                forked_from_turn_id: None,
+                creating: false,
+                done: false,
+            },
+            turns: vec![zeron_proto::StudioTurnView {
+                id: StudioTurnId::new(),
+                position: 0,
+                prompt: "a fox".into(),
+                source_turn_id: None,
+                batch_id: zeron_studio::StudioBatchId::new(),
+                created_at: Utc::now(),
+                runs: vec![zeron_proto::StudioRunView {
+                    id: run_id,
+                    position: 0,
+                    provider_id: "venice".into(),
+                    model: zeron_studio::MediaModel {
+                        provider_id: "venice".into(),
+                        id: "flux".into(),
+                        display_name: "Flux".into(),
+                        description: None,
+                        operation: zeron_studio::MediaOperation::TextToImage,
+                        output_kind: MediaKind::Image,
+                        output_mime_types: vec!["image/png".into()],
+                        input_constraints: Vec::new(),
+                        prompt_maximum_chars: None,
+                        negative_prompt_maximum_chars: None,
+                        maximum_output_count: 8,
+                        controls: Vec::new(),
+                        pricing: None,
+                        features: Vec::new(),
+                        manifest_version: "test".into(),
+                        fetched_at: Utc::now(),
+                    },
+                    controls: BTreeMap::new(),
+                    output_count: 1,
+                    display_aspect_ratio: (2, 3),
+                    state: StudioRunState::Running,
+                    progress: None,
+                    error: None,
+                    quote: None,
+                    prompt: Some("a fox".into()),
+                    inputs: Vec::new(),
+                    artifacts: Vec::new(),
+                }],
+            }],
+        };
+        let frames = frames_from_conversation(&view);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].key,
+            ArtifactFrameKey::Loading {
+                run_id,
+                output_ix: 0
+            }
+        );
+        assert_eq!(frames[0].prompt, "a fox");
+        assert_eq!(frames[0].width, Some(2));
+        assert_eq!(frames[0].height, Some(3));
+        assert!(frames[0].is_loading());
+        assert_eq!(
+            resolve_frame_key(
+                ArtifactFrameKey::Loading {
+                    run_id,
+                    output_ix: 0
+                },
+                &frames
+            ),
+            Some(frames[0].key)
+        );
     }
 
     #[test]

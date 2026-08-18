@@ -6,7 +6,9 @@
 use std::collections::BTreeMap;
 
 use gpui::{AnyElement, Context, IntoElement, SharedString, div, prelude::*, px};
-use zeron_proto::{StudioConversationView, StudioRunState, StudioTurnView};
+#[cfg(test)]
+use zeron_proto::StudioTurnView;
+use zeron_proto::{StudioConversationView, StudioRunState};
 use zeron_rpc::methods;
 use zeron_studio::{
     ControlId, ControlValue, GenerationInputSource, MediaModel, MediaOperation, StudioArtifactId,
@@ -346,6 +348,7 @@ impl StudioPage {
                 run_id: None,
             },
         );
+        self.pending_edit_source = Some(artifact_id);
         self.ensure_upscale_watch(conversation_id, cx);
         self.close_upscale_settings_menu(cx);
         cx.notify();
@@ -382,16 +385,20 @@ impl StudioPage {
                             if let Some(job) = page.upscale_jobs.get_mut(&artifact_id) {
                                 job.run_id = find_upscale_run(&view, artifact_id).map(|run| run.id);
                             }
+                            page.conversation = Some(view.clone());
+                            page.select_pending_derived(&view, artifact_id, cx);
                             page.observe_upscale_view(&view, cx);
                         }
                         Err(error) => {
                             page.upscale_jobs.remove(&artifact_id);
+                            page.pending_edit_source = None;
                             page.error =
                                 Some(format!("Upscale response was invalid: {error}").into());
                         }
                     },
                     Err(error) => {
                         page.upscale_jobs.remove(&artifact_id);
+                        page.pending_edit_source = None;
                         page.error = Some(error.to_string().into());
                     }
                 }
@@ -505,6 +512,7 @@ impl StudioPage {
 
 /// Hide derived-only turns as feed rows. Their images are spliced next to
 /// the source by [`super::lineage`].
+#[cfg(test)]
 pub(super) fn visible_conversation_view(view: &StudioConversationView) -> StudioConversationView {
     let mut visible = view.clone();
     visible.turns = super::lineage::visible_root_turns(view);

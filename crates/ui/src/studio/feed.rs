@@ -390,6 +390,7 @@ fn lineage_image_ids(
 }
 
 /// Image ids on `turns[range]`. Non-image artifacts and holes are skipped.
+#[cfg(test)]
 pub(super) fn feed_image_ids(
     turns: &[StudioTurnView],
     range: Range<usize>,
@@ -625,6 +626,19 @@ fn feed_output_slots(run: &StudioRunView) -> Vec<(usize, Option<StudioArtifactId
     }
 }
 
+pub(super) fn loading_effect(
+    seed: u32,
+    state: StudioRunState,
+    progress: Option<f32>,
+) -> Option<(Effect, Option<f32>)> {
+    match state {
+        StudioRunState::Queued => Some((Effect::SoftNoise { seed, amount: 0.7 }, None)),
+        StudioRunState::Downloading => Some((Effect::StarShimmer { seed, speed: 1.0 }, progress)),
+        StudioRunState::Running => Some((Effect::StarShimmer { seed, speed: 1.0 }, None)),
+        _ => None,
+    }
+}
+
 fn lattice_seed(turn_ix: usize, run_ix: usize, output_ix: usize) -> u32 {
     let mut x = (turn_ix as u32).wrapping_mul(0x9E37_79B9)
         ^ (run_ix as u32).wrapping_mul(0x85EB_CA6B)
@@ -645,6 +659,7 @@ impl StudioPage {
         aspect: (u32, u32),
         state: StudioRunState,
         artifact_id: Option<StudioArtifactId>,
+        run_id: zeron_studio::StudioRunId,
         progress: Option<f32>,
         theme: &Theme,
         window: &mut Window,
@@ -716,19 +731,10 @@ impl StudioPage {
                     .into_any_element();
             }
         }
-        let pending = matches!(
-            state,
-            StudioRunState::Queued | StudioRunState::Running | StudioRunState::Downloading
-        );
         let seed = lattice_seed(turn_ix, run_ix, output_ix);
-        let fill = pending.then(|| {
-            let effect = match state {
-                StudioRunState::Queued => Effect::SoftNoise { seed, amount: 0.7 },
-                StudioRunState::Downloading => Effect::StarShimmer { seed, speed: 1.0 },
-                _ => Effect::StarShimmer { seed, speed: 1.0 },
-            };
+        let fill = loading_effect(seed, state, progress).map(|(effect, wash)| {
             shader(effect)
-                .progress(progress.filter(|_| state == StudioRunState::Downloading))
+                .progress(wash)
                 .absolute()
                 .top_0()
                 .left_0()
@@ -736,12 +742,25 @@ impl StudioPage {
                 .h(px(height))
                 .rounded(px(10.0))
         });
+        let open_key = artifact_id
+            .map(super::artifact::ArtifactFrameKey::Ready)
+            .unwrap_or(super::artifact::ArtifactFrameKey::Loading { run_id, output_ix });
         base.relative()
             .flex()
             .items_center()
             .justify_center()
             .text_size(px(11.0))
             .text_color(theme.text_faint)
+            .cursor_pointer()
+            .on_click(cx.listener(move |page, _, window, cx| {
+                let frames = page
+                    .conversation
+                    .as_ref()
+                    .map(super::artifact::frames_from_conversation)
+                    .unwrap_or_default();
+                page.open_frame_viewer(open_key, frames, cx);
+                window.focus(&page.focus, cx);
+            }))
             .when_some(fill, |tile, fill| tile.child(fill))
             .when(state == StudioRunState::Failed, |tile| {
                 tile.child("Generation failed")
@@ -1445,6 +1464,7 @@ impl StudioPage {
                 tile.aspect,
                 tile.state,
                 tile.artifact_id,
+                tile.run_id,
                 tile.progress,
                 theme,
                 window,

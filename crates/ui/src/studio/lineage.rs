@@ -3,9 +3,9 @@
 use std::collections::{HashMap, HashSet};
 
 use zeron_proto::{StudioConversationView, StudioRunState, StudioRunView, StudioTurnView};
-use zeron_studio::{
-    GenerationInputSource, MediaOperation, StudioArtifactId, StudioRunId, StudioTurnId,
-};
+#[cfg(test)]
+use zeron_studio::MediaOperation;
+use zeron_studio::{GenerationInputSource, StudioArtifactId, StudioRunId, StudioTurnId};
 
 /// One output slot in lineage order: generate roots first, then their
 /// descendants depth-first in submission order.
@@ -48,6 +48,7 @@ pub(super) fn run_source_artifact(run: &StudioRunView) -> Option<StudioArtifactI
     })
 }
 
+#[cfg(test)]
 pub(super) fn is_derived_run(run: &StudioRunView) -> bool {
     matches!(
         run.model.operation,
@@ -489,6 +490,7 @@ mod tests {
         assert_eq!(tiles[1].artifact_id, None);
         assert_eq!(tiles[1].source_artifact_id, Some(a));
         assert_eq!(tiles[1].state, StudioRunState::Running);
+        assert!(is_derived_run(&conversation.turns[0].runs[1]));
     }
 
     #[test]

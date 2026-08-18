@@ -91,6 +91,7 @@ fn gallery_reveal_list_offset(row: usize, row_height: f32) -> ListOffset {
     }
 }
 
+#[cfg(test)]
 fn gallery_prefetch_row_order(total_rows: usize, visible: Range<usize>) -> Vec<usize> {
     let start = visible.start.min(total_rows);
     let end = visible.end.min(total_rows).max(start);
@@ -221,10 +222,10 @@ impl StudioPage {
         {
             self.gallery_anchor = None;
         }
-        if let Some(selected) = self.selected_artifact
+        if let Some(selected) = self.selected_artifact_id()
             && !self.gallery.iter().any(|item| item.id == selected)
         {
-            self.selected_artifact = None;
+            self.selected_frame = None;
             self.reset_lightbox_viewer();
             cx.emit(StudioEvent::CloseArtifact);
         }
@@ -350,7 +351,11 @@ impl StudioPage {
                 return Some(size);
             }
         }
-        if let Some(frame) = self.lightbox_frames.iter().find(|frame| frame.id == id) {
+        if let Some(frame) = self
+            .lightbox_frames
+            .iter()
+            .find(|frame| frame.artifact_id() == Some(id))
+        {
             if let Some(size) = nonzero(frame.width, frame.height) {
                 return Some(size);
             }
@@ -385,7 +390,7 @@ impl StudioPage {
     }
 
     pub(super) fn request_visible_gallery_images(&mut self, cx: &mut Context<Self>) {
-        if let Some(selected) = self.selected_artifact {
+        if let Some(selected) = self.selected_frame {
             let fulls = super::artifact::lightbox_neighbor_ids(&self.lightbox_frames, selected);
             let mut thumbs = self.visible_filmstrip_ids();
             for id in &fulls {
@@ -723,7 +728,7 @@ impl StudioPage {
             return;
         };
         let close = self
-            .selected_artifact
+            .selected_artifact_id()
             .is_some_and(|selected| ids.contains(&selected));
         self.busy = true;
         self.action_task = Some(cx.spawn(async move |this, cx| {
