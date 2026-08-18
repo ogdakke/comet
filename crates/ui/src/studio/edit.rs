@@ -1,5 +1,7 @@
 //! Lightbox image-edit mode: slim composer, brush, and derived-run submit.
 
+use std::time::Duration;
+
 use gpui::{
     AnyElement, App, Bounds, Context, Focusable as _, KeyDownEvent, MouseButton, Pixels, Point,
     SharedString, Window, canvas, div, point, prelude::*, px, size,
@@ -19,6 +21,8 @@ use super::paint::{BrushMode, PaintSession};
 const EDIT_COMPOSER_BOTTOM: f32 = 10.0;
 pub(super) const EDIT_COMPOSER_HEIGHT: f32 = COMPACT_TOTAL_HEIGHT + EDIT_COMPOSER_BOTTOM;
 const DEFAULT_BRUSH_T: f32 = 0.28;
+/// How long the centered size ring stays after the slider is released.
+const BRUSH_PREVIEW_HOLD: Duration = Duration::from_millis(800);
 /// Same cap as the agent model picker (`t3 max-h-86.5`).
 const EDIT_MODEL_PICKER_MAX_H: f32 = 346.0;
 
@@ -55,6 +59,7 @@ impl StudioPage {
         self.edit_target = Some(artifact_id);
         self.edit_paint = Some(PaintSession::new(width, height));
         self.edit_brush_t = DEFAULT_BRUSH_T;
+        self.hide_brush_size_preview();
         self.edit_add = true;
         self.edit_space_pan = false;
         self.reset_lightbox_swipe();
@@ -73,6 +78,7 @@ impl StudioPage {
         self.edit_space_pan = false;
         self.edit_brush_drag = false;
         self.edit_brush_track = None;
+        self.hide_brush_size_preview();
         cx.notify();
     }
 
@@ -385,16 +391,19 @@ impl StudioPage {
         let Some(image) = self.pointer_to_image(position) else {
             return false;
         };
-        let Some(paint) = self.edit_paint.as_mut() else {
-            return false;
-        };
-        let radius = PaintSession::brush_radius(paint.width, paint.height, self.edit_brush_t);
-        let mode = if self.edit_add {
-            BrushMode::Add
-        } else {
-            BrushMode::Subtract
-        };
-        paint.begin_stroke(image, radius, mode);
+        {
+            let Some(paint) = self.edit_paint.as_mut() else {
+                return false;
+            };
+            let radius = PaintSession::brush_radius(paint.width, paint.height, self.edit_brush_t);
+            let mode = if self.edit_add {
+                BrushMode::Add
+            } else {
+                BrushMode::Subtract
+            };
+            paint.begin_stroke(image, radius, mode);
+        }
+        self.hide_brush_size_preview();
         cx.notify();
         true
     }
@@ -540,6 +549,60 @@ impl StudioPage {
                 window
                     .paint_image(dest, gpui::Corners::default(), gpu.image, 0, false)
                     .ok();
+            },
+        )
+        .absolute()
+        .inset_0()
+        .into_any_element()
+    }
+
+    pub(super) fn render_brush_size_preview(&self) -> AnyElement {
+        if !self.edit_brush_preview {
+            return div().into_any_element();
+        }
+        if self
+            .edit_paint
+            .as_ref()
+            .is_some_and(PaintSession::is_drawing)
+        {
+            return div().into_any_element();
+        }
+        let Some(paint) = self.edit_paint.as_ref() else {
+            return div().into_any_element();
+        };
+        let radius_src = PaintSession::brush_radius(paint.width, paint.height, self.edit_brush_t);
+        let width = paint.width;
+        let height = paint.height;
+        let zoom = self.lightbox_zoom;
+        let pan = self.lightbox_pan;
+        canvas(
+            |_, _, _| {},
+            move |bounds, (), window, _| {
+                let image_bounds = super::artifact::lightbox_image_paint_bounds(
+                    bounds, width, height, zoom, pan, 0.0,
+                );
+                let scale = f32::from(image_bounds.size.width) / width.max(1) as f32;
+                let radius = (radius_src * scale).max(1.0);
+                let vis_x0 = image_bounds.origin.x.max(bounds.origin.x);
+                let vis_y0 = image_bounds.origin.y.max(bounds.origin.y);
+                let vis_x1 = (image_bounds.origin.x + image_bounds.size.width)
+                    .min(bounds.origin.x + bounds.size.width);
+                let vis_y1 = (image_bounds.origin.y + image_bounds.size.height)
+                    .min(bounds.origin.y + bounds.size.height);
+                let center_x = (vis_x0 + vis_x1) / 2.0;
+                let center_y = (vis_y0 + vis_y1) / 2.0;
+                let diameter = px(radius * 2.0);
+                window.paint_quad(gpui::quad(
+                    Bounds {
+                        origin: point(center_x - px(radius), center_y - px(radius)),
+                        size: size(diameter, diameter),
+                    },
+                    px(radius),
+                    gpui::white().opacity(0.2),
+                    px(1.5),
+                    gpui::white(),
+                    gpui::BorderStyle::default(),
+                ));
             },
         )
         .absolute()
@@ -880,6 +943,7 @@ impl StudioPage {
                         MouseButton::Left,
                         cx.listener(|page, event: &gpui::MouseDownEvent, _, cx| {
                             page.edit_brush_drag = true;
+                            page.show_brush_size_preview(cx);
                             if let Some(track) = page.edit_brush_track {
                                 page.set_brush_from_track(track, f32::from(event.position.x), cx);
                             }
@@ -924,7 +988,7 @@ impl StudioPage {
                                         let _ = entity_up.update(cx, |page, cx| {
                                             if page.edit_brush_drag {
                                                 page.edit_brush_drag = false;
-                                                cx.notify();
+                                                page.schedule_hide_brush_size_preview(cx);
                                             }
                                         });
                                     },
@@ -942,7 +1006,34 @@ impl StudioPage {
         let left = f32::from(track.origin.x);
         let width = f32::from(track.size.width).max(1.0);
         self.edit_brush_t = ((x - left) / width).clamp(0.0, 1.0);
+        self.show_brush_size_preview(cx);
+    }
+
+    fn show_brush_size_preview(&mut self, cx: &mut Context<Self>) {
+        self.edit_brush_preview_clear = None;
+        if !self.edit_brush_preview {
+            self.edit_brush_preview = true;
+        }
         cx.notify();
+    }
+
+    fn schedule_hide_brush_size_preview(&mut self, cx: &mut Context<Self>) {
+        self.edit_brush_preview_clear = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(BRUSH_PREVIEW_HOLD).await;
+            this.update(cx, |page, cx| {
+                if !page.edit_brush_drag {
+                    page.hide_brush_size_preview();
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn hide_brush_size_preview(&mut self) {
+        self.edit_brush_preview = false;
+        self.edit_brush_preview_clear = None;
     }
 
     pub(super) fn render_edit_action(

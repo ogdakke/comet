@@ -2306,7 +2306,9 @@ impl StudioPage {
             )
             .children(slides)
             .when(editing, |stage| {
-                stage.child(self.render_edit_strokes(window, cx))
+                stage
+                    .child(self.render_edit_strokes(window, cx))
+                    .child(self.render_brush_size_preview())
             });
 
         let close_button = div()
