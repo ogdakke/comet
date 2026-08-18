@@ -100,7 +100,7 @@ impl PaintSession {
 
     pub(super) fn brush_radius(width: u32, height: u32, t: f32) -> f32 {
         let short = width.min(height) as f32;
-        let min = 2.0;
+        let min = 4.0;
         let max = (short * 0.18).max(min + 1.0);
         min + t.clamp(0.0, 1.0) * (max - min)
     }
@@ -671,6 +671,13 @@ mod tests {
         let decoded = image::load_from_memory(&png).unwrap().to_rgb8();
         assert_eq!(*decoded.get_pixel(16, 16), image::Rgb([255, 255, 255]));
         assert_eq!(*decoded.get_pixel(0, 0), image::Rgb([0, 0, 0]));
+    }
+
+    #[test]
+    #[test]
+    fn smallest_brush_is_four_source_pixels() {
+        assert_eq!(PaintSession::brush_radius(1024, 1024, 0.0), 4.0);
+        assert!(PaintSession::brush_radius(1024, 1024, 1.0) > 4.0);
     }
 
     #[test]

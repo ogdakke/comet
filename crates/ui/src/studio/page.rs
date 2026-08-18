@@ -5,8 +5,8 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Point, Render, SharedString,
-    Subscription, Task, Window, div, prelude::*, px,
+    Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Point, Render,
+    SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 use zeron_proto::{
     ListStudioConversationsResponse, ListStudioModelsResponse, ListStudioProvidersResponse,
@@ -140,7 +140,9 @@ pub struct StudioPage {
     pub(super) edit_paint: Option<super::paint::PaintSession>,
     pub(super) edit_brush_t: f32,
     pub(super) edit_brush_drag: bool,
+    pub(super) edit_brush_track: Option<Bounds<Pixels>>,
     pub(super) edit_add: bool,
+    pub(super) edit_model_picker: popover::Popup<()>,
     pub(super) edit_space_pan: bool,
     pub(super) pending_edit_source: Option<StudioArtifactId>,
     pub(super) focus: FocusHandle,
@@ -295,7 +297,9 @@ impl StudioPage {
             edit_paint: None,
             edit_brush_t: 0.28,
             edit_brush_drag: false,
+            edit_brush_track: None,
             edit_add: true,
+            edit_model_picker: popover::Popup::default(),
             edit_space_pan: false,
             pending_edit_source: None,
             focus: cx.focus_handle(),
@@ -1594,6 +1598,8 @@ impl Render for StudioPage {
                 if page.dismiss_image_menu(event, cx) {
                     cx.stop_propagation();
                 } else if page.dismiss_upscale_settings_menu(event, cx) {
+                    cx.stop_propagation();
+                } else if page.dismiss_edit_model_picker(event, cx) {
                     cx.stop_propagation();
                 }
             }))

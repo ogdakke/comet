@@ -123,6 +123,20 @@ fn frame_prompt(run: &zeron_proto::StudioRunView, turn: &zeron_proto::StudioTurn
         .unwrap_or_else(|| turn.prompt.clone())
 }
 
+/// The artifact route is re-applied on every shell render. A loading slot
+/// has no artifact id, so the route still names the last Ready image —
+/// re-selecting it would yank the viewer off the in-flight frame.
+fn should_reapply_artifact_selection(
+    selected: Option<ArtifactFrameKey>,
+    requested: StudioArtifactId,
+) -> bool {
+    match selected {
+        None => true,
+        Some(ArtifactFrameKey::Ready(id)) => id != requested,
+        Some(ArtifactFrameKey::Loading { .. }) => false,
+    }
+}
+
 pub(super) fn resolve_frame_key(
     key: ArtifactFrameKey,
     frames: &[ArtifactFrame],
@@ -1203,7 +1217,7 @@ impl StudioPage {
         cx: &mut Context<Self>,
     ) {
         if self.artifact_frame(artifact_id).is_some() {
-            if self.selected_artifact_id() != Some(artifact_id) {
+            if should_reapply_artifact_selection(self.selected_frame, artifact_id) {
                 if let Some(index) = self
                     .lightbox_frames
                     .iter()
@@ -2406,7 +2420,7 @@ impl StudioPage {
             .border_color(theme.border)
             .bg(inspector_bg)
             .px(px(INSPECTOR_PAD_X))
-            .pt(px(Theme::TITLEBAR_HEIGHT + 18.0))
+            .pt(px(INSPECTOR_PAD_X))
             .pb(px(16.0));
         let inspector = if editing {
             inspector.child(self.render_precise_edit_sidebar(theme, cx))
@@ -2603,6 +2617,10 @@ impl StudioPage {
                         cx.stop_propagation();
                         return;
                     }
+                    if page.dismiss_edit_model_picker(event, cx) {
+                        cx.stop_propagation();
+                        return;
+                    }
                     match event.keystroke.key.as_str() {
                         "escape" if page.edit_target.is_some() => {
                             page.exit_edit_mode(cx);
@@ -2749,10 +2767,10 @@ impl StudioPage {
                         .h_full()
                         .flex_none()
                         .child(inspector)
-                        .child(
-                            crate::scrollbar::overlay("studio-inspector", &self.inspector_scroll)
-                                .inset_top(Theme::TITLEBAR_HEIGHT),
-                        ),
+                        .child(crate::scrollbar::overlay(
+                            "studio-inspector",
+                            &self.inspector_scroll,
+                        )),
                 )
                 .into_any_element(),
         )
@@ -2908,6 +2926,27 @@ mod tests {
     #[test]
     fn inspector_prompt_inner_width_leaves_room_for_copy() {
         assert!((inspector_prompt_inner_width() - 252.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn reapplying_the_route_does_not_steal_a_loading_frame() {
+        let ready = StudioArtifactId::new();
+        assert!(should_reapply_artifact_selection(None, ready));
+        assert!(!should_reapply_artifact_selection(
+            Some(ArtifactFrameKey::Ready(ready)),
+            ready
+        ));
+        assert!(should_reapply_artifact_selection(
+            Some(ArtifactFrameKey::Ready(StudioArtifactId::new())),
+            ready
+        ));
+        assert!(!should_reapply_artifact_selection(
+            Some(ArtifactFrameKey::Loading {
+                run_id: StudioRunId::new(),
+                output_ix: 0,
+            }),
+            ready
+        ));
     }
 
     #[test]

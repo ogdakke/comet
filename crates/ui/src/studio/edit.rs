@@ -9,6 +9,7 @@ use zeron_rpc::methods;
 use zeron_studio::{MediaKind, MediaModel, MediaOperation, ModelId, StudioArtifactId};
 
 use crate::composer::{COMPACT_TOTAL_HEIGHT, INPUT_LINE_HEIGHT};
+use crate::popover;
 use crate::theme::Theme;
 
 use super::page::StudioPage;
@@ -61,10 +62,12 @@ impl StudioPage {
     }
 
     pub(super) fn exit_edit_mode(&mut self, cx: &mut Context<Self>) {
+        self.close_edit_model_picker(cx);
         self.edit_target = None;
         self.edit_paint = None;
         self.edit_space_pan = false;
         self.edit_brush_drag = false;
+        self.edit_brush_track = None;
         cx.notify();
     }
 
@@ -84,7 +87,7 @@ impl StudioPage {
         if prompt.is_empty() {
             return;
         }
-        let Some(model) = self.resolve_edit_model(source_id) else {
+        let Some(model) = self.selected_edit_model() else {
             self.error = Some("No edit model is available".into());
             return;
         };
@@ -173,36 +176,73 @@ impl StudioPage {
                 output_ix: tile.output_ix,
             },
         };
+        if tile.artifact_id.is_some() {
+            self.pending_edit_source = None;
+        }
+        let stay_on_source =
+            self.selected_frame == Some(super::artifact::ArtifactFrameKey::Ready(source_id));
+        let already_on_child = self.selected_frame == Some(key);
+        if !stay_on_source && !already_on_child && self.selected_frame.is_some() {
+            return;
+        }
         if let Some(index) = self
             .lightbox_frames
             .iter()
             .position(|frame| frame.key == key)
         {
-            if tile.artifact_id.is_some() {
-                self.pending_edit_source = None;
-            }
             self.select_artifact_index(index, cx);
         }
     }
 
-    fn resolve_edit_model(&self, source_id: StudioArtifactId) -> Option<MediaModel> {
+    pub(super) fn selected_edit_model(&self) -> Option<MediaModel> {
         let edits: Vec<_> = self.edit_models().cloned().collect();
-        if let Some(last) = &self.remembered.last_edit_model_id
-            && let Some(model) = edits.iter().find(|model| &model.id == last)
-        {
-            return Some(model.clone());
+        let source_id = self.edit_target;
+        preferred_edit_model(
+            &edits,
+            self.remembered.last_edit_model_id.as_ref(),
+            source_id
+                .and_then(|id| self.source_run_model_id(id))
+                .as_ref(),
+        )
+    }
+
+    fn select_edit_model(&mut self, id: ModelId, cx: &mut Context<Self>) {
+        if self.edit_models().any(|model| model.id == id) {
+            self.remembered.last_edit_model_id = Some(id);
+            self.persist_composer_defaults(cx);
         }
-        if let Some(source_model) = self.source_run_model_id(source_id) {
-            let sibling = if source_model.as_str().ends_with("-edit") {
-                source_model.clone()
-            } else {
-                ModelId::new(format!("{}-edit", source_model.as_str()))
-            };
-            if let Some(model) = edits.iter().find(|model| model.id == sibling) {
-                return Some(model.clone());
-            }
+        self.close_edit_model_picker(cx);
+        cx.notify();
+    }
+
+    pub(super) fn close_edit_model_picker(&mut self, cx: &mut Context<Self>) {
+        if self.edit_model_picker.begin_close() {
+            popover::reap_popup(cx, |page: &mut Self| &mut page.edit_model_picker);
+            cx.notify();
         }
-        edits.into_iter().next()
+    }
+
+    pub(super) fn dismiss_edit_model_picker(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if event.keystroke.key == "escape" && self.edit_model_picker.is_open() {
+            self.close_edit_model_picker(cx);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn toggle_edit_model_picker(&mut self, cx: &mut Context<Self>) {
+        let pressed_open = self.edit_model_picker.take_press_was_open();
+        if self.edit_model_picker.is_open() || pressed_open {
+            self.close_edit_model_picker(cx);
+            return;
+        }
+        self.edit_model_picker.open(());
+        cx.notify();
     }
 
     fn source_run_model_id(&self, artifact_id: StudioArtifactId) -> Option<ModelId> {
@@ -462,29 +502,37 @@ impl StudioPage {
                     .child(self.edit_prompt.clone()),
             )
             .child(
-                div().flex_none().pr(px(8.0)).child(
-                    div()
-                        .id("studio-edit-send")
-                        .size(px(28.0))
-                        .flex_none()
-                        .rounded_full()
-                        .bg(theme.text)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .when(blocked, |button| button.opacity(0.35))
-                        .when(!blocked, |button| {
-                            button
-                                .cursor_pointer()
-                                .hover(|style| style.opacity(0.85))
-                                .on_click(cx.listener(|page, _, _, cx| page.submit_edit(cx)))
-                        })
-                        .child(
-                            crate::icons::icon(crate::icons::ARROW_UP)
-                                .size(px(14.0))
-                                .text_color(theme.bg),
-                        ),
-                ),
+                div()
+                    .flex_none()
+                    .pr(px(8.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(self.render_edit_model_chip(theme, cx))
+                    .child(
+                        div()
+                            .id("studio-edit-send")
+                            .size(px(28.0))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(theme.text)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(blocked, |button| button.opacity(0.35))
+                            .when(!blocked, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .hover(|style| style.opacity(0.85))
+                                    .on_click(cx.listener(|page, _, _, cx| page.submit_edit(cx)))
+                            })
+                            .child(
+                                crate::icons::icon(crate::icons::ARROW_UP)
+                                    .size(px(14.0))
+                                    .text_color(theme.bg),
+                            ),
+                    ),
             );
         div()
             .id("studio-artifact-edit-composer")
@@ -496,6 +544,92 @@ impl StudioPage {
             .justify_center()
             .child(crate::frost::frosted(26.0, 16.0, card))
             .into_any_element()
+    }
+
+    fn render_edit_model_chip(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let selected = self.selected_edit_model();
+        let label = selected
+            .as_ref()
+            .map(|model| model.display_name.clone())
+            .unwrap_or_else(|| "Model".into());
+        let selected_id = selected.as_ref().map(|model| model.id.clone());
+        let open = self.edit_model_picker.is_open() || self.edit_model_picker.is_closing();
+        let menu = open.then(|| {
+            let mut card = popover::popover_card(theme)
+                .id("studio-edit-model-picker")
+                .min_w(px(200.0))
+                .max_w(px(280.0))
+                .on_mouse_down_out(cx.listener(|page, _, _, cx| {
+                    page.close_edit_model_picker(cx);
+                }))
+                .flex()
+                .flex_col()
+                .gap(px(2.0));
+            for model in self.edit_models() {
+                let id = model.id.clone();
+                let active = selected_id.as_ref() == Some(&id);
+                let fade = format!("studio-edit-model-{}", id.as_str());
+                let mut row = popover::menu_row(theme, active, fade.clone())
+                    .id(SharedString::from(fade))
+                    .on_click(cx.listener(move |page, _, _, cx| {
+                        page.select_edit_model(id.clone(), cx);
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(SharedString::from(model.display_name.clone())),
+                    );
+                if active {
+                    row = row.child(
+                        crate::icons::icon(crate::icons::CHECK)
+                            .size(px(13.0))
+                            .text_color(theme.text_muted),
+                    );
+                }
+                card = card.child(row);
+            }
+            popover::anchored_menu_above_end(
+                "studio-edit-model-menu",
+                card.into_any_element(),
+                self.edit_model_picker.closing_since(),
+            )
+        });
+        let mut chip = div()
+            .id("studio-edit-model")
+            .relative()
+            .h(px(28.0))
+            .max_w(px(148.0))
+            .min_w_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .px(px(8.0))
+            .rounded(px(8.0))
+            .text_size(px(12.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme.text.opacity(0.9))
+            .cursor_pointer()
+            .hover(|style| style.bg(crate::theme::wash(0.10)))
+            .when(open, |chip| chip.bg(crate::theme::wash(0.10)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|page, event: &gpui::MouseDownEvent, _, cx| {
+                    page.edit_model_picker.note_trigger_press();
+                    cx.stop_propagation();
+                    let _ = event;
+                }),
+            )
+            .on_click(cx.listener(|page, _, _, cx| {
+                cx.stop_propagation();
+                page.toggle_edit_model_picker(cx);
+            }))
+            .child(div().min_w_0().truncate().child(SharedString::from(label)));
+        if let Some(menu) = menu {
+            chip = chip.child(menu);
+        }
+        chip.into_any_element()
     }
 
     pub(super) fn render_precise_edit_sidebar(
@@ -551,7 +685,6 @@ impl StudioPage {
             )
             .child(
                 div()
-                    .mt(px(10.0))
                     .text_size(px(13.0))
                     .text_color(theme.text_muted)
                     .child("Brush size"),
@@ -628,41 +761,30 @@ impl StudioPage {
             .child(brush_legend_ring(7.0, theme))
             .child(
                 div()
+                    .id("studio-edit-brush-track")
                     .relative()
                     .flex_1()
                     .h(px(24.0))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|page, _, _, cx| {
+                        cx.listener(|page, event: &gpui::MouseDownEvent, _, cx| {
                             page.edit_brush_drag = true;
-                            cx.notify();
+                            if let Some(track) = page.edit_brush_track {
+                                page.set_brush_from_track(track, f32::from(event.position.x), cx);
+                            }
+                            cx.stop_propagation();
                         }),
                     )
                     .child(
                         canvas(
                             |_, _, _| {},
-                            move |bounds, (), window, _| {
+                            move |bounds, (), window, cx| {
+                                let _ = entity.update(cx, |page, _| {
+                                    page.edit_brush_track = Some(bounds);
+                                });
                                 paint_brush_size_track(bounds, t, ink, window);
-                                let entity_down = entity.clone();
-                                let track = bounds;
-                                window.on_mouse_event(
-                                    move |event: &gpui::MouseDownEvent, phase, _, cx| {
-                                        if phase != gpui::DispatchPhase::Bubble
-                                            || event.button != MouseButton::Left
-                                        {
-                                            return;
-                                        }
-                                        let _ = entity_down.update(cx, |page, cx| {
-                                            page.edit_brush_drag = true;
-                                            page.set_brush_from_track(
-                                                track,
-                                                f32::from(event.position.x),
-                                                cx,
-                                            );
-                                        });
-                                    },
-                                );
                                 let entity_move = entity.clone();
+                                let track = bounds;
                                 window.on_mouse_event(
                                     move |event: &gpui::MouseMoveEvent, phase, _, cx| {
                                         if phase != gpui::DispatchPhase::Bubble || !event.dragging()
@@ -813,6 +935,29 @@ fn brush_legend_ring(size_px: f32, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
+fn preferred_edit_model(
+    edits: &[MediaModel],
+    last_id: Option<&ModelId>,
+    source_model_id: Option<&ModelId>,
+) -> Option<MediaModel> {
+    if let Some(last) = last_id
+        && let Some(model) = edits.iter().find(|model| &model.id == last)
+    {
+        return Some(model.clone());
+    }
+    if let Some(source_model) = source_model_id {
+        let sibling = if source_model.as_str().ends_with("-edit") {
+            source_model.clone()
+        } else {
+            ModelId::new(format!("{}-edit", source_model.as_str()))
+        };
+        if let Some(model) = edits.iter().find(|model| model.id == sibling) {
+            return Some(model.clone());
+        }
+    }
+    edits.first().cloned()
+}
+
 fn paint_brush_size_track(bounds: Bounds<Pixels>, t: f32, ink: gpui::Hsla, window: &mut Window) {
     let mid_y = bounds.origin.y + bounds.size.height / 2.0;
     let left = bounds.origin.x + px(8.0);
@@ -841,4 +986,61 @@ fn paint_brush_size_track(bounds: Bounds<Pixels>, t: f32, ink: gpui::Hsla, windo
         gpui::transparent_black(),
         gpui::BorderStyle::default(),
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use zeron_studio::MediaKind;
+
+    fn edit_model(id: &str, name: &str) -> MediaModel {
+        MediaModel {
+            provider_id: "venice".into(),
+            id: id.into(),
+            display_name: name.into(),
+            description: None,
+            operation: MediaOperation::ImageEdit,
+            output_kind: MediaKind::Image,
+            output_mime_types: vec!["image/png".into()],
+            input_constraints: Vec::new(),
+            prompt_maximum_chars: None,
+            negative_prompt_maximum_chars: None,
+            maximum_output_count: 1,
+            controls: Vec::new(),
+            pricing: None,
+            features: Vec::new(),
+            manifest_version: "test".into(),
+            fetched_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn edit_model_prefers_last_used_then_sibling_then_first() {
+        let qwen = edit_model("qwen-edit", "Qwen Edit");
+        let flux = edit_model("flux-edit", "Flux Edit");
+        let edits = vec![qwen.clone(), flux.clone()];
+        assert_eq!(
+            preferred_edit_model(&edits, Some(&flux.id), None)
+                .unwrap()
+                .id,
+            flux.id
+        );
+        assert_eq!(
+            preferred_edit_model(&edits, None, Some(&ModelId::new("qwen")))
+                .unwrap()
+                .id,
+            qwen.id
+        );
+        assert_eq!(
+            preferred_edit_model(&edits, None, None).unwrap().id,
+            qwen.id
+        );
+        assert_eq!(
+            preferred_edit_model(&edits, Some(&ModelId::new("gone")), None)
+                .unwrap()
+                .id,
+            qwen.id
+        );
+    }
 }
