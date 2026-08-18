@@ -2291,7 +2291,9 @@ impl StudioPage {
                 .inset_0(),
             )
             .children(slides)
-            .when(editing, |stage| stage.child(self.render_edit_strokes()));
+            .when(editing, |stage| {
+                stage.child(self.render_edit_strokes(window, cx))
+            });
 
         let close_button = div()
             .id("studio-artifact-close")
@@ -2405,23 +2407,27 @@ impl StudioPage {
             .bg(inspector_bg)
             .px(px(INSPECTOR_PAD_X))
             .pt(px(Theme::TITLEBAR_HEIGHT + 18.0))
-            .pb(px(16.0))
-            .when_some(
-                details,
-                |inspector, (turn_id, prompt, model, mime, size, pending)| {
-                    let has_prompt = !prompt.trim().is_empty();
-                    inspector
-                        .when(has_prompt, |inspector| {
-                            let copy_prompt = prompt.clone();
-                            let expanded = self.expanded_inspector_prompts.contains(&turn_id);
-                            let clampable = super::feed::prompt_exceeds_lines(
-                                &prompt,
-                                inspector_prompt_inner_width(),
-                                INSPECTOR_PROMPT_ADVANCE,
-                                INSPECTOR_PROMPT_COLLAPSED_LINES,
-                            );
-                            let collapsed = clampable && !expanded;
-                            inspector.child(
+            .pb(px(16.0));
+        let inspector = if editing {
+            inspector.child(self.render_precise_edit_sidebar(theme, cx))
+        } else {
+            inspector
+                .when_some(
+                    details,
+                    |inspector, (turn_id, prompt, model, mime, size, pending)| {
+                        let has_prompt = !prompt.trim().is_empty();
+                        inspector
+                            .when(has_prompt, |inspector| {
+                                let copy_prompt = prompt.clone();
+                                let expanded = self.expanded_inspector_prompts.contains(&turn_id);
+                                let clampable = super::feed::prompt_exceeds_lines(
+                                    &prompt,
+                                    inspector_prompt_inner_width(),
+                                    INSPECTOR_PROMPT_ADVANCE,
+                                    INSPECTOR_PROMPT_COLLAPSED_LINES,
+                                );
+                                let collapsed = clampable && !expanded;
+                                inspector.child(
                                 div()
                                     .flex_none()
                                     .flex()
@@ -2489,83 +2495,86 @@ impl StudioPage {
                                             ),
                                     ),
                             )
-                        })
+                            })
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .when(has_prompt, |meta| meta.mt(px(14.0)))
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text_muted)
+                                    .child(SharedString::from(if pending || mime.is_empty() {
+                                        model
+                                    } else {
+                                        format!("{model} · {mime} · {:.1} KB", size as f64 / 1024.0)
+                                    })),
+                            )
+                    },
+                )
+                .child(div().flex_1())
+                .when_some(id, |inspector, id| {
+                    inspector
+                        .child(self.render_edit_action(id, theme, cx))
+                        .child(div().h(px(8.0)))
+                        .child(self.render_artifact_upscale_actions(id, theme, cx))
                         .child(
                             div()
+                                .mt(px(8.0))
                                 .flex_none()
-                                .when(has_prompt, |meta| meta.mt(px(14.0)))
-                                .text_size(px(11.0))
-                                .text_color(theme.text_muted)
-                                .child(SharedString::from(if pending || mime.is_empty() {
-                                    model
-                                } else {
-                                    format!("{model} · {mime} · {:.1} KB", size as f64 / 1024.0)
-                                })),
-                        )
-                },
-            )
-            .child(div().flex_1())
-            .when_some(id, |inspector, id| {
-                inspector
-                    .child(self.render_edit_action(id, theme, cx))
-                    .child(div().h(px(8.0)))
-                    .child(self.render_artifact_upscale_actions(id, theme, cx))
-                    .child(
-                        div()
-                            .mt(px(8.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .id("studio-download-artifact")
-                                    .h(px(32.0))
-                                    .flex_1()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .gap(px(7.0))
-                                    .rounded(px(7.0))
-                                    .border_1()
-                                    .border_color(theme.border)
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(crate::theme::wash(0.09)))
-                                    .on_click(cx.listener(move |page, _, _, cx| {
-                                        page.download_artifact(id, cx)
-                                    }))
-                                    .child(
-                                        crate::icons::icon(crate::icons::ARROW_DOWN)
-                                            .size(px(14.0))
-                                            .text_color(theme.text_muted),
-                                    )
-                                    .child("Download"),
-                            )
-                            .child(
-                                div()
-                                    .id("studio-delete-artifact")
-                                    .h(px(32.0))
-                                    .flex_1()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .gap(px(7.0))
-                                    .rounded(px(7.0))
-                                    .cursor_pointer()
-                                    .text_color(theme.danger)
-                                    .hover(|style| style.bg(theme.danger.opacity(0.08)))
-                                    .on_click(cx.listener(move |page, _, _, cx| {
-                                        page.delete_artifact(id, cx)
-                                    }))
-                                    .child(
-                                        crate::icons::icon(crate::icons::TRASH_BIN_MINIMALISTIC)
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .id("studio-download-artifact")
+                                        .h(px(32.0))
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .gap(px(7.0))
+                                        .rounded(px(7.0))
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(crate::theme::wash(0.09)))
+                                        .on_click(cx.listener(move |page, _, _, cx| {
+                                            page.download_artifact(id, cx)
+                                        }))
+                                        .child(
+                                            crate::icons::icon(crate::icons::ARROW_DOWN)
+                                                .size(px(14.0))
+                                                .text_color(theme.text_muted),
+                                        )
+                                        .child("Download"),
+                                )
+                                .child(
+                                    div()
+                                        .id("studio-delete-artifact")
+                                        .h(px(32.0))
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .gap(px(7.0))
+                                        .rounded(px(7.0))
+                                        .cursor_pointer()
+                                        .text_color(theme.danger)
+                                        .hover(|style| style.bg(theme.danger.opacity(0.08)))
+                                        .on_click(cx.listener(move |page, _, _, cx| {
+                                            page.delete_artifact(id, cx)
+                                        }))
+                                        .child(
+                                            crate::icons::icon(
+                                                crate::icons::TRASH_BIN_MINIMALISTIC,
+                                            )
                                             .size(px(14.0))
                                             .text_color(theme.danger),
-                                    )
-                                    .child("Delete"),
-                            ),
-                    )
-            });
+                                        )
+                                        .child("Delete"),
+                                ),
+                        )
+                })
+        };
 
         Some(
             div()
@@ -2697,9 +2706,7 @@ impl StudioPage {
                                 )
                         })
                         .when(self.edit_target.is_some(), |stage| {
-                            stage
-                                .child(self.render_brush_slider(theme, cx))
-                                .child(self.render_edit_composer(theme, cx))
+                            stage.child(self.render_edit_composer(theme, cx))
                         })
                         .when(self.edit_target.is_none(), |stage| {
                             stage.child(

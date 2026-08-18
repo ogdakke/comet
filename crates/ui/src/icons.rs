@@ -92,6 +92,8 @@ icon_assets![
     (REFRESH, "refresh"),
     (RESTART, "restart"),
     (ADD_CIRCLE, "add-circle"),
+    (MINUS_CIRCLE, "minus-circle"),
+    (INVERT, "invert"),
     (TUNING, "tuning"),
     (PAPERCLIP, "paperclip"),
     (PEN, "pen"),

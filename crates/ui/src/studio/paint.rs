@@ -1,35 +1,71 @@
-//! Non-destructive brush strokes for Studio image edit.
+//! Unioned brush mask for Studio image edit.
 //!
-//! Strokes are stored in source-image pixels. Overlap is unioned into an A8
-//! mask so a figure-8 has a silhouette and no crossing X.
+//! A silhouette is a raster: overlapping strokes must flatten to one fill
+//! with a 1px edge, not a stack of ribbons. GPUI's scene cannot hold a
+//! primitive per stamp (that blew the Metal instance buffer), so this
+//! module owns an A8 mask, incrementally paints a BGRA overlay, and
+//! publishes one [`RenderImage`] for the viewer to blit.
 
+use std::cell::RefCell;
 use std::io::Cursor;
-#[cfg(test)]
 use std::sync::Arc;
 
-#[cfg(test)]
-use gpui::{Image, ImageFormat};
-use image::{GrayImage, Luma};
-#[cfg(test)]
-use image::{Rgba, RgbaImage};
+use gpui::{App, RenderImage, Window};
+use image::{Frame, GrayImage, Luma, Rgba, RgbaImage};
 
-#[cfg(test)]
 const FILL_ALPHA: u8 = 51; // 20% white
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BrushMode {
+    Add,
+    Subtract,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Stroke {
     pub points: Vec<(f32, f32)>,
     pub radius: f32,
+    pub mode: BrushMode,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum PaintOp {
+    Stroke(Stroke),
+    Invert,
+}
+
+#[derive(Clone)]
+pub(super) struct OverlayGpu {
+    pub image: Arc<RenderImage>,
+    pub x0: u32,
+    pub y0: u32,
+    pub x1: u32,
+    pub y1: u32,
+}
+
+impl std::fmt::Debug for OverlayGpu {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OverlayGpu")
+            .field("x0", &self.x0)
+            .field("y0", &self.y0)
+            .field("x1", &self.x1)
+            .field("y1", &self.y1)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct PaintSession {
     pub width: u32,
     pub height: u32,
-    pub strokes: Vec<Stroke>,
-    pub redo: Vec<Stroke>,
+    ops: Vec<PaintOp>,
+    redo: Vec<PaintOp>,
     live: Option<Stroke>,
     mask: GrayImage,
+    overlay: RgbaImage,
+    painted_bounds: Option<(u32, u32, u32, u32)>,
+    gpu: Option<OverlayGpu>,
+    stale_gpu: RefCell<Vec<Arc<RenderImage>>>,
 }
 
 impl PaintSession {
@@ -39,10 +75,14 @@ impl PaintSession {
         Self {
             width,
             height,
-            strokes: Vec::new(),
+            ops: Vec::new(),
             redo: Vec::new(),
             live: None,
             mask: GrayImage::new(width, height),
+            overlay: RgbaImage::new(width, height),
+            painted_bounds: None,
+            gpu: None,
+            stale_gpu: RefCell::new(Vec::new()),
         }
     }
 
@@ -51,7 +91,7 @@ impl PaintSession {
     }
 
     pub(super) fn has_paint(&self) -> bool {
-        self.strokes.iter().any(|stroke| !stroke.points.is_empty())
+        self.painted_bounds.is_some()
             || self
                 .live
                 .as_ref()
@@ -65,13 +105,27 @@ impl PaintSession {
         min + t.clamp(0.0, 1.0) * (max - min)
     }
 
-    pub(super) fn begin_stroke(&mut self, point: (f32, f32), radius: f32) {
+    pub(super) fn overlay_gpu(&self) -> Option<OverlayGpu> {
+        self.gpu.clone()
+    }
+
+    pub(super) fn flush_stale_gpu(&self, window: &mut Window, cx: &mut App) {
+        for image in self.stale_gpu.borrow_mut().drain(..) {
+            cx.drop_image(image, Some(window));
+        }
+    }
+
+    pub(super) fn begin_stroke(&mut self, point: (f32, f32), radius: f32, mode: BrushMode) {
         self.redo.clear();
+        let radius = radius.max(0.5);
         self.live = Some(Stroke {
             points: vec![point],
-            radius: radius.max(0.5),
+            radius,
+            mode,
         });
-        stamp_disk(&mut self.mask, point.0, point.1, radius.max(0.5));
+        if self.stamp_disk(point.0, point.1, radius, mode) {
+            self.publish_gpu();
+        }
     }
 
     #[cfg(test)]
@@ -82,12 +136,19 @@ impl PaintSession {
     /// `min_distance` is in source-image pixels. Use a screen-space conversion
     /// so a 4K photo does not record a point every sub-pixel.
     pub(super) fn extend_stroke_min(&mut self, point: (f32, f32), min_distance: f32) {
-        let Some(live) = self.live.as_mut() else {
+        let Some(live) = self.live.as_ref() else {
             return;
         };
-        let Some(&(prev_x, prev_y)) = live.points.last() else {
-            live.points.push(point);
-            stamp_disk(&mut self.mask, point.0, point.1, live.radius);
+        let radius = live.radius;
+        let mode = live.mode;
+        let prev = live.points.last().copied();
+        let Some((prev_x, prev_y)) = prev else {
+            if let Some(live) = self.live.as_mut() {
+                live.points.push(point);
+            }
+            if self.stamp_disk(point.0, point.1, radius, mode) {
+                self.publish_gpu();
+            }
             return;
         };
         let dx = point.0 - prev_x;
@@ -96,62 +157,63 @@ impl PaintSession {
         if dx * dx + dy * dy < min * min {
             return;
         }
-        live.points.push(point);
-        stamp_capsule(
-            &mut self.mask,
-            prev_x,
-            prev_y,
-            point.0,
-            point.1,
-            live.radius,
-        );
-    }
-
-    pub(super) fn iter_strokes(&self) -> impl Iterator<Item = &Stroke> {
-        self.strokes.iter().chain(self.live.as_ref())
+        if let Some(live) = self.live.as_mut() {
+            live.points.push(point);
+        }
+        if self.stamp_capsule(prev_x, prev_y, point.0, point.1, radius, mode) {
+            self.publish_gpu();
+        }
     }
 
     pub(super) fn end_stroke(&mut self) {
         if let Some(live) = self.live.take()
             && !live.points.is_empty()
         {
-            self.strokes.push(live);
+            if live.mode == BrushMode::Subtract {
+                self.rescan_bounds();
+            }
+            self.ops.push(PaintOp::Stroke(live));
+            self.publish_gpu();
         }
     }
 
     pub(super) fn undo(&mut self) -> bool {
-        let Some(stroke) = self.strokes.pop() else {
+        let Some(op) = self.ops.pop() else {
             return false;
         };
-        self.redo.push(stroke);
-        self.rebuild_mask();
+        self.redo.push(op);
+        self.rebuild_from_ops();
         true
     }
 
     pub(super) fn redo(&mut self) -> bool {
-        let Some(stroke) = self.redo.pop() else {
+        let Some(op) = self.redo.pop() else {
             return false;
         };
-        stamp_stroke(&mut self.mask, &stroke);
-        self.strokes.push(stroke);
+        apply_op(&mut self.mask, &op);
+        self.ops.push(op);
+        self.rebuild_overlay_full();
+        self.publish_gpu();
         true
     }
 
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(super) fn overlay_image(&self) -> Option<Arc<Image>> {
-        if !self.has_paint() {
-            return None;
-        }
-        let rgba = overlay_rgba(&self.mask);
-        let mut encoded = Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(rgba)
-            .write_to(&mut encoded, image::ImageFormat::Png)
-            .ok()?;
-        Some(Arc::new(Image::from_bytes(
-            ImageFormat::Png,
-            encoded.into_inner(),
-        )))
+    pub(super) fn invert(&mut self) {
+        self.commit_live();
+        self.redo.clear();
+        invert_mask(&mut self.mask);
+        self.ops.push(PaintOp::Invert);
+        self.rebuild_overlay_full();
+        self.publish_gpu();
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.ops.clear();
+        self.redo.clear();
+        self.live = None;
+        self.mask = GrayImage::new(self.width, self.height);
+        self.overlay = RgbaImage::new(self.width, self.height);
+        self.painted_bounds = None;
+        self.replace_gpu(None);
     }
 
     pub(super) fn mask_png(&self) -> Option<Vec<u8>> {
@@ -170,38 +232,145 @@ impl PaintSession {
         Some(encoded.into_inner())
     }
 
-    fn rebuild_mask(&mut self) {
+    fn commit_live(&mut self) {
+        if let Some(live) = self.live.take()
+            && !live.points.is_empty()
+        {
+            self.ops.push(PaintOp::Stroke(live));
+        }
+    }
+
+    fn stamp_disk(&mut self, cx: f32, cy: f32, radius: f32, mode: BrushMode) -> bool {
+        let rect = disk_rect(self.width, self.height, cx, cy, radius);
+        if stamp_disk_mask(&mut self.mask, cx, cy, radius, mode) {
+            refresh_overlay(
+                &self.mask,
+                &mut self.overlay,
+                padded_rect(rect, self.width, self.height),
+            );
+            self.note_bounds(rect, mode);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn stamp_capsule(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        radius: f32,
+        mode: BrushMode,
+    ) -> bool {
+        let rect = capsule_rect(self.width, self.height, x0, y0, x1, y1, radius);
+        if stamp_capsule_mask(&mut self.mask, x0, y0, x1, y1, radius, mode) {
+            refresh_overlay(
+                &self.mask,
+                &mut self.overlay,
+                padded_rect(rect, self.width, self.height),
+            );
+            self.note_bounds(rect, mode);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn note_bounds(&mut self, rect: (u32, u32, u32, u32), mode: BrushMode) {
+        if mode == BrushMode::Add {
+            self.painted_bounds = Some(union_bounds(self.painted_bounds, rect));
+        }
+    }
+
+    fn rescan_bounds(&mut self) {
+        self.painted_bounds = scan_bounds(&self.mask);
+    }
+
+    fn rebuild_from_ops(&mut self) {
         self.mask = GrayImage::new(self.width, self.height);
-        for stroke in &self.strokes {
-            stamp_stroke(&mut self.mask, stroke);
+        for op in &self.ops {
+            apply_op(&mut self.mask, op);
         }
         if let Some(live) = &self.live {
-            stamp_stroke(&mut self.mask, live);
+            stamp_stroke_mask(&mut self.mask, live);
         }
+        self.rebuild_overlay_full();
+        self.publish_gpu();
+    }
+
+    fn rebuild_overlay_full(&mut self) {
+        for y in 0..self.height {
+            for x in 0..self.width {
+                self.overlay
+                    .put_pixel(x, y, overlay_pixel(&self.mask, x, y));
+            }
+        }
+        self.rescan_bounds();
+    }
+
+    fn publish_gpu(&mut self) {
+        let Some((x0, y0, x1, y1)) = self.painted_bounds else {
+            self.replace_gpu(None);
+            return;
+        };
+        let width = (x1 - x0 + 1).max(1);
+        let height = (y1 - y0 + 1).max(1);
+        let crop = image::imageops::crop_imm(&self.overlay, x0, y0, width, height).to_image();
+        let gpu = OverlayGpu {
+            image: Arc::new(RenderImage::new(vec![Frame::new(crop)])),
+            x0,
+            y0,
+            x1,
+            y1,
+        };
+        self.replace_gpu(Some(gpu));
+    }
+
+    fn replace_gpu(&mut self, next: Option<OverlayGpu>) {
+        if let Some(old) = self.gpu.take() {
+            self.stale_gpu.borrow_mut().push(old.image);
+        }
+        self.gpu = next;
     }
 }
 
-fn stamp_stroke(mask: &mut GrayImage, stroke: &Stroke) {
+fn apply_op(mask: &mut GrayImage, op: &PaintOp) {
+    match op {
+        PaintOp::Stroke(stroke) => stamp_stroke_mask(mask, stroke),
+        PaintOp::Invert => invert_mask(mask),
+    }
+}
+
+fn stamp_stroke_mask(mask: &mut GrayImage, stroke: &Stroke) {
     if stroke.points.is_empty() {
         return;
     }
     if stroke.points.len() == 1 {
-        stamp_disk(mask, stroke.points[0].0, stroke.points[0].1, stroke.radius);
+        stamp_disk_mask(
+            mask,
+            stroke.points[0].0,
+            stroke.points[0].1,
+            stroke.radius,
+            stroke.mode,
+        );
         return;
     }
     for pair in stroke.points.windows(2) {
-        stamp_capsule(
+        stamp_capsule_mask(
             mask,
             pair[0].0,
             pair[0].1,
             pair[1].0,
             pair[1].1,
             stroke.radius,
+            stroke.mode,
         );
     }
 }
 
-fn stamp_disk(mask: &mut GrayImage, cx: f32, cy: f32, radius: f32) {
+fn stamp_disk_mask(mask: &mut GrayImage, cx: f32, cy: f32, radius: f32, mode: BrushMode) -> bool {
     let width = mask.width() as i32;
     let height = mask.height() as i32;
     let radius = radius.max(0.5);
@@ -210,25 +379,43 @@ fn stamp_disk(mask: &mut GrayImage, cx: f32, cy: f32, radius: f32) {
     let min_y = ((cy - radius).floor() as i32).max(0);
     let max_y = ((cy + radius).ceil() as i32).min(height - 1);
     let r2 = radius * radius;
+    let want = match mode {
+        BrushMode::Add => 255,
+        BrushMode::Subtract => 0,
+    };
+    let mut changed = false;
     for y in min_y..=max_y {
         for x in min_x..=max_x {
             let dx = x as f32 + 0.5 - cx;
             let dy = y as f32 + 0.5 - cy;
             if dx * dx + dy * dy <= r2 {
-                mask.put_pixel(x as u32, y as u32, Luma([255]));
+                let pixel = mask.get_pixel_mut(x as u32, y as u32);
+                if pixel.0[0] != want {
+                    *pixel = Luma([want]);
+                    changed = true;
+                }
             }
         }
     }
+    changed
 }
 
-fn stamp_capsule(mask: &mut GrayImage, x0: f32, y0: f32, x1: f32, y1: f32, radius: f32) {
-    stamp_disk(mask, x0, y0, radius);
-    stamp_disk(mask, x1, y1, radius);
+fn stamp_capsule_mask(
+    mask: &mut GrayImage,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    radius: f32,
+    mode: BrushMode,
+) -> bool {
+    let mut changed = stamp_disk_mask(mask, x0, y0, radius, mode);
+    changed |= stamp_disk_mask(mask, x1, y1, radius, mode);
     let vx = x1 - x0;
     let vy = y1 - y0;
     let len2 = vx * vx + vy * vy;
     if len2 < f32::EPSILON {
-        return;
+        return changed;
     }
     let width = mask.width() as i32;
     let height = mask.height() as i32;
@@ -238,6 +425,10 @@ fn stamp_capsule(mask: &mut GrayImage, x0: f32, y0: f32, x1: f32, y1: f32, radiu
     let min_y = ((y0.min(y1) - radius).floor() as i32).max(0);
     let max_y = ((y0.max(y1) + radius).ceil() as i32).min(height - 1);
     let r2 = radius * radius;
+    let want = match mode {
+        BrushMode::Add => 255,
+        BrushMode::Subtract => 0,
+    };
     for y in min_y..=max_y {
         for x in min_x..=max_x {
             let px = x as f32 + 0.5;
@@ -247,32 +438,36 @@ fn stamp_capsule(mask: &mut GrayImage, x0: f32, y0: f32, x1: f32, y1: f32, radiu
                 let dx = px - (x0 + t * vx);
                 let dy = py - (y0 + t * vy);
                 if dx * dx + dy * dy <= r2 {
-                    mask.put_pixel(x as u32, y as u32, Luma([255]));
+                    let pixel = mask.get_pixel_mut(x as u32, y as u32);
+                    if pixel.0[0] != want {
+                        *pixel = Luma([want]);
+                        changed = true;
+                    }
                 }
             }
         }
     }
+    changed
 }
 
-#[cfg(test)]
-fn overlay_rgba(mask: &GrayImage) -> RgbaImage {
-    let width = mask.width();
-    let height = mask.height();
-    let mut rgba = RgbaImage::new(width, height);
-    for y in 0..height {
-        for x in 0..width {
-            if mask.get_pixel(x, y).0[0] == 0 {
-                continue;
-            }
-            let edge = neighbor_empty(mask, x, y);
-            let alpha = if edge { 255 } else { FILL_ALPHA };
-            rgba.put_pixel(x, y, Rgba([255, 255, 255, alpha]));
-        }
+fn invert_mask(mask: &mut GrayImage) {
+    for pixel in mask.pixels_mut() {
+        pixel.0[0] = if pixel.0[0] > 0 { 0 } else { 255 };
     }
-    rgba
 }
 
-#[cfg(test)]
+fn overlay_pixel(mask: &GrayImage, x: u32, y: u32) -> Rgba<u8> {
+    if mask.get_pixel(x, y).0[0] == 0 {
+        return Rgba([0, 0, 0, 0]);
+    }
+    let alpha = if neighbor_empty(mask, x, y) {
+        255
+    } else {
+        FILL_ALPHA
+    };
+    Rgba([255, 255, 255, alpha])
+}
+
 fn neighbor_empty(mask: &GrayImage, x: u32, y: u32) -> bool {
     let width = mask.width();
     let height = mask.height();
@@ -287,6 +482,78 @@ fn neighbor_empty(mask: &GrayImage, x: u32, y: u32) -> bool {
         .any(|(nx, ny)| nx >= width || ny >= height || mask.get_pixel(nx, ny).0[0] == 0)
 }
 
+fn refresh_overlay(mask: &GrayImage, overlay: &mut RgbaImage, rect: (u32, u32, u32, u32)) {
+    let (x0, y0, x1, y1) = rect;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            overlay.put_pixel(x, y, overlay_pixel(mask, x, y));
+        }
+    }
+}
+
+fn overlay_rgba(mask: &GrayImage) -> RgbaImage {
+    let mut rgba = RgbaImage::new(mask.width(), mask.height());
+    refresh_overlay(mask, &mut rgba, (0, 0, mask.width() - 1, mask.height() - 1));
+    rgba
+}
+
+fn disk_rect(width: u32, height: u32, cx: f32, cy: f32, radius: f32) -> (u32, u32, u32, u32) {
+    let radius = radius.max(0.5);
+    let x0 = ((cx - radius).floor() as i32).max(0) as u32;
+    let y0 = ((cy - radius).floor() as i32).max(0) as u32;
+    let x1 = ((cx + radius).ceil() as i32).min(width as i32 - 1).max(0) as u32;
+    let y1 = ((cy + radius).ceil() as i32).min(height as i32 - 1).max(0) as u32;
+    (x0, y0, x1, y1)
+}
+
+fn capsule_rect(
+    width: u32,
+    height: u32,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    radius: f32,
+) -> (u32, u32, u32, u32) {
+    let a = disk_rect(width, height, x0, y0, radius);
+    let b = disk_rect(width, height, x1, y1, radius);
+    union_bounds(Some(a), b)
+}
+
+fn padded_rect(rect: (u32, u32, u32, u32), width: u32, height: u32) -> (u32, u32, u32, u32) {
+    (
+        rect.0.saturating_sub(1),
+        rect.1.saturating_sub(1),
+        (rect.2 + 1).min(width.saturating_sub(1)),
+        (rect.3 + 1).min(height.saturating_sub(1)),
+    )
+}
+
+fn union_bounds(
+    existing: Option<(u32, u32, u32, u32)>,
+    rect: (u32, u32, u32, u32),
+) -> (u32, u32, u32, u32) {
+    match existing {
+        None => rect,
+        Some((x0, y0, x1, y1)) => (
+            x0.min(rect.0),
+            y0.min(rect.1),
+            x1.max(rect.2),
+            y1.max(rect.3),
+        ),
+    }
+}
+
+fn scan_bounds(mask: &GrayImage) -> Option<(u32, u32, u32, u32)> {
+    let mut bounds = None;
+    for (x, y, pixel) in mask.enumerate_pixels() {
+        if pixel.0[0] > 0 {
+            bounds = Some(union_bounds(bounds, (x, y, x, y)));
+        }
+    }
+    bounds
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,7 +562,7 @@ mod tests {
     fn figure_eight_unions_and_has_no_interior_cross() {
         let mut session = PaintSession::new(80, 80);
         let radius = 6.0;
-        session.begin_stroke((25.0, 25.0), radius);
+        session.begin_stroke((25.0, 25.0), radius, BrushMode::Add);
         for t in 1..=40 {
             let a = t as f32 / 40.0 * std::f32::consts::TAU;
             session.extend_stroke((25.0 + 12.0 * a.cos(), 25.0 + 12.0 * a.sin()));
@@ -334,12 +601,70 @@ mod tests {
             center.0[3], FILL_ALPHA,
             "crossing must be fill, not an interior stroke X"
         );
+        assert_eq!(
+            session.overlay.get_pixel(40, 40).0[3],
+            FILL_ALPHA,
+            "live overlay must match the silhouette rule"
+        );
+        assert!(session.overlay_gpu().is_some());
+    }
+
+    #[test]
+    fn incremental_overlay_matches_full_rebuild() {
+        let mut session = PaintSession::new(48, 48);
+        session.begin_stroke((10.0, 10.0), 4.0, BrushMode::Add);
+        session.extend_stroke((24.0, 18.0));
+        session.extend_stroke((36.0, 30.0));
+        session.end_stroke();
+        let live = session.overlay.clone();
+        session.rebuild_overlay_full();
+        assert_eq!(live, session.overlay);
+    }
+
+    #[test]
+    fn subtract_erases_from_the_union() {
+        let mut session = PaintSession::new(40, 40);
+        session.begin_stroke((20.0, 20.0), 8.0, BrushMode::Add);
+        session.end_stroke();
+        assert!(session.mask.get_pixel(20, 20).0[0] > 0);
+        session.begin_stroke((20.0, 20.0), 5.0, BrushMode::Subtract);
+        session.end_stroke();
+        assert_eq!(session.mask.get_pixel(20, 20).0[0], 0);
+        assert!(session.mask.get_pixel(12, 20).0[0] > 0);
+        assert_eq!(session.overlay.get_pixel(20, 20).0[3], 0);
+    }
+
+    #[test]
+    fn invert_flips_the_mask_and_is_undoable() {
+        let mut session = PaintSession::new(24, 24);
+        session.begin_stroke((8.0, 8.0), 3.0, BrushMode::Add);
+        session.end_stroke();
+        assert!(session.mask.get_pixel(8, 8).0[0] > 0);
+        assert_eq!(session.mask.get_pixel(20, 20).0[0], 0);
+        session.invert();
+        assert_eq!(session.mask.get_pixel(8, 8).0[0], 0);
+        assert!(session.mask.get_pixel(20, 20).0[0] > 0);
+        assert!(session.undo());
+        assert!(session.mask.get_pixel(8, 8).0[0] > 0);
+        assert_eq!(session.mask.get_pixel(20, 20).0[0], 0);
+    }
+
+    #[test]
+    fn reset_clears_paint() {
+        let mut session = PaintSession::new(24, 24);
+        session.begin_stroke((8.0, 8.0), 3.0, BrushMode::Add);
+        session.end_stroke();
+        session.invert();
+        session.reset();
+        assert!(!session.has_paint());
+        assert_eq!(session.mask.get_pixel(8, 8).0[0], 0);
+        assert!(session.overlay_gpu().is_none());
     }
 
     #[test]
     fn mask_png_is_white_on_black() {
         let mut session = PaintSession::new(32, 32);
-        session.begin_stroke((16.0, 16.0), 4.0);
+        session.begin_stroke((16.0, 16.0), 4.0, BrushMode::Add);
         session.end_stroke();
         let png = session.mask_png().expect("painted mask");
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
@@ -351,9 +676,9 @@ mod tests {
     #[test]
     fn undo_clears_the_last_stroke() {
         let mut session = PaintSession::new(40, 40);
-        session.begin_stroke((10.0, 10.0), 3.0);
+        session.begin_stroke((10.0, 10.0), 3.0, BrushMode::Add);
         session.end_stroke();
-        session.begin_stroke((30.0, 30.0), 3.0);
+        session.begin_stroke((30.0, 30.0), 3.0, BrushMode::Add);
         session.end_stroke();
         assert!(session.mask.get_pixel(30, 30).0[0] > 0);
         assert!(session.undo());
