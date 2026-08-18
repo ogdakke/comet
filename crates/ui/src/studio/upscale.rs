@@ -748,6 +748,7 @@ mod tests {
             ],
             pricing: None,
             features: Vec::new(),
+            video: zeron_studio::VideoModelMeta::default(),
             manifest_version: "test-v1".into(),
             fetched_at: Utc::now(),
         }

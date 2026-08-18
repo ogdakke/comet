@@ -72,6 +72,7 @@ fn image_model(provider_id: &str) -> MediaModel {
         controls: Vec::new(),
         pricing: None,
         features: Vec::new(),
+        video: zeron_studio::VideoModelMeta::default(),
         manifest_version: "fixture-v1".into(),
         fetched_at: chrono::Utc::now(),
     }
@@ -2049,8 +2050,7 @@ fn upscale_model(provider_id: &str) -> MediaModel {
             mime: MimeConstraint {
                 accepted: vec!["image/png".into(), "image/jpeg".into(), "image/webp".into()],
                 maximum_bytes: Some(25 * 1024 * 1024),
-                maximum_width: None,
-                maximum_height: None,
+                ..MimeConstraint::default()
             },
         }],
         prompt_maximum_chars: None,
@@ -2071,6 +2071,7 @@ fn upscale_model(provider_id: &str) -> MediaModel {
         }],
         pricing: None,
         features: Vec::new(),
+        video: zeron_studio::VideoModelMeta::default(),
         manifest_version: "fixture-v1".into(),
         fetched_at: chrono::Utc::now(),
     }
@@ -2140,8 +2141,7 @@ fn edit_model(provider_id: &str) -> MediaModel {
                 mime: MimeConstraint {
                     accepted: vec!["image/png".into(), "image/jpeg".into(), "image/webp".into()],
                     maximum_bytes: Some(25 * 1024 * 1024),
-                    maximum_width: None,
-                    maximum_height: None,
+                    ..MimeConstraint::default()
                 },
             },
             InputConstraint {
@@ -2151,8 +2151,7 @@ fn edit_model(provider_id: &str) -> MediaModel {
                 mime: MimeConstraint {
                     accepted: vec!["image/png".into(), "image/jpeg".into(), "image/webp".into()],
                     maximum_bytes: Some(25 * 1024 * 1024),
-                    maximum_width: None,
-                    maximum_height: None,
+                    ..MimeConstraint::default()
                 },
             },
         ],
@@ -2162,6 +2161,7 @@ fn edit_model(provider_id: &str) -> MediaModel {
         controls: Vec::new(),
         pricing: None,
         features: Vec::new(),
+        video: zeron_studio::VideoModelMeta::default(),
         manifest_version: "fixture-v1".into(),
         fetched_at: chrono::Utc::now(),
     }

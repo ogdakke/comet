@@ -3313,6 +3313,7 @@ mod tests {
                         controls: Vec::new(),
                         pricing: None,
                         features: Vec::new(),
+                        video: zeron_studio::VideoModelMeta::default(),
                         manifest_version: "test".into(),
                         fetched_at: Utc::now(),
                     },
@@ -3380,6 +3381,7 @@ mod tests {
                         controls: Vec::new(),
                         pricing: None,
                         features: Vec::new(),
+                        video: zeron_studio::VideoModelMeta::default(),
                         manifest_version: "test".into(),
                         fetched_at: Utc::now(),
                     },
@@ -3460,6 +3462,7 @@ mod tests {
                 controls: Vec::new(),
                 pricing: None,
                 features: Vec::new(),
+                video: zeron_studio::VideoModelMeta::default(),
                 manifest_version: "test".into(),
                 fetched_at: Utc::now(),
             };

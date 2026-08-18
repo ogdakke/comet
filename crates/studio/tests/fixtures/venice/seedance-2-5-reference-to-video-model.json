@@ -1,0 +1,33 @@
+{
+  "data": [
+    {
+      "created": 1773964800,
+      "id": "seedance-2-5-reference-to-video-basic",
+      "model_spec": {
+        "privacy": "anonymized",
+        "constraints": {
+          "model_type": "image-to-video",
+          "aspect_ratios": ["16:9", "9:16", "1:1"],
+          "resolutions": ["720p", "480p"],
+          "durations": ["4s", "5s", "8s", "10s", "15s", "30s"],
+          "audio": true,
+          "audio_configurable": true,
+          "audio_input": true,
+          "per_reference_audio": true,
+          "video_input": true,
+          "prompt_character_limit": 3500
+        },
+        "model_sets": ["uncensored", "audio"],
+        "name": "Seedance 2.5 Reference to Video",
+        "offline": false,
+        "traits": [],
+        "uncensored": true
+      },
+      "object": "model",
+      "owned_by": "venice.ai",
+      "type": "video"
+    }
+  ],
+  "object": "list",
+  "type": "video"
+}

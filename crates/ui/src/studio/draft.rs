@@ -165,10 +165,12 @@ pub(super) fn control_value_label(value: &zeron_studio::ControlValue) -> String 
         ControlValue::Number { value } | ControlValue::DurationSeconds { value } => {
             value.to_string()
         }
+        ControlValue::DurationAuto => "Auto".into(),
         ControlValue::Boolean { value } => if *value { "On" } else { "Off" }.into(),
         ControlValue::Dimensions { width, height } => format!("{width}×{height}"),
         ControlValue::AspectRatio { width, height } => format!("{width}:{height}"),
         ControlValue::AspectRatioAuto => "Auto".into(),
+        ControlValue::AspectRatioAdaptive => "Adaptive".into(),
     }
 }
 
@@ -195,6 +197,7 @@ mod tests {
             controls,
             pricing: None,
             features: Vec::new(),
+            video: zeron_studio::VideoModelMeta::default(),
             manifest_version: "test".into(),
             fetched_at: Utc::now(),
         }

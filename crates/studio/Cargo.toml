@@ -17,6 +17,7 @@ reqwest.workspace = true
 futures.workspace = true
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+toml = "0.8"
 
 [dev-dependencies]
 tokio.workspace = true

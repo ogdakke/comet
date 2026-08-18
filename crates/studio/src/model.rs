@@ -33,6 +33,20 @@ string_id!(ModelId);
 string_id!(ControlId);
 string_id!(InputRole);
 
+/// Semantic input roles the composer tray understands.
+/// Wire adapters map these onto provider fields.
+pub const ROLE_SOURCE: &str = "source";
+pub const ROLE_LAST_FRAME: &str = "last_frame";
+pub const ROLE_REFERENCE: &str = "reference";
+pub const ROLE_REFERENCE_VIDEO: &str = "reference_video";
+pub const ROLE_REFERENCE_AUDIO: &str = "reference_audio";
+pub const ROLE_AUDIO: &str = "audio";
+// ROLE_VIDEO is reserved. VideoToVideo uses `source` (same as I2V).
+// Do not emit ROLE_VIDEO unless a future overlay row advertises it.
+pub const ROLE_ELEMENT: &str = "element";
+pub const ROLE_SCENE: &str = "scene";
+pub const ROLE_KEYFRAME: &str = "keyframe";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaKind {
@@ -53,15 +67,36 @@ pub enum MediaOperation {
     VideoToVideo,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MimeConstraint {
     pub accepted: Vec<String>,
     pub maximum_bytes: Option<u64>,
     pub maximum_width: Option<u32>,
     pub maximum_height: Option<u32>,
+    #[serde(default)]
+    pub minimum_short_side: Option<u32>,
+    #[serde(default)]
+    pub minimum_aspect_ratio: Option<f64>,
+    #[serde(default)]
+    pub maximum_aspect_ratio: Option<f64>,
+    #[serde(default)]
+    pub minimum_duration_seconds: Option<f64>,
+    #[serde(default)]
+    pub maximum_duration_seconds: Option<f64>,
+    #[serde(default)]
+    pub maximum_total_duration_seconds: Option<f64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+impl MimeConstraint {
+    pub fn accepting(accepted: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            accepted: accepted.into_iter().map(Into::into).collect(),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InputConstraint {
     pub role: InputRole,
     pub minimum_count: u32,
@@ -79,8 +114,10 @@ pub enum ControlValue {
     Dimensions { width: u32, height: u32 },
     AspectRatio { width: u32, height: u32 },
     AspectRatioAuto,
+    AspectRatioAdaptive,
     Resolution { value: String },
     DurationSeconds { value: f64 },
+    DurationAuto,
 }
 
 impl ControlValue {
@@ -91,9 +128,11 @@ impl ControlValue {
             Self::Number { .. } => ControlKind::Number,
             Self::Boolean { .. } => ControlKind::Boolean,
             Self::Dimensions { .. } => ControlKind::Dimensions,
-            Self::AspectRatio { .. } | Self::AspectRatioAuto => ControlKind::AspectRatio,
+            Self::AspectRatio { .. } | Self::AspectRatioAuto | Self::AspectRatioAdaptive => {
+                ControlKind::AspectRatio
+            }
             Self::Resolution { .. } => ControlKind::Resolution,
-            Self::DurationSeconds { .. } => ControlKind::Duration,
+            Self::DurationSeconds { .. } | Self::DurationAuto => ControlKind::Duration,
         }
     }
 
@@ -316,6 +355,9 @@ pub struct MediaModel {
     /// Display-only badges. Excluded from [`Self::manifest_version`].
     #[serde(default)]
     pub features: Vec<ModelFeature>,
+    /// Overlay-derived video extras. Image models leave this defaulted.
+    #[serde(default, skip_serializing_if = "VideoModelMeta::is_default")]
+    pub video: VideoModelMeta,
     /// Changes whenever submit-relevant constraints or controls change.
     /// Display copy and pricing are excluded so a catalog refresh does not
     /// invalidate an otherwise identical form.
@@ -323,7 +365,127 @@ pub struct MediaModel {
     pub fetched_at: DateTime<Utc>,
 }
 
+/// Overlay-derived fields persisted on a [`MediaModel`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VideoModelMeta {
+    pub adapter_family: AdapterFamily,
+    pub requires_visual_reference: bool,
+    pub reference_audio_requires_visual: bool,
+    pub source_matched_duration: bool,
+    pub source_matched_aspect: bool,
+    pub generate_audio: AudioCapability,
+}
+
+impl VideoModelMeta {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterFamily {
+    Seedance,
+    Grok,
+    #[default]
+    Hidden,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioCapability {
+    #[default]
+    None,
+    ForcedOn,
+    Configurable {
+        default: bool,
+    },
+}
+
+/// Derived video surface. `None` when [`MediaModel::output_kind`] is not video.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VideoCapability {
+    pub operation: MediaOperation,
+    pub adapter_family: AdapterFamily,
+    pub prompt_maximum_chars: Option<u32>,
+    pub durations: Vec<ControlValue>,
+    pub resolutions: Vec<String>,
+    pub aspect_ratios: Vec<ControlValue>,
+    pub generate_audio: AudioCapability,
+    pub inputs: Vec<InputConstraint>,
+    pub requires_visual_reference: bool,
+    pub reference_audio_requires_visual: bool,
+    pub source_matched_duration: bool,
+    pub source_matched_aspect: bool,
+}
+
 impl MediaModel {
+    /// Derived. Returns None when `output_kind != Video`.
+    pub fn video_capability(&self) -> Option<VideoCapability> {
+        if self.output_kind != MediaKind::Video {
+            return None;
+        }
+        let durations = self
+            .controls
+            .iter()
+            .find(|control| control.id.as_str() == "duration")
+            .map(|control| {
+                control
+                    .choices
+                    .iter()
+                    .map(|choice| choice.value.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let resolutions = self
+            .controls
+            .iter()
+            .find(|control| control.id.as_str() == "resolution")
+            .map(|control| {
+                control
+                    .choices
+                    .iter()
+                    .filter_map(|choice| match &choice.value {
+                        ControlValue::Resolution { value } => Some(value.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let aspect_ratios = self
+            .controls
+            .iter()
+            .find(|control| control.id.as_str() == "aspect_ratio")
+            .map(|control| {
+                control
+                    .choices
+                    .iter()
+                    .map(|choice| choice.value.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(VideoCapability {
+            operation: self.operation,
+            adapter_family: self.video.adapter_family,
+            prompt_maximum_chars: self.prompt_maximum_chars,
+            durations,
+            resolutions,
+            aspect_ratios,
+            generate_audio: self.video.generate_audio,
+            inputs: self.input_constraints.clone(),
+            requires_visual_reference: self.video.requires_visual_reference,
+            reference_audio_requires_visual: self.video.reference_audio_requires_visual,
+            source_matched_duration: self.video.source_matched_duration,
+            source_matched_aspect: self.video.source_matched_aspect,
+        })
+    }
+
+    /// Hidden video models stay in the catalog but are omitted from the picker.
+    pub fn is_picker_visible(&self) -> bool {
+        self.output_kind != MediaKind::Video || self.video.adapter_family != AdapterFamily::Hidden
+    }
+
     /// Identify persistable output from bytes, but only if this model advertises that MIME.
     pub fn accepted_output_mime(&self, bytes: &[u8]) -> Option<String> {
         crate::accepted_output_mime(bytes, &self.output_mime_types)

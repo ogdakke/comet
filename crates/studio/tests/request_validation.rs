@@ -5,6 +5,7 @@ use zeron_studio::{
     ControlId, ControlKind, ControlValidationError, ControlValue, GenerationInput,
     GenerationInputSource, GenerationRequest, InputConstraint, MediaKind, MediaModel,
     MediaOperation, MimeConstraint, ModelControl, RequestValidationError, StudioArtifactId,
+    VideoModelMeta,
 };
 
 fn model() -> MediaModel {
@@ -35,6 +36,7 @@ fn model() -> MediaModel {
         }],
         pricing: None,
         features: Vec::new(),
+        video: VideoModelMeta::default(),
         manifest_version: "fixture-v1".to_owned(),
         fetched_at: Utc::now(),
     }
@@ -128,8 +130,7 @@ fn upscale_model() -> MediaModel {
             mime: MimeConstraint {
                 accepted: vec!["image/png".to_owned()],
                 maximum_bytes: Some(25 * 1024 * 1024),
-                maximum_width: None,
-                maximum_height: None,
+                ..MimeConstraint::default()
             },
         }],
         prompt_maximum_chars: None,
@@ -138,6 +139,7 @@ fn upscale_model() -> MediaModel {
         controls: Vec::new(),
         pricing: None,
         features: Vec::new(),
+        video: VideoModelMeta::default(),
         manifest_version: "fixture-v1".to_owned(),
         fetched_at: Utc::now(),
     }
@@ -230,8 +232,7 @@ fn edit_model() -> MediaModel {
                 mime: MimeConstraint {
                     accepted: vec!["image/png".to_owned()],
                     maximum_bytes: Some(25 * 1024 * 1024),
-                    maximum_width: None,
-                    maximum_height: None,
+                    ..MimeConstraint::default()
                 },
             },
             InputConstraint {
@@ -241,8 +242,7 @@ fn edit_model() -> MediaModel {
                 mime: MimeConstraint {
                     accepted: vec!["image/png".to_owned()],
                     maximum_bytes: Some(25 * 1024 * 1024),
-                    maximum_width: None,
-                    maximum_height: None,
+                    ..MimeConstraint::default()
                 },
             },
         ],
@@ -252,6 +252,7 @@ fn edit_model() -> MediaModel {
         controls: Vec::new(),
         pricing: None,
         features: Vec::new(),
+        video: VideoModelMeta::default(),
         manifest_version: "fixture-v1".to_owned(),
         fetched_at: Utc::now(),
     }

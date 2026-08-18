@@ -3,6 +3,7 @@
 //! Provider wire types belong in adapter modules. The types exported here are the stable boundary
 //! consumed by the engine, RPC layer, and UI.
 
+mod catalog;
 mod mime;
 mod model;
 mod provider;
@@ -10,8 +11,10 @@ mod request;
 
 pub mod fake;
 pub mod venice;
+pub mod venice_overlay;
 mod venice_provider;
 
+pub use catalog::{CapabilityIntersection, intersect_video_globals, picker_models};
 pub use fake::{FakeMediaProvider, FakeSubmissionMode};
 pub use mime::{accepted_output_mime, sniff_media_mime};
 pub use model::*;

@@ -1474,6 +1474,7 @@ mod tests {
             controls: Vec::new(),
             pricing: None,
             features: features.to_vec(),
+            video: zeron_studio::VideoModelMeta::default(),
             manifest_version: "test".into(),
             fetched_at: Utc::now(),
         }

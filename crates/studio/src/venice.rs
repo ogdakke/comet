@@ -8,9 +8,11 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ControlChoice, ControlId, ControlKind, ControlValue, InputConstraint, InputRole, MediaKind,
-    MediaModel, MediaOperation, MimeConstraint, ModelControl, ModelFeature, ModelId, PricingEntry,
-    PricingMetadata, PricingUnit, ProviderId,
+    AdapterFamily, AudioCapability, ControlChoice, ControlId, ControlKind, ControlValue,
+    InputConstraint, InputRole, MediaKind, MediaModel, MediaOperation, MimeConstraint,
+    ModelControl, ModelFeature, ModelId, PricingEntry, PricingMetadata, PricingUnit, ProviderId,
+    ROLE_SOURCE, VideoModelMeta,
+    venice_overlay::{ImageGeometry, OverlayError, VeniceVideoOverlay, bundled_video_overlay},
 };
 
 pub const VENICE_PROVIDER_ID: &str = "venice";
@@ -35,6 +37,8 @@ pub enum VeniceCatalogError {
     },
     #[error("Venice model {model_id} has invalid duration {value}")]
     InvalidDuration { model_id: String, value: String },
+    #[error(transparent)]
+    Overlay(#[from] OverlayError),
 }
 
 #[derive(Deserialize)]
@@ -105,8 +109,20 @@ struct VideoConstraints {
     durations: Vec<String>,
     audio: bool,
     audio_configurable: bool,
+    #[serde(default)]
+    audio_input: bool,
+    #[serde(default)]
+    video_input: bool,
+    #[serde(default)]
+    per_reference_audio: bool,
     #[serde(default = "default_video_prompt_limit")]
     prompt_character_limit: u32,
+    #[serde(default)]
+    reference_image_min_short_side_pixels: Option<u32>,
+    #[serde(default)]
+    reference_image_min_aspect_ratio: Option<f64>,
+    #[serde(default)]
+    reference_image_max_aspect_ratio: Option<f64>,
 }
 
 fn default_video_prompt_limit() -> u32 {
@@ -122,6 +138,7 @@ pub fn normalize_model_catalog(
     json: &[u8],
     fetched_at: DateTime<Utc>,
 ) -> Result<Vec<MediaModel>, VeniceCatalogError> {
+    let overlay = bundled_video_overlay()?;
     let response: CatalogResponse = serde_json::from_slice(json)?;
     Ok(response
         .data
@@ -132,17 +149,18 @@ pub fn normalize_model_catalog(
                 "image" | "video" | "upscale" | "inpaint"
             )
         })
-        .filter_map(|model| normalize_model(model, fetched_at).ok())
+        .filter_map(|model| normalize_model(model, fetched_at, &overlay).ok())
         .collect())
 }
 
 fn normalize_model(
     model: CatalogModel,
     fetched_at: DateTime<Utc>,
+    overlay: &VeniceVideoOverlay,
 ) -> Result<MediaModel, VeniceCatalogError> {
     match model.media_type.as_str() {
         "image" => normalize_image(model, fetched_at),
-        "video" => normalize_video(model, fetched_at),
+        "video" => normalize_video(model, fetched_at, overlay),
         "upscale" => normalize_upscale(model, fetched_at),
         "inpaint" => normalize_inpaint(model, fetched_at),
         _ => unreachable!("caller filters non-media model types"),
@@ -273,6 +291,7 @@ fn normalize_image(
         controls,
         pricing: pricing_metadata(model.model_spec.pricing.as_ref()),
         features,
+        video: VideoModelMeta::default(),
         manifest_version: String::new(),
         fetched_at,
     })
@@ -359,6 +378,7 @@ fn normalize_upscale(
         controls,
         pricing: upscale_pricing_metadata(model.model_spec.pricing.as_ref()),
         features,
+        video: VideoModelMeta::default(),
         manifest_version: String::new(),
         fetched_at,
     })
@@ -512,6 +532,7 @@ fn normalize_inpaint(
         controls,
         pricing: inpaint_pricing_metadata(model.model_spec.pricing.as_ref()),
         features,
+        video: VideoModelMeta::default(),
         manifest_version: String::new(),
         fetched_at,
     })
@@ -520,22 +541,35 @@ fn normalize_inpaint(
 fn normalize_video(
     model: CatalogModel,
     fetched_at: DateTime<Utc>,
+    overlay: &VeniceVideoOverlay,
 ) -> Result<MediaModel, VeniceCatalogError> {
     let features = model_features(&model.model_spec);
     let constraints: VideoConstraints = serde_json::from_value(model.model_spec.constraints)?;
+    // Parsed so live extras are not dropped. Counts/roles come from the overlay.
+    let _ = (
+        constraints.audio_input,
+        constraints.video_input,
+        constraints.per_reference_audio,
+    );
+    let geometry = ImageGeometry {
+        minimum_short_side: constraints.reference_image_min_short_side_pixels,
+        minimum_aspect_ratio: constraints.reference_image_min_aspect_ratio,
+        maximum_aspect_ratio: constraints.reference_image_max_aspect_ratio,
+    };
     let (operation, input_constraints) = match constraints.model_type.as_str() {
         "text-to-video" => (MediaOperation::TextToVideo, Vec::new()),
-        "image-to-video" => (
-            MediaOperation::ImageToVideo,
-            vec![input_constraint(
-                "source",
-                &["image/jpeg", "image/png", "image/webp"],
-            )],
-        ),
+        "image-to-video" => {
+            let mut source =
+                input_constraint(ROLE_SOURCE, &["image/jpeg", "image/png", "image/webp"]);
+            source.mime.minimum_short_side = geometry.minimum_short_side;
+            source.mime.minimum_aspect_ratio = geometry.minimum_aspect_ratio;
+            source.mime.maximum_aspect_ratio = geometry.maximum_aspect_ratio;
+            (MediaOperation::ImageToVideo, vec![source])
+        }
         "video" => (
             MediaOperation::VideoToVideo,
             vec![input_constraint(
-                "source",
+                ROLE_SOURCE,
                 &["video/mp4", "video/quicktime", "video/webm"],
             )],
         ),
@@ -563,7 +597,7 @@ fn normalize_video(
     if !constraints.durations.is_empty() {
         controls.push(duration_control(&model.id, &constraints.durations)?);
     }
-    if constraints.audio && constraints.audio_configurable {
+    let generate_audio = if constraints.audio && constraints.audio_configurable {
         controls.push(ModelControl {
             id: ControlId::from("audio"),
             label: "Generate audio".to_owned(),
@@ -577,9 +611,15 @@ fn normalize_video(
             choices: Vec::new(),
             visible_when: Vec::new(),
         });
-    }
+        AudioCapability::Configurable { default: true }
+    } else if constraints.audio {
+        AudioCapability::ForcedOn
+    } else {
+        AudioCapability::None
+    };
 
-    finish_manifest(MediaModel {
+    let live_model_type = constraints.model_type.clone();
+    let mut model = MediaModel {
         provider_id: ProviderId::from(VENICE_PROVIDER_ID),
         id: ModelId::new(model.id),
         display_name: model
@@ -597,9 +637,16 @@ fn normalize_video(
         controls,
         pricing: pricing_metadata(model.model_spec.pricing.as_ref()),
         features,
+        video: VideoModelMeta {
+            adapter_family: AdapterFamily::Hidden,
+            generate_audio,
+            ..VideoModelMeta::default()
+        },
         manifest_version: String::new(),
         fetched_at,
-    })
+    };
+    overlay.apply(&mut model, &live_model_type, geometry)?;
+    finish_manifest(model)
 }
 
 fn model_features(spec: &ModelSpec) -> Vec<ModelFeature> {
@@ -638,6 +685,9 @@ fn parse_aspect_ratio(value: &str) -> Option<ControlValue> {
     if value.eq_ignore_ascii_case("auto") {
         return Some(ControlValue::AspectRatioAuto);
     }
+    if value.eq_ignore_ascii_case("adaptive") {
+        return Some(ControlValue::AspectRatioAdaptive);
+    }
     let (width, height) = value.split_once(':')?;
     let width = width.parse().ok()?;
     let height = height.parse().ok()?;
@@ -647,6 +697,7 @@ fn parse_aspect_ratio(value: &str) -> Option<ControlValue> {
 fn aspect_ratio_label(value: &str, parsed: &ControlValue) -> String {
     match parsed {
         ControlValue::AspectRatioAuto => "Auto".to_owned(),
+        ControlValue::AspectRatioAdaptive => "Adaptive".to_owned(),
         _ => value.to_owned(),
     }
 }
@@ -686,29 +737,39 @@ fn aspect_ratio_control(values: &[String], default: Option<&str>) -> Option<Mode
     })
 }
 
+fn parse_duration(value: &str) -> Option<(ControlValue, String)> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("auto") || trimmed == "-1" {
+        return Some((ControlValue::DurationAuto, "Auto".to_owned()));
+    }
+    let seconds = trimmed.strip_suffix('s').unwrap_or(trimmed);
+    let seconds: f64 = seconds.parse().ok()?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    Some((
+        ControlValue::DurationSeconds { value: seconds },
+        trimmed.to_owned(),
+    ))
+}
+
 fn duration_control(model_id: &str, values: &[String]) -> Result<ModelControl, VeniceCatalogError> {
     let choices = values
         .iter()
-        .map(|value| {
-            let seconds =
-                value
-                    .strip_suffix('s')
-                    .ok_or_else(|| VeniceCatalogError::InvalidDuration {
-                        model_id: model_id.to_owned(),
-                        value: value.clone(),
-                    })?;
-            let seconds = seconds
-                .parse()
-                .map_err(|_| VeniceCatalogError::InvalidDuration {
-                    model_id: model_id.to_owned(),
-                    value: value.clone(),
-                })?;
-            Ok(ControlChoice {
-                value: ControlValue::DurationSeconds { value: seconds },
-                label: value.clone(),
+        .filter_map(|value| {
+            let (parsed, label) = parse_duration(value)?;
+            Some(ControlChoice {
+                value: parsed,
+                label,
             })
         })
-        .collect::<Result<Vec<_>, VeniceCatalogError>>()?;
+        .collect::<Vec<_>>();
+    if choices.is_empty() {
+        return Err(VeniceCatalogError::InvalidDuration {
+            model_id: model_id.to_owned(),
+            value: values.join(","),
+        });
+    }
     Ok(ModelControl {
         id: ControlId::from("duration"),
         label: "Duration".to_owned(),
@@ -829,12 +890,7 @@ fn input_constraint(role: &'static str, mime_types: &[&str]) -> InputConstraint 
         role: InputRole::from(role),
         minimum_count: 1,
         maximum_count: 1,
-        mime: MimeConstraint {
-            accepted: mime_types.iter().map(|value| (*value).to_owned()).collect(),
-            maximum_bytes: None,
-            maximum_width: None,
-            maximum_height: None,
-        },
+        mime: MimeConstraint::accepting(mime_types.iter().copied()),
     }
 }
 

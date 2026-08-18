@@ -85,7 +85,8 @@ impl VeniceMediaProvider {
         let image = self.models_of_type(secret, "image").await;
         let upscale = self.models_of_type(secret, "upscale").await;
         let inpaint = self.models_of_type(secret, "inpaint").await;
-        merge_catalog_fetches([image, upscale, inpaint])
+        let video = self.models_of_type(secret, "video").await;
+        merge_catalog_fetches([image, upscale, inpaint, video])
     }
 
     async fn billing_balance(&self, secret: &Secret) -> ProviderResult<AccountBalance> {
@@ -239,7 +240,7 @@ impl VeniceMediaProvider {
 }
 
 fn merge_catalog_fetches(
-    results: [ProviderResult<Vec<crate::MediaModel>>; 3],
+    results: impl IntoIterator<Item = ProviderResult<Vec<crate::MediaModel>>>,
 ) -> ProviderResult<Vec<crate::MediaModel>> {
     let mut models = Vec::new();
     let mut first_error = None;
@@ -257,7 +258,7 @@ fn merge_catalog_fetches(
         return Err(first_error.unwrap_or_else(|| {
             ProviderError::new(
                 ProviderErrorKind::Other,
-                "Venice returned no image, upscale, or inpaint models",
+                "Venice returned no image, upscale, inpaint, or video models",
             )
         }));
     }
@@ -1591,17 +1592,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_models_fetches_image_upscale_and_inpaint_catalogs() {
+    async fn list_models_fetches_image_upscale_inpaint_and_video_catalogs() {
         let image = include_bytes!("../tests/fixtures/venice/image-model.json");
         let upscale = include_bytes!("../tests/fixtures/venice/upscale-model.json");
         let inpaint = include_bytes!("../tests/fixtures/venice/inpaint-model.json");
+        let video = include_bytes!("../tests/fixtures/venice/text-to-video-model.json");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_server = seen.clone();
         let server = tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            for _ in 0..3 {
+            for _ in 0..4 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut incoming = vec![0_u8; 4096];
                 let n = stream.read(&mut incoming).await.unwrap_or(0);
@@ -1610,6 +1612,8 @@ mod tests {
                     "upscale"
                 } else if request.contains("type=inpaint") {
                     "inpaint"
+                } else if request.contains("type=video") {
+                    "video"
                 } else {
                     "image"
                 };
@@ -1617,6 +1621,7 @@ mod tests {
                 let body: &[u8] = match media_type {
                     "upscale" => upscale,
                     "inpaint" => inpaint,
+                    "video" => video,
                     _ => image,
                 };
                 let response = format!(
@@ -1631,7 +1636,7 @@ mod tests {
         let models = provider.list_models(&Secret::new("token")).await.unwrap();
         let mut types: Vec<_> = seen.lock().unwrap().clone();
         types.sort();
-        assert_eq!(types, ["image", "inpaint", "upscale"]);
+        assert_eq!(types, ["image", "inpaint", "upscale", "video"]);
         assert!(
             models
                 .iter()
@@ -1646,6 +1651,11 @@ mod tests {
             models
                 .iter()
                 .any(|model| model.operation == crate::MediaOperation::ImageEdit)
+        );
+        assert!(
+            models
+                .iter()
+                .any(|model| model.operation == crate::MediaOperation::TextToVideo)
         );
         server.await.unwrap();
     }

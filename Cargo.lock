@@ -9238,6 +9238,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.19",
  "tokio",
+ "toml 0.8.23",
  "uuid",
 ]
 
