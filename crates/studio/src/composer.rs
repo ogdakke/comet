@@ -336,6 +336,8 @@ pub enum ResolveAction {
     ClearDuration,
     RevertMode {
         mode: ComposerMode,
+        selected: Vec<SelectedModelRef>,
+        duration: Option<ControlValue>,
     },
     RevertModelSelection {
         selected: Vec<SelectedModelRef>,
@@ -502,6 +504,10 @@ pub fn map_tray(
                     leftovers.push(index);
                     continue;
                 };
+                if !mime_accepted(&constraint.mime, &attachment.mime_type) {
+                    leftovers.push(index);
+                    continue;
+                }
                 if count >= constraint.maximum_count {
                     overflow.push(index);
                     continue;
@@ -808,11 +814,12 @@ fn attachment_constraint_conflict(
     constraint: &InputConstraint,
 ) -> Option<ComposerConflict> {
     if !mime_accepted(&constraint.mime, &attachment.mime_type) {
-        return Some(attachment_code_conflict(
-            ConflictCode::AttachmentGeometry,
-            model,
-            attachment,
-            "This file type is not accepted by the selected model.",
+        return Some(make_conflict(
+            ConflictCode::UnsupportedReferences,
+            leftover_title(model, &[attachment.kind]),
+            "Remove the leftover attachments or choose a compatible model.",
+            subjects(vec![model.id.clone()], vec![attachment.id], Vec::new()),
+            unsupported_actions(model, &ComposerSnapshot::default(), &[attachment.id]),
         ));
     }
     if constraint
@@ -932,7 +939,7 @@ pub fn estimate_queue_body_bytes(
     inputs: &[GenerationInput],
     controls: &BTreeMap<ControlId, ControlValue>,
     prompt: &str,
-    probes: &BTreeMap<StudioAssetId, u64>,
+    snapshot: &ComposerSnapshot,
 ) -> u64 {
     let prompt_json = serde_json::to_vec(prompt)
         .map(|bytes| bytes.len() as u64)
@@ -945,13 +952,28 @@ pub fn estimate_queue_body_bytes(
         .saturating_add(controls_json)
         .saturating_add(fields.saturating_mul(64));
     for input in inputs {
-        let raw = match &input.source {
-            GenerationInputSource::Asset { asset_id } => probes.get(asset_id).copied().unwrap_or(0),
-            GenerationInputSource::Artifact { .. } => 0,
-        };
+        let raw = attachment_for_input(snapshot, input)
+            .map(|attachment| attachment.byte_size)
+            .unwrap_or(0);
         total = total.saturating_add(raw.saturating_mul(4) / 3);
     }
     total
+}
+
+fn attachment_for_input<'a>(
+    snapshot: &'a ComposerSnapshot,
+    input: &GenerationInput,
+) -> Option<&'a ComposerAttachment> {
+    snapshot
+        .attachments
+        .iter()
+        .find(|attachment| match &input.source {
+            GenerationInputSource::Asset { asset_id } => attachment.id == *asset_id,
+            GenerationInputSource::Artifact { artifact_id } => matches!(
+                &attachment.origin,
+                AttachmentOrigin::Artifact { artifact_id: origin } if origin == artifact_id
+            ),
+        })
 }
 
 pub fn evaluate_composer(snapshot: &ComposerSnapshot, catalog: &[MediaModel]) -> ComposerView {
@@ -1031,9 +1053,9 @@ fn evaluate_composer_inner(
 
     let intersection = video_intersection(&usable);
     let duration_choices = duration_choices(&usable, &intersection);
-    let chips = chip_views(snapshot, catalog, &mapped);
+    let chips = chip_views(snapshot, catalog, &mapped, &conflicts);
     let budgets = budgets(snapshot, &usable, &mapped);
-    let hints = hints(&usable, &mapped);
+    let hints = hints(&usable, &mapped, &conflicts);
 
     ComposerView {
         phase,
@@ -1065,6 +1087,7 @@ pub fn apply_event(
 ) -> (ComposerSnapshot, ComposerView) {
     let previous_mode = snapshot.mode;
     let previous_selected = snapshot.selected.clone();
+    let previous_duration = snapshot.duration.clone();
     let mut flags = ViewFlags::default();
     let inject_mode = matches!(event, ComposerEvent::SetMode { .. });
     let inject_selection = matches!(
@@ -1193,10 +1216,34 @@ pub fn apply_event(
         ComposerEvent::CatalogUpdated { fetched_at } => {
             snapshot.catalog_fetched_at = Some(fetched_at);
         }
-        ComposerEvent::Resolve { action, .. } => {
-            snapshot = apply_resolve(snapshot, catalog, &action);
-            flags.open_picker = matches!(action, ResolveAction::OpenModelPicker);
-            flags.refresh_catalog = matches!(action, ResolveAction::RefreshCatalog);
+        ComposerEvent::Resolve {
+            action,
+            conflict_id,
+        } => {
+            let preview = evaluate_composer(&snapshot, catalog);
+            if let Some(conflict) = preview
+                .conflicts
+                .iter()
+                .find(|conflict| conflict.id == conflict_id)
+                .or_else(|| preview.conflicts.first())
+            {
+                let mut offered = conflict.clone();
+                if matches!(
+                    action,
+                    ResolveAction::RevertMode { .. } | ResolveAction::RevertModelSelection { .. }
+                ) && !offered.actions.iter().any(|view| view.action == action)
+                {
+                    offered.actions.push(action_view(action.clone()));
+                }
+                match apply_resolve_checked(snapshot.clone(), catalog, &offered, &action) {
+                    Ok(next) => {
+                        snapshot = next;
+                        flags.open_picker = matches!(action, ResolveAction::OpenModelPicker);
+                        flags.refresh_catalog = matches!(action, ResolveAction::RefreshCatalog);
+                    }
+                    Err(ResolveError::ActionNotOffered) => {}
+                }
+            }
         }
         ComposerEvent::Send => {}
     }
@@ -1205,7 +1252,12 @@ pub fn apply_event(
 
     let mut view = evaluate_composer_inner(&snapshot, catalog, flags);
     if inject_mode {
-        inject_revert_mode(&mut view, previous_mode);
+        inject_revert_mode(
+            &mut view,
+            previous_mode,
+            &previous_selected,
+            previous_duration,
+        );
     }
     if inject_selection {
         inject_revert_selection(&mut view, previous_selected);
@@ -1247,8 +1299,14 @@ pub fn apply_resolve(
             snapshot.duration = None;
             strip_duration_from_chips(&mut snapshot);
         }
-        ResolveAction::RevertMode { mode } => {
+        ResolveAction::RevertMode {
+            mode,
+            selected,
+            duration,
+        } => {
             snapshot.mode = *mode;
+            snapshot.selected = selected.clone();
+            snapshot.duration = duration.clone();
             apply_mode_duration(&mut snapshot, catalog);
         }
         ResolveAction::RevertModelSelection { selected } => {
@@ -1638,7 +1696,7 @@ fn collect_image_mode_media_conflicts(
         subjects(Vec::new(), asset_ids.clone(), Vec::new()),
         vec![
             ResolveAction::RemoveUnsupportedReferences { asset_ids },
-            ResolveAction::RevertMode {
+            ResolveAction::SwitchMode {
                 mode: ComposerMode::Video,
             },
         ],
@@ -1710,7 +1768,6 @@ fn collect_queue_conflicts(
     mapped: &BTreeMap<String, Vec<GenerationInput>>,
     conflicts: &mut Vec<ComposerConflict>,
 ) {
-    let probes = probes_from_attachments(snapshot);
     for model in usable {
         let Some(inputs) = mapped.get(model.id.as_str()) else {
             continue;
@@ -1726,17 +1783,15 @@ fn collect_queue_conflicts(
             controls.insert(ControlId::from(DURATION_CONTROL), duration);
         }
         let estimate =
-            estimate_queue_body_bytes(model, inputs, &controls, &snapshot.prompt, &probes);
+            estimate_queue_body_bytes(model, inputs, &controls, &snapshot.prompt, snapshot);
         if estimate <= QUEUE_BODY_LIMIT_BYTES {
             continue;
         }
         let mut sized: Vec<(StudioAssetId, u64)> = inputs
             .iter()
-            .filter_map(|input| match input.source {
-                GenerationInputSource::Asset { asset_id } => {
-                    Some((asset_id, probes.get(&asset_id).copied().unwrap_or(0)))
-                }
-                GenerationInputSource::Artifact { .. } => None,
+            .filter_map(|input| {
+                attachment_for_input(snapshot, input)
+                    .map(|attachment| (attachment.id, attachment.byte_size))
             })
             .collect();
         sized.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
@@ -1760,6 +1815,7 @@ fn chip_views(
     snapshot: &ComposerSnapshot,
     catalog: &[MediaModel],
     mapped: &BTreeMap<String, Vec<GenerationInput>>,
+    conflicts: &[ComposerConflict],
 ) -> Vec<ChipView> {
     let mut chips = Vec::new();
     for selected in &snapshot.selected {
@@ -1787,7 +1843,7 @@ fn chip_views(
         }
         let mapped_ok = mapped.contains_key(model.id.as_str());
         let mapped_inputs = mapped.get(model.id.as_str()).cloned().unwrap_or_default();
-        let badge = chip_badge(model, &mapped_inputs, mapped_ok);
+        let badge = chip_badge(model, &mapped_inputs, mapped_ok, conflicts);
         let output_count =
             if snapshot.mode == ComposerMode::Video || model.output_kind == MediaKind::Video {
                 1
@@ -1813,11 +1869,18 @@ fn chip_views(
     chips
 }
 
-fn chip_badge(model: &MediaModel, inputs: &[GenerationInput], mapped_ok: bool) -> Option<String> {
+fn chip_badge(
+    model: &MediaModel,
+    _inputs: &[GenerationInput],
+    _mapped_ok: bool,
+    conflicts: &[ComposerConflict],
+) -> Option<String> {
     if model.operation == MediaOperation::ImageToVideo
-        && !inputs
-            .iter()
-            .any(|input| input.role.as_str() == ROLE_SOURCE)
+        && conflicts.iter().any(|conflict| {
+            conflict.code == ConflictCode::MissingRequiredInput
+                && conflict.subjects.model_ids.contains(&model.id)
+                && conflict.subjects.control_ids.is_empty()
+        })
     {
         return Some("Needs a start frame".to_owned());
     }
@@ -1826,17 +1889,6 @@ fn chip_badge(model: &MediaModel, inputs: &[GenerationInput], mapped_ok: bool) -
         .is_some_and(|cap| cap.generate_audio == AudioCapability::None)
     {
         return Some("No audio".to_owned());
-    }
-    if mapped_ok
-        && model.video.requires_visual_reference
-        && !inputs.iter().any(|input| {
-            matches!(
-                input.role.as_str(),
-                ROLE_SOURCE | ROLE_REFERENCE | ROLE_REFERENCE_VIDEO
-            )
-        })
-    {
-        return Some("Needs a start frame".to_owned());
     }
     None
 }
@@ -1929,15 +1981,16 @@ fn tray_kind_count(snapshot: &ComposerSnapshot, role: &str) -> u32 {
 
 fn hints(
     usable: &[&MediaModel],
-    mapped: &BTreeMap<String, Vec<GenerationInput>>,
+    _mapped: &BTreeMap<String, Vec<GenerationInput>>,
+    conflicts: &[ComposerConflict],
 ) -> Vec<LimitHint> {
     let mut hints = Vec::new();
     for model in usable {
         if model.operation == MediaOperation::ImageToVideo
-            && mapped.get(model.id.as_str()).is_some_and(|inputs| {
-                !inputs
-                    .iter()
-                    .any(|input| input.role.as_str() == ROLE_SOURCE)
+            && conflicts.iter().any(|conflict| {
+                conflict.code == ConflictCode::MissingRequiredInput
+                    && conflict.subjects.model_ids.contains(&model.id)
+                    && conflict.subjects.control_ids.is_empty()
             })
         {
             hints.push(LimitHint {
@@ -2324,14 +2377,6 @@ fn strip_duration_from_chips(snapshot: &mut ComposerSnapshot) {
     }
 }
 
-fn probes_from_attachments(snapshot: &ComposerSnapshot) -> BTreeMap<StudioAssetId, u64> {
-    snapshot
-        .attachments
-        .iter()
-        .map(|attachment| (attachment.id, attachment.byte_size))
-        .collect()
-}
-
 fn attach_index(snapshot: &ComposerSnapshot, id: &StudioAssetId) -> usize {
     snapshot
         .attachments
@@ -2398,7 +2443,12 @@ fn first_attach_index(snapshot: &ComposerSnapshot, subjects: &ConflictSubjects) 
         .unwrap_or(usize::MAX)
 }
 
-fn inject_revert_mode(view: &mut ComposerView, previous: ComposerMode) {
+fn inject_revert_mode(
+    view: &mut ComposerView,
+    previous: ComposerMode,
+    previous_selected: &[SelectedModelRef],
+    previous_duration: Option<ControlValue>,
+) {
     if view.mode == previous {
         return;
     }
@@ -2415,7 +2465,11 @@ fn inject_revert_mode(view: &mut ComposerView, previous: ComposerMode) {
         }
         conflict
             .actions
-            .push(action_view(ResolveAction::RevertMode { mode: previous }));
+            .push(action_view(ResolveAction::RevertMode {
+                mode: previous,
+                selected: previous_selected.to_vec(),
+                duration: previous_duration.clone(),
+            }));
     }
 }
 

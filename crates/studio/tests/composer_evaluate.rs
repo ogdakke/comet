@@ -8,8 +8,9 @@ use zeron_studio::{
     MediaKind, MediaModel, MediaOperation, MimeConstraint, ModelControl, ProviderId,
     QUEUE_BODY_LIMIT_BYTES, ROLE_LAST_FRAME, ROLE_REFERENCE, ROLE_REFERENCE_AUDIO,
     ROLE_REFERENCE_VIDEO, ROLE_SOURCE, ResolveAction, ResolveError, SelectedModelRef,
-    StudioAssetId, VideoModelMeta, apply_event, apply_resolve_checked, estimate_queue_body_bytes,
-    evaluate_composer, map_tray, picker_models, popup_conflict, venice::normalize_model_catalog,
+    StudioArtifactId, StudioAssetId, VideoModelMeta, apply_event, apply_resolve_checked,
+    estimate_queue_body_bytes, evaluate_composer, map_tray, picker_models, popup_conflict,
+    venice::normalize_model_catalog,
 };
 
 const IMAGE: &[u8] = include_bytes!("fixtures/venice/image-model.json");
@@ -545,13 +546,7 @@ fn queue_payload_is_estimated_per_run() {
     assert_eq!(conflict.subjects.asset_ids, vec![huge.id]);
 
     let mapped = map_tray(&one, &left).unwrap();
-    let estimate = estimate_queue_body_bytes(
-        &left,
-        &mapped,
-        &BTreeMap::new(),
-        &one.prompt,
-        &BTreeMap::from([(huge.id, huge.byte_size)]),
-    );
+    let estimate = estimate_queue_body_bytes(&left, &mapped, &BTreeMap::new(), &one.prompt, &one);
     assert!(estimate > QUEUE_BODY_LIMIT_BYTES);
 }
 
@@ -1206,6 +1201,18 @@ fn image_mode_video_attachment_is_unsupported() {
     };
     let view = evaluate_composer(&snapshot, std::slice::from_ref(&t2i));
     assert_eq!(codes(&view), vec![ConflictCode::UnsupportedReferences]);
+    let offered = actions(conflict(&view, ConflictCode::UnsupportedReferences));
+    assert!(offered.iter().any(|action| matches!(
+        action,
+        ResolveAction::SwitchMode {
+            mode: ComposerMode::Video
+        }
+    )));
+    assert!(
+        offered
+            .iter()
+            .all(|action| !matches!(action, ResolveAction::RevertMode { .. }))
+    );
 }
 
 #[test]
@@ -1218,4 +1225,223 @@ fn send_event_does_not_mutate_the_snapshot() {
         ComposerEvent::Send,
     );
     assert_eq!(next, snapshot);
+}
+
+fn resolve(
+    snapshot: ComposerSnapshot,
+    catalog: &[MediaModel],
+    view: &zeron_studio::ComposerView,
+    action: ResolveAction,
+) -> (ComposerSnapshot, zeron_studio::ComposerView) {
+    let conflict_id = view
+        .conflicts
+        .iter()
+        .find(|conflict| {
+            conflict
+                .actions
+                .iter()
+                .any(|offered| offered.action == action)
+        })
+        .map(|conflict| conflict.id.clone())
+        .or_else(|| view.conflicts.first().map(|conflict| conflict.id.clone()))
+        .expect("no conflict to resolve");
+    apply_event(
+        snapshot,
+        catalog,
+        ComposerEvent::Resolve {
+            conflict_id,
+            action,
+        },
+    )
+}
+
+#[test]
+fn set_mode_revert_mode_restores_image_chips() {
+    let t2v = t2v("t2v", &[4.0, 6.0, 8.0]);
+    let t2i = t2i("flux");
+    let attachments = vec![still("keep-a"), still("keep-b")];
+    let image = ComposerSnapshot {
+        mode: ComposerMode::Image,
+        prompt: "stay".to_owned(),
+        attachments: attachments.clone(),
+        selected: vec![selected(&t2i)],
+        ..ComposerSnapshot::default()
+    };
+    let catalog = catalog(&[&t2v, &t2i]);
+    let (video, view) = apply_event(
+        image,
+        &catalog,
+        ComposerEvent::SetMode {
+            mode: ComposerMode::Video,
+            restore: vec![selected(&t2v)],
+        },
+    );
+    assert_eq!(video.attachments.len(), 2);
+    assert!(codes(&view).contains(&ConflictCode::UnsupportedReferences));
+    let revert = actions(conflict(&view, ConflictCode::UnsupportedReferences))
+        .into_iter()
+        .find(|action| matches!(action, ResolveAction::RevertMode { .. }))
+        .expect("SetMode should offer RevertMode");
+    let (restored, view) = resolve(video, &catalog, &view, revert);
+    assert_eq!(restored.mode, ComposerMode::Image);
+    assert_eq!(restored.selected.len(), 1);
+    assert_eq!(restored.selected[0].model_id, t2i.id);
+    assert_eq!(restored.attachments.len(), 2);
+    assert_eq!(
+        restored.attachments[0].content_hash,
+        attachments[0].content_hash
+    );
+    assert!(view.send.enabled, "{:?}", codes(&view));
+    assert_eq!(view.mode, ComposerMode::Image);
+}
+
+#[test]
+fn artifact_origin_clip_counts_toward_queue_payload() {
+    let r2v = r2v("r2v", 9, &[5.0, 8.0]);
+    let mut huge = clip("artifact-30mb", 30 * 1024 * 1024, Some(4.0));
+    huge.origin = AttachmentOrigin::Artifact {
+        artifact_id: StudioArtifactId::new(),
+    };
+    let snapshot = video_snapshot(&[&r2v], vec![huge.clone()], 5.0);
+    let view = evaluate_composer(&snapshot, std::slice::from_ref(&r2v));
+    assert_eq!(codes(&view), vec![ConflictCode::QueuePayloadTooLarge]);
+    let blocked = conflict(&view, ConflictCode::QueuePayloadTooLarge);
+    assert_eq!(blocked.subjects.asset_ids, vec![huge.id]);
+    let remove = ResolveAction::RemoveUnsupportedReferences {
+        asset_ids: vec![huge.id],
+    };
+    assert!(actions(blocked).contains(&remove));
+    let cleared =
+        apply_resolve_checked(snapshot, std::slice::from_ref(&r2v), blocked, &remove).unwrap();
+    assert!(cleared.attachments.is_empty());
+}
+
+#[test]
+fn i2v_badge_only_for_missing_source() {
+    let i2v = i2v("i2v", false);
+    let missing = evaluate_composer(
+        &video_snapshot(&[&i2v], Vec::new(), 6.0),
+        std::slice::from_ref(&i2v),
+    );
+    assert_eq!(codes(&missing), vec![ConflictCode::MissingRequiredInput]);
+    assert_eq!(
+        missing.models[0].badge.as_deref(),
+        Some("Needs a start frame")
+    );
+
+    let leftovers = evaluate_composer(
+        &video_snapshot(&[&i2v], vec![still("a"), still("b")], 6.0),
+        std::slice::from_ref(&i2v),
+    );
+    assert!(codes(&leftovers).contains(&ConflictCode::UnsupportedReferences));
+    assert_ne!(
+        leftovers.models[0].badge.as_deref(),
+        Some("Needs a start frame")
+    );
+}
+
+#[test]
+fn resolve_event_rejects_unoffered_action() {
+    let t2v = t2v("t2v", &[5.0, 8.0]);
+    let snapshot = video_snapshot(&[&t2v], vec![still("left")], 5.0);
+    let view = evaluate_composer(&snapshot, std::slice::from_ref(&t2v));
+    assert!(codes(&view).contains(&ConflictCode::UnsupportedReferences));
+    let before = snapshot.clone();
+    let (next, _) = apply_event(
+        snapshot,
+        std::slice::from_ref(&t2v),
+        ComposerEvent::Resolve {
+            conflict_id: view.conflicts[0].id.clone(),
+            action: ResolveAction::ClearPrompt,
+        },
+    );
+    assert_eq!(next, before);
+}
+
+#[test]
+fn resolve_actions_mutate_as_specified() {
+    let short = t2v("short", &[4.0, 6.0, 8.0]);
+    let long = t2v("long", &[6.0, 8.0, 12.0]);
+    let clamp_catalog = catalog(&[&short, &long]);
+    let unsupported = video_snapshot(&[&short, &long], Vec::new(), 12.0);
+    let view = evaluate_composer(&unsupported, &clamp_catalog);
+    assert_eq!(codes(&view), vec![ConflictCode::DurationUnsupported]);
+    let clamp = actions(conflict(&view, ConflictCode::DurationUnsupported))
+        .into_iter()
+        .find(|action| matches!(action, ResolveAction::ClampDuration { .. }))
+        .unwrap();
+    let (clamped, view) = resolve(unsupported, &clamp_catalog, &view, clamp);
+    assert_eq!(
+        clamped.duration,
+        Some(ControlValue::DurationSeconds { value: 8.0 })
+    );
+    assert!(view.send.enabled, "{:?}", codes(&view));
+
+    let a = t2v("a", &[4.0, 8.0]);
+    let b = t2v("b", &[8.0, 10.0]);
+    let c = t2v("c", &[4.0, 10.0]);
+    let disjoint_catalog = catalog(&[&a, &b, &c]);
+    let disjoint = video_snapshot(&[&a, &b, &c], Vec::new(), 4.0);
+    let view = evaluate_composer(&disjoint, &disjoint_catalog);
+    assert_eq!(codes(&view), vec![ConflictCode::DisjointDurations]);
+    let keep = actions(conflict(&view, ConflictCode::DisjointDurations))
+        .into_iter()
+        .find(|action| matches!(action, ResolveAction::KeepModelsDropOthers { .. }))
+        .unwrap();
+    let (kept, view) = resolve(disjoint, &disjoint_catalog, &view, keep);
+    let ids: Vec<&str> = kept
+        .selected
+        .iter()
+        .map(|selected| selected.model_id.as_str())
+        .collect();
+    assert_eq!(ids, ["a", "c"]);
+    assert!(view.send.enabled, "{:?}", codes(&view));
+
+    let t2v = t2v("empty", &[5.0, 8.0]);
+    let mut empty = video_snapshot(&[&t2v], Vec::new(), 5.0);
+    empty.selected.clear();
+    let view = evaluate_composer(&empty, std::slice::from_ref(&t2v));
+    assert_eq!(codes(&view), vec![ConflictCode::EmptyModelSet]);
+    let (same, view) = resolve(
+        empty.clone(),
+        std::slice::from_ref(&t2v),
+        &view,
+        ResolveAction::OpenModelPicker,
+    );
+    assert_eq!(same.selected, empty.selected);
+    assert!(view.open_picker);
+
+    let kling = hidden_kling();
+    let stale = video_snapshot(&[&kling], Vec::new(), 5.0);
+    let stale_catalog = catalog(&[&kling]);
+    let view = evaluate_composer(&stale, &stale_catalog);
+    assert_eq!(codes(&view), vec![ConflictCode::StaleModel]);
+    let (refreshed, view) = resolve(
+        stale.clone(),
+        &stale_catalog,
+        &view,
+        ResolveAction::RefreshCatalog,
+    );
+    assert_eq!(refreshed.selected, stale.selected);
+    assert!(view.refresh_catalog);
+    let drop = ResolveAction::DropVanishedModels {
+        model_ids: vec![kling.id.clone()],
+    };
+    let (dropped, view) = resolve(stale, &stale_catalog, &view, drop);
+    assert!(dropped.selected.is_empty());
+    assert_eq!(codes(&view), vec![ConflictCode::EmptyModelSet]);
+}
+
+#[test]
+fn mime_mismatch_is_unsupported_references() {
+    let r2v = r2v("r2v", 9, &[5.0, 8.0]);
+    let mut gif = still("gif");
+    gif.mime_type = "image/gif".to_owned();
+    let snapshot = video_snapshot(&[&r2v], vec![gif], 5.0);
+    let err = map_tray(&snapshot, &r2v).unwrap_err();
+    assert_eq!(err.code, ConflictCode::UnsupportedReferences);
+    assert_ne!(err.code, ConflictCode::AttachmentGeometry);
+    let view = evaluate_composer(&snapshot, std::slice::from_ref(&r2v));
+    assert!(codes(&view).contains(&ConflictCode::UnsupportedReferences));
+    assert!(!codes(&view).contains(&ConflictCode::AttachmentGeometry));
 }
