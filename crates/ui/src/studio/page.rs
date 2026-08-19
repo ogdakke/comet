@@ -688,6 +688,7 @@ impl StudioPage {
             self.focused_artifact = None;
             self.close_artifact(cx);
             self.composer_seeded_for = None;
+            self.source_turn = None;
             self.prompt_history.reset();
             self.expanded_prompts.clear();
             self.expanded_inspector_prompts.clear();
@@ -1169,8 +1170,10 @@ impl StudioPage {
                 snapshot_from_committed_turn(turn, &self.models, &self.known_studio_artifacts())
         {
             // Opening a thread restores chips/tray, not the last prompt.
+            // Leave source_turn unset so "Using previous settings" is only
+            // shown after an explicit Use prompt.
             snapshot.prompt = self.prompt.read(cx).text().to_owned();
-            self.source_turn = Some(turn.id);
+            snapshot.source_turn_id = None;
             self.apply_composer_event(ComposerEvent::RestoreDraft { snapshot }, None, cx);
         } else {
             self.apply_remembered_or_default_models(cx);
