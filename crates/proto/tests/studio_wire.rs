@@ -1,12 +1,16 @@
 use zeron_proto::{
-    AppendStudioDerivedRunRequest, ExtendStudioTurnRequest, ListStudioArtifactsResponse,
-    ListStudioProvidersResponse, ProviderValidationState, QuoteStudioBatchResponse,
-    QuoteStudioRunView, ReadStudioArtifactChunkRequest, SetStudioProviderCredentialRequest,
+    AppendStudioDerivedRunRequest, AttachmentOrigin, ComposerAttachment, ComposerMediaKind,
+    ComposerMode, ComposerSnapshot, CreateStudioTurnRequest, ExtendStudioTurnRequest,
+    ImportStudioAssetChunk, ImportStudioAssetRequest, ImportStudioAssetResponse,
+    ListStudioArtifactsResponse, ListStudioProvidersResponse, ProviderValidationState,
+    QuoteStudioBatchRequest, QuoteStudioBatchResponse, QuoteStudioRunView,
+    ReadStudioArtifactChunkRequest, STUDIO_VALIDATION_CODE, SetStudioProviderCredentialRequest,
     SetStudioProviderPreferencesRequest, StudioConversationSummary, StudioGalleryItem,
-    StudioProviderBalanceResponse, StudioProviderConnection, StudioRunState,
+    StudioProviderBalanceResponse, StudioProviderConnection, StudioRunState, StudioValidationError,
 };
 use zeron_studio::{
-    AccountBalance, MediaKind, Quote, StudioArtifactId, StudioConversationId, StudioTurnId,
+    AccountBalance, MediaKind, Quote, StudioArtifactId, StudioAssetId, StudioConversationId,
+    StudioTurnId, evaluate_composer,
 };
 
 #[test]
@@ -174,6 +178,7 @@ fn gallery_items_use_camel_case_wire_shape() {
             created_at: chrono::Utc::now(),
             thumbhash: Some("3OcRJYB4d3h/iIeHeEh3eIhw+j3A".into()),
             source_artifact_id: None,
+            duration_seconds: None,
         }],
     };
     let json = serde_json::to_value(response).unwrap();
@@ -188,6 +193,7 @@ fn gallery_items_use_camel_case_wire_shape() {
             .and_then(|v| v.as_str()),
         Some("3OcRJYB4d3h/iIeHeEh3eIhw+j3A")
     );
+    assert!(json["artifacts"][0].get("durationSeconds").is_none());
     assert!(json["artifacts"][0].get("conversation_id").is_none());
 }
 
@@ -210,4 +216,141 @@ fn artifact_view_exposes_content_hash() {
     let json = serde_json::to_value(artifact).unwrap();
     assert_eq!(json["contentHash"], "abc123");
     assert!(json.get("content_hash").is_none());
+}
+
+#[test]
+fn create_and_quote_omit_composer_by_default() {
+    let create = serde_json::json!({
+        "conversationId": StudioConversationId::new(),
+        "prompt": "a comet",
+        "runs": []
+    });
+    let create: CreateStudioTurnRequest = serde_json::from_value(create).unwrap();
+    assert!(create.composer.is_none());
+
+    let quote = serde_json::json!({
+        "prompt": "a comet",
+        "runs": []
+    });
+    let quote: QuoteStudioBatchRequest = serde_json::from_value(quote).unwrap();
+    assert!(quote.composer.is_none());
+}
+
+#[test]
+fn create_and_quote_round_trip_composer_snapshot() {
+    let snapshot = ComposerSnapshot {
+        conversation_id: Some(StudioConversationId::new()),
+        mode: ComposerMode::Video,
+        prompt: "a comet over water".into(),
+        duration: Some(zeron_studio::ControlValue::DurationSeconds { value: 6.0 }),
+        ..ComposerSnapshot::default()
+    };
+    let create = CreateStudioTurnRequest {
+        conversation_id: snapshot.conversation_id.unwrap(),
+        prompt: snapshot.prompt.clone(),
+        runs: Vec::new(),
+        source_turn_id: None,
+        composer: Some(snapshot.clone()),
+    };
+    let json = serde_json::to_value(&create).unwrap();
+    assert_eq!(json["composer"]["mode"], "video");
+    assert_eq!(json["composer"]["prompt"], "a comet over water");
+    assert_eq!(json["composer"]["duration"]["type"], "duration_seconds");
+    assert!(json.get("sourceTurnId").is_none());
+    let decoded: CreateStudioTurnRequest = serde_json::from_value(json).unwrap();
+    assert_eq!(decoded.composer, Some(snapshot.clone()));
+
+    let quote = QuoteStudioBatchRequest {
+        prompt: snapshot.prompt.clone(),
+        runs: Vec::new(),
+        composer: Some(snapshot.clone()),
+    };
+    let json = serde_json::to_value(&quote).unwrap();
+    assert_eq!(json["composer"]["mode"], "video");
+    let decoded: QuoteStudioBatchRequest = serde_json::from_value(json).unwrap();
+    assert_eq!(decoded.composer, Some(snapshot));
+}
+
+#[test]
+fn studio_validation_error_uses_shared_conflict_types() {
+    let view = evaluate_composer(&ComposerSnapshot::default(), &[]);
+    assert!(
+        view.conflicts
+            .iter()
+            .any(|conflict| conflict.code == zeron_studio::ConflictCode::EmptyModelSet)
+    );
+    let error = StudioValidationError::new(view.conflicts);
+    let json = serde_json::to_value(&error).unwrap();
+    assert_eq!(json["code"], STUDIO_VALIDATION_CODE);
+    assert_eq!(json["conflicts"][0]["code"], "empty_model_set");
+    assert_eq!(json["conflicts"][0]["severity"], "block_send");
+    let decoded: StudioValidationError = serde_json::from_value(json).unwrap();
+    assert_eq!(decoded.code, STUDIO_VALIDATION_CODE);
+    assert_eq!(
+        decoded.conflicts[0].code,
+        zeron_studio::ConflictCode::EmptyModelSet
+    );
+}
+
+#[test]
+fn import_studio_asset_frames_use_camel_case_wire_shape() {
+    let asset_id = StudioAssetId::new();
+    let request = ImportStudioAssetRequest {
+        asset_id,
+        offset: 0,
+        data: "Zg==".into(),
+        last: false,
+        expected_hash: None,
+        mime_hint: Some("image/png".into()),
+    };
+    let json = serde_json::to_value(&request).unwrap();
+    assert!(json.get("assetId").is_some());
+    assert_eq!(json["offset"], 0);
+    assert_eq!(json["last"], false);
+    assert_eq!(json["mimeHint"], "image/png");
+    assert!(json.get("expectedHash").is_none());
+
+    let last = ImportStudioAssetRequest {
+        last: true,
+        expected_hash: Some("abc".into()),
+        mime_hint: None,
+        ..request
+    };
+    let json = serde_json::to_value(&last).unwrap();
+    assert_eq!(json["expectedHash"], "abc");
+
+    let cont = ImportStudioAssetResponse::Continue(ImportStudioAssetChunk {
+        asset_id,
+        next_offset: 12,
+    });
+    let json = serde_json::to_value(&cont).unwrap();
+    assert_eq!(json["nextOffset"], 12);
+    assert!(json.get("assetId").is_some());
+    let decoded: ImportStudioAssetResponse = serde_json::from_value(json).unwrap();
+    assert!(matches!(
+        decoded,
+        ImportStudioAssetResponse::Continue(chunk) if chunk.next_offset == 12
+    ));
+
+    let complete = ImportStudioAssetResponse::Complete(ComposerAttachment {
+        id: asset_id,
+        kind: ComposerMediaKind::Image,
+        pending: false,
+        origin: AttachmentOrigin::Asset,
+        mime_type: "image/png".into(),
+        byte_size: 12,
+        width: Some(4),
+        height: Some(4),
+        duration_seconds: None,
+        content_hash: "abc".into(),
+        role_hint: None,
+    });
+    let json = serde_json::to_value(&complete).unwrap();
+    assert_eq!(json["pending"], false);
+    assert_eq!(json["mimeType"], "image/png");
+    assert_eq!(json["origin"]["type"], "asset");
+    let decoded: ImportStudioAssetResponse = serde_json::from_value(json).unwrap();
+    assert!(
+        matches!(decoded, ImportStudioAssetResponse::Complete(attachment) if !attachment.pending)
+    );
 }

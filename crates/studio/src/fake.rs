@@ -52,6 +52,9 @@ pub struct FakeMediaProvider {
     quote: Option<Quote>,
     balance: Option<AccountBalance>,
     mode: FakeSubmissionMode,
+    transient_polls: AtomicUsize,
+    last_quote_reference_video_total: Mutex<Option<Option<f64>>>,
+    complete_calls: AtomicUsize,
     state: Mutex<State>,
 }
 
@@ -65,6 +68,9 @@ impl FakeMediaProvider {
             quote: None,
             balance: None,
             mode,
+            transient_polls: AtomicUsize::new(0),
+            last_quote_reference_video_total: Mutex::new(None),
+            complete_calls: AtomicUsize::new(0),
             state: Mutex::new(State {
                 next_job: 1,
                 jobs: HashMap::new(),
@@ -72,6 +78,22 @@ impl FakeMediaProvider {
                 last_submit_inputs: Vec::new(),
             }),
         }
+    }
+
+    pub fn with_transient_polls(self, count: usize) -> Self {
+        self.transient_polls.store(count, Ordering::SeqCst);
+        self
+    }
+
+    pub fn last_quote_reference_video_total(&self) -> Option<Option<f64>> {
+        *self
+            .last_quote_reference_video_total
+            .lock()
+            .expect("fake provider lock poisoned")
+    }
+
+    pub fn complete_call_count(&self) -> usize {
+        self.complete_calls.load(Ordering::SeqCst)
     }
 
     pub fn set_models(&self, models: Vec<MediaModel>) {
@@ -88,6 +110,27 @@ impl FakeMediaProvider {
             .expect("fake provider lock poisoned")
             .last_submit_inputs
             .clone()
+    }
+
+    /// Insert a queued job so a restarted poll can resume without re-submitting.
+    pub fn seed_queued_job(
+        &self,
+        job_id: impl Into<String>,
+        polls_before_completion: usize,
+        artifacts: Vec<ProviderArtifact>,
+    ) {
+        self.state
+            .lock()
+            .expect("fake provider lock poisoned")
+            .jobs
+            .insert(
+                job_id.into(),
+                FakeJob {
+                    remaining_polls: polls_before_completion,
+                    artifacts,
+                    cancelled: false,
+                },
+            );
     }
 
     pub fn with_accepted_secret(mut self, secret: impl Into<String>) -> Self {
@@ -153,8 +196,13 @@ impl MediaProvider for FakeMediaProvider {
         &self,
         secret: &Secret,
         _request: &GenerationRequest,
+        reference_video_total_duration: Option<f64>,
     ) -> ProviderResult<Option<Quote>> {
         self.authenticate(secret)?;
+        *self
+            .last_quote_reference_video_total
+            .lock()
+            .expect("fake provider lock poisoned") = Some(reference_video_total_duration);
         Ok(self.quote.clone())
     }
 
@@ -226,6 +274,15 @@ impl MediaProvider for FakeMediaProvider {
 
     async fn poll(&self, secret: &Secret, remote_job: &RemoteJob) -> ProviderResult<PollResult> {
         self.authenticate(secret)?;
+        if self.transient_polls.load(Ordering::SeqCst) > 0 {
+            self.transient_polls.fetch_sub(1, Ordering::SeqCst);
+            return Ok(PollResult::Failed {
+                error: ProviderError::new(
+                    ProviderErrorKind::Transient,
+                    "fake provider transient poll error",
+                ),
+            });
+        }
         let mut state = self.state.lock().expect("fake provider lock poisoned");
         let job = state.jobs.get_mut(&remote_job.id).ok_or_else(|| {
             ProviderError::new(ProviderErrorKind::InvalidRequest, "unknown fake job")
@@ -242,6 +299,12 @@ impl MediaProvider for FakeMediaProvider {
         Ok(PollResult::Completed {
             artifacts: job.artifacts.clone(),
         })
+    }
+
+    async fn complete(&self, secret: &Secret, _remote_job: &RemoteJob) -> ProviderResult<()> {
+        self.authenticate(secret)?;
+        self.complete_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     async fn cancel(

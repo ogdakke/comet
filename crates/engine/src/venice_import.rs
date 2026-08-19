@@ -370,6 +370,7 @@ fn stub_model(
         controls: Vec::new(),
         pricing: None,
         features: Vec::new(),
+        video: zeron_studio::VideoModelMeta::default(),
         manifest_version: "venice-import-v1".into(),
         fetched_at: Utc
             .timestamp_millis_opt(created_at)

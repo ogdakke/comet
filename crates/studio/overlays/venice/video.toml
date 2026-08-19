@@ -1,0 +1,133 @@
+# Review: 2026-08-18
+# Sources:
+#   https://docs.venice.ai/guides/media/seedance-2-0
+#   https://docs.venice.ai/guides/media/reference-to-video
+#   https://docs.venice.ai/api-reference/endpoint/video/queue
+#   crates/studio/tests/fixtures/venice/text-to-video-model.json
+#   crates/studio/tests/fixtures/venice/image-to-video-model.json
+
+[[model]]
+id = "seedance-1-5-pro-text-to-video-basic"
+operation = "text_to_video"
+adapter_family = "seedance"
+source = "live fixture + swagger"
+reviewed = "2026-08-18"
+# no reference_* keys → T2V stays input_constraints: []
+
+[[model]]
+id = "seedance-1-5-pro-image-to-video-basic"
+operation = "image_to_video"
+adapter_family = "seedance"
+source = "live fixture + swagger"
+reviewed = "2026-08-18"
+# last_frame not advertised live; omit
+
+[[family]]
+id_prefix = "seedance-2-0-reference-to-video"
+operation = "reference_to_video"
+adapter_family = "seedance"
+source = "https://docs.venice.ai/guides/media/seedance-2-0"
+reviewed = "2026-08-18"
+requires_visual_reference = true
+reference_audio_requires_visual = true
+reference_images = { min = 0, max = 9 }
+reference_videos = { min = 0, max = 3 }
+reference_audios = { min = 0, max = 3 }
+per_reference_video_seconds = { min = 2.0, max = 15.0 }
+total_reference_video_seconds = 15.0
+per_reference_audio_seconds = { min = 2.0, max = 15.0 }
+total_reference_audio_seconds = 15.0
+per_reference_video_bytes = 52428800
+source_matched_aspect = true
+
+[[family]]
+id_prefix = "seedance-2-0-fast-reference-to-video"
+inherit = "seedance-2-0-reference-to-video"
+source = "https://docs.venice.ai/guides/media/seedance-2-0"
+reviewed = "2026-08-18"
+# resolutions come from live catalog (480p/720p)
+
+[[family]]
+id_prefix = "seedance-2-5-reference-to-video"
+inherit = "seedance-2-0-reference-to-video"
+source = "https://docs.venice.ai/guides/media/seedance-2-0"
+reviewed = "2026-08-18"
+reference_images = { min = 0, max = 30 }
+reference_videos = { min = 0, max = 10 }
+reference_audios = { min = 0, max = 10 }
+per_reference_video_seconds = { min = 2.0, max = 30.0 }
+total_reference_video_seconds = 30.0
+per_reference_image_bytes = 31457280
+source_matched_duration = true
+
+[[family]]
+id_prefix = "seedance-2-0-text-to-video"
+operation = "text_to_video"
+adapter_family = "seedance"
+source = "https://docs.venice.ai/guides/media/seedance-2-0"
+reviewed = "2026-08-19"
+# no reference_* keys → T2V stays input_constraints: []
+
+[[family]]
+id_prefix = "seedance-2-5-text-to-video"
+inherit = "seedance-2-0-text-to-video"
+source = "https://docs.venice.ai/guides/media/seedance-2-0"
+reviewed = "2026-08-19"
+
+[[family]]
+id_prefix = "seedance-2-0-image-to-video"
+operation = "image_to_video"
+adapter_family = "seedance"
+source = "https://docs.venice.ai/guides/media/seedance-2-0"
+reviewed = "2026-08-18"
+last_frame = { min = 0, max = 1 }
+
+[[family]]
+id_prefix = "seedance-2-5-image-to-video"
+inherit = "seedance-2-0-image-to-video"
+source = "https://docs.venice.ai/guides/media/seedance-2-0"
+reviewed = "2026-08-18"
+
+[[family]]
+id_prefix = "grok-imagine-reference-to-video"
+operation = "reference_to_video"
+adapter_family = "grok"
+source = "https://docs.venice.ai/guides/media/reference-to-video"
+reviewed = "2026-08-18"
+requires_visual_reference = true
+reference_images = { min = 1, max = 7 }
+# matches grok-imagine-reference-to-video and *-private (download_url path)
+
+[[family]]
+id_prefix = "grok-imagine-video-to-video"
+operation = "video_to_video"
+adapter_family = "grok"
+source = "https://docs.venice.ai/api-reference/endpoint/video/queue"
+reviewed = "2026-08-19"
+reference_images = { min = 0, max = 7 }
+# matches grok-imagine-video-to-video and *-private; source clip is required
+
+[[family]]
+id_prefix = "wan-2-7-video-to-video"
+operation = "video_to_video"
+adapter_family = "seedance"
+source = "https://docs.venice.ai/api-reference/endpoint/video/queue"
+reviewed = "2026-08-19"
+reference_images = { min = 0, max = 1 }
+
+[[family]]
+id_prefix = "happyhorse-1-0-video-to-video"
+operation = "video_to_video"
+adapter_family = "seedance"
+source = "https://docs.venice.ai/api-reference/endpoint/video/queue"
+reviewed = "2026-08-19"
+reference_images = { min = 0, max = 9 }
+
+[[model]]
+id = "kling-o3-pro-reference-to-video"
+operation = "reference_to_video"
+adapter_family = "hidden"
+source = "https://docs.venice.ai/guides/media/reference-to-video"
+reviewed = "2026-08-18"
+reference_images = { min = 1, max = 7 }
+# picker hides Hidden; no v1 wire mapping

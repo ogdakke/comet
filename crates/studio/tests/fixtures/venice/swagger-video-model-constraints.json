@@ -1,0 +1,14 @@
+{
+  "title": "Video Model Constraints",
+  "swaggerVersion": "20260818.121409",
+  "source": "https://docs.venice.ai/swagger.yaml",
+  "properties": {
+    "model_type": { "type": "string" },
+    "aspect_ratios": { "type": "array" },
+    "resolutions": { "type": "array" },
+    "durations": { "type": "array" },
+    "audio": { "type": "boolean" },
+    "audio_configurable": { "type": "boolean" },
+    "prompt_character_limit": { "type": "integer" }
+  }
+}

@@ -2,20 +2,24 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Point, Render,
-    SharedString, Subscription, Task, Window, div, prelude::*, px,
+    Bounds, Context, DragMoveEvent, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable,
+    Image, Pixels, Point, Render, SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 use zeron_proto::{
     ListStudioConversationsResponse, ListStudioModelsResponse, ListStudioProvidersResponse,
     QuoteStudioBatchResponse, StudioConversationSummary, StudioConversationView, StudioGalleryItem,
-    StudioProviderBalanceResponse, StudioProviderConnection, StudioRunState, StudioTurnView,
-    UNTITLED_STUDIO_TITLE,
+    StudioProviderBalanceResponse, StudioProviderConnection, StudioRunState, StudioRunView,
+    StudioTurnView, UNTITLED_STUDIO_TITLE,
 };
 use zeron_rpc::methods;
-use zeron_studio::{StudioArtifactId, StudioConversationId};
+use zeron_studio::{
+    ComposerEvent, ComposerMode, ComposerSnapshot, ComposerView, ConflictId, MediaOperation,
+    StudioArtifactId, StudioAssetId, StudioConversationId, evaluate_composer,
+};
 
 use crate::composer::{PromptHistory, PromptHistoryItem};
 use crate::popover;
@@ -24,10 +28,10 @@ use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme::Theme;
 
 use super::StudioEvent;
+use super::artifact::{render_run_error_chip, run_error_message};
 use super::defaults::StudioDefaults;
 use super::draft::{
-    DraftRunConfig, apply_remembered_drafts, apply_remembered_selection, apply_turn_models,
-    draft_aspect, select_first_model,
+    DraftRunConfig, apply_remembered_drafts, draft_aspect, snapshot_from_committed_turn,
 };
 use super::feed::{
     ARTIFACT_FOCUS_FADE, ARTIFACT_FOCUS_HOLD, FeedLayoutSig, artifact_focus_alpha,
@@ -48,6 +52,14 @@ pub struct StudioPage {
     pub(super) edit_models: Vec<zeron_studio::MediaModel>,
     pub(super) selected_models: BTreeSet<zeron_studio::ModelId>,
     pub(super) draft_runs: HashMap<zeron_studio::ModelId, DraftRunConfig>,
+    pub(super) composer: ComposerSnapshot,
+    pub(super) composer_view: ComposerView,
+    pub(super) popup_conflict: Option<ConflictId>,
+    pub(super) conflict_more_open: bool,
+    pub(super) catalog_refresh_task: Option<Task<()>>,
+    pub(super) import_tasks: HashMap<StudioAssetId, Task<()>>,
+    pub(super) tray_picker_task: Option<Task<()>>,
+    pub(super) tray_previews: HashMap<StudioAssetId, Arc<Image>>,
     pub(super) remembered: StudioDefaults,
     pub(super) live_quotes: HashMap<zeron_studio::ModelId, zeron_studio::Quote>,
     pub(super) quote_generation: u64,
@@ -75,7 +87,20 @@ pub struct StudioPage {
     pub(super) model_picker_focus: FocusHandle,
     pub(super) model_picker_favorites: bool,
     pub(super) model_picker_filters: BTreeSet<zeron_studio::ModelFeature>,
+    pub(super) model_picker_operations: BTreeSet<zeron_studio::MediaOperation>,
+    pub(super) model_chips_scroll: gpui::ScrollHandle,
+    pub(super) file_drag_active: bool,
+    pub(super) tray_preview: Option<crate::attachments::PreviewImage>,
+    pub(super) tray_preview_focus: FocusHandle,
+    pub(super) tray_preview_focus_pending: bool,
     pub(super) model_config_menu: popover::Popup<zeron_studio::ModelId>,
+    pub(super) duration_popup: popover::Popup<()>,
+    pub(super) duration_dragging: bool,
+    pub(super) duration_drag_from_chip: bool,
+    pub(super) duration_drag_origin_x: f32,
+    pub(super) duration_drag_start_index: usize,
+    pub(super) duration_drag_moved: bool,
+    pub(super) duration_track: Option<Bounds<Pixels>>,
     pub(super) feed_list: gpui::ListState,
     pub(super) feed_width: f32,
     pub(super) feed_columns: usize,
@@ -176,6 +201,14 @@ pub struct StudioPage {
     pub(super) full_image_tasks: HashMap<StudioArtifactId, Task<()>>,
     pub(super) display_tasks: HashMap<StudioArtifactId, Task<()>>,
     pub(super) loading_displays: HashSet<StudioArtifactId>,
+    pub(super) video: Option<super::video::StudioVideoPlayback>,
+    pub(super) video_task: Option<Task<()>>,
+    pub(super) video_frame_scheduled: bool,
+    /// Tile currently armed for muted hover autoplay. Distinct from lightbox.
+    pub(super) hover_target: Option<StudioArtifactId>,
+    pub(super) hover_generation: u64,
+    pub(super) hover_play: Option<super::video::StudioVideoPlayback>,
+    pub(super) hover_task: Option<Task<()>>,
     pub(super) _observe: Subscription,
     pub(super) _prompt_events: Subscription,
     pub(super) _edit_prompt_events: Subscription,
@@ -195,8 +228,10 @@ impl StudioPage {
         let model_search = cx.new(|cx| TextInput::palette_search("Search models…", cx));
         let prompt_events = cx.subscribe(&prompt, |page: &mut Self, _, event, cx| match event {
             TextInputEvent::Submitted => page.submit(cx),
-            TextInputEvent::Edited => cx.notify(),
+            TextInputEvent::Edited => page.on_prompt_edited(cx),
             TextInputEvent::HistoryNavigate(dir) => page.on_history_navigate(*dir, cx),
+            TextInputEvent::PastedImages(images) => page.add_pasted_images(images.clone(), cx),
+            TextInputEvent::PastedPaths(paths) => page.add_dropped_paths(paths.clone(), cx),
             _ => {}
         });
         let edit_prompt_events =
@@ -230,6 +265,14 @@ impl StudioPage {
             edit_models: Vec::new(),
             selected_models: BTreeSet::new(),
             draft_runs: HashMap::new(),
+            composer: ComposerSnapshot::default(),
+            composer_view: evaluate_composer(&ComposerSnapshot::default(), &[]),
+            popup_conflict: None,
+            conflict_more_open: false,
+            catalog_refresh_task: None,
+            import_tasks: HashMap::new(),
+            tray_picker_task: None,
+            tray_previews: HashMap::new(),
             remembered,
             live_quotes: HashMap::new(),
             quote_generation: 0,
@@ -256,7 +299,20 @@ impl StudioPage {
             model_picker_focus: cx.focus_handle(),
             model_picker_favorites: false,
             model_picker_filters: BTreeSet::new(),
+            model_picker_operations: BTreeSet::new(),
+            model_chips_scroll: gpui::ScrollHandle::new(),
+            file_drag_active: false,
+            tray_preview: None,
+            tray_preview_focus: cx.focus_handle(),
+            tray_preview_focus_pending: false,
             model_config_menu: popover::Popup::default(),
+            duration_popup: popover::Popup::default(),
+            duration_dragging: false,
+            duration_drag_from_chip: false,
+            duration_drag_origin_x: 0.0,
+            duration_drag_start_index: 0,
+            duration_drag_moved: false,
+            duration_track: None,
             feed_list: new_feed_list(cx),
             feed_width: 0.0,
             feed_columns: 0,
@@ -347,6 +403,13 @@ impl StudioPage {
             display_tasks: HashMap::new(),
             loading_displays: HashSet::new(),
             preview_failed: HashSet::new(),
+            video: None,
+            video_task: None,
+            video_frame_scheduled: false,
+            hover_target: None,
+            hover_generation: 0,
+            hover_play: None,
+            hover_task: None,
             _observe: observe,
             _prompt_events: prompt_events,
             _edit_prompt_events: edit_prompt_events,
@@ -382,42 +445,50 @@ impl StudioPage {
                 stale: false,
             });
             if let Ok(value) = &providers
-                && let Ok(list) = serde_json::from_value::<ListStudioProvidersResponse>(value.clone())
+                && let Ok(list) =
+                    serde_json::from_value::<ListStudioProvidersResponse>(value.clone())
                 && let Some(provider) = list.providers.iter().find(|provider| provider.configured)
             {
                 models = engine
                     .client()
                     .call(
                         methods::LIST_STUDIO_MODELS,
-                        serde_json::json!({ "providerId": provider.provider_id, "mediaKind": "image" }),
+                        serde_json::json!({ "providerId": provider.provider_id }),
                     )
                     .await
                     .map_err(|error| error.to_string())
-                    .and_then(|value| serde_json::from_value(value).map_err(|error| error.to_string()));
+                    .and_then(|value| {
+                        serde_json::from_value(value).map_err(|error| error.to_string())
+                    });
             }
             this.update(cx, |page, cx| {
                 page.loading = false;
                 match (providers, conversations, models) {
                     (Ok(providers), Ok(conversations), Ok(models)) => {
-                        page.providers = serde_json::from_value::<ListStudioProvidersResponse>(providers)
-                            .map(|value| value.providers)
-                            .unwrap_or_default();
-                        page.conversations = serde_json::from_value::<ListStudioConversationsResponse>(conversations)
-                            .map(|value| value.conversations)
-                            .unwrap_or_default();
+                        page.providers =
+                            serde_json::from_value::<ListStudioProvidersResponse>(providers)
+                                .map(|value| value.providers)
+                                .unwrap_or_default();
+                        page.conversations = serde_json::from_value::<
+                            ListStudioConversationsResponse,
+                        >(conversations)
+                        .map(|value| value.conversations)
+                        .unwrap_or_default();
                         page.apply_models(models.models);
-                        page.apply_remembered_or_default_models();
-                        page.persist_composer_defaults(cx);
+                        page.apply_remembered_or_default_models(cx);
                         page.refresh_account_balance(cx, false);
                         page.watch_conversations(cx);
                         page.watch_gallery(cx);
                         cx.emit(StudioEvent::SidebarChanged);
                     }
-                    (Err(error), _, _) | (_, Err(error), _) => page.error = Some(error.to_string().into()),
+                    (Err(error), _, _) | (_, Err(error), _) => {
+                        page.error = Some(error.to_string().into())
+                    }
                     (_, _, Err(error)) => page.error = Some(error.into()),
                 }
                 cx.notify();
-            }).ok();
+            })
+            .ok();
         }));
     }
 
@@ -624,11 +695,13 @@ impl StudioPage {
         let Some(engine) = self.engine(cx) else {
             return;
         };
+        self.stop_hover_playback();
         self.close_image_menu(cx);
         if self.selected_conversation != Some(id) {
             self.focused_artifact = None;
             self.close_artifact(cx);
             self.composer_seeded_for = None;
+            self.source_turn = None;
             self.prompt_history.reset();
             self.expanded_prompts.clear();
             self.expanded_inspector_prompts.clear();
@@ -681,6 +754,11 @@ impl StudioPage {
                             .scroll_after_turn_count
                             .is_some_and(|before| view.turns.len() > before);
                         let last_turn_id = view.turns.last().map(|turn| turn.id);
+                        if let Some(previous) = page.conversation.as_ref()
+                            && let Some(message) = first_newly_failed_message(previous, &view)
+                        {
+                            page.error = Some(message);
+                        }
                         page.observe_upscale_view(&view, cx);
                         page.apply_conversation_summary(view.conversation.clone(), cx);
                         page.conversation = Some(view.clone());
@@ -842,6 +920,21 @@ impl StudioPage {
         self.full_image_tasks.remove(&artifact_id);
         self.display_tasks.remove(&artifact_id);
         self.feed_viewport_fulls.remove(&artifact_id);
+        if self
+            .video
+            .as_ref()
+            .is_some_and(|player| player.artifact_id == artifact_id)
+        {
+            self.stop_video_playback();
+        }
+        if self.hover_target == Some(artifact_id)
+            || self
+                .hover_play
+                .as_ref()
+                .is_some_and(|player| player.artifact_id == artifact_id)
+        {
+            self.stop_hover_playback();
+        }
         self.gallery.retain(|item| item.id != artifact_id);
         self.gallery_selected.remove(&artifact_id);
         if self.gallery_anchor == Some(artifact_id) {
@@ -948,7 +1041,24 @@ impl StudioPage {
             return;
         };
         let prompt = self.prompt.read(cx).text().trim().to_owned();
-        if prompt.is_empty() || self.selected_models.is_empty() || self.busy {
+        if prompt.is_empty() || self.busy {
+            return;
+        }
+        self.sync_prompt_into_composer(cx);
+        // Engine requires request.prompt == composer.prompt; do not send a trimmed
+        // request next to an untrimmed snapshot.
+        self.composer.prompt = prompt.clone();
+        if !self.composer_view.send.enabled {
+            if let Some(conflict) = self
+                .composer_view
+                .conflicts
+                .iter()
+                .find(|conflict| conflict.blocks_send())
+            {
+                self.popup_conflict = Some(conflict.id.clone());
+                self.conflict_more_open = false;
+                cx.notify();
+            }
             return;
         }
         let runs = self
@@ -970,6 +1080,7 @@ impl StudioPage {
                 })
             })
             .collect::<Vec<_>>();
+        let composer = self.composer.clone();
         let source = self.source_turn;
         let provider_id = self
             .providers
@@ -1000,7 +1111,7 @@ impl StudioPage {
                     methods::CREATE_STUDIO_TURN,
                     serde_json::json!({
                         "conversationId": conversation_id, "prompt": prompt, "runs": runs,
-                        "sourceTurnId": source,
+                        "sourceTurnId": source, "composer": composer,
                     }),
                 )
                 .await;
@@ -1009,7 +1120,7 @@ impl StudioPage {
                     .client()
                     .call(
                         methods::LIST_STUDIO_MODELS,
-                        serde_json::json!({ "providerId": provider_id, "mediaKind": "image" }),
+                        serde_json::json!({ "providerId": provider_id }),
                     )
                     .await
                     .ok()
@@ -1036,7 +1147,7 @@ impl StudioPage {
                         if let Some(quote) = batch_quote.as_ref() {
                             page.release_account_spend(quote);
                         }
-                        page.error = Some(error.to_string().into());
+                        page.apply_studio_rpc_error(error);
                     }
                 }
                 cx.notify();
@@ -1056,15 +1167,16 @@ impl StudioPage {
         self.edit_models = edit_models;
         self.models = models;
         apply_remembered_drafts(&mut self.draft_runs, &self.models, &self.remembered.drafts);
+        self.reevaluate_composer(None);
     }
 
-    pub(super) fn apply_remembered_or_default_models(&mut self) {
-        apply_remembered_selection(
-            &mut self.selected_models,
-            &self.models,
-            &self.remembered.selected_model_ids,
-        );
-        select_first_model(&mut self.selected_models, &self.models);
+    pub(super) fn apply_remembered_or_default_models(&mut self, cx: &mut Context<Self>) {
+        let mode = self.remembered.last_mode;
+        if mode == ComposerMode::Video {
+            self.composer.duration = self.remembered.video_duration.clone();
+        }
+        let restore = self.restore_refs_for(mode);
+        self.apply_composer_event(ComposerEvent::SetMode { mode, restore }, None, cx);
     }
 
     pub(super) fn seed_composer_from_conversation(&mut self, cx: &mut Context<Self>) {
@@ -1079,33 +1191,45 @@ impl StudioPage {
         }) else {
             return;
         };
-        if let Some(turn) = last_turn.as_ref() {
-            apply_turn_models(
-                &mut self.selected_models,
-                &mut self.draft_runs,
-                &self.models,
-                turn,
-            );
+        if let Some(turn) = last_turn.as_ref()
+            && let Some(mut snapshot) =
+                snapshot_from_committed_turn(turn, &self.models, &self.known_studio_artifacts())
+        {
+            // Opening a thread restores chips/tray, not the last prompt.
+            // Leave source_turn unset so "Using previous settings" is only
+            // shown after an explicit Use prompt.
+            snapshot.prompt = self.prompt.read(cx).text().to_owned();
+            snapshot.source_turn_id = None;
+            self.apply_composer_event(ComposerEvent::RestoreDraft { snapshot }, None, cx);
+        } else {
+            self.apply_remembered_or_default_models(cx);
         }
-        self.apply_remembered_or_default_models();
         self.composer_seeded_for = Some(conversation_id);
         self.persist_composer_defaults(cx);
     }
 
     pub(super) fn persist_composer_defaults(&mut self, cx: &mut Context<Self>) {
         if let Some(dir) = self.state.read(cx).data_dir.clone() {
-            let last_edit_model_id = self.remembered.last_edit_model_id.clone();
+            let (image_ids, video_ids) = self.remembered_mode_lists();
+            let video_duration = match self.composer.mode {
+                ComposerMode::Video => self.composer.duration.clone(),
+                ComposerMode::Image => self.remembered.video_duration.clone(),
+            };
             self.remembered = StudioDefaults::capture(
-                &self.selected_models,
+                &image_ids,
+                &video_ids,
                 &self.draft_runs,
                 &self.remembered.favorites,
                 &self.remembered.upscale,
+                video_duration,
+                self.composer.mode,
+                self.remembered.last_edit_model_id.clone(),
             );
-            self.remembered.last_edit_model_id = last_edit_model_id;
             if let Err(err) = self.remembered.save(&dir) {
                 tracing::warn!(error = %err, "studio-defaults save failed");
             }
         }
+        self.sync_prompt_placeholder(cx);
         self.refresh_draft_quotes(cx);
     }
 
@@ -1119,26 +1243,10 @@ impl StudioPage {
         let Some(engine) = self.engine(cx) else {
             return;
         };
-        let prompt = self.prompt.read(cx).text().to_owned();
-        let runs = self
-            .models
-            .iter()
-            .filter(|model| self.selected_models.contains(&model.id))
-            .map(|model| {
-                let draft = self
-                    .draft_runs
-                    .get(&model.id)
-                    .cloned()
-                    .unwrap_or_else(|| DraftRunConfig::from_model(model));
-                serde_json::json!({
-                    "providerId": model.provider_id, "modelId": model.id,
-                    "operation": model.operation, "outputCount": draft.output_count, "controls": draft.controls,
-                    "inputs": [], "manifestVersion": model.manifest_version,
-                    "displayAspectRatio": draft_aspect(model, &draft),
-                })
-            })
-            .collect::<Vec<_>>();
-        if runs.is_empty() {
+        self.sync_prompt_into_composer(cx);
+        let prompt = self.composer.prompt.clone();
+        let composer = self.composer.clone();
+        if composer.selected.is_empty() {
             return;
         }
         self.quote_generation = self.quote_generation.saturating_add(1);
@@ -1151,7 +1259,7 @@ impl StudioPage {
                 .client()
                 .call(
                     methods::QUOTE_STUDIO_BATCH,
-                    serde_json::json!({ "prompt": prompt, "runs": runs }),
+                    serde_json::json!({ "prompt": prompt, "composer": composer }),
                 )
                 .await;
             this.update(cx, |page, cx| {
@@ -1198,16 +1306,31 @@ impl StudioPage {
         cx.notify();
     }
 
+    fn known_studio_artifacts(&self) -> Vec<zeron_proto::StudioArtifactView> {
+        self.conversation
+            .as_ref()
+            .map(|view| {
+                view.turns
+                    .iter()
+                    .flat_map(|turn| {
+                        turn.runs
+                            .iter()
+                            .flat_map(|run| run.artifacts.iter().cloned())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub(super) fn use_prompt(&mut self, turn: &StudioTurnView, cx: &mut Context<Self>) {
         self.prompt_history.reset();
         self.prompt
             .update(cx, |input, cx| input.set_text(turn.prompt.clone(), cx));
-        apply_turn_models(
-            &mut self.selected_models,
-            &mut self.draft_runs,
-            &self.models,
-            turn,
-        );
+        if let Some(snapshot) =
+            snapshot_from_committed_turn(turn, &self.models, &self.known_studio_artifacts())
+        {
+            self.apply_composer_event(ComposerEvent::RestoreDraft { snapshot }, None, cx);
+        }
         if let Some(conversation_id) = self.selected_conversation {
             self.composer_seeded_for = Some(conversation_id);
         }
@@ -1270,7 +1393,7 @@ impl StudioPage {
                     if let Some(quote) = quote.as_ref() {
                         page.release_account_spend(quote);
                     }
-                    page.error = Some(error.to_string().into());
+                    page.apply_studio_rpc_error(error);
                 }
                 cx.notify();
             })
@@ -1535,6 +1658,44 @@ fn newly_settled_runs(previous: &StudioConversationView, next: &StudioConversati
     terminal_run_ids(next).difference(&before).next().is_some()
 }
 
+fn first_newly_failed_message(
+    previous: &StudioConversationView,
+    next: &StudioConversationView,
+) -> Option<SharedString> {
+    let before: HashMap<zeron_studio::StudioRunId, StudioRunState> = previous
+        .turns
+        .iter()
+        .flat_map(|turn| turn.runs.iter())
+        .map(|run| (run.id, run.state))
+        .collect();
+    next.turns
+        .iter()
+        .flat_map(|turn| turn.runs.iter())
+        .find(|run| {
+            run.state == StudioRunState::Failed
+                && before.get(&run.id).copied() != Some(StudioRunState::Failed)
+        })
+        .map(format_run_failure)
+}
+
+fn format_run_failure(run: &StudioRunView) -> SharedString {
+    let detail = run_error_message(run.error.as_deref());
+    match run.model.operation {
+        MediaOperation::Upscale => match detail {
+            Some(message) => format!("Upscale failed: {message}").into(),
+            None => "Upscale failed".into(),
+        },
+        MediaOperation::ImageEdit => match detail {
+            Some(message) => format!("Edit failed: {message}").into(),
+            None => "Edit failed".into(),
+        },
+        _ => match detail {
+            Some(message) => message.to_string().into(),
+            None => "Generation failed".into(),
+        },
+    }
+}
+
 fn terminal_run_ids(view: &StudioConversationView) -> HashSet<zeron_studio::StudioRunId> {
     view.turns
         .iter()
@@ -1559,6 +1720,18 @@ impl Focusable for StudioPage {
 impl Render for StudioPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_lineage();
+        if self.video_needs_frame() && !self.video_frame_scheduled {
+            self.video_frame_scheduled = true;
+            let entity = cx.weak_entity();
+            window.on_next_frame(move |window, cx| {
+                entity
+                    .update(cx, |page: &mut StudioPage, cx| {
+                        page.video_frame_scheduled = false;
+                        page.step_video_frame(window, cx);
+                    })
+                    .ok();
+            });
+        }
         if self.lightbox_motion_pending() && crate::motion::reduced_motion(cx) {
             self.finish_lightbox_snap_immediate(cx);
         } else if self.lightbox_motion_pending() && !self.lightbox_swipe_scheduled {
@@ -1627,16 +1800,67 @@ impl Render for StudioPage {
         } else if self.selected_conversation.is_none() {
             self.render_gallery(window, &theme, cx)
         } else {
+            let file_drag_active = self.file_drag_active && cx.has_active_drag();
+            let veil = file_drag_active.then(|| {
+                div()
+                    .absolute()
+                    .inset_0()
+                    .bg(theme.scrim().opacity(0.4 / 0.6))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(13.0))
+                    .text_color(theme.text)
+                    .child(SharedString::from(super::tray::studio_drop_veil_copy(
+                        &self.composer_view.attachments.accept,
+                    )))
+            });
             div()
+                .id("studio-dropzone")
                 .relative()
                 .flex_1()
                 .min_w_0()
                 .h_full()
                 .overflow_hidden()
+                .on_drag_move::<ExternalPaths>(cx.listener(
+                    |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
+                        let inside = e.bounds.contains(&e.event.position);
+                        if this.file_drag_active != inside {
+                            this.file_drag_active = inside;
+                            cx.notify();
+                        }
+                    },
+                ))
+                .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                    this.file_drag_active = false;
+                    this.add_dropped_paths(paths.paths().to_vec(), cx);
+                    cx.notify();
+                }))
                 .child(self.render_conversation_feed(window, &theme, cx))
                 .child(self.render_composer(window, &theme, cx))
+                .children(veil)
                 .into_any_element()
         };
+        if std::mem::take(&mut self.tray_preview_focus_pending) {
+            window.focus(&self.tray_preview_focus, cx);
+        }
+        let tray_lightbox = self.tray_preview.clone().map(|preview| {
+            let weak = cx.weak_entity();
+            crate::attachments::lightbox(
+                window.viewport_size(),
+                &preview,
+                &self.tray_preview_focus,
+                move |window, cx| {
+                    if let Ok(focus) = weak.update(cx, |page, cx| {
+                        page.tray_preview = None;
+                        cx.notify();
+                        page.focus.clone()
+                    }) {
+                        window.focus(&focus, cx);
+                    }
+                },
+            )
+        });
         div()
             .relative()
             .size_full()
@@ -1656,20 +1880,24 @@ impl Render for StudioPage {
             .when_some(self.error.clone(), |el, error| {
                 el.child(
                     div()
+                        .id("studio-error")
                         .absolute()
                         .top(px(12.0))
                         .right(px(12.0))
-                        .rounded(px(8.0))
-                        .bg(theme.danger)
-                        .text_color(theme.bg)
-                        .px(px(10.0))
-                        .py(px(6.0))
-                        .child(error),
+                        .w(px(420.0))
+                        .max_w(gpui::relative(0.92))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|page, _, _, cx| {
+                            page.error = None;
+                            cx.notify();
+                        }))
+                        .child(render_run_error_chip(&theme, error.as_ref())),
                 )
             })
             .when_some(self.render_image_menu(&theme, cx), |el, menu| {
                 el.child(menu)
             })
+            .children(tray_lightbox)
     }
 }
 
@@ -1733,5 +1961,125 @@ mod tests {
         let fill = hist.down(&items, "").unwrap();
         assert_eq!(fill.text, "unsent draft");
         assert!(!fill.caret_at_start);
+    }
+
+    fn conversation_with_run(
+        run_id: zeron_studio::StudioRunId,
+        state: StudioRunState,
+        operation: MediaOperation,
+        error: Option<&str>,
+    ) -> StudioConversationView {
+        StudioConversationView {
+            conversation: StudioConversationSummary {
+                id: StudioConversationId::new(),
+                title: "one".into(),
+                turn_count: 1,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                archived: false,
+                forked_from_turn_id: None,
+                creating: false,
+                done: false,
+            },
+            turns: vec![StudioTurnView {
+                id: StudioTurnId::new(),
+                position: 0,
+                prompt: "a clip".into(),
+                source_turn_id: None,
+                batch_id: StudioBatchId::new(),
+                created_at: Utc::now(),
+                runs: vec![StudioRunView {
+                    id: run_id,
+                    position: 0,
+                    provider_id: "venice".into(),
+                    model: zeron_studio::MediaModel {
+                        provider_id: "venice".into(),
+                        id: "seedance".into(),
+                        display_name: "Seedance".into(),
+                        description: None,
+                        operation,
+                        output_kind: zeron_studio::MediaKind::Video,
+                        output_mime_types: vec!["video/mp4".into()],
+                        input_constraints: Vec::new(),
+                        prompt_maximum_chars: None,
+                        negative_prompt_maximum_chars: None,
+                        maximum_output_count: 1,
+                        controls: Vec::new(),
+                        pricing: None,
+                        features: Vec::new(),
+                        video: zeron_studio::VideoModelMeta::default(),
+                        manifest_version: "test".into(),
+                        fetched_at: Utc::now(),
+                    },
+                    controls: Default::default(),
+                    output_count: 1,
+                    display_aspect_ratio: (9, 16),
+                    state,
+                    progress: None,
+                    error: error.map(str::to_string),
+                    quote: None,
+                    prompt: None,
+                    inputs: Vec::new(),
+                    artifacts: Vec::new(),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn newly_failed_run_surfaces_the_provider_message() {
+        let run_id = zeron_studio::StudioRunId::new();
+        let previous = conversation_with_run(
+            run_id,
+            StudioRunState::Running,
+            MediaOperation::ReferenceToVideo,
+            None,
+        );
+        let next = conversation_with_run(
+            run_id,
+            StudioRunState::Failed,
+            MediaOperation::ReferenceToVideo,
+            Some("Your prompt violates the content policy of Venice.ai or the model provider"),
+        );
+        assert_eq!(
+            first_newly_failed_message(&previous, &next).as_deref(),
+            Some("Your prompt violates the content policy of Venice.ai or the model provider")
+        );
+        assert_eq!(first_newly_failed_message(&next, &next), None);
+    }
+
+    #[test]
+    fn newly_failed_upscale_keeps_its_prefix() {
+        let run_id = zeron_studio::StudioRunId::new();
+        let previous = conversation_with_run(
+            run_id,
+            StudioRunState::Running,
+            MediaOperation::Upscale,
+            None,
+        );
+        let next = conversation_with_run(
+            run_id,
+            StudioRunState::Failed,
+            MediaOperation::Upscale,
+            Some("pixel limit"),
+        );
+        assert_eq!(
+            first_newly_failed_message(&previous, &next).as_deref(),
+            Some("Upscale failed: pixel limit")
+        );
+    }
+
+    #[test]
+    fn failed_run_without_provider_copy_uses_a_generic_label() {
+        let run = conversation_with_run(
+            zeron_studio::StudioRunId::new(),
+            StudioRunState::Failed,
+            MediaOperation::TextToImage,
+            None,
+        );
+        assert_eq!(
+            format_run_failure(&run.turns[0].runs[0]).as_ref(),
+            "Generation failed"
+        );
     }
 }

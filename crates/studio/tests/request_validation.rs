@@ -4,7 +4,8 @@ use chrono::Utc;
 use zeron_studio::{
     ControlId, ControlKind, ControlValidationError, ControlValue, GenerationInput,
     GenerationInputSource, GenerationRequest, InputConstraint, MediaKind, MediaModel,
-    MediaOperation, MimeConstraint, ModelControl, RequestValidationError, StudioArtifactId,
+    MediaOperation, MediaProbe, MimeConstraint, ModelControl, RequestValidationError,
+    StudioArtifactId, VideoModelMeta, validate_inputs_against_bytes,
 };
 
 fn model() -> MediaModel {
@@ -35,6 +36,7 @@ fn model() -> MediaModel {
         }],
         pricing: None,
         features: Vec::new(),
+        video: VideoModelMeta::default(),
         manifest_version: "fixture-v1".to_owned(),
         fetched_at: Utc::now(),
     }
@@ -128,8 +130,7 @@ fn upscale_model() -> MediaModel {
             mime: MimeConstraint {
                 accepted: vec!["image/png".to_owned()],
                 maximum_bytes: Some(25 * 1024 * 1024),
-                maximum_width: None,
-                maximum_height: None,
+                ..MimeConstraint::default()
             },
         }],
         prompt_maximum_chars: None,
@@ -138,6 +139,7 @@ fn upscale_model() -> MediaModel {
         controls: Vec::new(),
         pricing: None,
         features: Vec::new(),
+        video: VideoModelMeta::default(),
         manifest_version: "fixture-v1".to_owned(),
         fetched_at: Utc::now(),
     }
@@ -230,8 +232,7 @@ fn edit_model() -> MediaModel {
                 mime: MimeConstraint {
                     accepted: vec!["image/png".to_owned()],
                     maximum_bytes: Some(25 * 1024 * 1024),
-                    maximum_width: None,
-                    maximum_height: None,
+                    ..MimeConstraint::default()
                 },
             },
             InputConstraint {
@@ -241,8 +242,7 @@ fn edit_model() -> MediaModel {
                 mime: MimeConstraint {
                     accepted: vec!["image/png".to_owned()],
                     maximum_bytes: Some(25 * 1024 * 1024),
-                    maximum_width: None,
-                    maximum_height: None,
+                    ..MimeConstraint::default()
                 },
             },
         ],
@@ -252,6 +252,7 @@ fn edit_model() -> MediaModel {
         controls: Vec::new(),
         pricing: None,
         features: Vec::new(),
+        video: VideoModelMeta::default(),
         manifest_version: "fixture-v1".to_owned(),
         fetched_at: Utc::now(),
     }
@@ -308,5 +309,102 @@ fn image_edit_rejects_a_missing_source() {
     assert!(matches!(
         request.validate_against(&edit_model()),
         Err(RequestValidationError::InvalidInputCount { .. })
+    ));
+}
+
+fn probe(
+    mime: &str,
+    bytes: u64,
+    width: Option<u32>,
+    height: Option<u32>,
+    duration: Option<f64>,
+) -> MediaProbe {
+    MediaProbe {
+        mime_type: mime.to_owned(),
+        size_bytes: bytes,
+        width,
+        height,
+        duration_seconds: duration,
+    }
+}
+
+#[test]
+fn bytes_validation_accepts_matching_mime_geometry_and_duration() {
+    let mut model = edit_model();
+    model.input_constraints[0].mime.minimum_short_side = Some(300);
+    model.input_constraints[0].mime.minimum_aspect_ratio = Some(0.4);
+    model.input_constraints[0].mime.maximum_aspect_ratio = Some(2.5);
+    let input = source_input();
+    let media = probe("image/png", 1_024, Some(640), Some(480), None);
+    validate_inputs_against_bytes(&model, &[input], &[media]).unwrap();
+}
+
+#[test]
+fn bytes_validation_rejects_mime_bytes_short_side_aspect_and_unproved_duration() {
+    let mut model = edit_model();
+    model.input_constraints[0].mime.maximum_bytes = Some(100);
+    let input = source_input();
+    assert!(matches!(
+        validate_inputs_against_bytes(
+            &model,
+            &[input.clone()],
+            &[probe("image/jpeg", 50, Some(640), Some(480), None)]
+        ),
+        Err(RequestValidationError::UnsupportedInputMime { .. })
+    ));
+    assert!(matches!(
+        validate_inputs_against_bytes(
+            &model,
+            &[input.clone()],
+            &[probe("image/png", 200, Some(640), Some(480), None)]
+        ),
+        Err(RequestValidationError::InputTooLarge { .. })
+    ));
+
+    model.input_constraints[0].mime.maximum_bytes = None;
+    model.input_constraints[0].mime.minimum_short_side = Some(300);
+    assert!(matches!(
+        validate_inputs_against_bytes(
+            &model,
+            &[input.clone()],
+            &[probe("image/png", 50, Some(200), Some(200), None)]
+        ),
+        Err(RequestValidationError::InputGeometry { .. })
+    ));
+
+    model.input_constraints[0].mime.minimum_short_side = None;
+    model.input_constraints[0].mime.minimum_aspect_ratio = Some(0.4);
+    model.input_constraints[0].mime.maximum_aspect_ratio = Some(2.5);
+    assert!(matches!(
+        validate_inputs_against_bytes(
+            &model,
+            &[input.clone()],
+            &[probe("image/png", 50, Some(100), Some(10), None)]
+        ),
+        Err(RequestValidationError::InputGeometry { .. })
+    ));
+
+    let mut video = model.clone();
+    video.input_constraints[0].mime = MimeConstraint {
+        accepted: vec!["video/mp4".into()],
+        minimum_duration_seconds: Some(2.0),
+        maximum_duration_seconds: Some(15.0),
+        ..MimeConstraint::default()
+    };
+    assert!(matches!(
+        validate_inputs_against_bytes(
+            &video,
+            &[input.clone()],
+            &[probe("video/mp4", 50, None, None, None)]
+        ),
+        Err(RequestValidationError::InputDuration { .. })
+    ));
+    assert!(matches!(
+        validate_inputs_against_bytes(
+            &video,
+            &[input],
+            &[probe("video/mp4", 50, None, None, Some(20.0))]
+        ),
+        Err(RequestValidationError::InputDuration { .. })
     ));
 }

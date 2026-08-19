@@ -5,15 +5,18 @@
 //! paint the visible window plus overdraw. Off-screen tiles load 512 previews;
 //! tiles that intersect the reading band fetch the original and paint a 1280px
 //! display frame so large thread images stay sharp without 4K GPU textures.
+//! Drag a still or clip onto the composer to attach it as a reference.
 
 use std::collections::HashSet;
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
 use gpui::{
-    AnyElement, ClipboardItem, Context, ListAlignment, ListOffset, ListScrollEvent, ListState,
-    SharedString, Window, canvas, div, list, prelude::*, px,
+    AnyElement, ClipboardItem, Context, Image, ListAlignment, ListOffset, ListScrollEvent,
+    ListState, Pixels, Point, Render, SharedString, WeakEntity, Window, canvas, div, list,
+    prelude::*, px,
 };
 use zeron_proto::{StudioRunState, StudioRunView, StudioTurnView};
 use zeron_studio::{MediaKind, StudioArtifactId};
@@ -28,7 +31,10 @@ use crate::state::format_time_ago;
 use crate::theme::Theme;
 use crate::transcript::{self, format_timestamp};
 
-use super::artifact::{StudioPaint, contain_layers};
+use super::artifact::{
+    StudioPaint, contain_layers, render_run_error_chip, render_run_failed_overlay,
+    run_error_message,
+};
 use super::page::StudioPage;
 
 /// Scroll runway below the final Studio turn. The composer floats 18px above
@@ -690,6 +696,10 @@ fn feed_output_slots(run: &StudioRunView) -> Vec<(usize, Option<StudioArtifactId
     }
 }
 
+fn previewable_feed_kind(kind: MediaKind) -> bool {
+    matches!(kind, MediaKind::Image | MediaKind::Video)
+}
+
 pub(super) fn loading_effect(
     seed: u32,
     state: StudioRunState,
@@ -718,6 +728,92 @@ pub(super) fn feed_tile_element_id(
     }
 }
 
+fn video_duration_badge(theme: &Theme, seconds: Option<f64>) -> AnyElement {
+    super::video::duration_overlay_badge(theme, seconds)
+        .absolute()
+        .right(px(8.0))
+        .bottom(px(8.0))
+        .into_any_element()
+}
+
+/// Long edge of the floating tile that follows the cursor during a thread
+/// drag. Large enough to read, small enough to keep the composer visible.
+const ARTIFACT_DRAG_GHOST_MAX_EDGE: f32 = 168.0;
+
+/// In-window drag of a generated thread still or clip onto the composer.
+#[derive(Clone)]
+pub(super) struct StudioArtifactDrag {
+    pub artifact_id: StudioArtifactId,
+    image: Arc<Image>,
+    width: f32,
+    height: f32,
+    video: bool,
+    duration_seconds: Option<f64>,
+    page: WeakEntity<StudioPage>,
+}
+
+struct ArtifactDragGhost {
+    image: Arc<Image>,
+    grab: Point<Pixels>,
+    width: f32,
+    height: f32,
+    video: bool,
+    duration_seconds: Option<f64>,
+}
+
+pub(super) fn artifact_drag_ghost_size(width: f32, height: f32) -> (f32, f32) {
+    let long = width.max(height).max(1.0);
+    let scale = (ARTIFACT_DRAG_GHOST_MAX_EDGE / long).min(1.0);
+    ((width * scale).max(36.0), (height * scale).max(36.0))
+}
+
+/// Place the shrunken ghost so the grab point stays under the cursor.
+pub(super) fn artifact_drag_ghost_offset(
+    tile_width: f32,
+    tile_height: f32,
+    grab: Point<Pixels>,
+    ghost_width: f32,
+    ghost_height: f32,
+) -> (f32, f32) {
+    let grab_x = f32::from(grab.x).clamp(0.0, tile_width.max(0.0));
+    let grab_y = f32::from(grab.y).clamp(0.0, tile_height.max(0.0));
+    let scale_x = ghost_width / tile_width.max(1.0);
+    let scale_y = ghost_height / tile_height.max(1.0);
+    (grab_x - grab_x * scale_x, grab_y - grab_y * scale_y)
+}
+
+impl Render for ArtifactDragGhost {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        let (ghost_w, ghost_h) = artifact_drag_ghost_size(self.width, self.height);
+        let (left, top) =
+            artifact_drag_ghost_offset(self.width, self.height, self.grab, ghost_w, ghost_h);
+        let video = self.video;
+        let duration = self.duration_seconds;
+        div()
+            .w(px((left + ghost_w).max(1.0)))
+            .h(px((top + ghost_h).max(1.0)))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .top(px(top))
+                    .w(px(ghost_w))
+                    .h(px(ghost_h))
+                    .rounded(px(10.0))
+                    .border_1()
+                    .border_color(theme.border_strong)
+                    .bg(crate::theme::ink(0.10))
+                    .shadow_lg()
+                    .opacity(0.92)
+                    .child(contain_layers(self.image.clone(), None, px(10.0), None))
+                    .when(video, |ghost| {
+                        ghost.child(video_duration_badge(&theme, duration))
+                    }),
+            )
+    }
+}
+
 fn lattice_seed(turn_ix: usize, run_ix: usize, output_ix: usize) -> u32 {
     let mut x = (turn_ix as u32).wrapping_mul(0x9E37_79B9)
         ^ (run_ix as u32).wrapping_mul(0x85EB_CA6B)
@@ -740,11 +836,15 @@ impl StudioPage {
         artifact_id: Option<StudioArtifactId>,
         run_id: zeron_studio::StudioRunId,
         progress: Option<f32>,
+        media_kind: MediaKind,
+        duration_seconds: Option<f64>,
+        error: Option<&str>,
         theme: &Theme,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let height = width * aspect.1 as f32 / aspect.0.max(1) as f32;
+        let video = media_kind == MediaKind::Video;
         let mut base = div()
             .id(feed_tile_element_id(artifact_id, run_id, output_ix))
             .w(px(width))
@@ -757,19 +857,29 @@ impl StudioPage {
             } else {
                 0.045
             }));
-        if let Some(id) = artifact_id
-            && let Some(conversation_id) = self.selected_conversation
-        {
-            base = self.bind_image_menu(
+        if let Some(id) = artifact_id {
+            if let Some(conversation_id) = self.selected_conversation {
+                base = self.bind_image_menu(
+                    base,
+                    id,
+                    conversation_id,
+                    super::image_menu::ImageSurface::ThreadTile,
+                    cx,
+                );
+            }
+            base = self.bind_thread_artifact_drag(
                 base,
                 id,
-                conversation_id,
-                super::image_menu::ImageSurface::ThreadTile,
+                width,
+                height,
+                video,
+                duration_seconds,
                 cx,
             );
         }
+        let badge = video.then(|| video_duration_badge(theme, duration_seconds));
         if let Some(id) = artifact_id {
-            let paint = if self.feed_viewport_fulls.contains(&id) {
+            let paint = if !video && self.feed_viewport_fulls.contains(&id) {
                 StudioPaint::Display
             } else {
                 StudioPaint::Thumb
@@ -781,7 +891,13 @@ impl StudioPage {
                     .cursor_pointer()
                     .on_hover(cx.listener(move |page, hovered: &bool, window, cx| {
                         if *hovered {
-                            page.prefetch_gallery_full(id, window, cx);
+                            if page.artifact_is_video(id) {
+                                page.arm_hover_autoplay(id, cx);
+                            } else {
+                                page.prefetch_gallery_full(id, window, cx);
+                            }
+                        } else {
+                            page.disarm_hover_autoplay(id, cx);
                         }
                     }))
                     .on_click(cx.listener(move |page, _, window, cx| {
@@ -802,6 +918,11 @@ impl StudioPage {
                             Some(SharedString::from(format!("studio-thumb-ready-{}", id.0))),
                         )),
                     ))
+                    .when_some(
+                        self.hover_video_layer(id, gpui::ObjectFit::Contain, theme.bg),
+                        |tile, layer| tile.child(layer),
+                    )
+                    .when_some(badge, |tile, badge| tile.child(badge))
                     .when_some(self.artifact_focus_ring(id, theme), |tile, ring| {
                         tile.child(ring)
                     })
@@ -819,6 +940,26 @@ impl StudioPage {
                 .h(px(height))
                 .rounded(px(10.0))
         });
+        let play = (video && state == StudioRunState::Succeeded).then(|| {
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .size(px(44.0))
+                        .rounded_full()
+                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.55))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(16.0))
+                        .text_color(gpui::hsla(0.0, 0.0, 1.0, 0.96))
+                        .child(SharedString::from("▶")),
+                )
+        });
         let open_key = artifact_id
             .map(super::artifact::ArtifactFrameKey::Ready)
             .unwrap_or(super::artifact::ArtifactFrameKey::Loading { run_id, output_ix });
@@ -829,6 +970,17 @@ impl StudioPage {
             .text_size(px(11.0))
             .text_color(theme.text_faint)
             .cursor_pointer()
+            .when_some(artifact_id, |tile, id| {
+                tile.on_hover(cx.listener(move |page, hovered: &bool, _, cx| {
+                    if *hovered {
+                        if page.artifact_is_video(id) {
+                            page.arm_hover_autoplay(id, cx);
+                        }
+                    } else {
+                        page.disarm_hover_autoplay(id, cx);
+                    }
+                }))
+            })
             .on_click(cx.listener(move |page, _, window, cx| {
                 let frames = page
                     .conversation
@@ -839,14 +991,73 @@ impl StudioPage {
                 window.focus(&page.focus, cx);
             }))
             .when_some(fill, |tile, fill| tile.child(fill))
+            .when_some(play, |tile, play| tile.child(play))
+            .when_some(
+                artifact_id
+                    .and_then(|id| self.hover_video_layer(id, gpui::ObjectFit::Contain, theme.bg)),
+                |tile, layer| tile.child(layer),
+            )
             .when(state == StudioRunState::Failed, |tile| {
-                tile.child("Generation failed")
+                tile.child(render_run_failed_overlay(theme, error))
             })
+            .when_some(badge, |tile, badge| tile.child(badge))
             .when_some(
                 artifact_id.and_then(|id| self.artifact_focus_ring(id, theme)),
                 |tile, ring| tile.child(ring),
             )
             .into_any_element()
+    }
+
+    fn bind_thread_artifact_drag<E>(
+        &self,
+        element: E,
+        artifact_id: StudioArtifactId,
+        width: f32,
+        height: f32,
+        video: bool,
+        duration_seconds: Option<f64>,
+        cx: &mut Context<Self>,
+    ) -> E
+    where
+        E: StatefulInteractiveElement,
+    {
+        let Some(image) = self
+            .images
+            .get_display(&artifact_id)
+            .or_else(|| self.images.get_thumb(&artifact_id))
+            .or_else(|| self.images.get_placeholder(&artifact_id))
+        else {
+            return element;
+        };
+        element.on_drag(
+            StudioArtifactDrag {
+                artifact_id,
+                image,
+                width,
+                height,
+                video,
+                duration_seconds,
+                page: cx.weak_entity(),
+            },
+            |payload, grab, _, cx| {
+                cx.stop_propagation();
+                let artifact_id = payload.artifact_id;
+                payload
+                    .page
+                    .update(cx, |page, cx| {
+                        page.disarm_hover_autoplay(artifact_id, cx);
+                    })
+                    .ok();
+                cx.new(|_| ArtifactDragGhost {
+                    image: payload.image.clone(),
+                    grab,
+                    width: payload.width,
+                    height: payload.height,
+                    video: payload.video,
+                    duration_seconds: payload.duration_seconds,
+                })
+            },
+        )
     }
 
     fn artifact_focus_ring(
@@ -1178,7 +1389,7 @@ impl StudioPage {
         let visible = feed_visible_or_tail(self.feed_visible_rows.clone(), count);
         let have_cull = self.feed_cull_bottom > self.feed_cull_top;
         if !have_cull {
-            return self.lineage_image_ids_for_feed_range(visible, max);
+            return self.lineage_preview_ids_for_feed_range(visible, max);
         }
         let extra = (overdraw - FEED_OVERDRAW_PX).max(0.0);
         let band_top = self.feed_cull_top - extra;
@@ -1211,6 +1422,9 @@ impl StudioPage {
                 let Some(id) = tile.artifact_id else {
                     continue;
                 };
+                if !previewable_feed_kind(tile.media_kind) {
+                    continue;
+                }
                 let (aw, ah) = tile.aspect;
                 let tile_h = tile_width * ah as f32 / aw.max(1) as f32;
                 let (top, bottom) =
@@ -1219,15 +1433,32 @@ impl StudioPage {
             }
         }
         if !any_bounds {
-            return self.lineage_image_ids_for_feed_range(visible, max);
+            return self.lineage_preview_ids_for_feed_range(visible, max);
         }
         feed_display_ids_in_band(&tiles, band_top, band_bottom.max(band_top + 1.0), max)
+    }
+
+    fn lineage_preview_ids_for_feed_range(
+        &self,
+        range: Range<usize>,
+        max: usize,
+    ) -> Vec<StudioArtifactId> {
+        self.lineage_ids_for_feed_range(range, max, previewable_feed_kind)
     }
 
     fn lineage_image_ids_for_feed_range(
         &self,
         range: Range<usize>,
         max: usize,
+    ) -> Vec<StudioArtifactId> {
+        self.lineage_ids_for_feed_range(range, max, |kind| kind == MediaKind::Image)
+    }
+
+    fn lineage_ids_for_feed_range(
+        &self,
+        range: Range<usize>,
+        max: usize,
+        accept: impl Fn(MediaKind) -> bool,
     ) -> Vec<StudioArtifactId> {
         let end = range.end.min(self.feed_turn_count());
         let start = range.start.min(end);
@@ -1237,6 +1468,9 @@ impl StudioPage {
                 continue;
             };
             for tile in self.lineage.tiles_for_root(turn_id) {
+                if !accept(tile.media_kind) {
+                    continue;
+                }
                 if let Some(id) = tile.artifact_id {
                     ids.push(id);
                     if ids.len() >= max {
@@ -1307,6 +1541,9 @@ impl StudioPage {
                 let (aw, ah) = tile.aspect;
                 let tile_h = tile_width * ah as f32 / aw.max(1) as f32;
                 if let Some(id) = tile.artifact_id {
+                    if tile.media_kind != MediaKind::Image {
+                        continue;
+                    }
                     let (top, bottom) =
                         feed_tile_vertical_span(turn_top, header, slot, columns, tile_h, gap);
                     tiles.push((id, top, bottom));
@@ -1688,6 +1925,9 @@ impl StudioPage {
                         tile.artifact_id,
                         tile.run_id,
                         tile.progress,
+                        tile.media_kind,
+                        tile.duration_seconds,
+                        tile.error.as_deref(),
                         theme,
                         window,
                         cx,
@@ -1716,6 +1956,16 @@ impl StudioPage {
                         .is_some_and(|error| error.contains("may have completed")),
                 )
             })
+            .collect::<Vec<_>>();
+        let mut seen_errors = HashSet::new();
+        let error_chips = turn
+            .runs
+            .iter()
+            .filter(|run| run.state == StudioRunState::Failed)
+            .filter_map(|run| {
+                run_error_message(run.error.as_deref()).map(|message| message.to_string())
+            })
+            .filter(|message| seen_errors.insert(message.clone()))
             .collect::<Vec<_>>();
         let show_more = clampable.then(|| {
             show_more_action(
@@ -1787,6 +2037,11 @@ impl StudioPage {
                                     .children(show_more)
                                 }),
                         ),
+                    )
+                    .children(
+                        error_chips
+                            .into_iter()
+                            .map(|message| render_run_error_chip(theme, &message)),
                     )
                     .child(
                         div()
@@ -2048,6 +2303,30 @@ mod tests {
     use zeron_proto::StudioTurnView;
 
     #[test]
+    fn artifact_drag_ghost_shrinks_around_the_long_edge() {
+        assert_eq!(artifact_drag_ghost_size(336.0, 336.0), (168.0, 168.0));
+        assert_eq!(artifact_drag_ghost_size(336.0, 168.0), (168.0, 84.0));
+        assert_eq!(artifact_drag_ghost_size(120.0, 80.0), (120.0, 80.0));
+    }
+
+    #[test]
+    fn artifact_drag_ghost_keeps_the_grab_point_under_the_cursor() {
+        let (width, height) = artifact_drag_ghost_size(400.0, 400.0);
+        let (left, top) = artifact_drag_ghost_offset(
+            400.0,
+            400.0,
+            gpui::point(px(200.0), px(200.0)),
+            width,
+            height,
+        );
+        assert!((left - 200.0 + 200.0 * (width / 400.0)).abs() < 0.01);
+        assert!((top - left).abs() < 0.01);
+        let (origin_left, origin_top) =
+            artifact_drag_ghost_offset(400.0, 400.0, gpui::point(px(0.0), px(0.0)), width, height);
+        assert_eq!((origin_left, origin_top), (0.0, 0.0));
+    }
+
+    #[test]
     fn feed_breakpoints_follow_the_plan() {
         assert_eq!(grid_columns(519.0), 1);
         assert_eq!(grid_columns(520.0), 2);
@@ -2087,6 +2366,7 @@ mod tests {
             controls: Vec::new(),
             pricing: None,
             features: Vec::new(),
+            video: zeron_studio::VideoModelMeta::default(),
             manifest_version: "test".into(),
             fetched_at: Utc::now(),
         }
@@ -2280,6 +2560,18 @@ mod tests {
         assert!(!prompt_exceeds_lines(&ten, inner, advance, 10));
         assert!(prompt_exceeds_lines(&eleven, inner, advance, 10));
         assert!(!prompt_exceeds_lines("short", inner, advance, 10));
+    }
+
+    #[test]
+    fn video_duration_badge_uses_clock_style() {
+        assert_eq!(
+            crate::studio::video::format_duration_badge(Some(6.2)),
+            "0:06"
+        );
+        assert_eq!(
+            crate::studio::video::format_duration_badge(Some(75.0)),
+            "1:15"
+        );
     }
 
     #[test]

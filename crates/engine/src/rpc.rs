@@ -54,22 +54,23 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde::Deserialize;
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 use zeron_doc::{MessagePart, SessionCommandPayload};
 use zeron_proto::{
     AppendStudioDerivedRunRequest, ArchiveStudioConversationRequest, ChatConfig,
-    CreateStudioConversationRequest, CreateStudioTurnRequest, DeleteStudioArtifactRequest,
-    DeleteStudioConversationRequest, EngineInfo, ExtendStudioTurnRequest, HarnessId,
+    CheckStudioRunRequest, CreateStudioConversationRequest, CreateStudioTurnRequest,
+    DeleteStudioArtifactRequest, DeleteStudioConversationRequest, EngineInfo,
+    EvaluateStudioComposerRequest, ExtendStudioTurnRequest, HarnessId, ImportStudioAssetRequest,
     ListStudioArtifactsResponse, ListStudioConversationsRequest, ListStudioConversationsResponse,
     ListStudioModelsRequest, ListStudioModelsResponse, ListStudioProvidersResponse,
     MarkStudioConversationSeenRequest, ProviderValidationState, QuoteStudioBatchRequest,
     QuoteStudioBatchResponse, QuoteStudioRunView, ReadStudioArtifactChunkRequest,
     RenameStudioConversationRequest, RetryStudioRunRequest, SetStudioProviderCredentialRequest,
     SetStudioProviderPreferencesRequest, StudioModelRunSpec, StudioProviderBalanceResponse,
-    StudioProviderConnection, StudioProviderRequest, ToolCall, WatchStudioConversationRequest,
-    WorkspaceScope,
+    StudioProviderConnection, StudioProviderRequest, StudioValidationError, ToolCall,
+    WatchStudioConversationRequest, WorkspaceScope,
 };
 use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
@@ -80,7 +81,10 @@ use crate::doc_host::DocHost;
 use crate::registry::HarnessRegistry;
 use crate::repos::{Repos, home_dir};
 use crate::sessions::SessionsEngine;
-use crate::studio::{PreparedStudioRun, StoredStudioRun, StudioProviderRegistry, StudioStore};
+use crate::studio::{
+    CompleteRun, PreparedStudioRun, StoredStudioRun, StudioAttemptCheck, StudioProviderRegistry,
+    StudioStore, StudioStoreError,
+};
 use crate::studio_credentials::StudioCredentials;
 use crate::terminals::Terminals;
 use crate::uploads::Uploads;
@@ -525,6 +529,45 @@ impl EngineRpc {
         }
     }
 
+    async fn composer_catalog(
+        &self,
+        snapshot: &zeron_studio::ComposerSnapshot,
+        provider_id: Option<&zeron_studio::ProviderId>,
+    ) -> Result<Vec<zeron_studio::MediaModel>, RpcError> {
+        let mut ids = HashSet::new();
+        if let Some(provider_id) = provider_id {
+            ids.insert(provider_id.clone());
+        }
+        for selected in &snapshot.selected {
+            ids.insert(selected.provider_id.clone());
+        }
+        let mut models = Vec::new();
+        for id in ids {
+            models.extend(self.studio_catalog(&id, false).await?.models);
+        }
+        Ok(models)
+    }
+
+    async fn prepare_studio_runs_from_composer(
+        &self,
+        prompt: &str,
+        composer: &zeron_studio::ComposerSnapshot,
+        submit: bool,
+    ) -> Result<Vec<PreparedStudioRun>, RpcError> {
+        if prompt != composer.prompt {
+            return Err(RpcError::BadParams(
+                "prompt must equal composer.prompt".into(),
+            ));
+        }
+        let catalog = self.composer_catalog(composer, None).await?;
+        let view = zeron_studio::evaluate_composer(composer, &catalog);
+        if !view.send.enabled || view.conflicts.iter().any(|conflict| conflict.blocks_send()) {
+            return Err(studio_validation_error(&view.conflicts));
+        }
+        let specs = project_composer_specs(composer, &catalog)?;
+        self.prepare_studio_runs(prompt, specs, submit).await
+    }
+
     async fn prepare_studio_runs(
         &self,
         prompt: &str,
@@ -535,16 +578,9 @@ impl EngineRpc {
             std::collections::BTreeMap::<zeron_studio::ProviderId, ListStudioModelsResponse>::new();
         let mut prepared = Vec::with_capacity(specs.len());
         for spec in specs {
-            if submit
-                && !matches!(
-                    spec.operation,
-                    zeron_studio::MediaOperation::TextToImage
-                        | zeron_studio::MediaOperation::Upscale
-                        | zeron_studio::MediaOperation::ImageEdit
-                )
-            {
+            if submit && !submit_operation_allowed(spec.operation) {
                 return Err(RpcError::Failed(
-                    "only text-to-image, image-edit, and upscale runs are available in the current Studio slice"
+                    "only text-to-image, image-edit, upscale, and video runs are available in the current Studio slice"
                         .into(),
                 ));
             }
@@ -599,7 +635,7 @@ impl EngineRpc {
                     zeron_studio::ControlValue::Boolean { value: safe_mode },
                 );
             }
-            let quote = self.resolve_studio_quote(&generation, &model).await;
+            let quote = self.resolve_studio_quote(&generation, &model).await?;
             prepared.push(PreparedStudioRun {
                 model,
                 request: generation,
@@ -613,14 +649,50 @@ impl EngineRpc {
         &self,
         request: &zeron_studio::GenerationRequest,
         model: &zeron_studio::MediaModel,
-    ) -> Option<zeron_studio::Quote> {
+    ) -> Result<Option<zeron_studio::Quote>, RpcError> {
+        let has_reference_video = request
+            .inputs
+            .iter()
+            .any(|input| input.role.as_str() == zeron_studio::ROLE_REFERENCE_VIDEO);
+        if has_reference_video {
+            let total = self
+                .studio
+                .reference_video_total_duration(request)
+                .map_err(|error| RpcError::Failed(error.to_string()))?
+                .ok_or_else(|| {
+                    RpcError::Failed(
+                        "video quote requires reference_video_total_duration when reference clips are present"
+                            .into(),
+                    )
+                })?;
+            let provider = self
+                .studio_providers
+                .get(&request.provider_id)
+                .map_err(|error| RpcError::Failed(error.to_string()))?
+                .ok_or_else(|| RpcError::Failed("unknown studio provider".into()))?;
+            let secret = self
+                .studio_credentials
+                .secret(&request.provider_id)
+                .await
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+            let quote = provider
+                .quote(&secret, request, Some(total))
+                .await
+                .map_err(|error| RpcError::Failed(error.to_string()))?
+                .ok_or_else(|| {
+                    RpcError::Failed(
+                        "video quote is required when reference clips are present".into(),
+                    )
+                })?;
+            return Ok(Some(quote));
+        }
         if let Ok(Some(provider)) = self.studio_providers.get(&request.provider_id)
             && let Ok(secret) = self.studio_credentials.secret(&request.provider_id).await
-            && let Ok(Some(quote)) = provider.quote(&secret, request).await
+            && let Ok(Some(quote)) = provider.quote(&secret, request, None).await
         {
-            return Some(quote);
+            return Ok(Some(quote));
         }
-        model.estimate_cost(&request.controls, request.output_count)
+        Ok(model.estimate_cost(&request.controls, request.output_count))
     }
 
     fn local_importer(&self) -> Result<&crate::local_import::LocalImporter, RpcError> {
@@ -1294,6 +1366,46 @@ impl RpcService for EngineRpc {
                 if let Some(kind) = request.media_kind {
                     response.models.retain(|model| model.output_kind == kind);
                 }
+                response.models.retain(|model| model.is_picker_visible());
+                RpcReply::value(&response)
+            }
+            methods::EVALUATE_STUDIO_COMPOSER => {
+                let request: EvaluateStudioComposerRequest = parse_params(params)?;
+                let catalog = self
+                    .composer_catalog(&request.composer, request.provider_id.as_ref())
+                    .await?;
+                RpcReply::value(&zeron_studio::evaluate_composer(
+                    &request.composer,
+                    &catalog,
+                ))
+            }
+            methods::IMPORT_STUDIO_ASSET => {
+                let request: ImportStudioAssetRequest = parse_params(params)?;
+                if request.data.len() > crate::studio::MAX_IMPORT_B64_CHARS {
+                    return Err(RpcError::BadParams("studio asset exceeds 64 MiB".into()));
+                }
+                let data = base64::engine::general_purpose::STANDARD
+                    .decode(&request.data)
+                    .map_err(|error| {
+                        RpcError::BadParams(format!("import chunk is not valid base64: {error}"))
+                    })?;
+                let expected_hash = request.expected_hash.as_deref();
+                if request.last && expected_hash.is_none_or(|value| value.trim().is_empty()) {
+                    return Err(RpcError::BadParams(
+                        "expectedHash is required when last is true".into(),
+                    ));
+                }
+                let response = self
+                    .studio
+                    .import_asset_chunk(
+                        request.asset_id,
+                        request.offset,
+                        &data,
+                        request.last,
+                        expected_hash,
+                        request.mime_hint.as_deref(),
+                    )
+                    .map_err(import_studio_asset_error)?;
                 RpcReply::value(&response)
             }
             methods::LIST_STUDIO_CONVERSATIONS => {
@@ -1416,9 +1528,13 @@ impl RpcService for EngineRpc {
             }
             methods::QUOTE_STUDIO_BATCH => {
                 let request: QuoteStudioBatchRequest = parse_params(params)?;
-                let prepared = self
-                    .prepare_studio_runs(&request.prompt, request.runs, false)
-                    .await?;
+                let prepared = if let Some(composer) = request.composer.as_ref() {
+                    self.prepare_studio_runs_from_composer(&request.prompt, composer, false)
+                        .await?
+                } else {
+                    self.prepare_studio_runs(&request.prompt, request.runs, false)
+                        .await?
+                };
                 let runs = prepared
                     .into_iter()
                     .map(|run| QuoteStudioRunView {
@@ -1454,18 +1570,31 @@ impl RpcService for EngineRpc {
             }
             methods::CREATE_STUDIO_TURN => {
                 let request: CreateStudioTurnRequest = parse_params(params)?;
-                if request
-                    .runs
-                    .iter()
-                    .any(|run| run.operation == zeron_studio::MediaOperation::ImageEdit)
-                {
-                    return Err(RpcError::Failed(
-                        "image edits must be appended to the source image's turn".into(),
-                    ));
-                }
-                let prepared = self
-                    .prepare_studio_runs(&request.prompt, request.runs, true)
-                    .await?;
+                let prepared = if let Some(composer) = request.composer.as_ref() {
+                    self.prepare_studio_runs_from_composer(&request.prompt, composer, true)
+                        .await?
+                } else {
+                    if request
+                        .runs
+                        .iter()
+                        .any(|run| run.operation == zeron_studio::MediaOperation::ImageEdit)
+                    {
+                        return Err(RpcError::Failed(
+                            "image edits must be appended to the source image's turn".into(),
+                        ));
+                    }
+                    if request
+                        .runs
+                        .iter()
+                        .any(|run| is_video_operation(run.operation))
+                    {
+                        return Err(RpcError::Failed(
+                            "video runs require a composer snapshot".into(),
+                        ));
+                    }
+                    self.prepare_studio_runs(&request.prompt, request.runs, true)
+                        .await?
+                };
                 let stored = self
                     .studio
                     .create_turn(
@@ -1500,6 +1629,11 @@ impl RpcService for EngineRpc {
                     .studio
                     .turn_extend_spec(request.turn_id)
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
+                if specs.iter().any(|run| is_video_operation(run.operation)) {
+                    return Err(RpcError::Failed(
+                        "video extend requires a composer snapshot".into(),
+                    ));
+                }
                 let prepared = self.prepare_studio_runs(&prompt, specs, true).await?;
                 let (conversation_id, stored) = self
                     .studio
@@ -1649,6 +1783,27 @@ impl RpcService for EngineRpc {
                 let providers = self.studio_providers.clone();
                 let credentials = self.studio_credentials.clone();
                 tokio::spawn(execute_studio_run(store, providers, credentials, run));
+                RpcReply::value(&view)
+            }
+            methods::CHECK_STUDIO_RUN => {
+                let request: CheckStudioRunRequest = parse_params(params)?;
+                let check = self
+                    .studio
+                    .latest_attempt_for_check(request.run_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let view = self
+                    .studio
+                    .conversation_view(check.conversation_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let store = self.studio.clone();
+                let providers = self.studio_providers.clone();
+                let credentials = self.studio_credentials.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = check_studio_run(store, providers, credentials, check).await
+                    {
+                        tracing::warn!(error = %error, "studio check status failed");
+                    }
+                });
                 RpcReply::value(&view)
             }
             methods::READ_STUDIO_ARTIFACT_CHUNK => {
@@ -2367,6 +2522,124 @@ impl RpcService for EngineRpc {
     }
 }
 
+fn import_studio_asset_error(error: StudioStoreError) -> RpcError {
+    match error {
+        StudioStoreError::InvalidValue(message) => RpcError::BadParams(message),
+        StudioStoreError::ArtifactTooLarge => {
+            RpcError::BadParams("studio asset exceeds 64 MiB".into())
+        }
+        other => RpcError::Failed(other.to_string()),
+    }
+}
+
+fn studio_validation_error(conflicts: &[zeron_studio::ComposerConflict]) -> RpcError {
+    let error = StudioValidationError::new(conflicts.to_vec());
+    let message = conflicts
+        .iter()
+        .find(|conflict| conflict.blocks_send())
+        .or(conflicts.first())
+        .map(|conflict| conflict.title.clone())
+        .unwrap_or_else(|| "studio validation failed".into());
+    let payload = serde_json::to_value(&error).unwrap_or_else(|_| {
+        serde_json::json!({
+            "code": zeron_studio::STUDIO_VALIDATION_CODE,
+            "conflicts": []
+        })
+    });
+    RpcError::FailedStructured { message, payload }
+}
+
+fn project_composer_specs(
+    snapshot: &zeron_studio::ComposerSnapshot,
+    catalog: &[zeron_studio::MediaModel],
+) -> Result<Vec<StudioModelRunSpec>, RpcError> {
+    let mut specs = Vec::with_capacity(snapshot.selected.len());
+    for selected in &snapshot.selected {
+        let model = catalog
+            .iter()
+            .find(|model| {
+                model.id == selected.model_id && model.provider_id == selected.provider_id
+            })
+            .ok_or_else(|| RpcError::Failed("studio model is unavailable".into()))?;
+        let inputs = zeron_studio::map_tray(snapshot, model)
+            .map_err(|conflict| studio_validation_error(std::slice::from_ref(&conflict)))?;
+        let mut controls = selected.controls.clone();
+        for control in &model.controls {
+            if control.id.as_str() == "duration" {
+                continue;
+            }
+            if !controls.contains_key(&control.id)
+                && let Some(default) = &control.default
+            {
+                controls.insert(control.id.clone(), default.clone());
+            }
+        }
+        if snapshot.mode == zeron_studio::ComposerMode::Video
+            && let Some(duration) = zeron_studio::assigned_duration(snapshot, model)
+        {
+            controls.insert(zeron_studio::ControlId::from("duration"), duration);
+        }
+        let output_count = match snapshot.mode {
+            zeron_studio::ComposerMode::Video => 1,
+            zeron_studio::ComposerMode::Image => selected.output_count.max(1),
+        };
+        specs.push(StudioModelRunSpec {
+            provider_id: selected.provider_id.clone(),
+            model_id: selected.model_id.clone(),
+            operation: model.operation,
+            output_count,
+            display_aspect_ratio: composer_display_aspect(snapshot, &controls, &inputs),
+            controls,
+            inputs,
+            manifest_version: model.manifest_version.clone(),
+        });
+    }
+    Ok(specs)
+}
+
+fn composer_display_aspect(
+    snapshot: &zeron_studio::ComposerSnapshot,
+    controls: &std::collections::BTreeMap<zeron_studio::ControlId, zeron_studio::ControlValue>,
+    inputs: &[zeron_studio::GenerationInput],
+) -> (u32, u32) {
+    if let Some((width, height)) = controls
+        .values()
+        .find_map(|value| value.aspect_ratio_dimensions())
+        && width > 0
+        && height > 0
+    {
+        return (width, height);
+    }
+    for input in inputs {
+        if input.role.as_str() != zeron_studio::ROLE_SOURCE {
+            continue;
+        }
+        let attachment = snapshot
+            .attachments
+            .iter()
+            .find(|attachment| match &input.source {
+                zeron_studio::GenerationInputSource::Asset { asset_id } => {
+                    attachment.id == *asset_id
+                }
+                zeron_studio::GenerationInputSource::Artifact { artifact_id } => {
+                    matches!(
+                        &attachment.origin,
+                        zeron_studio::AttachmentOrigin::Artifact { artifact_id: origin }
+                            if origin == artifact_id
+                    )
+                }
+            });
+        if let Some(attachment) = attachment
+            && let (Some(width), Some(height)) = (attachment.width, attachment.height)
+            && width > 0
+            && height > 0
+        {
+            return (width, height);
+        }
+    }
+    (16, 9)
+}
+
 fn studio_provider_label(provider_id: &zeron_studio::ProviderId) -> String {
     match provider_id.as_str() {
         "venice" => "Venice".to_owned(),
@@ -2419,6 +2692,23 @@ async fn execute_studio_run(
     credentials: std::sync::Arc<StudioCredentials>,
     run: StoredStudioRun,
 ) -> Result<(), String> {
+    execute_studio_run_with_policy(
+        store,
+        providers,
+        credentials,
+        run,
+        VideoPollPolicy::production(),
+    )
+    .await
+}
+
+async fn execute_studio_run_with_policy(
+    store: std::sync::Arc<StudioStore>,
+    providers: std::sync::Arc<StudioProviderRegistry>,
+    credentials: std::sync::Arc<StudioCredentials>,
+    run: StoredStudioRun,
+    policy: VideoPollPolicy,
+) -> Result<(), String> {
     let provider = match providers.get(&run.request.provider_id) {
         Ok(Some(provider)) => provider,
         Ok(None) => {
@@ -2462,19 +2752,39 @@ async fn execute_studio_run(
     let request = apply_venice_safe_mode_for_submit(&credentials, run.request.clone());
     match provider.submit(&secret, &request, &context).await {
         Ok(zeron_studio::Submission::Completed { artifacts }) => {
-            if let Err(error) = store.complete_run(&run, &artifacts) {
-                let message = error.to_string();
-                fail_studio_run(&store, &run, &message, false)
-            } else {
-                Ok(())
+            match store.complete_run(&run, &artifacts) {
+                Ok(CompleteRun::Published | CompleteRun::Failed | CompleteRun::AlreadyTerminal) => {
+                    Ok(())
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    fail_studio_run(&store, &run, &message, false)
+                }
             }
         }
-        Ok(zeron_studio::Submission::Queued { .. }) => fail_studio_run(
-            &store,
-            &run,
-            "provider queued an image job that this release cannot poll",
-            true,
-        ),
+        Ok(zeron_studio::Submission::Queued { remote_job }) => {
+            if !is_video_operation(run.request.operation) {
+                return fail_studio_run(
+                    &store,
+                    &run,
+                    "provider queued an image job that this release cannot poll",
+                    true,
+                );
+            }
+            if let Err(error) = store.mark_queued(&run, &remote_job) {
+                let message = error.to_string();
+                return fail_studio_run(&store, &run, &message, true);
+            }
+            poll_queued_video_job(
+                &store,
+                provider.as_ref(),
+                &secret,
+                &run,
+                &remote_job,
+                policy,
+            )
+            .await
+        }
         Err(error) => {
             if error.kind == zeron_studio::ProviderErrorKind::InvalidRequest
                 && let Ok(models) = provider.list_models(&secret).await
@@ -2521,6 +2831,406 @@ async fn execute_studio_run(
     }
 }
 
+const VIDEO_POLL_FIRST_TICK: Duration = Duration::from_secs(5);
+const VIDEO_POLL_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+const VIDEO_POLL_BASE_TICK: Duration = Duration::from_secs(5);
+const VIDEO_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug)]
+struct VideoPollPolicy {
+    first_tick: Duration,
+    timeout: Duration,
+    base_tick: Duration,
+    max_backoff: Duration,
+}
+
+impl VideoPollPolicy {
+    fn production() -> Self {
+        Self {
+            first_tick: VIDEO_POLL_FIRST_TICK,
+            timeout: VIDEO_POLL_TIMEOUT,
+            base_tick: VIDEO_POLL_BASE_TICK,
+            max_backoff: VIDEO_POLL_MAX_BACKOFF,
+        }
+    }
+
+    /// Restart/Check status: the job has already been queued, so poll immediately.
+    fn resume() -> Self {
+        Self {
+            first_tick: Duration::ZERO,
+            timeout: VIDEO_POLL_TIMEOUT,
+            base_tick: VIDEO_POLL_BASE_TICK,
+            max_backoff: VIDEO_POLL_MAX_BACKOFF,
+        }
+    }
+
+    fn timed_out(self, started: Instant) -> bool {
+        started.elapsed() >= self.timeout
+    }
+
+    fn remaining(self, started: Instant) -> Duration {
+        self.timeout.saturating_sub(started.elapsed())
+    }
+
+    fn sleep_for(self, started: Instant, delay: Duration) -> Option<Duration> {
+        let remaining = self.remaining(started);
+        if remaining.is_zero() {
+            None
+        } else if delay.is_zero() {
+            Some(Duration::ZERO)
+        } else {
+            Some(delay.min(remaining))
+        }
+    }
+}
+
+fn submit_operation_allowed(operation: zeron_studio::MediaOperation) -> bool {
+    matches!(
+        operation,
+        zeron_studio::MediaOperation::TextToImage
+            | zeron_studio::MediaOperation::Upscale
+            | zeron_studio::MediaOperation::ImageEdit
+            | zeron_studio::MediaOperation::TextToVideo
+            | zeron_studio::MediaOperation::ImageToVideo
+            | zeron_studio::MediaOperation::ReferenceToVideo
+            | zeron_studio::MediaOperation::VideoToVideo
+    )
+}
+
+fn is_video_operation(operation: zeron_studio::MediaOperation) -> bool {
+    matches!(
+        operation,
+        zeron_studio::MediaOperation::TextToVideo
+            | zeron_studio::MediaOperation::ImageToVideo
+            | zeron_studio::MediaOperation::ReferenceToVideo
+            | zeron_studio::MediaOperation::VideoToVideo
+    )
+}
+
+fn video_poll_backoff(n: u32, retry_after: Option<Duration>, policy: VideoPollPolicy) -> Duration {
+    if let Some(retry_after) = retry_after.filter(|value| !value.is_zero()) {
+        return retry_after;
+    }
+    let raw = policy.base_tick.as_secs_f64() * 1.5f64.powi(n as i32);
+    let capped = raw.min(policy.max_backoff.as_secs_f64());
+    jitter_pm_20(Duration::from_secs_f64(capped))
+}
+
+fn jitter_pm_20(duration: Duration) -> Duration {
+    if duration.is_zero() {
+        return duration;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.subsec_nanos())
+        .unwrap_or(0);
+    // [0.8, 1.2)
+    let factor = 0.8 + f64::from(nanos % 400) / 1_000.0;
+    Duration::from_secs_f64(duration.as_secs_f64() * factor)
+}
+
+struct VideoPollGuard<'a> {
+    store: &'a StudioStore,
+    attempt_id: zeron_studio::StudioAttemptId,
+}
+
+impl Drop for VideoPollGuard<'_> {
+    fn drop(&mut self) {
+        self.store.end_video_poll(self.attempt_id);
+    }
+}
+
+async fn poll_queued_video_job(
+    store: &StudioStore,
+    provider: &dyn zeron_studio::MediaProvider,
+    secret: &zeron_studio::Secret,
+    run: &StoredStudioRun,
+    remote_job: &zeron_studio::RemoteJob,
+    policy: VideoPollPolicy,
+) -> Result<(), String> {
+    if !store.try_begin_video_poll(run.attempt_id) {
+        tracing::debug!(
+            run_id = %run.run_id.0,
+            attempt_id = %run.attempt_id.0,
+            "studio video poll already in flight"
+        );
+        return Ok(());
+    }
+    let _guard = VideoPollGuard {
+        store,
+        attempt_id: run.attempt_id,
+    };
+    let started = Instant::now();
+    let mut delay = policy.first_tick;
+    let mut transient_n = 0u32;
+    loop {
+        let Some(sleep_for) = policy.sleep_for(started, delay) else {
+            return fail_studio_run(store, run, "video job timed out after 45 minutes", false);
+        };
+        if !sleep_for.is_zero() {
+            tokio::time::sleep(sleep_for).await;
+            if policy.timed_out(started) {
+                return fail_studio_run(store, run, "video job timed out after 45 minutes", false);
+            }
+        }
+        match provider.poll(secret, remote_job).await {
+            Ok(zeron_studio::PollResult::Queued { .. }) => {
+                delay = policy.base_tick;
+            }
+            Ok(zeron_studio::PollResult::Running { progress }) => {
+                if let Err(error) = store.mark_running(run, progress) {
+                    let message = error.to_string();
+                    return fail_studio_run(store, run, &message, false);
+                }
+                delay = policy.base_tick;
+            }
+            Ok(zeron_studio::PollResult::Completed { artifacts }) => {
+                if let Err(error) = store.mark_downloading(run, Some(1.0)) {
+                    let message = error.to_string();
+                    return fail_studio_run(store, run, &message, false);
+                }
+                match store.complete_run(run, &artifacts) {
+                    Ok(CompleteRun::Published) => {
+                        if let Err(error) = provider.complete(secret, remote_job).await {
+                            tracing::warn!(
+                                run_id = %run.run_id.0,
+                                attempt_id = %run.attempt_id.0,
+                                error = %error,
+                                "studio video complete failed"
+                            );
+                        }
+                        return Ok(());
+                    }
+                    Ok(CompleteRun::Failed | CompleteRun::AlreadyTerminal) => return Ok(()),
+                    Err(error) => {
+                        let message = error.to_string();
+                        return fail_studio_run(store, run, &message, false);
+                    }
+                }
+            }
+            Ok(zeron_studio::PollResult::Failed { error })
+                if error.kind == zeron_studio::ProviderErrorKind::Transient =>
+            {
+                delay = video_poll_backoff(transient_n, error.retry_after(), policy);
+                transient_n = transient_n.saturating_add(1);
+            }
+            Ok(zeron_studio::PollResult::Failed { error }) => {
+                return fail_studio_run(store, run, &error.to_string(), false);
+            }
+            Err(error) if error.kind == zeron_studio::ProviderErrorKind::Transient => {
+                delay = video_poll_backoff(transient_n, error.retry_after(), policy);
+                transient_n = transient_n.saturating_add(1);
+            }
+            Err(error) => {
+                return fail_studio_run(store, run, &error.to_string(), false);
+            }
+        }
+    }
+}
+
+pub(crate) async fn resume_queued_video_runs(
+    store: std::sync::Arc<StudioStore>,
+    providers: std::sync::Arc<StudioProviderRegistry>,
+    credentials: std::sync::Arc<StudioCredentials>,
+) {
+    let attempts = match store.resumable_video_attempts() {
+        Ok(attempts) => attempts,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to list resumable studio video jobs");
+            return;
+        }
+    };
+    if attempts.is_empty() {
+        return;
+    }
+    tracing::info!(
+        count = attempts.len(),
+        "resuming in-flight studio video jobs"
+    );
+    let tasks = attempts.into_iter().map(|run| {
+        let store = store.clone();
+        let providers = providers.clone();
+        let credentials = credentials.clone();
+        async move {
+            if let Err(error) = resume_one_video_job(
+                store,
+                providers,
+                credentials,
+                run,
+                VideoPollPolicy::resume(),
+            )
+            .await
+            {
+                tracing::warn!(error = %error, "studio video resume failed");
+            }
+        }
+    });
+    futures::future::join_all(tasks).await;
+}
+
+async fn resume_one_video_job(
+    store: std::sync::Arc<StudioStore>,
+    providers: std::sync::Arc<StudioProviderRegistry>,
+    credentials: std::sync::Arc<StudioCredentials>,
+    run: StoredStudioRun,
+    policy: VideoPollPolicy,
+) -> Result<(), String> {
+    let provider = match providers.get(&run.request.provider_id) {
+        Ok(Some(provider)) => provider,
+        Ok(None) => {
+            tracing::warn!(
+                run_id = %run.run_id.0,
+                provider = %run.request.provider_id.as_str(),
+                "skipping studio video resume: provider unavailable"
+            );
+            return Ok(());
+        }
+        Err(error) => return fail_studio_run(&store, &run, &error.to_string(), false),
+    };
+    let secret = match credentials.secret(&run.request.provider_id).await {
+        Ok(secret) => secret,
+        Err(error) => {
+            tracing::warn!(
+                run_id = %run.run_id.0,
+                provider = %run.request.provider_id.as_str(),
+                error = %error,
+                "skipping studio video resume: credentials missing"
+            );
+            return Ok(());
+        }
+    };
+    let remote_job = match store.remote_job_for_attempt(run.attempt_id) {
+        Ok(Some(remote_job)) => remote_job,
+        Ok(None) => {
+            tracing::warn!(
+                run_id = %run.run_id.0,
+                "skipping studio video resume: remote_job_id missing"
+            );
+            return Ok(());
+        }
+        Err(error) => return fail_studio_run(&store, &run, &error.to_string(), false),
+    };
+    poll_queued_video_job(
+        &store,
+        provider.as_ref(),
+        &secret,
+        &run,
+        &remote_job,
+        policy,
+    )
+    .await
+}
+
+async fn check_studio_run(
+    store: std::sync::Arc<StudioStore>,
+    providers: std::sync::Arc<StudioProviderRegistry>,
+    credentials: std::sync::Arc<StudioCredentials>,
+    check: StudioAttemptCheck,
+) -> Result<(), String> {
+    if check.remote_job.is_some() {
+        if matches!(check.attempt_state.as_str(), "succeeded" | "cancelled") {
+            return Ok(());
+        }
+        let provider = match providers.get(&check.run.request.provider_id) {
+            Ok(Some(provider)) => provider,
+            Ok(None) => return Ok(()),
+            Err(error) => return fail_studio_run(&store, &check.run, &error.to_string(), false),
+        };
+        let secret = match credentials.secret(&check.run.request.provider_id).await {
+            Ok(secret) => secret,
+            Err(_) => return Ok(()),
+        };
+        let remote_job = match store.remote_job_for_attempt(check.run.attempt_id) {
+            Ok(Some(remote_job)) => remote_job,
+            Ok(None) => return Ok(()),
+            Err(error) => return fail_studio_run(&store, &check.run, &error.to_string(), false),
+        };
+        if matches!(
+            check.attempt_state.as_str(),
+            "submission_unknown" | "failed"
+        ) && !store
+            .reopen_unknown_for_poll(&check.run)
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(());
+        }
+        return poll_queued_video_job(
+            &store,
+            provider.as_ref(),
+            &secret,
+            &check.run,
+            &remote_job,
+            VideoPollPolicy::resume(),
+        )
+        .await;
+    }
+    reconcile_studio_attempt(store, providers, credentials, check).await
+}
+
+async fn reconcile_studio_attempt(
+    store: std::sync::Arc<StudioStore>,
+    providers: std::sync::Arc<StudioProviderRegistry>,
+    credentials: std::sync::Arc<StudioCredentials>,
+    check: StudioAttemptCheck,
+) -> Result<(), String> {
+    let provider = match providers.get(&check.run.request.provider_id) {
+        Ok(Some(provider)) => provider,
+        Ok(None) => return Ok(()),
+        Err(error) => return fail_studio_run(&store, &check.run, &error.to_string(), false),
+    };
+    let secret = match credentials.secret(&check.run.request.provider_id).await {
+        Ok(secret) => secret,
+        Err(_) => return Ok(()),
+    };
+    let attempt = zeron_studio::RemoteAttempt {
+        idempotency_key: check.run.idempotency_key.clone(),
+        remote_job_id: None,
+        request_wire_hash: check.request_wire_hash,
+    };
+    match provider.reconcile(&secret, &attempt).await {
+        Ok(None) => Ok(()),
+        Ok(Some(submission)) => {
+            if matches!(
+                check.attempt_state.as_str(),
+                "submission_unknown" | "failed"
+            ) && !store
+                .reopen_unknown_for_poll(&check.run)
+                .map_err(|error| error.to_string())?
+            {
+                return Ok(());
+            }
+            match submission {
+                zeron_studio::Submission::Completed { artifacts } => {
+                    match store.complete_run(&check.run, &artifacts) {
+                        Ok(_) => Ok(()),
+                        Err(error) => {
+                            fail_studio_run(&store, &check.run, &error.to_string(), false)
+                        }
+                    }
+                }
+                zeron_studio::Submission::Queued { remote_job } => {
+                    if !is_video_operation(check.run.request.operation) {
+                        return Ok(());
+                    }
+                    if let Err(error) = store.mark_queued(&check.run, &remote_job) {
+                        return fail_studio_run(&store, &check.run, &error.to_string(), true);
+                    }
+                    poll_queued_video_job(
+                        &store,
+                        provider.as_ref(),
+                        &secret,
+                        &check.run,
+                        &remote_job,
+                        VideoPollPolicy::resume(),
+                    )
+                    .await
+                }
+            }
+        }
+        Err(error) => fail_studio_run(&store, &check.run, &error.to_string(), false),
+    }
+}
+
 fn fail_studio_run(
     store: &StudioStore,
     run: &StoredStudioRun,
@@ -2552,6 +3262,7 @@ fn fail_studio_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeron_proto::StudioRunState;
 
     /// The UI's Switch/Forget calls send `{id, accountId, harness}` (+ optional
     /// `targetDeviceId`); the extra fields must be tolerated, `accountId` wins.
@@ -2594,5 +3305,310 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn video_poll_production_cap_is_45_minutes() {
+        let policy = VideoPollPolicy::production();
+        assert_eq!(policy.first_tick, Duration::from_secs(5));
+        assert_eq!(policy.timeout, Duration::from_secs(45 * 60));
+        assert_eq!(policy.max_backoff, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn video_poll_times_out_after_injected_limit() {
+        let policy = VideoPollPolicy {
+            first_tick: Duration::ZERO,
+            timeout: Duration::from_millis(1),
+            base_tick: Duration::ZERO,
+            max_backoff: Duration::from_secs(30),
+        };
+        let started = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(policy.timed_out(started));
+    }
+
+    #[test]
+    fn video_poll_backoff_prefers_retry_after() {
+        let policy = VideoPollPolicy::production();
+        assert_eq!(
+            video_poll_backoff(0, Some(Duration::from_secs(9)), policy),
+            Duration::from_secs(9)
+        );
+    }
+
+    #[test]
+    fn video_poll_sleep_is_capped_to_remaining_timeout() {
+        let policy = VideoPollPolicy {
+            first_tick: Duration::from_secs(5),
+            timeout: Duration::from_secs(10),
+            base_tick: Duration::from_secs(5),
+            max_backoff: Duration::from_secs(30),
+        };
+        let started = Instant::now() - Duration::from_secs(8);
+        let sleep = policy
+            .sleep_for(started, Duration::from_secs(3600))
+            .expect("time remains inside the cap");
+        assert!(sleep <= Duration::from_secs(2));
+        assert!(sleep > Duration::ZERO);
+        let expired = Instant::now() - Duration::from_secs(10);
+        assert_eq!(policy.sleep_for(expired, Duration::from_secs(1)), None);
+    }
+
+    #[derive(Default)]
+    struct MemorySecrets(
+        std::sync::Mutex<std::collections::BTreeMap<zeron_studio::ProviderId, String>>,
+    );
+
+    #[async_trait]
+    impl crate::StudioSecretBackend for MemorySecrets {
+        async fn set(
+            &self,
+            provider_id: &zeron_studio::ProviderId,
+            secret: &zeron_studio::Secret,
+        ) -> Result<(), crate::StudioCredentialError> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(provider_id.clone(), secret.expose().to_owned());
+            Ok(())
+        }
+
+        async fn get(
+            &self,
+            provider_id: &zeron_studio::ProviderId,
+        ) -> Result<zeron_studio::Secret, crate::StudioCredentialError> {
+            self.0
+                .lock()
+                .unwrap()
+                .get(provider_id)
+                .cloned()
+                .map(zeron_studio::Secret::new)
+                .ok_or(crate::StudioCredentialError::NotConfigured)
+        }
+
+        async fn remove(
+            &self,
+            provider_id: &zeron_studio::ProviderId,
+        ) -> Result<(), crate::StudioCredentialError> {
+            self.0.lock().unwrap().remove(provider_id);
+            Ok(())
+        }
+    }
+
+    fn video_model() -> zeron_studio::MediaModel {
+        zeron_studio::MediaModel {
+            provider_id: "fake".into(),
+            id: "seedance-t2v".into(),
+            display_name: "Seedance T2V".into(),
+            description: None,
+            operation: zeron_studio::MediaOperation::TextToVideo,
+            output_kind: zeron_studio::MediaKind::Video,
+            output_mime_types: vec!["video/mp4".into()],
+            input_constraints: Vec::new(),
+            prompt_maximum_chars: Some(2_500),
+            negative_prompt_maximum_chars: None,
+            maximum_output_count: 1,
+            controls: Vec::new(),
+            pricing: None,
+            features: Vec::new(),
+            video: zeron_studio::VideoModelMeta {
+                adapter_family: zeron_studio::AdapterFamily::Seedance,
+                ..zeron_studio::VideoModelMeta::default()
+            },
+            manifest_version: "fixture-v1".into(),
+            fetched_at: chrono::Utc::now(),
+        }
+    }
+
+    fn mp4_bytes() -> Vec<u8> {
+        let mut bytes = Vec::from(20u32.to_be_bytes());
+        bytes.extend_from_slice(b"ftyp");
+        bytes.extend_from_slice(b"isom");
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(b"isom");
+        bytes
+    }
+
+    fn mp4_artifact() -> zeron_studio::ProviderArtifact {
+        zeron_studio::ProviderArtifact {
+            media_kind: zeron_studio::MediaKind::Video,
+            mime_type: "video/mp4".into(),
+            bytes: mp4_bytes(),
+            width: None,
+            height: None,
+            duration_seconds: Some(6.0),
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    fn png_artifact() -> zeron_studio::ProviderArtifact {
+        zeron_studio::ProviderArtifact {
+            media_kind: zeron_studio::MediaKind::Image,
+            mime_type: "image/png".into(),
+            bytes: b"\x89PNG\r\n\x1a\ngenerated image".to_vec(),
+            width: Some(8),
+            height: Some(8),
+            duration_seconds: None,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    fn instant_policy() -> VideoPollPolicy {
+        VideoPollPolicy {
+            first_tick: Duration::ZERO,
+            timeout: Duration::from_secs(2),
+            base_tick: Duration::ZERO,
+            max_backoff: Duration::from_millis(1),
+        }
+    }
+
+    async fn video_run_harness(
+        provider: std::sync::Arc<zeron_studio::FakeMediaProvider>,
+    ) -> (
+        tempfile::TempDir,
+        std::sync::Arc<StudioStore>,
+        std::sync::Arc<StudioProviderRegistry>,
+        std::sync::Arc<StudioCredentials>,
+        StoredStudioRun,
+        zeron_studio::StudioConversationId,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(StudioStore::open(root.path(), 1024 * 1024).unwrap());
+        let model = video_model();
+        let conversation = store.create_conversation("Video", None).unwrap();
+        let prepared = PreparedStudioRun {
+            model: model.clone(),
+            quote: None,
+            request: zeron_studio::GenerationRequest {
+                provider_id: model.provider_id.clone(),
+                model_id: model.id.clone(),
+                operation: model.operation,
+                prompt: "a comet".into(),
+                negative_prompt: None,
+                output_count: 1,
+                controls: std::collections::BTreeMap::new(),
+                inputs: Vec::new(),
+                manifest_version: model.manifest_version.clone(),
+                display_aspect_ratio: (16, 9),
+            },
+        };
+        let runs = store
+            .create_turn(conversation.id, "a comet", None, &[prepared], "device-a")
+            .unwrap();
+        let providers = std::sync::Arc::new(StudioProviderRegistry::new());
+        providers.register(provider).unwrap();
+        let credentials = std::sync::Arc::new(
+            StudioCredentials::with_backend(
+                root.path(),
+                std::sync::Arc::new(MemorySecrets::default()),
+            )
+            .unwrap(),
+        );
+        credentials
+            .set(
+                "fake".into(),
+                "Fake".into(),
+                zeron_studio::Secret::new("valid"),
+            )
+            .await
+            .unwrap();
+        (
+            root,
+            store,
+            providers,
+            credentials,
+            runs.into_iter().next().unwrap(),
+            conversation.id,
+        )
+    }
+
+    #[tokio::test]
+    async fn video_poll_retries_transient_then_completes() {
+        let provider = std::sync::Arc::new(
+            zeron_studio::FakeMediaProvider::new(
+                "fake",
+                vec![video_model()],
+                zeron_studio::FakeSubmissionMode::Queue {
+                    polls_before_completion: 0,
+                    artifacts: vec![mp4_artifact()],
+                },
+            )
+            .with_transient_polls(1),
+        );
+        let (_root, store, providers, credentials, run, conversation_id) =
+            video_run_harness(provider.clone()).await;
+        execute_studio_run_with_policy(
+            store.clone(),
+            providers,
+            credentials,
+            run,
+            instant_policy(),
+        )
+        .await
+        .unwrap();
+        let view = store.conversation_view(conversation_id).unwrap();
+        assert_eq!(view.turns[0].runs[0].state, StudioRunState::Succeeded);
+        assert_eq!(provider.complete_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn video_poll_cap_fails_the_run() {
+        let provider = std::sync::Arc::new(zeron_studio::FakeMediaProvider::new(
+            "fake",
+            vec![video_model()],
+            zeron_studio::FakeSubmissionMode::Queue {
+                polls_before_completion: 1_000,
+                artifacts: vec![mp4_artifact()],
+            },
+        ));
+        let (_root, store, providers, credentials, run, conversation_id) =
+            video_run_harness(provider).await;
+        let policy = VideoPollPolicy {
+            first_tick: Duration::ZERO,
+            timeout: Duration::from_millis(15),
+            base_tick: Duration::ZERO,
+            max_backoff: Duration::from_millis(1),
+        };
+        execute_studio_run_with_policy(store.clone(), providers, credentials, run, policy)
+            .await
+            .unwrap();
+        let view = store.conversation_view(conversation_id).unwrap();
+        assert_eq!(view.turns[0].runs[0].state, StudioRunState::Failed);
+        assert!(
+            view.turns[0].runs[0]
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("timed out")),
+            "{:?}",
+            view.turns[0].runs[0].error
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_persist_does_not_complete_the_remote_job() {
+        let provider = std::sync::Arc::new(zeron_studio::FakeMediaProvider::new(
+            "fake",
+            vec![video_model()],
+            zeron_studio::FakeSubmissionMode::Queue {
+                polls_before_completion: 0,
+                artifacts: vec![png_artifact()],
+            },
+        ));
+        let (_root, store, providers, credentials, run, conversation_id) =
+            video_run_harness(provider.clone()).await;
+        execute_studio_run_with_policy(
+            store.clone(),
+            providers,
+            credentials,
+            run,
+            instant_policy(),
+        )
+        .await
+        .unwrap();
+        let view = store.conversation_view(conversation_id).unwrap();
+        assert_eq!(view.turns[0].runs[0].state, StudioRunState::Failed);
+        assert!(view.turns[0].runs[0].artifacts.is_empty());
+        assert_eq!(provider.complete_call_count(), 0);
     }
 }

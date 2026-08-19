@@ -117,6 +117,7 @@ fn image_model(id: &str, name: &str) -> MediaModel {
         controls: Vec::new(),
         pricing: None,
         features: Vec::new(),
+        video: zeron_studio::VideoModelMeta::default(),
         manifest_version: "fixture-v1".into(),
         fetched_at: chrono::Utc::now(),
     }

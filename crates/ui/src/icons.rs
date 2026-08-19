@@ -113,6 +113,9 @@ icon_assets![
     (WIDGET, "widget"),
     (GALLERY_WIDE, "gallery-wide"),
     (GALLERY_MINIMALISTIC, "gallery-minimalistic"),
+    // Solar Camera / Videocamera (Linear) — studio Image | Video toggle.
+    (CAMERA, "camera"),
+    (VIDEOCAMERA, "videocamera"),
     (PALETTE, "palette"),
     (WIFI_OFF, "wifi-off"),
     (CLOSE_CIRCLE, "close-circle"),
@@ -128,6 +131,10 @@ icon_assets![
     // plus/return ports) — the embedded set has neither.
     (BELL, "bell"),
     (VOLUME_LOUD, "volume-loud"),
+    (VOLUME_CROSS, "volume-cross"),
+    // Solar Play / Pause (Linear) — generic video chrome.
+    (PLAY, "play"),
+    (PAUSE, "pause"),
     // Hand-drawn zeron glyphs (terminal-panel.tsx / composer-actions.tsx /
     // menu-check.tsx / logo.tsx).
     (TERMINAL, "terminal"),

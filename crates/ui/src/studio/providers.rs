@@ -242,15 +242,15 @@ impl ProvidersPage {
             ),
             ProviderValidationState::Invalid => (
                 "Invalid key",
-                widgets::badge(theme, "Invalid key").into_any_element(),
+                widgets::badge_danger(theme, "Invalid key").into_any_element(),
             ),
             ProviderValidationState::Unavailable => (
                 "Unavailable",
-                widgets::badge(theme, "Unavailable").into_any_element(),
+                widgets::badge_warning(theme, "Unavailable").into_any_element(),
             ),
             ProviderValidationState::NotValidated if configured => (
                 "Not validated",
-                widgets::badge(theme, "Not validated").into_any_element(),
+                widgets::badge_warning(theme, "Not validated").into_any_element(),
             ),
             _ => (
                 "Not connected",

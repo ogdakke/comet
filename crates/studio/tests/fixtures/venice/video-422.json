@@ -1,0 +1,8 @@
+{
+  "error": {
+    "message": "The selected model provider rejected this request due to its content policies. Credits have been refunded.",
+    "type": "provider_content_policy",
+    "recommended_model": "wan-2-7-text-to-video",
+    "credits_refunded": true
+  }
+}

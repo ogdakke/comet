@@ -257,16 +257,28 @@ pub fn badge(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div {
 /// Emerald status pill (the Accounts "Active" badge:
 /// `bg-emerald-400/[0.12] text-emerald-300/90`).
 pub fn badge_active(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div {
-    let emerald = theme.success;
-    let emerald_text = theme.success_muted; // emerald-300
+    status_badge(theme.success, theme.success_muted, label)
+}
+
+/// Amber status pill, same wash as [`badge_active`].
+pub fn badge_warning(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div {
+    status_badge(theme.warning, theme.warning_muted, label)
+}
+
+/// Red status pill, same wash as [`badge_active`].
+pub fn badge_danger(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div {
+    status_badge(theme.danger, theme.danger_muted, label)
+}
+
+fn status_badge(fill: gpui::Hsla, text: gpui::Hsla, label: impl Into<SharedString>) -> gpui::Div {
     div()
         .flex_none()
         .px(px(8.0))
         .py(px(2.0))
         .rounded_full()
-        .bg(emerald.opacity(0.12))
+        .bg(fill.opacity(0.12))
         .text_size(px(10.5))
-        .text_color(emerald_text.opacity(0.9))
+        .text_color(text.opacity(0.9))
         .child(label.into())
 }
 

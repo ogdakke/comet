@@ -867,7 +867,7 @@ pub enum TextInputEvent {
     /// wrapper walks this thread's sent prompts, stashing the draft.
     HistoryNavigate(isize),
     /// Images pasted from the clipboard (screenshots / copied image data) —
-    /// the wrapper stages them as attachments (use-attachments.ts onPaste).
+    /// chat stages them as attachments; studio stages them as references.
     PastedImages(Vec<gpui::Image>),
     /// File paths pasted from the clipboard (a file manager "Copy").
     PastedPaths(Vec<PathBuf>),

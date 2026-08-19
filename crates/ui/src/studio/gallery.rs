@@ -1,4 +1,4 @@
-//! Profile-wide image gallery: virtualized grid, multi-select, bulk actions.
+//! Profile-wide gallery: virtualized grid, multi-select, bulk actions.
 
 use std::ops::Range;
 
@@ -8,7 +8,7 @@ use gpui::{
 };
 use zeron_proto::StudioGalleryItem;
 use zeron_rpc::methods;
-use zeron_studio::StudioArtifactId;
+use zeron_studio::{MediaKind, StudioArtifactId};
 
 use crate::icons;
 use crate::theme::{Theme, hairline};
@@ -124,6 +124,7 @@ pub(super) fn new_gallery_list(cx: &mut Context<StudioPage>) -> ListState {
 
 impl StudioPage {
     pub fn show_gallery(&mut self, cx: &mut Context<Self>) {
+        self.stop_hover_playback();
         self.close_image_menu(cx);
         self.scroll_to_artifact = None;
         self.focused_artifact = None;
@@ -480,11 +481,13 @@ impl StudioPage {
             if inflight >= max_in_flight {
                 break;
             }
+            let video = self.artifact_is_video(id);
             // Hover used to treat a cached original as a thumb, so the preview
             // was never fetched. If that preview later failed, still salvage a
-            // grid JPEG from the original we already have in RAM.
+            // grid JPEG from the original we already have in RAM. Videos never
+            // downsample the bitstream — the engine persists a poster JPEG.
             if self.preview_failed.contains(&id) {
-                if let Some(full) = self.images.get_full(&id) {
+                if !video && let Some(full) = self.images.get_full(&id) {
                     self.spawn_thumb_from_bytes(id, full.bytes.clone(), cx);
                     inflight += 1;
                 }
@@ -601,6 +604,9 @@ impl StudioPage {
         self.image_protect.extend(ids.iter().copied());
         let mut inflight = self.loading_full_images.len();
         for id in ids {
+            if self.artifact_is_video(id) {
+                continue;
+            }
             if self.images.contains_full(&id) || self.image_failed.contains(&id) {
                 continue;
             }
@@ -879,6 +885,9 @@ impl StudioPage {
         let extension = match mime {
             "image/jpeg" => "jpg",
             "image/webp" => "webp",
+            "video/quicktime" => "mov",
+            "video/webm" => "webm",
+            mime if mime.starts_with("video/") => "mp4",
             _ => "png",
         };
         format!("studio-{}.{extension}", artifact_id.0)
@@ -931,7 +940,7 @@ impl StudioPage {
                                 .mt(px(12.0))
                                 .text_size(px(14.0))
                                 .text_color(theme.text_muted.opacity(0.6))
-                                .child("No images yet"),
+                                .child("No generations yet"),
                         )
                         .child(
                             div()
@@ -1187,6 +1196,14 @@ impl StudioPage {
                 )
             });
         let conversation_id = item.conversation_id;
+        let video = item.media_kind == MediaKind::Video;
+        let badge = video.then(|| {
+            super::video::duration_overlay_badge(theme, item.duration_seconds)
+                .absolute()
+                .right(px(8.0))
+                .bottom(px(8.0))
+        });
+        let hover = self.hover_video_layer(id, gpui::ObjectFit::Cover, theme.bg);
         let frame = self.bind_image_menu(
             div()
                 .id(SharedString::from(format!("studio-gallery-tile-{}", id.0)))
@@ -1205,7 +1222,13 @@ impl StudioPage {
                 })
                 .on_hover(cx.listener(move |page, hovered: &bool, window, cx| {
                     if *hovered {
-                        page.prefetch_gallery_full(id, window, cx);
+                        if page.artifact_is_video(id) {
+                            page.arm_hover_autoplay(id, cx);
+                        } else {
+                            page.prefetch_gallery_full(id, window, cx);
+                        }
+                    } else {
+                        page.disarm_hover_autoplay(id, cx);
                     }
                 }))
                 .on_click(
@@ -1226,9 +1249,37 @@ impl StudioPage {
                     px(10.0),
                     Some(SharedString::from(format!("studio-thumb-ready-{}", id.0))),
                 ))
+                .when_some(hover, |tile, layer| tile.child(layer))
+                .when_some(badge, |tile, badge| tile.child(badge))
                 .child(checkbox)
                 .into_any_element(),
-            None => frame.child(checkbox).into_any_element(),
+            None => frame
+                .when(video, |tile| {
+                    tile.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .size(px(44.0))
+                                    .rounded_full()
+                                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.55))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(16.0))
+                                    .text_color(gpui::hsla(0.0, 0.0, 1.0, 0.96))
+                                    .child(SharedString::from("▶")),
+                            ),
+                    )
+                })
+                .when_some(hover, |tile, layer| tile.child(layer))
+                .when_some(badge, |tile, badge| tile.child(badge))
+                .child(checkbox)
+                .into_any_element(),
         }
     }
 }

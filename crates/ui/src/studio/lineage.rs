@@ -9,7 +9,8 @@ use zeron_proto::{StudioConversationView, StudioRunState, StudioRunView};
 #[cfg(test)]
 use zeron_studio::MediaOperation;
 use zeron_studio::{
-    GenerationInputSource, StudioArtifactId, StudioConversationId, StudioRunId, StudioTurnId,
+    GenerationInputSource, MediaKind, StudioArtifactId, StudioConversationId, StudioRunId,
+    StudioTurnId,
 };
 
 /// One output slot in lineage order: generate roots first, then their
@@ -26,6 +27,9 @@ pub(super) struct LineageTile {
     pub aspect: (u32, u32),
     pub state: StudioRunState,
     pub progress: Option<f32>,
+    pub media_kind: MediaKind,
+    pub duration_seconds: Option<f64>,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -39,6 +43,9 @@ struct Slot {
     own_aspect: (u32, u32),
     state: StudioRunState,
     progress: Option<f32>,
+    media_kind: MediaKind,
+    duration_seconds: Option<f64>,
+    error: Option<String>,
 }
 
 pub(super) fn run_source_artifact(run: &StudioRunView) -> Option<StudioArtifactId> {
@@ -99,6 +106,33 @@ fn slot_own_aspect(run: &StudioRunView, artifact_id: Option<StudioArtifactId>) -
         .unwrap_or(run.display_aspect_ratio)
 }
 
+fn slot_media_kind(run: &StudioRunView, artifact_id: Option<StudioArtifactId>) -> MediaKind {
+    artifact_id
+        .and_then(|id| {
+            run.artifacts
+                .iter()
+                .find(|artifact| artifact.id == id)
+                .map(|artifact| artifact.media_kind)
+        })
+        .unwrap_or(run.model.output_kind)
+}
+
+fn slot_duration(run: &StudioRunView, artifact_id: Option<StudioArtifactId>) -> Option<f64> {
+    artifact_id
+        .and_then(|id| {
+            run.artifacts
+                .iter()
+                .find(|artifact| artifact.id == id)
+                .and_then(|artifact| artifact.duration_seconds)
+        })
+        .or_else(|| {
+            run.controls.values().find_map(|value| match value {
+                zeron_studio::ControlValue::DurationSeconds { value } => Some(*value),
+                _ => None,
+            })
+        })
+}
+
 fn collect_slots(view: &StudioConversationView) -> Vec<Slot> {
     let mut slots = Vec::new();
     for turn in &view.turns {
@@ -115,6 +149,9 @@ fn collect_slots(view: &StudioConversationView) -> Vec<Slot> {
                     own_aspect: slot_own_aspect(run, artifact_id),
                     state: run.state,
                     progress: run.progress,
+                    media_kind: slot_media_kind(run, artifact_id),
+                    duration_seconds: slot_duration(run, artifact_id),
+                    error: run.error.clone(),
                 });
             }
         }
@@ -229,6 +266,7 @@ pub(super) struct LineageIndex {
     aspects: HashMap<StudioArtifactId, (u32, u32)>,
     pixel_sizes: HashMap<StudioArtifactId, (u32, u32)>,
     thumbhashes: HashMap<StudioArtifactId, String>,
+    media_kinds: HashMap<StudioArtifactId, MediaKind>,
 }
 
 impl LineageIndex {
@@ -294,6 +332,9 @@ impl LineageIndex {
                 aspect: resolved_aspect(index, slots, by_artifact),
                 state: slot.state,
                 progress: slot.progress,
+                media_kind: slot.media_kind,
+                duration_seconds: slot.duration_seconds,
+                error: slot.error.clone(),
             });
             if let Some(artifact_id) = slot.artifact_id
                 && let Some(kids) = children.get(&artifact_id)
@@ -359,6 +400,10 @@ impl LineageIndex {
             .iter()
             .filter_map(|tile| tile.artifact_id.map(|id| (id, tile.aspect)))
             .collect();
+        let media_kinds = tiles
+            .iter()
+            .filter_map(|tile| tile.artifact_id.map(|id| (id, tile.media_kind)))
+            .collect();
 
         Self {
             tiles,
@@ -368,6 +413,7 @@ impl LineageIndex {
             aspects,
             pixel_sizes,
             thumbhashes,
+            media_kinds,
         }
     }
 
@@ -408,6 +454,10 @@ impl LineageIndex {
 
     pub(super) fn thumbhash(&self, artifact_id: StudioArtifactId) -> Option<&str> {
         self.thumbhashes.get(&artifact_id).map(String::as_str)
+    }
+
+    pub(super) fn media_kind(&self, artifact_id: StudioArtifactId) -> Option<MediaKind> {
+        self.media_kinds.get(&artifact_id).copied()
     }
 }
 
@@ -520,6 +570,7 @@ mod tests {
             controls: Vec::new(),
             pricing: None,
             features: Vec::new(),
+            video: zeron_studio::VideoModelMeta::default(),
             manifest_version: "test".into(),
             fetched_at: Utc::now(),
         }
@@ -786,5 +837,30 @@ mod tests {
         assert!(turn_has_root_outputs(&conversation, generate_id));
         assert!(turn_has_root_outputs(&conversation, other_id));
         assert_eq!(visible_root_turns(&conversation).len(), 2);
+    }
+
+    #[test]
+    fn failed_run_tiles_keep_the_provider_error() {
+        let mut failed = run(
+            MediaOperation::ReferenceToVideo,
+            "seedance",
+            Vec::new(),
+            None,
+            StudioRunState::Failed,
+            1,
+        );
+        failed.error = Some(
+            "Your prompt violates the content policy of Venice.ai or the model provider".into(),
+        );
+        failed.model.output_kind = MediaKind::Video;
+        let generate = turn("a comet", vec![failed]);
+        let generate_id = generate.id;
+        let tiles = lineage_tiles_for_turn(&view(vec![generate]), generate_id);
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(tiles[0].state, StudioRunState::Failed);
+        assert_eq!(
+            tiles[0].error.as_deref(),
+            Some("Your prompt violates the content policy of Venice.ai or the model provider")
+        );
     }
 }

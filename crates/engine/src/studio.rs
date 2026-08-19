@@ -1,7 +1,7 @@
 //! Profile-scoped durable storage for Studio metadata and generated media.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, Write},
     path::{Path, PathBuf},
@@ -15,21 +15,29 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeron_proto::{
-    LEGACY_UNTITLED_STUDIO_TITLE, ListStudioModelsResponse, StudioArtifactChunk,
-    StudioArtifactView, StudioConversationSummary, StudioConversationView, StudioGalleryItem,
-    StudioModelRunSpec, StudioRunState, StudioRunView, StudioTurnView, UNTITLED_STUDIO_TITLE,
+    AttachmentOrigin, ComposerAttachment, ComposerMediaKind, ImportStudioAssetChunk,
+    ImportStudioAssetResponse, LEGACY_UNTITLED_STUDIO_TITLE, ListStudioModelsResponse,
+    StudioArtifactChunk, StudioArtifactView, StudioConversationSummary, StudioConversationView,
+    StudioGalleryItem, StudioModelRunSpec, StudioRunState, StudioRunView, StudioTurnView,
+    UNTITLED_STUDIO_TITLE,
 };
 use zeron_studio::{
     GenerationInput, GenerationInputSource, GenerationRequest, InputRole, MediaKind, MediaModel,
-    MediaOperation, MediaProvider, ProviderArtifact, ProviderId, Quote, ResolvedInput,
-    StudioArtifactId, StudioAssetId, StudioAttemptId, StudioBatchId, StudioConversationId,
-    StudioRunId, StudioTurnId, SubmissionCapabilities, sniff_media_mime,
+    MediaOperation, MediaProvider, ProviderArtifact, ProviderId, Quote, ROLE_REFERENCE_VIDEO,
+    RemoteJob, ResolvedInput, StudioArtifactId, StudioAssetId, StudioAttemptId, StudioBatchId,
+    StudioConversationId, StudioRunId, StudioTurnId, SubmissionCapabilities, probe_media,
+    sniff_media_mime, validate_inputs_against_bytes,
 };
 
 use crate::venice_import::{ImportReport, ImportedStudioHistory};
 
 const DATABASE_FILE: &str = "studio.sqlite3";
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
+pub(crate) const MAX_IMPORT_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_IMPORT_B64_CHARS: usize = (MAX_IMPORT_BYTES as usize) / 3 * 4 + 8;
+const IMPORT_STAGING_TTL: Duration = Duration::from_secs(10 * 60);
+const ASSET_INPUT_REJECTED: &str =
+    "studio asset inputs are only accepted for video roles and ImageEdit masks";
 const MAX_CREATE_TURN_RUNS: usize = 16;
 const MAX_TURN_RUNS: usize = 64;
 pub(crate) const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
@@ -66,6 +74,8 @@ const ARTIFACT_FORMATS: &[(&str, &str)] = &[
     ("mp4", "video/mp4"),
     ("mov", "video/quicktime"),
     ("webm", "video/webm"),
+    ("wav", "audio/wav"),
+    ("mp3", "audio/mpeg"),
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -135,6 +145,8 @@ CREATE TABLE IF NOT EXISTS studio_assets (
     content_hash TEXT NOT NULL,
     width INTEGER CHECK (width IS NULL OR width > 0),
     height INTEGER CHECK (height IS NULL OR height > 0),
+    duration_seconds REAL CHECK (duration_seconds IS NULL OR duration_seconds >= 0.0),
+    media_kind TEXT NOT NULL DEFAULT 'image' CHECK (media_kind IN ('image', 'video', 'audio')),
     created_at INTEGER NOT NULL
 ) STRICT;
 
@@ -214,7 +226,7 @@ CREATE TABLE IF NOT EXISTS studio_run_events (
     created_at INTEGER NOT NULL
 ) STRICT;
 
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;
 COMMIT;
 "#;
 
@@ -230,6 +242,16 @@ BEGIN IMMEDIATE;
 ALTER TABLE studio_conversations ADD COLUMN last_seen_at INTEGER;
 UPDATE studio_conversations SET last_seen_at = updated_at WHERE last_seen_at IS NULL;
 PRAGMA user_version = 3;
+COMMIT;
+"#;
+
+const SCHEMA_V4: &str = r#"
+BEGIN IMMEDIATE;
+ALTER TABLE studio_assets ADD COLUMN duration_seconds REAL
+    CHECK (duration_seconds IS NULL OR duration_seconds >= 0.0);
+ALTER TABLE studio_assets ADD COLUMN media_kind TEXT NOT NULL DEFAULT 'image'
+    CHECK (media_kind IN ('image', 'video', 'audio'));
+PRAGMA user_version = 4;
 COMMIT;
 "#;
 
@@ -329,6 +351,15 @@ pub enum StudioStoreError {
     RunNotFound,
 }
 
+/// Outcome of [`StudioStore::complete_run`]. Internal `fail_run` is `Failed`,
+/// not `Ok` — callers must not treat that as a published artifact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompleteRun {
+    Published,
+    Failed,
+    AlreadyTerminal,
+}
+
 #[derive(Clone)]
 pub struct PreparedStudioRun {
     pub model: MediaModel,
@@ -344,12 +375,25 @@ pub struct StoredStudioRun {
     pub request: GenerationRequest,
 }
 
+#[derive(Clone, Debug)]
+pub struct StudioAttemptCheck {
+    pub run: StoredStudioRun,
+    pub attempt_state: String,
+    pub run_state: String,
+    pub remote_job: Option<RemoteJob>,
+    pub request_wire_hash: String,
+    pub conversation_id: StudioConversationId,
+}
+
 /// SQLite catalog rooted under one active profile.
 pub struct StudioStore {
     database_path: PathBuf,
     connection: Mutex<Connection>,
     artifacts: ArtifactStore,
     changes: tokio::sync::watch::Sender<u64>,
+    /// In-process pollers for a given attempt. Process death clears this, which
+    /// is the only case startup resume should start a new 45-minute timer.
+    video_polls: Mutex<HashSet<StudioAttemptId>>,
 }
 
 impl StudioStore {
@@ -376,6 +420,9 @@ impl StudioStore {
             if version < 3 {
                 connection.execute_batch(SCHEMA_V3)?;
             }
+            if version < 4 {
+                migrate_studio_assets_v4(&connection)?;
+            }
         }
 
         let (changes, _) = tokio::sync::watch::channel(0);
@@ -384,6 +431,7 @@ impl StudioStore {
             connection: Mutex::new(connection),
             artifacts: ArtifactStore::open(&studio_root, maximum_artifact_bytes)?,
             changes,
+            video_polls: Mutex::new(HashSet::new()),
         })
     }
 
@@ -404,6 +452,10 @@ impl StudioStore {
     /// Resolve image attempts interrupted by a process restart. A prepared attempt is known not to
     /// have sent network bytes and becomes an ordinary retryable failure. Once submission began,
     /// the provider may have charged for work, so preserve the ambiguity and require Retry anyway.
+    ///
+    /// Video attempts that already reached `queued`/`running` **with** a `remote_job_id`
+    /// are left in place so a later resume pass can keep polling. Queued/running video
+    /// without an id, and prepared/submitting video, still follow the image path.
     pub fn recover_interrupted_image_runs(&self) -> Result<usize, StudioStoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
@@ -414,7 +466,13 @@ impl StudioStore {
                  FROM studio_attempts a
                  JOIN studio_runs r ON r.id = a.run_id
                  WHERE a.state IN ('prepared', 'submitting', 'queued', 'running')
-                   AND r.state IN ('queued', 'running', 'downloading')",
+                   AND r.state IN ('queued', 'running', 'downloading')
+                   AND NOT (
+                       r.operation IN ('text_to_video', 'image_to_video', 'reference_to_video', 'video_to_video')
+                       AND a.state IN ('queued', 'running')
+                       AND a.remote_job_id IS NOT NULL
+                       AND TRIM(a.remote_job_id) != ''
+                   )",
             )?;
             statement
                 .query_map([], |row| {
@@ -454,6 +512,190 @@ impl StudioStore {
             self.notify_change();
         }
         Ok(rows.len())
+    }
+
+    /// Queued/running video attempts that already have a durable `remote_job_id`.
+    /// Startup resumes these instead of marking them `submission_unknown`.
+    pub fn resumable_video_attempts(&self) -> Result<Vec<StoredStudioRun>, StudioStoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT a.id, a.run_id, a.idempotency_key, a.request_json
+             FROM studio_attempts a
+             JOIN studio_runs r ON r.id = a.run_id
+             WHERE a.state IN ('queued', 'running')
+               AND r.state IN ('queued', 'running', 'downloading')
+               AND r.operation IN ('text_to_video', 'image_to_video', 'reference_to_video', 'video_to_video')
+               AND a.remote_job_id IS NOT NULL
+               AND TRIM(a.remote_job_id) != ''
+             ORDER BY a.created_at ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut attempts = Vec::new();
+        for row in rows {
+            let (attempt_id, run_id, idempotency_key, request_json) = row?;
+            attempts.push(StoredStudioRun {
+                run_id: StudioRunId(parse_uuid(&run_id)?),
+                attempt_id: StudioAttemptId(parse_uuid(&attempt_id)?),
+                idempotency_key,
+                request: serde_json::from_str(&request_json)
+                    .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?,
+            });
+        }
+        Ok(attempts)
+    }
+
+    pub fn remote_job_for_attempt(
+        &self,
+        attempt_id: StudioAttemptId,
+    ) -> Result<Option<RemoteJob>, StudioStoreError> {
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT remote_job_id, response_metadata_json FROM studio_attempts WHERE id = ?1",
+                [attempt_id.0.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StudioStoreError::RunNotFound,
+                other => other.into(),
+            })?;
+        let Some(id) = row.0.filter(|value| !value.trim().is_empty()) else {
+            return Ok(None);
+        };
+        let metadata = match row.1.as_deref() {
+            Some(json) => serde_json::from_str(json)
+                .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?,
+            None => serde_json::Value::Null,
+        };
+        Ok(Some(RemoteJob { id, metadata }))
+    }
+
+    pub fn latest_attempt_for_check(
+        &self,
+        run_id: StudioRunId,
+    ) -> Result<StudioAttemptCheck, StudioStoreError> {
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT a.id, a.idempotency_key, a.request_json, a.state, a.remote_job_id,
+                        a.response_metadata_json, a.request_wire_hash, r.state, t.conversation_id
+                 FROM studio_runs r
+                 JOIN studio_batches b ON b.id = r.batch_id
+                 JOIN studio_turns t ON t.id = b.turn_id
+                 JOIN studio_attempts a ON a.run_id = r.id
+                 WHERE r.id = ?1 ORDER BY a.attempt_number DESC LIMIT 1",
+                [run_id.0.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                },
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StudioStoreError::RunNotFound,
+                other => other.into(),
+            })?;
+        let remote_job = match row.4.filter(|value| !value.trim().is_empty()) {
+            Some(id) => {
+                let metadata = match row.5.as_deref() {
+                    Some(json) => serde_json::from_str(json)
+                        .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?,
+                    None => serde_json::Value::Null,
+                };
+                Some(RemoteJob { id, metadata })
+            }
+            None => None,
+        };
+        Ok(StudioAttemptCheck {
+            run: StoredStudioRun {
+                run_id,
+                attempt_id: StudioAttemptId(parse_uuid(&row.0)?),
+                idempotency_key: row.1,
+                request: serde_json::from_str(&row.2)
+                    .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?,
+            },
+            attempt_state: row.3,
+            run_state: row.7,
+            remote_job,
+            request_wire_hash: row.6.unwrap_or_default(),
+            conversation_id: StudioConversationId(parse_uuid(&row.8)?),
+        })
+    }
+
+    /// Move a `submission_unknown` or `failed` attempt that already has a queue
+    /// id back to `queued` so Check status can poll the same attempt.
+    ///
+    /// Returns `false` when another attempt is already active for the run
+    /// (`studio_one_active_attempt_per_run`) or this row is no longer reopenable.
+    pub fn reopen_unknown_for_poll(&self, run: &StoredStudioRun) -> Result<bool, StudioStoreError> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let other_active: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM studio_attempts
+             WHERE run_id = ?1 AND id != ?2
+               AND state IN ('prepared', 'submitting', 'submission_unknown', 'queued', 'running')",
+            rusqlite::params![run.run_id.0.to_string(), run.attempt_id.0.to_string()],
+            |row| row.get(0),
+        )?;
+        if other_active > 0 {
+            return Ok(false);
+        }
+        let changed = transaction.execute(
+            "UPDATE studio_attempts SET state = 'queued', error_json = NULL
+             WHERE id = ?1 AND run_id = ?2
+               AND state IN ('submission_unknown', 'failed')
+               AND remote_job_id IS NOT NULL AND TRIM(remote_job_id) != ''",
+            rusqlite::params![run.attempt_id.0.to_string(), run.run_id.0.to_string()],
+        )?;
+        if changed != 1 {
+            return Ok(false);
+        }
+        transaction.execute(
+            "UPDATE studio_runs SET state = 'queued', progress = NULL, error_json = NULL, updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![run.run_id.0.to_string(), now],
+        )?;
+        transaction.execute(
+            "INSERT INTO studio_run_events (run_id, attempt_id, state, created_at) VALUES (?1, ?2, 'queued', ?3)",
+            rusqlite::params![run.run_id.0.to_string(), run.attempt_id.0.to_string(), now],
+        )?;
+        transaction.commit()?;
+        self.notify_change();
+        Ok(true)
+    }
+
+    pub(crate) fn try_begin_video_poll(&self, attempt_id: StudioAttemptId) -> bool {
+        self.video_polls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(attempt_id)
+    }
+
+    pub(crate) fn end_video_poll(&self, attempt_id: StudioAttemptId) {
+        self.video_polls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&attempt_id);
     }
 
     pub fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -528,12 +770,13 @@ impl StudioStore {
                         FROM studio_run_inputs
                         WHERE run_id = r.id AND role = 'source' AND ordinal = 0
                         LIMIT 1
-                    )
+                    ),
+                    a.duration_seconds
              FROM studio_artifacts a
              JOIN studio_runs r ON r.id = a.run_id
              JOIN studio_batches b ON b.id = r.batch_id
              JOIN studio_turns t ON t.id = b.turn_id
-             WHERE a.deleted_at IS NULL AND a.media_kind = 'image'
+             WHERE a.deleted_at IS NULL AND a.media_kind IN ('image', 'video')
              ORDER BY a.created_at DESC, a.id DESC",
         )?;
         let rows = statement.query_map([], gallery_item_from_row)?;
@@ -1248,7 +1491,7 @@ impl StudioStore {
         let (existing_path, existing_hash): (Option<String>, Option<String>) =
             match self.connection()?.query_row(
                 "SELECT preview_relative_path, thumbhash FROM studio_artifacts
-                 WHERE id = ?1 AND deleted_at IS NULL AND media_kind = 'image'",
+                 WHERE id = ?1 AND deleted_at IS NULL AND media_kind IN ('image', 'video')",
                 [artifact_id.0.to_string()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             ) {
@@ -1298,7 +1541,7 @@ impl StudioStore {
         );
         let mut statement = connection.prepare(
             "SELECT id FROM studio_artifacts
-             WHERE deleted_at IS NULL AND media_kind = 'image'
+             WHERE deleted_at IS NULL AND media_kind IN ('image', 'video')
                AND (
                  preview_relative_path IS NULL
                  OR thumbhash IS NULL
@@ -1361,7 +1604,7 @@ impl StudioStore {
         let transaction = connection.transaction()?;
         let row = transaction
             .query_row(
-                "SELECT a.id, a.request_json, a.state, r.provider_id, t.conversation_id
+                "SELECT a.id, a.request_json, a.state, r.provider_id, t.conversation_id, r.state
              FROM studio_runs r
              JOIN studio_batches b ON b.id = r.batch_id
              JOIN studio_turns t ON t.id = b.turn_id
@@ -1375,6 +1618,7 @@ impl StudioStore {
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
@@ -1382,6 +1626,11 @@ impl StudioStore {
                 rusqlite::Error::QueryReturnedNoRows => StudioStoreError::RunNotFound,
                 other => other.into(),
             })?;
+        if matches!(row.5.as_str(), "queued" | "running" | "downloading") {
+            return Err(StudioStoreError::InvalidValue(
+                "cannot retry a run that is still queued, running, or downloading".into(),
+            ));
+        }
         if row.2 == "submission_unknown" && !retry_anyway {
             return Err(StudioStoreError::InvalidValue(
                 "retrying this uncertain submission may duplicate provider work; explicit confirmation is required".into(),
@@ -1465,13 +1714,183 @@ impl StudioStore {
         self.set_run_state(run.run_id, run.attempt_id, "running", None)
     }
 
+    /// First writer of `remote_job_id`. Persist provider metadata (`model`, `download_url`)
+    /// and move the attempt + run to `queued`.
+    ///
+    /// The remote id is written even if the state CAS fails so a later
+    /// `submission_unknown` still has a queue id to resume or retry against.
+    pub fn mark_queued(
+        &self,
+        run: &StoredStudioRun,
+        remote: &RemoteJob,
+    ) -> Result<(), StudioStoreError> {
+        let metadata = serde_json::to_string(&remote.metadata)
+            .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let persisted = transaction.execute(
+            "UPDATE studio_attempts
+             SET remote_job_id = ?3,
+                 response_metadata_json = ?4,
+                 last_polled_at = ?5
+             WHERE id = ?1 AND run_id = ?2",
+            rusqlite::params![
+                run.attempt_id.0.to_string(),
+                run.run_id.0.to_string(),
+                remote.id,
+                metadata,
+                now
+            ],
+        )?;
+        if persisted != 1 {
+            return Err(StudioStoreError::RunNotFound);
+        }
+        let queued = transaction.execute(
+            "UPDATE studio_attempts SET state = 'queued'
+             WHERE id = ?1 AND run_id = ?2 AND state IN ('submitting', 'queued')",
+            rusqlite::params![run.attempt_id.0.to_string(), run.run_id.0.to_string()],
+        )?;
+        if queued != 1 {
+            transaction.commit()?;
+            self.notify_change();
+            return Err(StudioStoreError::InvalidValue(
+                "studio attempt could not be marked queued".into(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE studio_runs SET state = 'queued', progress = NULL, updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![run.run_id.0.to_string(), now],
+        )?;
+        transaction.execute(
+            "INSERT INTO studio_run_events (run_id, attempt_id, state, created_at) VALUES (?1, ?2, 'queued', ?3)",
+            rusqlite::params![run.run_id.0.to_string(), run.attempt_id.0.to_string(), now],
+        )?;
+        transaction.commit()?;
+        self.notify_change();
+        Ok(())
+    }
+
+    pub fn mark_running(
+        &self,
+        run: &StoredStudioRun,
+        progress: Option<f32>,
+    ) -> Result<(), StudioStoreError> {
+        self.mark_in_flight(run, "running", "running", progress)
+    }
+
+    pub fn mark_downloading(
+        &self,
+        run: &StoredStudioRun,
+        progress: Option<f32>,
+    ) -> Result<(), StudioStoreError> {
+        // Attempt CHECK has no `downloading`; keep the attempt `running`.
+        self.mark_in_flight(run, "running", "downloading", progress)
+    }
+
+    fn mark_in_flight(
+        &self,
+        run: &StoredStudioRun,
+        attempt_state: &str,
+        run_state: &str,
+        progress: Option<f32>,
+    ) -> Result<(), StudioStoreError> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE studio_attempts
+             SET state = ?3,
+                 last_polled_at = ?4
+             WHERE id = ?1 AND run_id = ?2 AND state IN ('queued', 'running')",
+            rusqlite::params![
+                run.attempt_id.0.to_string(),
+                run.run_id.0.to_string(),
+                attempt_state,
+                now
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StudioStoreError::RunNotFound);
+        }
+        transaction.execute(
+            "UPDATE studio_runs SET state = ?2, progress = ?3, updated_at = ?4 WHERE id = ?1",
+            rusqlite::params![run.run_id.0.to_string(), run_state, progress, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO studio_run_events (run_id, attempt_id, state, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![run.run_id.0.to_string(), run.attempt_id.0.to_string(), run_state, now],
+        )?;
+        transaction.commit()?;
+        self.notify_change();
+        Ok(())
+    }
+
+    /// Sum probed durations of `reference_video` inputs. `None` when no clips are
+    /// attached, or when any clip is missing a duration (cannot prove compliance).
+    pub fn reference_video_total_duration(
+        &self,
+        request: &GenerationRequest,
+    ) -> Result<Option<f64>, StudioStoreError> {
+        let mut total = 0.0;
+        let mut any = false;
+        for input in &request.inputs {
+            if input.role.as_str() != ROLE_REFERENCE_VIDEO {
+                continue;
+            }
+            any = true;
+            let duration = match &input.source {
+                GenerationInputSource::Asset { asset_id } => self.asset_duration(*asset_id)?,
+                GenerationInputSource::Artifact { artifact_id } => {
+                    self.artifact_duration(*artifact_id)?
+                }
+            };
+            let Some(duration) = duration.filter(|value| value.is_finite() && *value >= 0.0) else {
+                return Ok(None);
+            };
+            total += duration;
+        }
+        Ok(any.then_some(total))
+    }
+
+    fn asset_duration(&self, asset_id: StudioAssetId) -> Result<Option<f64>, StudioStoreError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT duration_seconds FROM studio_assets WHERE id = ?1",
+                [asset_id.0.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StudioStoreError::AssetNotFound,
+                other => other.into(),
+            })
+    }
+
+    fn artifact_duration(
+        &self,
+        artifact_id: StudioArtifactId,
+    ) -> Result<Option<f64>, StudioStoreError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT duration_seconds FROM studio_artifacts WHERE id = ?1 AND deleted_at IS NULL",
+                [artifact_id.0.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StudioStoreError::ArtifactNotFound,
+                other => other.into(),
+            })
+    }
+
     pub fn complete_run(
         &self,
         run: &StoredStudioRun,
         artifacts: &[ProviderArtifact],
-    ) -> Result<(), StudioStoreError> {
+    ) -> Result<CompleteRun, StudioStoreError> {
         if artifacts.len() != run.request.output_count as usize {
-            return self.fail_run(
+            self.fail_run(
                 run,
                 &format!(
                     "provider returned {} artifacts; {} were requested",
@@ -1479,17 +1898,19 @@ impl StudioStore {
                     run.request.output_count
                 ),
                 false,
-            );
+            )?;
+            return Ok(CompleteRun::Failed);
         }
         let model = self.run_model(run.run_id)?;
         let mut published = Vec::with_capacity(artifacts.len());
         for artifact in artifacts {
             let Some(mime_type) = model.accepted_output_mime(&artifact.bytes) else {
-                return self.fail_run(
+                self.fail_run(
                     run,
                     "provider artifact is not a supported format for this model",
                     false,
-                );
+                )?;
+                return Ok(CompleteRun::Failed);
             };
             let id = StudioArtifactId::new();
             let extension = extension_for_mime(&mime_type).ok_or_else(|| {
@@ -1499,9 +1920,12 @@ impl StudioStore {
             })?;
             match self.artifacts.publish(id, extension, &artifact.bytes) {
                 Ok(path) => {
-                    let preview = matches!(artifact.media_kind, zeron_studio::MediaKind::Image)
-                        .then(|| self.artifacts.persist_preview(id, &artifact.bytes))
-                        .flatten();
+                    let preview = matches!(
+                        artifact.media_kind,
+                        zeron_studio::MediaKind::Image | zeron_studio::MediaKind::Video
+                    )
+                    .then(|| self.artifacts.persist_preview(id, &artifact.bytes))
+                    .flatten();
                     published.push((id, path, extension, artifact, mime_type, preview));
                 }
                 Err(error) => {
@@ -1518,6 +1942,14 @@ impl StudioStore {
             let mut connection = self.connection()?;
             let transaction = connection.transaction()?;
             let now = chrono::Utc::now().timestamp_millis();
+            let claimed = transaction.execute(
+                "UPDATE studio_attempts SET state = 'succeeded', completed_at = ?2
+                 WHERE id = ?1 AND state IN ('prepared', 'submitting', 'queued', 'running')",
+                rusqlite::params![run.attempt_id.0.to_string(), now],
+            )?;
+            if claimed != 1 {
+                return Ok(CompleteRun::AlreadyTerminal);
+            }
             for (position, (id, path, _, artifact, mime_type, preview)) in
                 published.iter().enumerate()
             {
@@ -1536,10 +1968,6 @@ impl StudioStore {
                 )?;
             }
             transaction.execute(
-                "UPDATE studio_attempts SET state = 'succeeded', completed_at = ?2 WHERE id = ?1",
-                rusqlite::params![run.attempt_id.0.to_string(), now],
-            )?;
-            transaction.execute(
                 "UPDATE studio_runs SET state = 'succeeded', progress = 1.0, updated_at = ?2 WHERE id = ?1",
                 rusqlite::params![run.run_id.0.to_string(), now],
             )?;
@@ -1549,16 +1977,17 @@ impl StudioStore {
             )?;
             recompute_batch(&transaction, run.run_id, now)?;
             transaction.commit()?;
-            Ok::<(), StudioStoreError>(())
+            Ok(CompleteRun::Published)
         })();
-        if result.is_err() {
-            for (id, _, extension, _, _, _) in &published {
-                let _ = self.artifacts.delete(*id, extension);
-                let _ = self.artifacts.delete_preview(*id);
+        match &result {
+            Ok(CompleteRun::Published) => self.notify_change(),
+            Ok(CompleteRun::AlreadyTerminal) | Err(_) => {
+                for (id, _, extension, _, _, _) in &published {
+                    let _ = self.artifacts.delete(*id, extension);
+                    let _ = self.artifacts.delete_preview(*id);
+                }
             }
-        }
-        if result.is_ok() {
-            self.notify_change();
+            Ok(CompleteRun::Failed) => {}
         }
         result
     }
@@ -1578,10 +2007,14 @@ impl StudioStore {
             "failed"
         };
         let error = serde_json::json!({ "message": message }).to_string();
-        transaction.execute(
-            "UPDATE studio_attempts SET state = ?2, error_json = ?3, completed_at = CASE WHEN ?2 = 'failed' THEN ?4 ELSE NULL END WHERE id = ?1",
+        let claimed = transaction.execute(
+            "UPDATE studio_attempts SET state = ?2, error_json = ?3, completed_at = CASE WHEN ?2 = 'failed' THEN ?4 ELSE NULL END
+             WHERE id = ?1 AND state IN ('prepared', 'submitting', 'queued', 'running')",
             rusqlite::params![run.attempt_id.0.to_string(), attempt_state, error, now],
         )?;
+        if claimed != 1 {
+            return Ok(());
+        }
         transaction.execute(
             "UPDATE studio_runs SET state = 'failed', error_json = ?2, updated_at = ?3 WHERE id = ?1",
             rusqlite::params![run.run_id.0.to_string(), error, now],
@@ -1617,7 +2050,7 @@ impl StudioStore {
         Ok(())
     }
 
-    /// Stamp and verify artifact- and mask-asset inputs.
+    /// Stamp and verify artifact- and asset inputs.
     pub fn bind_generation_inputs(
         &self,
         request: &mut GenerationRequest,
@@ -1625,12 +2058,8 @@ impl StudioStore {
         for input in &mut request.inputs {
             match &input.source {
                 GenerationInputSource::Asset { asset_id } => {
-                    if request.operation != MediaOperation::ImageEdit
-                        || input.role.as_str() != "mask"
-                    {
-                        return Err(StudioStoreError::InvalidValue(
-                            "studio asset inputs are only accepted as an image-edit mask".into(),
-                        ));
+                    if !asset_input_allowed(request.operation, input.role.as_str()) {
+                        return Err(StudioStoreError::InvalidValue(ASSET_INPUT_REJECTED.into()));
                     }
                     let stored_hash = self.asset_input_hash(*asset_id)?;
                     if input.content_hash.is_empty() {
@@ -1644,9 +2073,9 @@ impl StudioStore {
                 GenerationInputSource::Artifact { artifact_id } => {
                     let (kind, stored_hash, width, height) =
                         self.artifact_input_row(*artifact_id)?;
-                    if kind != MediaKind::Image {
+                    if !matches!(kind, MediaKind::Image | MediaKind::Video) {
                         return Err(StudioStoreError::InvalidValue(
-                            "generation source must be an image artifact".into(),
+                            "studio input is not a supported media type.".into(),
                         ));
                     }
                     if input.content_hash.is_empty() {
@@ -1682,24 +2111,21 @@ impl StudioStore {
         model: &MediaModel,
     ) -> Result<Vec<ResolvedInput>, StudioStoreError> {
         let mut resolved = Vec::with_capacity(request.inputs.len());
+        let mut probes = Vec::with_capacity(request.inputs.len());
         for input in &request.inputs {
             let (path, stored_hash) = match &input.source {
                 GenerationInputSource::Asset { asset_id } => {
-                    if request.operation != MediaOperation::ImageEdit
-                        || input.role.as_str() != "mask"
-                    {
-                        return Err(StudioStoreError::InvalidValue(
-                            "studio asset inputs are only accepted as an image-edit mask".into(),
-                        ));
+                    if !asset_input_allowed(request.operation, input.role.as_str()) {
+                        return Err(StudioStoreError::InvalidValue(ASSET_INPUT_REJECTED.into()));
                     }
                     let (path, hash) = self.asset_input_file(*asset_id)?;
                     (path, hash)
                 }
                 GenerationInputSource::Artifact { artifact_id } => {
                     let (kind, stored_hash, _, _) = self.artifact_input_row(*artifact_id)?;
-                    if kind != MediaKind::Image {
+                    if !matches!(kind, MediaKind::Image | MediaKind::Video) {
                         return Err(StudioStoreError::InvalidValue(
-                            "generation input must be an image artifact".into(),
+                            "studio input is not a supported media type.".into(),
                         ));
                     }
                     let (path, _, _) = self.artifacts.locate(*artifact_id)?;
@@ -1716,34 +2142,9 @@ impl StudioStore {
                 ));
             }
             let mime_type = sniff_media_mime(&bytes).ok_or_else(|| {
-                StudioStoreError::InvalidValue("studio input is not a supported image".into())
+                StudioStoreError::InvalidValue("studio input is not a supported media type.".into())
             })?;
-            let constraint = model
-                .input_constraints
-                .iter()
-                .find(|constraint| constraint.role == input.role);
-            if let Some(constraint) = constraint {
-                if !constraint
-                    .mime
-                    .accepted
-                    .iter()
-                    .any(|accepted| accepted == mime_type)
-                {
-                    return Err(StudioStoreError::InvalidValue(format!(
-                        "studio input MIME {mime_type} is not accepted for role {}",
-                        input.role.as_str()
-                    )));
-                }
-                if constraint
-                    .mime
-                    .maximum_bytes
-                    .is_some_and(|maximum| bytes.len() as u64 > maximum)
-                {
-                    return Err(StudioStoreError::InvalidValue(
-                        "studio input exceeds the model size limit".into(),
-                    ));
-                }
-            }
+            let probe = probe_media(&bytes, mime_type);
             resolved.push(ResolvedInput {
                 role: input.role.clone(),
                 ordinal: input.ordinal,
@@ -1752,7 +2153,10 @@ impl StudioStore {
                 content_hash: hash,
                 size_bytes: bytes.len() as u64,
             });
+            probes.push(probe);
         }
+        validate_inputs_against_bytes(model, &request.inputs, &probes)
+            .map_err(|error| StudioStoreError::InvalidValue(error.to_string()))?;
         Ok(resolved)
     }
 
@@ -1838,44 +2242,262 @@ impl StudioStore {
     ) -> Result<StudioAssetId, StudioStoreError> {
         let mime_type = sniff_media_mime(bytes).filter(|sniffed| *sniffed == mime_type);
         let mime_type = mime_type.ok_or_else(|| {
-            StudioStoreError::InvalidValue("studio asset is not a supported image".into())
+            StudioStoreError::InvalidValue("studio asset is not a supported media type.".into())
         })?;
-        if !matches!(mime_type, "image/png" | "image/jpeg" | "image/webp") {
-            return Err(StudioStoreError::InvalidValue(
-                "studio asset MIME is not accepted".into(),
-            ));
-        }
         if bytes.len() as u64 > DEFAULT_MAX_ARTIFACT_BYTES {
             return Err(StudioStoreError::ArtifactTooLarge);
         }
         let extension = extension_for_mime(mime_type).ok_or(StudioStoreError::InvalidExtension)?;
         let id = StudioAssetId::new();
+        self.insert_published_asset(id, bytes, mime_type, extension)?;
+        Ok(id)
+    }
+
+    /// Stage or commit one ImportStudioAsset chunk. Idempotent on
+    /// `(asset_id, content_hash)` after a completed import.
+    pub fn import_asset_chunk(
+        &self,
+        asset_id: StudioAssetId,
+        offset: u64,
+        data: &[u8],
+        last: bool,
+        expected_hash: Option<&str>,
+        mime_hint: Option<&str>,
+    ) -> Result<ImportStudioAssetResponse, StudioStoreError> {
+        self.artifacts.sweep_import_staging();
+        if data.len() as u64 > MAX_IMPORT_BYTES {
+            return Err(StudioStoreError::ArtifactTooLarge);
+        }
+        if last {
+            let expected = expected_hash
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    StudioStoreError::InvalidValue(
+                        "expectedHash is required when last is true".into(),
+                    )
+                })?;
+            if let Some(existing) = self.asset_attachment(asset_id)? {
+                if !existing.content_hash.eq_ignore_ascii_case(expected) {
+                    return Err(StudioStoreError::InvalidValue(
+                        "studio asset already exists with a different content hash".into(),
+                    ));
+                }
+                self.artifacts.remove_import_staging(asset_id)?;
+                return Ok(ImportStudioAssetResponse::Complete(existing));
+            }
+            let next_offset = self.accept_import_chunk(asset_id, offset, data)?;
+            let commit = (|| {
+                let bytes = self.artifacts.read_import_staging(asset_id)?;
+                if bytes.len() as u64 != next_offset {
+                    return Err(StudioStoreError::InvalidValue(
+                        "import staging is incomplete".into(),
+                    ));
+                }
+                let hash = format!("{:x}", Sha256::digest(&bytes));
+                if !hash.eq_ignore_ascii_case(expected) {
+                    return Err(StudioStoreError::InvalidValue(
+                        "import content hash does not match expectedHash".into(),
+                    ));
+                }
+                let sniffed = sniff_media_mime(&bytes).ok_or_else(|| {
+                    StudioStoreError::InvalidValue(
+                        "studio input is not a supported media type.".into(),
+                    )
+                })?;
+                let mime_type = match mime_hint {
+                    Some(hint) if hint == sniffed => sniffed,
+                    _ => sniffed,
+                };
+                let kind = composer_kind_from_mime(mime_type).ok_or_else(|| {
+                    StudioStoreError::InvalidValue(
+                        "studio input is not a supported media type.".into(),
+                    )
+                })?;
+                let extension =
+                    extension_for_mime(mime_type).ok_or(StudioStoreError::InvalidExtension)?;
+                self.insert_published_asset(asset_id, &bytes, mime_type, extension)?;
+                let probe = probe_media(&bytes, mime_type);
+                Ok(ComposerAttachment {
+                    id: asset_id,
+                    kind,
+                    pending: false,
+                    origin: AttachmentOrigin::Asset,
+                    mime_type: mime_type.to_owned(),
+                    byte_size: bytes.len() as u64,
+                    width: probe.width,
+                    height: probe.height,
+                    duration_seconds: probe.duration_seconds,
+                    content_hash: hash,
+                    role_hint: None,
+                })
+            })();
+            match commit {
+                Ok(attachment) => {
+                    self.artifacts.remove_import_staging(asset_id)?;
+                    Ok(ImportStudioAssetResponse::Complete(attachment))
+                }
+                Err(error) => {
+                    let keep_staging = matches!(
+                        &error,
+                        StudioStoreError::InvalidValue(message)
+                            if message.contains("content hash does not match expectedHash")
+                    );
+                    if !keep_staging {
+                        self.artifacts.remove_import_staging(asset_id)?;
+                    }
+                    Err(error)
+                }
+            }
+        } else if let Some(existing) = self.asset_attachment(asset_id)? {
+            self.artifacts.remove_import_staging(asset_id)?;
+            Ok(ImportStudioAssetResponse::Continue(
+                ImportStudioAssetChunk {
+                    asset_id,
+                    next_offset: existing.byte_size,
+                },
+            ))
+        } else {
+            let next_offset = self.accept_import_chunk(asset_id, offset, data)?;
+            Ok(ImportStudioAssetResponse::Continue(
+                ImportStudioAssetChunk {
+                    asset_id,
+                    next_offset,
+                },
+            ))
+        }
+    }
+
+    fn accept_import_chunk(
+        &self,
+        asset_id: StudioAssetId,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<u64, StudioStoreError> {
+        let (last_offset, next_offset) = self.artifacts.import_staging_offsets(asset_id)?;
+        let write_at = if offset == next_offset {
+            next_offset
+        } else if last_offset.is_some_and(|last| last == offset) {
+            offset
+        } else {
+            return Err(StudioStoreError::InvalidValue(
+                "import offset must equal nextOffset".into(),
+            ));
+        };
+        if next_offset == 0 && last_offset.is_none() && offset != 0 {
+            return Err(StudioStoreError::InvalidValue(
+                "import offset must equal nextOffset".into(),
+            ));
+        }
+        let assembled = write_at.saturating_add(data.len() as u64);
+        if assembled > MAX_IMPORT_BYTES {
+            return Err(StudioStoreError::ArtifactTooLarge);
+        }
+        self.artifacts
+            .write_import_chunk(asset_id, write_at, data)?;
+        Ok(assembled)
+    }
+
+    fn insert_published_asset(
+        &self,
+        id: StudioAssetId,
+        bytes: &[u8],
+        mime_type: &str,
+        extension: &str,
+    ) -> Result<(), StudioStoreError> {
         let relative_path = format!("inputs/{}.{}", id.0, extension);
-        self.artifacts.publish_input(id, extension, bytes)?;
+        self.artifacts.ensure_input(id, extension, bytes)?;
         let hash = format!("{:x}", Sha256::digest(bytes));
-        let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
-            .with_guessed_format()
-            .ok()
-            .and_then(|reader| reader.into_dimensions().ok())
-            .map(|(width, height)| (Some(width), Some(height)))
-            .unwrap_or((None, None));
+        let probe = probe_media(bytes, mime_type);
+        let media_kind = match composer_kind_from_mime(mime_type) {
+            Some(ComposerMediaKind::Image) => "image",
+            Some(ComposerMediaKind::Video) => "video",
+            Some(ComposerMediaKind::Audio) => "audio",
+            None => {
+                return Err(StudioStoreError::InvalidValue(
+                    "studio input is not a supported media type.".into(),
+                ));
+            }
+        };
         let now = chrono::Utc::now().timestamp_millis();
         self.connection()?.execute(
             "INSERT INTO studio_assets
-             (id, relative_path, mime_type, size_bytes, content_hash, width, height, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (id, relative_path, mime_type, size_bytes, content_hash, width, height, duration_seconds, media_kind, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 id.0.to_string(),
                 relative_path,
                 mime_type,
                 bytes.len() as i64,
                 hash,
-                width,
-                height,
+                probe.width,
+                probe.height,
+                probe.duration_seconds,
+                media_kind,
                 now
             ],
         )?;
-        Ok(id)
+        Ok(())
+    }
+
+    fn asset_attachment(
+        &self,
+        asset_id: StudioAssetId,
+    ) -> Result<Option<ComposerAttachment>, StudioStoreError> {
+        let connection = self.connection()?;
+        let row = connection.query_row(
+            "SELECT mime_type, size_bytes, content_hash, width, height, duration_seconds, media_kind
+             FROM studio_assets WHERE id = ?1",
+            [asset_id.0.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<u32>>(3)?,
+                    row.get::<_, Option<u32>>(4)?,
+                    row.get::<_, Option<f64>>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        );
+        match row {
+            Ok((
+                mime_type,
+                size_bytes,
+                content_hash,
+                width,
+                height,
+                duration_seconds,
+                media_kind,
+            )) => {
+                let kind = match media_kind.as_str() {
+                    "image" => ComposerMediaKind::Image,
+                    "video" => ComposerMediaKind::Video,
+                    "audio" => ComposerMediaKind::Audio,
+                    _ => {
+                        return Err(StudioStoreError::InvalidValue(
+                            "studio input is not a supported media type.".into(),
+                        ));
+                    }
+                };
+                Ok(Some(ComposerAttachment {
+                    id: asset_id,
+                    kind,
+                    pending: false,
+                    origin: AttachmentOrigin::Asset,
+                    mime_type,
+                    byte_size: size_bytes as u64,
+                    width,
+                    height,
+                    duration_seconds,
+                    content_hash,
+                    role_hint: None,
+                }))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn asset_input_hash(&self, asset_id: StudioAssetId) -> Result<String, StudioStoreError> {
@@ -2182,6 +2804,77 @@ fn extension_for_mime(mime: &str) -> Option<&'static str> {
         .find_map(|(extension, supported)| (*supported == mime).then_some(*extension))
 }
 
+fn asset_input_allowed(operation: MediaOperation, role: &str) -> bool {
+    match operation {
+        MediaOperation::TextToVideo
+        | MediaOperation::ImageToVideo
+        | MediaOperation::ReferenceToVideo
+        | MediaOperation::VideoToVideo => true,
+        MediaOperation::ImageEdit => role == "mask",
+        _ => false,
+    }
+}
+
+fn composer_kind_from_mime(mime: &str) -> Option<ComposerMediaKind> {
+    if mime.starts_with("image/") {
+        Some(ComposerMediaKind::Image)
+    } else if mime.starts_with("video/") {
+        Some(ComposerMediaKind::Video)
+    } else if mime.starts_with("audio/") {
+        Some(ComposerMediaKind::Audio)
+    } else {
+        None
+    }
+}
+
+fn refuse_symlink(path: &Path) -> Result<(), StudioStoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(StudioStoreError::InvalidArtifact),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn open_jail_file(path: &Path) -> Result<File, StudioStoreError> {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            StudioStoreError::InvalidArtifact
+        } else {
+            error.into()
+        }
+    })
+}
+
+fn write_jail_file(path: &Path, bytes: &[u8]) -> Result<(), StudioStoreError> {
+    let mut file = open_jail_file(path)?;
+    file.set_len(0)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn migrate_studio_assets_v4(connection: &Connection) -> Result<(), StudioStoreError> {
+    let has_assets: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'studio_assets'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_assets > 0 {
+        connection.execute_batch(SCHEMA_V4)?;
+    } else {
+        connection.pragma_update(None, "user_version", 4)?;
+    }
+    Ok(())
+}
+
 fn parse_uuid(value: &str) -> Result<Uuid, StudioStoreError> {
     Uuid::parse_str(value).map_err(|error| StudioStoreError::InvalidValue(error.to_string()))
 }
@@ -2246,6 +2939,7 @@ fn gallery_item_from_row(row: &rusqlite::Row<'_>) -> Result<StudioGalleryItem, r
             .map(|value| parse_uuid(13, value))
             .transpose()?
             .map(StudioArtifactId),
+        duration_seconds: row.get(14)?,
     })
 }
 
@@ -2396,12 +3090,14 @@ impl ArtifactStore {
         {
             return Err(StudioStoreError::InvalidArtifact);
         }
-        Ok(Self {
+        let store = Self {
             root,
             preview_root,
             inputs_root,
             maximum_artifact_bytes,
-        })
+        };
+        store.sweep_import_staging();
+        Ok(store)
     }
 
     pub fn publish(
@@ -2536,7 +3232,7 @@ impl ArtifactStore {
         Ok(self.root.join(format!("{}.{}", artifact_id.0, extension)))
     }
 
-    fn publish_input(
+    fn ensure_input(
         &self,
         asset_id: StudioAssetId,
         extension: &str,
@@ -2554,9 +3250,30 @@ impl ArtifactStore {
         let destination = self
             .inputs_root
             .join(format!("{}.{}", asset_id.0, extension));
+        if let Ok(metadata) = fs::symlink_metadata(&destination) {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(StudioStoreError::InvalidArtifact);
+            }
+            let existing = fs::read(&destination)?;
+            if existing == bytes {
+                return Ok(destination);
+            }
+            fs::remove_file(&destination)?;
+        }
+        self.write_input_destination(&destination, bytes)
+    }
+
+    fn write_input_destination(
+        &self,
+        destination: &Path,
+        bytes: &[u8],
+    ) -> Result<PathBuf, StudioStoreError> {
         let temporary = self.inputs_root.join(format!(
             ".{}.tmp-{}-{}",
-            asset_id.0,
+            destination
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("input"),
             std::process::id(),
             Uuid::new_v4()
         ));
@@ -2578,11 +3295,140 @@ impl ArtifactStore {
         match publish_result {
             Ok(()) => {
                 sync_directory(&self.inputs_root)?;
-                Ok(destination)
+                Ok(destination.to_path_buf())
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 Err(StudioStoreError::ArtifactExists)
             }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn import_tmp_root(&self) -> PathBuf {
+        self.inputs_root.join("tmp")
+    }
+
+    fn import_staging_dir(&self, asset_id: StudioAssetId) -> PathBuf {
+        self.import_tmp_root().join(asset_id.0.to_string())
+    }
+
+    fn sweep_import_staging(&self) {
+        let tmp = self.import_tmp_root();
+        match fs::symlink_metadata(&tmp) {
+            Err(_) => return,
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let _ = fs::remove_file(&tmp);
+                return;
+            }
+            Ok(_) => {}
+        }
+        let Ok(entries) = fs::read_dir(&tmp) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if refuse_symlink(&path).is_err() {
+                let _ = fs::remove_dir_all(&path);
+                continue;
+            }
+            let newest = fs::read_dir(&path)
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|file| file.metadata().ok()?.modified().ok())
+                .max();
+            let expired = match newest {
+                Some(at) => at
+                    .elapsed()
+                    .map(|age| age > IMPORT_STAGING_TTL)
+                    .unwrap_or(true),
+                None => true,
+            };
+            if expired {
+                let _ = fs::remove_dir_all(&path);
+            }
+        }
+    }
+
+    fn import_staging_offsets(
+        &self,
+        asset_id: StudioAssetId,
+    ) -> Result<(Option<u64>, u64), StudioStoreError> {
+        let dir = self.import_staging_dir(asset_id);
+        let data_path = dir.join("data");
+        let last_path = dir.join("last");
+        match fs::symlink_metadata(&dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((None, 0)),
+            Err(error) => return Err(error.into()),
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(StudioStoreError::InvalidArtifact);
+            }
+            Ok(_) => {}
+        }
+        refuse_symlink(&data_path)?;
+        refuse_symlink(&last_path)?;
+        let next_offset = match fs::metadata(&data_path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.into()),
+        };
+        let last_offset = match fs::read_to_string(&last_path) {
+            Ok(value) => Some(value.trim().parse::<u64>().map_err(|error| {
+                StudioStoreError::InvalidValue(format!("invalid import staging offset: {error}"))
+            })?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        Ok((last_offset, next_offset))
+    }
+
+    fn write_import_chunk(
+        &self,
+        asset_id: StudioAssetId,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), StudioStoreError> {
+        self.sweep_import_staging();
+        let tmp = self.import_tmp_root();
+        refuse_symlink(&tmp)?;
+        fs::create_dir_all(&tmp)?;
+        refuse_symlink(&tmp)?;
+        let dir = self.import_staging_dir(asset_id);
+        refuse_symlink(&dir)?;
+        fs::create_dir_all(&dir)?;
+        refuse_symlink(&dir)?;
+        let data_path = dir.join("data");
+        let last_path = dir.join("last");
+        refuse_symlink(&data_path)?;
+        refuse_symlink(&last_path)?;
+        write_jail_file(&last_path, offset.to_string().as_bytes())?;
+        let mut file = open_jail_file(&data_path)?;
+        file.set_len(offset)?;
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    fn read_import_staging(&self, asset_id: StudioAssetId) -> Result<Vec<u8>, StudioStoreError> {
+        let path = self.import_staging_dir(asset_id).join("data");
+        refuse_symlink(&path)?;
+        match fs::read(&path) {
+            Ok(bytes) => Ok(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn remove_import_staging(&self, asset_id: StudioAssetId) -> Result<(), StudioStoreError> {
+        let dir = self.import_staging_dir(asset_id);
+        match fs::symlink_metadata(&dir) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                Err(StudioStoreError::InvalidArtifact)
+            }
+            Ok(_) => fs::remove_dir_all(&dir).map_err(Into::into),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         }
     }

@@ -2,13 +2,16 @@ use std::collections::BTreeMap;
 
 use chrono::{TimeZone, Utc};
 use zeron_studio::{
-    ControlId, ControlKind, ControlValue, MediaOperation, ModelFeature, PricingUnit, QuoteSource,
-    venice::normalize_model_catalog,
+    AdapterFamily, AudioCapability, ControlId, ControlKind, ControlValue, MediaOperation,
+    ModelFeature, PricingUnit, QuoteSource, ROLE_REFERENCE, ROLE_SOURCE, intersect_video_globals,
+    picker_models, venice::normalize_model_catalog,
 };
 
 const IMAGE: &[u8] = include_bytes!("fixtures/venice/image-model.json");
 const TEXT_TO_VIDEO: &[u8] = include_bytes!("fixtures/venice/text-to-video-model.json");
 const IMAGE_TO_VIDEO: &[u8] = include_bytes!("fixtures/venice/image-to-video-model.json");
+const SEEDANCE_2_5_R2V: &[u8] =
+    include_bytes!("fixtures/venice/seedance-2-5-reference-to-video-model.json");
 const UPSCALE: &[u8] = include_bytes!("fixtures/venice/upscale-model.json");
 const INPAINT: &[u8] = include_bytes!("fixtures/venice/inpaint-model.json");
 
@@ -53,8 +56,38 @@ fn real_catalog_fixtures_render_as_provider_neutral_controls() {
         .remove(0);
     assert_eq!(text_video.operation, MediaOperation::TextToVideo);
     assert!(text_video.input_constraints.is_empty());
+    assert_eq!(text_video.video.adapter_family, AdapterFamily::Seedance);
     assert_control(&text_video, "duration", ControlKind::Duration, 9);
     assert_control(&text_video, "audio", ControlKind::Boolean, 0);
+    assert_eq!(
+        text_video
+            .controls
+            .iter()
+            .find(|control| control.id == ControlId::from("aspect_ratio"))
+            .and_then(|control| control.default.clone()),
+        Some(ControlValue::AspectRatio {
+            width: 16,
+            height: 9
+        })
+    );
+    assert_eq!(
+        text_video
+            .controls
+            .iter()
+            .find(|control| control.id == ControlId::from("resolution"))
+            .and_then(|control| control.default.clone()),
+        Some(ControlValue::Resolution {
+            value: "1080p".into()
+        })
+    );
+    assert_eq!(
+        text_video
+            .controls
+            .iter()
+            .find(|control| control.id == ControlId::from("duration"))
+            .and_then(|control| control.default.clone()),
+        Some(ControlValue::DurationSeconds { value: 6.0 })
+    );
     assert_eq!(
         text_video.features,
         vec![ModelFeature::Uncensored, ModelFeature::Anon]
@@ -65,7 +98,19 @@ fn real_catalog_fixtures_render_as_provider_neutral_controls() {
         .remove(0);
     assert_eq!(image_video.operation, MediaOperation::ImageToVideo);
     assert_eq!(image_video.input_constraints.len(), 1);
-    assert_eq!(image_video.input_constraints[0].role.as_str(), "source");
+    assert_eq!(image_video.input_constraints[0].role.as_str(), ROLE_SOURCE);
+    assert_eq!(
+        image_video.input_constraints[0].mime.minimum_short_side,
+        Some(300)
+    );
+    assert_eq!(
+        image_video.input_constraints[0].mime.minimum_aspect_ratio,
+        Some(0.4)
+    );
+    assert_eq!(
+        image_video.input_constraints[0].mime.maximum_aspect_ratio,
+        Some(2.5)
+    );
     assert!(
         image_video
             .controls
@@ -641,6 +686,342 @@ fn missing_pricing_yields_no_estimate() {
         .remove(0);
     assert!(model.pricing.is_none());
     assert!(model.estimate_cost(&BTreeMap::new(), 1).is_none());
+}
+
+#[test]
+fn t2v_fixture_stays_empty_after_overlay() {
+    let model = normalize_model_catalog(TEXT_TO_VIDEO, fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(model.operation, MediaOperation::TextToVideo);
+    assert!(model.input_constraints.is_empty());
+    assert!(
+        model
+            .input_constraints
+            .iter()
+            .all(|constraint| !constraint.role.as_str().starts_with("reference"))
+    );
+}
+
+#[test]
+fn i2v_geometry_is_parsed_from_live_extras() {
+    let model = normalize_model_catalog(IMAGE_TO_VIDEO, fetched_at())
+        .unwrap()
+        .remove(0);
+    let source = model
+        .input_constraints
+        .iter()
+        .find(|constraint| constraint.role.as_str() == ROLE_SOURCE)
+        .unwrap();
+    assert_eq!(source.mime.minimum_short_side, Some(300));
+    assert_eq!(source.mime.minimum_aspect_ratio, Some(0.4));
+    assert_eq!(source.mime.maximum_aspect_ratio, Some(2.5));
+}
+
+#[test]
+fn seedance_2_5_r2v_overlay_inserts_duration_auto_and_adaptive_aspect() {
+    let model = normalize_model_catalog(SEEDANCE_2_5_R2V, fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(model.operation, MediaOperation::ReferenceToVideo);
+    assert_eq!(model.video.adapter_family, AdapterFamily::Seedance);
+    assert!(model.video.source_matched_duration);
+    assert!(model.video.source_matched_aspect);
+    assert!(model.video.requires_visual_reference);
+    let duration = model
+        .controls
+        .iter()
+        .find(|control| control.id == ControlId::from("duration"))
+        .unwrap();
+    assert!(
+        duration
+            .choices
+            .iter()
+            .any(|choice| choice.value == ControlValue::DurationAuto)
+    );
+    let aspect = model
+        .controls
+        .iter()
+        .find(|control| control.id == ControlId::from("aspect_ratio"))
+        .unwrap();
+    assert!(
+        aspect
+            .choices
+            .iter()
+            .any(|choice| choice.value == ControlValue::AspectRatioAdaptive)
+    );
+    let references = model
+        .input_constraints
+        .iter()
+        .find(|constraint| constraint.role.as_str() == ROLE_REFERENCE)
+        .unwrap();
+    assert_eq!(references.minimum_count, 0);
+    assert_eq!(references.maximum_count, 30);
+    assert!(
+        model
+            .input_constraints
+            .iter()
+            .all(|constraint| constraint.role.as_str() != ROLE_SOURCE)
+    );
+}
+
+#[test]
+fn hidden_kling_is_not_selectable() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(IMAGE_TO_VIDEO).unwrap();
+    fixture["data"][0]["id"] = "kling-o3-pro-reference-to-video".into();
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(model.operation, MediaOperation::ReferenceToVideo);
+    assert_eq!(model.video.adapter_family, AdapterFamily::Hidden);
+    assert!(!model.is_picker_visible());
+    assert!(picker_models(std::slice::from_ref(&model)).is_empty());
+}
+
+#[test]
+fn unlisted_live_video_defaults_to_hidden() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(TEXT_TO_VIDEO).unwrap();
+    fixture["data"][0]["id"] = "opaque-unlisted-video".into();
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(model.operation, MediaOperation::TextToVideo);
+    assert_eq!(model.video.adapter_family, AdapterFamily::Hidden);
+    assert!(!model.is_picker_visible());
+}
+
+#[test]
+fn seedance_2_5_text_to_video_is_selectable() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(TEXT_TO_VIDEO).unwrap();
+    fixture["data"][0]["id"] = "seedance-2-5-text-to-video-basic".into();
+    fixture["data"][0]["model_spec"]["name"] = "Seedance 2.5".into();
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(model.operation, MediaOperation::TextToVideo);
+    assert_eq!(model.video.adapter_family, AdapterFamily::Seedance);
+    assert!(model.input_constraints.is_empty());
+    assert!(model.is_picker_visible());
+    assert!(picker_models(std::slice::from_ref(&model)).len() == 1);
+}
+
+#[test]
+fn grok_id_prefix_matches_private_variants() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(IMAGE_TO_VIDEO).unwrap();
+    fixture["data"][0]["id"] = "grok-imagine-reference-to-video-private".into();
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(model.operation, MediaOperation::ReferenceToVideo);
+    assert_eq!(model.video.adapter_family, AdapterFamily::Grok);
+    assert_eq!(model.video.generate_audio, AudioCapability::None);
+    assert!(
+        model
+            .controls
+            .iter()
+            .all(|control| control.id.as_str() != "audio")
+    );
+    let references = model
+        .input_constraints
+        .iter()
+        .find(|constraint| constraint.role.as_str() == ROLE_REFERENCE)
+        .unwrap();
+    assert_eq!(references.minimum_count, 1);
+    assert_eq!(references.maximum_count, 7);
+    assert!(model.is_picker_visible());
+}
+
+fn video_source_mimes(model: &zeron_studio::MediaModel) -> Vec<String> {
+    model
+        .input_constraints
+        .iter()
+        .find(|constraint| constraint.role.as_str() == ROLE_SOURCE)
+        .map(|constraint| constraint.mime.accepted.clone())
+        .unwrap_or_default()
+}
+
+#[test]
+fn wan_video_to_video_is_selectable() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(IMAGE_TO_VIDEO).unwrap();
+    fixture["data"][0]["id"] = "wan-2-7-video-to-video".into();
+    fixture["data"][0]["model_spec"]["name"] = "Wan 2.7 Edit".into();
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(model.operation, MediaOperation::VideoToVideo);
+    assert_eq!(model.video.adapter_family, AdapterFamily::Seedance);
+    assert!(
+        video_source_mimes(&model)
+            .iter()
+            .any(|mime| mime.starts_with("video/"))
+    );
+    let references = model
+        .input_constraints
+        .iter()
+        .find(|constraint| constraint.role.as_str() == ROLE_REFERENCE)
+        .unwrap();
+    assert_eq!(references.minimum_count, 0);
+    assert_eq!(references.maximum_count, 1);
+    assert!(model.is_picker_visible());
+}
+
+#[test]
+fn happyhorse_video_to_video_is_selectable() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(IMAGE_TO_VIDEO).unwrap();
+    fixture["data"][0]["id"] = "happyhorse-1-0-video-to-video".into();
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(model.operation, MediaOperation::VideoToVideo);
+    assert_eq!(model.video.adapter_family, AdapterFamily::Seedance);
+    let references = model
+        .input_constraints
+        .iter()
+        .find(|constraint| constraint.role.as_str() == ROLE_REFERENCE)
+        .unwrap();
+    assert_eq!(references.minimum_count, 0);
+    assert_eq!(references.maximum_count, 9);
+    assert!(model.is_picker_visible());
+}
+
+#[test]
+fn grok_video_to_video_keeps_audio_and_is_selectable() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(IMAGE_TO_VIDEO).unwrap();
+    fixture["data"][0]["id"] = "grok-imagine-video-to-video-private".into();
+    fixture["data"][0]["model_spec"]["name"] = "Grok Imagine".into();
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(model.operation, MediaOperation::VideoToVideo);
+    assert_eq!(model.video.adapter_family, AdapterFamily::Grok);
+    assert_ne!(model.video.generate_audio, AudioCapability::None);
+    assert!(
+        model
+            .controls
+            .iter()
+            .any(|control| control.id.as_str() == "audio")
+    );
+    assert!(
+        video_source_mimes(&model)
+            .iter()
+            .any(|mime| mime.starts_with("video/"))
+    );
+    assert!(model.is_picker_visible());
+}
+
+#[test]
+fn live_video_model_type_is_video_to_video() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(TEXT_TO_VIDEO).unwrap();
+    fixture["data"][0]["id"] = "wan-2-7-video-to-video".into();
+    fixture["data"][0]["model_spec"]["constraints"]["model_type"] = "video".into();
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(model.operation, MediaOperation::VideoToVideo);
+    assert_eq!(model.video.adapter_family, AdapterFamily::Seedance);
+    assert!(
+        video_source_mimes(&model)
+            .iter()
+            .any(|mime| mime.starts_with("video/"))
+    );
+    assert!(model.is_picker_visible());
+}
+
+#[test]
+fn invalid_duration_choices_are_skipped() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(TEXT_TO_VIDEO).unwrap();
+    fixture["data"][0]["id"] = "duration-skip".into();
+    fixture["data"][0]["model_spec"]["constraints"]["durations"] =
+        serde_json::json!(["4s", "nope", "8", "auto", "-1", "bad"]);
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    let duration = model
+        .controls
+        .iter()
+        .find(|control| control.id == ControlId::from("duration"))
+        .unwrap();
+    assert_eq!(duration.choices.len(), 4);
+    assert_eq!(
+        duration.choices[0].value,
+        ControlValue::DurationSeconds { value: 4.0 }
+    );
+    assert_eq!(
+        duration.choices[1].value,
+        ControlValue::DurationSeconds { value: 8.0 }
+    );
+    assert_eq!(duration.choices[2].value, ControlValue::DurationAuto);
+    assert_eq!(duration.choices[3].value, ControlValue::DurationAuto);
+}
+
+#[test]
+fn zero_valid_durations_skips_the_model_not_the_catalog() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(TEXT_TO_VIDEO).unwrap();
+    let good = fixture["data"][0].clone();
+    let mut broken = good.clone();
+    broken["id"] = "broken-durations".into();
+    broken["model_spec"]["constraints"]["durations"] = serde_json::json!(["nope", "also-bad"]);
+    fixture["data"] = serde_json::json!([broken, good]);
+    let models =
+        normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at()).unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(
+        models[0].id.as_str(),
+        "seedance-1-5-pro-text-to-video-basic"
+    );
+}
+
+#[test]
+fn adaptive_aspect_ratio_is_a_first_class_choice() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(TEXT_TO_VIDEO).unwrap();
+    fixture["data"][0]["id"] = "adaptive-aspect".into();
+    fixture["data"][0]["model_spec"]["constraints"]["aspect_ratios"] =
+        serde_json::json!(["adaptive", "16:9"]);
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    let aspect = model
+        .controls
+        .iter()
+        .find(|control| control.id == ControlId::from("aspect_ratio"))
+        .unwrap();
+    assert_eq!(aspect.choices[0].value, ControlValue::AspectRatioAdaptive);
+    assert_eq!(aspect.choices[0].label, "Adaptive");
+}
+
+#[test]
+fn video_global_intersection_keeps_shared_durations() {
+    let t2v = normalize_model_catalog(TEXT_TO_VIDEO, fetched_at())
+        .unwrap()
+        .remove(0);
+    let r2v = normalize_model_catalog(SEEDANCE_2_5_R2V, fetched_at())
+        .unwrap()
+        .remove(0);
+    let intersection = intersect_video_globals([&t2v, &r2v]);
+    assert!(
+        intersection
+            .durations
+            .contains(&ControlValue::DurationSeconds { value: 4.0 })
+    );
+    assert!(!intersection.durations.contains(&ControlValue::DurationAuto));
+    assert_eq!(intersection.prompt_maximum_chars, Some(3500));
+}
+
+#[test]
+fn colliding_video_display_names_get_an_operation_suffix() {
+    let mut text: serde_json::Value = serde_json::from_slice(TEXT_TO_VIDEO).unwrap();
+    let image: serde_json::Value = serde_json::from_slice(IMAGE_TO_VIDEO).unwrap();
+    text["data"]
+        .as_array_mut()
+        .unwrap()
+        .push(image["data"][0].clone());
+    let models =
+        normalize_model_catalog(&serde_json::to_vec(&text).unwrap(), fetched_at()).unwrap();
+    let names: Vec<_> = models
+        .iter()
+        .map(|model| model.display_name.as_str())
+        .collect();
+    assert_eq!(names, vec!["Seedance 1.5 Pro T2V", "Seedance 1.5 Pro I2V"]);
 }
 
 fn assert_control(
