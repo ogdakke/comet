@@ -1324,9 +1324,14 @@ fn i2v_badge_only_for_missing_source() {
         std::slice::from_ref(&i2v),
     );
     assert_eq!(codes(&missing), vec![ConflictCode::MissingRequiredInput]);
-    assert_eq!(
-        missing.models[0].badge.as_deref(),
-        Some("Needs a start frame")
+    assert!(missing.models[0].badge.is_none());
+    assert!(
+        missing
+            .budgets
+            .iter()
+            .any(|budget| matches!(&budget.kind, zeron_studio::BudgetKind::Role { role } if role.as_str() == ROLE_SOURCE)
+                && budget.used == 0
+                && budget.maximum == Some(1))
     );
 
     let leftovers = evaluate_composer(
@@ -1334,10 +1339,7 @@ fn i2v_badge_only_for_missing_source() {
         std::slice::from_ref(&i2v),
     );
     assert!(codes(&leftovers).contains(&ConflictCode::UnsupportedReferences));
-    assert_ne!(
-        leftovers.models[0].badge.as_deref(),
-        Some("Needs a start frame")
-    );
+    assert!(leftovers.models[0].badge.is_none());
 }
 
 #[test]

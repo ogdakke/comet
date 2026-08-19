@@ -1140,6 +1140,7 @@ pub fn apply_event(
                     copy_duration_to_chips(&mut snapshot);
                 }
             }
+            seed_selected_control_defaults(&mut snapshot, catalog);
         }
         ComposerEvent::SetPrompt { text } => snapshot.prompt = text,
         ComposerEvent::SetDuration { value } => {
@@ -1189,6 +1190,7 @@ pub fn apply_event(
                 seed_or_keep_duration(&mut snapshot, catalog);
                 force_video_output_counts(&mut snapshot, catalog);
                 copy_duration_to_chips(&mut snapshot);
+                seed_selected_control_defaults(&mut snapshot, catalog);
             }
         }
         ComposerEvent::DeselectModel { model_id } => {
@@ -1203,6 +1205,7 @@ pub fn apply_event(
             force_video_output_counts(&mut snapshot, catalog);
             seed_or_keep_duration(&mut snapshot, catalog);
             copy_duration_to_chips(&mut snapshot);
+            seed_selected_control_defaults(&mut snapshot, catalog);
         }
         ComposerEvent::SetModelControl {
             model_id,
@@ -1236,6 +1239,7 @@ pub fn apply_event(
             force_video_output_counts(&mut snapshot, catalog);
             seed_or_keep_duration(&mut snapshot, catalog);
             copy_duration_to_chips(&mut snapshot);
+            seed_selected_control_defaults(&mut snapshot, catalog);
         }
         ComposerEvent::CatalogUpdated { fetched_at } => {
             snapshot.catalog_fetched_at = Some(fetched_at);
@@ -1262,6 +1266,14 @@ pub fn apply_event(
                 match apply_resolve_checked(snapshot.clone(), catalog, &offered, &action) {
                     Ok(next) => {
                         snapshot = next;
+                        if !matches!(
+                            action,
+                            ResolveAction::OpenModelPicker
+                                | ResolveAction::RefreshCatalog
+                                | ResolveAction::DismissWarn
+                        ) {
+                            seed_selected_control_defaults(&mut snapshot, catalog);
+                        }
                         flags.open_picker = matches!(action, ResolveAction::OpenModelPicker);
                         flags.refresh_catalog = matches!(action, ResolveAction::RefreshCatalog);
                     }
@@ -1897,17 +1909,8 @@ fn chip_badge(
     model: &MediaModel,
     _inputs: &[GenerationInput],
     _mapped_ok: bool,
-    conflicts: &[ComposerConflict],
+    _conflicts: &[ComposerConflict],
 ) -> Option<String> {
-    if model.operation == MediaOperation::ImageToVideo
-        && conflicts.iter().any(|conflict| {
-            conflict.code == ConflictCode::MissingRequiredInput
-                && conflict.subjects.model_ids.contains(&model.id)
-                && conflict.subjects.control_ids.is_empty()
-        })
-    {
-        return Some("Needs a start frame".to_owned());
-    }
     if model
         .video_capability()
         .is_some_and(|cap| cap.generate_audio == AudioCapability::None)
@@ -2369,6 +2372,27 @@ fn first_concrete_aspect(model: &MediaModel) -> Option<ControlValue> {
                 })
             })
     })
+}
+
+fn seed_selected_control_defaults(snapshot: &mut ComposerSnapshot, catalog: &[MediaModel]) {
+    for selected in &mut snapshot.selected {
+        let Some(model) = find_model(catalog, &selected.provider_id, &selected.model_id) else {
+            continue;
+        };
+        for control in &model.controls {
+            if control.id.as_str() == DURATION_CONTROL {
+                continue;
+            }
+            if selected.controls.contains_key(&control.id) {
+                continue;
+            }
+            if let Some(default) = &control.default {
+                selected
+                    .controls
+                    .insert(control.id.clone(), default.clone());
+            }
+        }
+    }
 }
 
 fn force_video_output_counts(snapshot: &mut ComposerSnapshot, catalog: &[MediaModel]) {
