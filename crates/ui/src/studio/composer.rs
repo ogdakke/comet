@@ -8,8 +8,9 @@ use gpui::{
 };
 use zeron_rpc::{RpcError, methods};
 use zeron_studio::{
-    ComposerEvent, ComposerMode, ComposerView, ControlValue, MediaKind, MediaModel, ModelFeature,
-    ModelId, SelectedModelRef, StudioValidationError, apply_event, popup_conflict,
+    AudioCapability, ChipView, ComposerEvent, ComposerMode, ComposerView, ControlValue, MediaKind,
+    MediaModel, ModelControl, ModelFeature, ModelId, SelectedModelRef, StudioValidationError,
+    apply_event, popup_conflict,
 };
 
 use crate::motion;
@@ -141,7 +142,7 @@ impl StudioPage {
                     selected.model_id.clone(),
                     DraftRunConfig {
                         output_count: selected.output_count,
-                        controls: selected.controls.clone(),
+                        controls: super::draft::drop_global_duration(&selected.controls),
                     },
                 );
             }
@@ -756,6 +757,12 @@ impl StudioPage {
         let plus_id = model_id.clone();
         let mut controls = div().flex().flex_col().gap(px(12.0));
         let video_mode = self.composer.mode == ComposerMode::Video;
+        let chip = self
+            .composer_view
+            .models
+            .iter()
+            .find(|chip| chip.model_id == model.id);
+        let advertised = chip_popover_controls(model, chip);
 
         if !video_mode {
             controls = controls.child(
@@ -791,8 +798,7 @@ impl StudioPage {
             );
         }
 
-        if let Some(aspect) = model
-            .controls
+        if let Some(aspect) = advertised
             .iter()
             .find(|control| control.id.as_str() == "aspect_ratio")
         {
@@ -803,11 +809,7 @@ impl StudioPage {
         let mut resolution_reasoning = div().w_full().flex().items_start().gap(px(12.0));
         let mut has_resolution_reasoning = false;
         for id in ["resolution", "reasoning"] {
-            if let Some(control) = model
-                .controls
-                .iter()
-                .find(|control| control.id.as_str() == id)
-            {
+            if let Some(control) = advertised.iter().find(|control| control.id.as_str() == id) {
                 has_resolution_reasoning = true;
                 resolution_reasoning = resolution_reasoning.child(
                     div()
@@ -821,8 +823,7 @@ impl StudioPage {
             controls = controls.child(resolution_reasoning);
         }
 
-        if let Some(format) = model
-            .controls
+        if let Some(format) = advertised
             .iter()
             .find(|control| control.id.as_str() == "format")
         {
@@ -830,17 +831,10 @@ impl StudioPage {
                 controls.child(self.render_model_control(&model_id, format, draft, theme, cx));
         }
 
-        for control in &model.controls {
-            // `steps` is submitted at the catalog default and is not a user knob.
+        for control in advertised {
             if matches!(
                 control.id.as_str(),
-                "aspect_ratio"
-                    | "resolution"
-                    | "reasoning"
-                    | "steps"
-                    | "format"
-                    | "safe_mode"
-                    | "duration"
+                "aspect_ratio" | "resolution" | "reasoning" | "format"
             ) {
                 continue;
             }
@@ -881,18 +875,14 @@ impl StudioPage {
             .cloned()
             .unwrap_or_else(|| DraftRunConfig::from_model(&model));
         let amount = draft.output_count;
-        let aspect_label = model
-            .controls
+        let chip = self
+            .composer_view
+            .models
             .iter()
-            .find(|control| control.id.as_str() == "aspect_ratio")
-            .and_then(|control| draft.controls.get(&control.id).or(control.default.as_ref()))
-            .map(control_value_label);
-        let resolution_label = model
-            .controls
-            .iter()
-            .find(|control| control.id.as_str() == "resolution")
-            .and_then(|control| draft.controls.get(&control.id).or(control.default.as_ref()))
-            .map(control_value_label);
+            .find(|chip| chip.model_id == model.id);
+        let aspect_label = chip_control_readout(&model, &draft, chip, "aspect_ratio");
+        let resolution_label = chip_control_readout(&model, &draft, chip, "resolution");
+        let audio_label = chip_control_readout(&model, &draft, chip, "audio");
         let menu_here = self.model_config_menu.get() == Some(&model.id);
         let menu = menu_here.then(|| {
             popover::anchored_menu_above(
@@ -973,6 +963,9 @@ impl StudioPage {
                 chip.child(config_readout(SharedString::from(label), theme))
             })
             .when_some(resolution_label, |chip, label| {
+                chip.child(config_readout(SharedString::from(label), theme))
+            })
+            .when_some(audio_label, |chip, label| {
                 chip.child(config_readout(SharedString::from(label), theme))
             })
             .child(
@@ -1826,6 +1819,48 @@ fn config_aspect_choice(
         .child(label.into())
 }
 
+/// Advertised chip knobs. Duration is global. Audio only when Configurable.
+fn chip_popover_controls<'a>(
+    model: &'a MediaModel,
+    chip: Option<&'a ChipView>,
+) -> Vec<&'a ModelControl> {
+    let advertised = chip
+        .map(|chip| chip.controls.as_slice())
+        .unwrap_or(model.controls.as_slice());
+    advertised
+        .iter()
+        .filter(|control| popover_shows_control(model, control))
+        .collect()
+}
+
+fn popover_shows_control(model: &MediaModel, control: &ModelControl) -> bool {
+    match control.id.as_str() {
+        "duration" | "steps" | "safe_mode" => false,
+        "audio" => matches!(
+            model.video_capability().map(|cap| cap.generate_audio),
+            Some(AudioCapability::Configurable { .. })
+        ),
+        _ => true,
+    }
+}
+
+fn chip_control_readout(
+    model: &MediaModel,
+    draft: &DraftRunConfig,
+    chip: Option<&ChipView>,
+    control_id: &str,
+) -> Option<String> {
+    let control = chip_popover_controls(model, chip)
+        .into_iter()
+        .find(|control| control.id.as_str() == control_id)?;
+    draft
+        .controls
+        .get(&control.id)
+        .or(control.default.as_ref())
+        .or_else(|| chip.and_then(|chip| chip.values.get(&control.id)))
+        .map(control_value_label)
+}
+
 fn config_readout(label: SharedString, theme: &Theme) -> gpui::Div {
     div()
         .flex_none()
@@ -1998,5 +2033,112 @@ mod tests {
             vec![1]
         );
         assert!(visible_model_indices(&models, "gpt", false, &favorites, &uncensored).is_empty());
+    }
+
+    fn video_model(
+        id: &str,
+        operation: zeron_studio::MediaOperation,
+        audio: AudioCapability,
+        controls: Vec<ModelControl>,
+    ) -> MediaModel {
+        MediaModel {
+            provider_id: "venice".into(),
+            id: id.into(),
+            display_name: id.into(),
+            description: None,
+            operation,
+            output_kind: MediaKind::Video,
+            output_mime_types: vec!["video/mp4".into()],
+            input_constraints: Vec::new(),
+            prompt_maximum_chars: None,
+            negative_prompt_maximum_chars: None,
+            maximum_output_count: 1,
+            controls,
+            pricing: None,
+            features: Vec::new(),
+            video: zeron_studio::VideoModelMeta {
+                adapter_family: zeron_studio::AdapterFamily::Seedance,
+                generate_audio: audio,
+                ..zeron_studio::VideoModelMeta::default()
+            },
+            manifest_version: "test".into(),
+            fetched_at: Utc::now(),
+        }
+    }
+
+    fn control(id: &str, kind: zeron_studio::ControlKind) -> ModelControl {
+        ModelControl {
+            id: zeron_studio::ControlId::new(id),
+            label: id.into(),
+            description: None,
+            kind,
+            required: false,
+            default: None,
+            minimum: None,
+            maximum: None,
+            step: None,
+            choices: Vec::new(),
+            visible_when: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn video_popover_shows_only_advertised_controls() {
+        let i2v = video_model(
+            "seedance-i2v",
+            zeron_studio::MediaOperation::ImageToVideo,
+            AudioCapability::Configurable { default: true },
+            vec![
+                control("resolution", zeron_studio::ControlKind::Resolution),
+                control("duration", zeron_studio::ControlKind::Duration),
+                control("audio", zeron_studio::ControlKind::Boolean),
+            ],
+        );
+        let ids: Vec<_> = chip_popover_controls(&i2v, None)
+            .into_iter()
+            .map(|control| control.id.as_str().to_owned())
+            .collect();
+        assert_eq!(ids, vec!["resolution", "audio"]);
+        assert!(
+            chip_control_readout(
+                &i2v,
+                &DraftRunConfig::from_model(&i2v),
+                None,
+                "aspect_ratio"
+            )
+            .is_none()
+        );
+
+        let grok = video_model(
+            "grok-r2v",
+            zeron_studio::MediaOperation::ReferenceToVideo,
+            AudioCapability::None,
+            vec![
+                control("aspect_ratio", zeron_studio::ControlKind::AspectRatio),
+                control("resolution", zeron_studio::ControlKind::Resolution),
+                control("duration", zeron_studio::ControlKind::Duration),
+                control("audio", zeron_studio::ControlKind::Boolean),
+            ],
+        );
+        let grok_ids: Vec<_> = chip_popover_controls(&grok, None)
+            .into_iter()
+            .map(|control| control.id.as_str().to_owned())
+            .collect();
+        assert_eq!(grok_ids, vec!["aspect_ratio", "resolution"]);
+
+        let forced = video_model(
+            "forced-audio",
+            zeron_studio::MediaOperation::TextToVideo,
+            AudioCapability::ForcedOn,
+            vec![
+                control("resolution", zeron_studio::ControlKind::Resolution),
+                control("audio", zeron_studio::ControlKind::Boolean),
+            ],
+        );
+        let forced_ids: Vec<_> = chip_popover_controls(&forced, None)
+            .into_iter()
+            .map(|control| control.id.as_str().to_owned())
+            .collect();
+        assert_eq!(forced_ids, vec!["resolution"]);
     }
 }

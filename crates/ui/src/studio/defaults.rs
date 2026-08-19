@@ -141,7 +141,7 @@ impl StudioDefaults {
                         id.clone(),
                         RememberedDraft {
                             output_count: draft.output_count,
-                            controls: draft.controls.clone(),
+                            controls: super::draft::drop_global_duration(&draft.controls),
                         },
                     )
                 })
@@ -288,5 +288,54 @@ mod tests {
         );
         assert_eq!(loaded.last_mode, ComposerMode::Video);
         assert!(loaded.selected_model_ids.is_empty());
+    }
+
+    #[test]
+    fn capture_drops_duration_from_remembered_drafts() {
+        let mut drafts = HashMap::new();
+        drafts.insert(
+            ModelId::new("seedance-t2v"),
+            DraftRunConfig {
+                output_count: 1,
+                controls: BTreeMap::from([
+                    (
+                        ControlId::new("duration"),
+                        ControlValue::DurationSeconds { value: 8.0 },
+                    ),
+                    (
+                        ControlId::new("resolution"),
+                        ControlValue::Resolution {
+                            value: "720p".into(),
+                        },
+                    ),
+                ]),
+            },
+        );
+        let defaults = StudioDefaults::capture(
+            &[],
+            &[ModelId::new("seedance-t2v")],
+            &drafts,
+            &[],
+            &UpscaleDefaults::default(),
+            Some(ControlValue::DurationSeconds { value: 8.0 }),
+            ComposerMode::Video,
+            None,
+        );
+        let remembered = defaults.drafts.get(&ModelId::new("seedance-t2v")).unwrap();
+        assert!(
+            !remembered
+                .controls
+                .contains_key(&ControlId::new("duration"))
+        );
+        assert_eq!(
+            remembered.controls[&ControlId::new("resolution")],
+            ControlValue::Resolution {
+                value: "720p".into()
+            }
+        );
+        assert_eq!(
+            defaults.video_duration,
+            Some(ControlValue::DurationSeconds { value: 8.0 })
+        );
     }
 }

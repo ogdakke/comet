@@ -30,6 +30,7 @@ impl DraftRunConfig {
             controls: model
                 .controls
                 .iter()
+                .filter(|control| control.id.as_str() != "duration")
                 .filter_map(|control| {
                     control
                         .default
@@ -42,7 +43,7 @@ impl DraftRunConfig {
 }
 
 /// Overlay last-used values onto a model's current defaults, dropping controls
-/// the catalog no longer accepts.
+/// the catalog no longer accepts. Duration stays global — never a per-chip draft.
 pub(super) fn overlay_draft(
     model: &MediaModel,
     output_count: u32,
@@ -51,6 +52,9 @@ pub(super) fn overlay_draft(
     let mut draft = DraftRunConfig::from_model(model);
     draft.output_count = output_count.clamp(1, model.maximum_output_count.max(1));
     for (id, value) in controls {
+        if id.as_str() == "duration" {
+            continue;
+        }
         if let Some(control) = model.controls.iter().find(|control| &control.id == id)
             && control.validate(value).is_ok()
         {
@@ -58,6 +62,16 @@ pub(super) fn overlay_draft(
         }
     }
     draft
+}
+
+pub(super) fn drop_global_duration(
+    controls: &BTreeMap<ControlId, ControlValue>,
+) -> BTreeMap<ControlId, ControlValue> {
+    controls
+        .iter()
+        .filter(|(id, _)| id.as_str() != "duration")
+        .map(|(id, value)| (id.clone(), value.clone()))
+        .collect()
 }
 
 /// Select remembered models that still exist in the catalog. Leaves an already
@@ -314,7 +328,7 @@ pub(super) fn restore_refs(
                     output_count: 1,
                     controls: drafts
                         .get(id)
-                        .map(|draft| draft.controls.clone())
+                        .map(|draft| drop_global_duration(&draft.controls))
                         .unwrap_or_default(),
                 }
             }
@@ -568,6 +582,80 @@ mod tests {
         ));
         assert_eq!(selected, BTreeSet::from([ModelId::new("flux")]));
         assert!(drafts.is_empty());
+    }
+
+    #[test]
+    fn overlay_and_from_model_drop_global_duration() {
+        let model = test_model_kind(
+            "seedance-t2v",
+            MediaOperation::TextToVideo,
+            MediaKind::Video,
+            vec![
+                ModelControl {
+                    id: ControlId::new("duration"),
+                    label: "Duration".into(),
+                    description: None,
+                    kind: ControlKind::Duration,
+                    required: true,
+                    default: Some(ControlValue::DurationSeconds { value: 6.0 }),
+                    minimum: None,
+                    maximum: None,
+                    step: None,
+                    choices: Vec::new(),
+                    visible_when: Vec::new(),
+                },
+                ModelControl {
+                    id: ControlId::new("resolution"),
+                    label: "Resolution".into(),
+                    description: None,
+                    kind: ControlKind::Resolution,
+                    required: false,
+                    default: Some(ControlValue::Resolution {
+                        value: "720p".into(),
+                    }),
+                    minimum: None,
+                    maximum: None,
+                    step: None,
+                    choices: Vec::new(),
+                    visible_when: Vec::new(),
+                },
+            ],
+        );
+        let from_model = DraftRunConfig::from_model(&model);
+        assert!(
+            !from_model
+                .controls
+                .contains_key(&ControlId::new("duration"))
+        );
+        assert_eq!(
+            from_model.controls[&ControlId::new("resolution")],
+            ControlValue::Resolution {
+                value: "720p".into()
+            }
+        );
+        let overlaid = overlay_draft(
+            &model,
+            1,
+            &BTreeMap::from([
+                (
+                    ControlId::new("duration"),
+                    ControlValue::DurationSeconds { value: 10.0 },
+                ),
+                (
+                    ControlId::new("resolution"),
+                    ControlValue::Resolution {
+                        value: "1080p".into(),
+                    },
+                ),
+            ]),
+        );
+        assert!(!overlaid.controls.contains_key(&ControlId::new("duration")));
+        assert_eq!(
+            overlaid.controls[&ControlId::new("resolution")],
+            ControlValue::Resolution {
+                value: "1080p".into()
+            }
+        );
     }
 
     #[test]

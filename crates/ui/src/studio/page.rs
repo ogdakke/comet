@@ -1191,24 +1191,6 @@ impl StudioPage {
         self.sync_prompt_into_composer(cx);
         let prompt = self.composer.prompt.clone();
         let composer = self.composer.clone();
-        let runs = self
-            .models
-            .iter()
-            .filter(|model| self.selected_models.contains(&model.id))
-            .map(|model| {
-                let draft = self
-                    .draft_runs
-                    .get(&model.id)
-                    .cloned()
-                    .unwrap_or_else(|| DraftRunConfig::from_model(model));
-                serde_json::json!({
-                    "providerId": model.provider_id, "modelId": model.id,
-                    "operation": model.operation, "outputCount": draft.output_count, "controls": draft.controls,
-                    "inputs": [], "manifestVersion": model.manifest_version,
-                    "displayAspectRatio": draft_aspect(model, &draft),
-                })
-            })
-            .collect::<Vec<_>>();
         if composer.selected.is_empty() {
             return;
         }
@@ -1222,7 +1204,7 @@ impl StudioPage {
                 .client()
                 .call(
                     methods::QUOTE_STUDIO_BATCH,
-                    serde_json::json!({ "prompt": prompt, "runs": runs, "composer": composer }),
+                    serde_json::json!({ "prompt": prompt, "composer": composer }),
                 )
                 .await;
             this.update(cx, |page, cx| {
