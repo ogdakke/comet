@@ -1,6 +1,5 @@
 //! Composer attachment tray: file pick, ImportStudioAsset, budgets, Make video.
 
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,9 +13,9 @@ use zeron_proto::ImportStudioAssetResponse;
 use zeron_rpc::{RpcError, methods};
 use zeron_studio::{
     AttachmentOrigin, BudgetKind, ComposerAttachment, ComposerEvent, ComposerMediaKind,
-    ComposerMode, InputRole, LimitBudget, MediaKind, MediaOperation, ROLE_REFERENCE,
-    ROLE_REFERENCE_AUDIO, ROLE_REFERENCE_VIDEO, ROLE_SOURCE, StudioArtifactId, StudioAssetId,
-    StudioConversationId, TrayAccept, sniff_media_mime,
+    ComposerMode, InputRole, LimitBudget, MediaKind, MediaOperation, ROLE_LAST_FRAME,
+    ROLE_REFERENCE, ROLE_REFERENCE_AUDIO, ROLE_REFERENCE_VIDEO, ROLE_SOURCE, StudioArtifactId,
+    StudioAssetId, StudioConversationId, TrayAccept, sniff_media_mime,
 };
 
 use crate::state::EngineHandle;
@@ -71,6 +70,26 @@ impl StudioPage {
                 Ok(Ok(Some(paths))) if !paths.is_empty() => paths,
                 _ => return,
             };
+            this.update(cx, |page, cx| page.import_tray_paths(paths, accept, cx))
+                .ok();
+        }));
+    }
+
+    pub(super) fn add_dropped_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if !self.tray_add_enabled() || paths.is_empty() {
+            return;
+        }
+        let accept = self.composer_view.attachments.accept.clone();
+        self.import_tray_paths(paths, accept, cx);
+    }
+
+    fn import_tray_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+        accept: TrayAccept,
+        cx: &mut Context<Self>,
+    ) {
+        self.tray_picker_task = Some(cx.spawn(async move |this, cx| {
             let accept = this
                 .update(cx, |page, _| page.composer_view.attachments.accept.clone())
                 .ok()
@@ -312,6 +331,8 @@ impl StudioPage {
             .flex()
             .items_center()
             .gap(px(8.0))
+            .pt(px(6.0))
+            .pr(px(6.0))
             .overflow_x_scroll();
         for attachment in items {
             chips = chips.child(self.render_tray_chip(attachment, theme, cx));
@@ -336,6 +357,9 @@ impl StudioPage {
         let pending = attachment.pending;
         let group: SharedString = format!("studio-att-{}", asset_id.0).into();
         let preview = self.tray_chip_image(attachment);
+        let lightbox = (!pending)
+            .then(|| self.tray_lightbox_preview(attachment))
+            .flatten();
         let icon = match attachment.kind {
             ComposerMediaKind::Image => crate::icons::GALLERY_MINIMALISTIC,
             ComposerMediaKind::Video => crate::icons::GALLERY_WIDE,
@@ -345,45 +369,61 @@ impl StudioPage {
             .id(SharedString::from(format!("studio-att-{}", asset_id.0)))
             .group(group.clone())
             .relative()
-            .size(px(TRAY_THUMB))
             .flex_none()
-            .rounded(px(8.0))
-            .overflow_hidden()
-            .border_1()
-            .border_color(theme.border)
-            .bg(crate::theme::wash(0.06))
-            .flex()
-            .items_center()
-            .justify_center()
-            .when(pending, |chip| chip.opacity(0.7))
-            .child(match preview {
-                Some(image) => img(image)
-                    .size_full()
-                    .rounded(px(7.0))
-                    .object_fit(ObjectFit::Cover)
-                    .into_any_element(),
-                None => crate::icons::icon(icon)
-                    .size(px(16.0))
-                    .text_color(theme.text_muted)
-                    .into_any_element(),
-            })
-            .when(pending, |chip| {
-                chip.child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .bg(theme.bg.opacity(0.45))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(crate::loaders::mini_gradient_spinner(
-                            format!("studio-att-spin-{}", asset_id.0),
-                            2.0,
-                            cx.entity_id(),
-                            cx,
-                        )),
-                )
-            })
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "studio-att-thumb-{}",
+                        asset_id.0
+                    )))
+                    .relative()
+                    .size(px(TRAY_THUMB))
+                    .rounded(px(8.0))
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(crate::theme::wash(0.06))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(pending, |chip| chip.opacity(0.7))
+                    .when_some(lightbox.clone(), |chip, preview| {
+                        chip.cursor_pointer()
+                            .on_click(cx.listener(move |page, _, _, cx| {
+                                page.tray_preview = Some(preview.clone());
+                                page.tray_preview_focus_pending = true;
+                                cx.notify();
+                            }))
+                    })
+                    .child(match preview {
+                        Some(image) => img(image)
+                            .size_full()
+                            .rounded(px(7.0))
+                            .object_fit(ObjectFit::Cover)
+                            .into_any_element(),
+                        None => crate::icons::icon(icon)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted)
+                            .into_any_element(),
+                    })
+                    .when(pending, |chip| {
+                        chip.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .bg(theme.bg.opacity(0.45))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(crate::loaders::mini_gradient_spinner(
+                                    format!("studio-att-spin-{}", asset_id.0),
+                                    2.0,
+                                    cx.entity_id(),
+                                    cx,
+                                )),
+                        )
+                    }),
+            )
             .child(crate::frost::layered(
                 div()
                     .id(SharedString::from(format!(
@@ -441,9 +481,35 @@ impl StudioPage {
             return Some(preview.clone());
         }
         if let AttachmentOrigin::Artifact { artifact_id } = attachment.origin {
-            return self.images.get_thumb(&artifact_id);
+            return self
+                .images
+                .get_display(&artifact_id)
+                .or_else(|| self.images.get_thumb(&artifact_id));
         }
         None
+    }
+
+    fn tray_lightbox_preview(
+        &self,
+        attachment: &ComposerAttachment,
+    ) -> Option<crate::attachments::PreviewImage> {
+        if attachment.kind != ComposerMediaKind::Image {
+            return None;
+        }
+        let image = if let Some(preview) = self.tray_previews.get(&attachment.id) {
+            preview.clone()
+        } else if let AttachmentOrigin::Artifact { artifact_id } = attachment.origin {
+            self.images
+                .get_full(&artifact_id)
+                .or_else(|| self.images.get_display(&artifact_id))
+                .or_else(|| self.images.get_thumb(&artifact_id))?
+        } else {
+            return None;
+        };
+        Some(crate::attachments::PreviewImage {
+            name: SharedString::from("Reference image"),
+            image,
+        })
     }
 
     pub(super) fn render_prompt_budget(&self, theme: &Theme) -> Option<gpui::Stateful<gpui::Div>> {
@@ -469,13 +535,10 @@ impl StudioPage {
     }
 
     fn render_role_budgets(&self, theme: &Theme) -> Option<gpui::Stateful<gpui::Div>> {
-        let labels = self
-            .composer_view
-            .budgets
-            .iter()
-            .filter(|budget| matches!(budget.kind, BudgetKind::Role { .. }))
-            .filter_map(budget_label)
-            .collect::<Vec<_>>();
+        let labels = tray_budget_labels(
+            &self.composer_view.budgets,
+            &self.composer_view.attachments.items,
+        );
         if labels.is_empty() {
             return None;
         }
@@ -589,12 +652,68 @@ pub(super) fn budget_label(budget: &LimitBudget) -> Option<String> {
     }
 }
 
+pub(super) fn tray_budget_labels(
+    budgets: &[LimitBudget],
+    attachments: &[ComposerAttachment],
+) -> Vec<String> {
+    let mut labels = Vec::new();
+    let mut frame_max = 0u32;
+    let mut has_frames = false;
+    for budget in budgets {
+        match &budget.kind {
+            BudgetKind::Role { role } if matches!(role.as_str(), ROLE_SOURCE | ROLE_LAST_FRAME) => {
+                let Some(maximum) = budget.maximum else {
+                    continue;
+                };
+                has_frames = true;
+                frame_max += maximum;
+            }
+            BudgetKind::Role { .. } => {
+                if let Some(label) = budget_label(budget) {
+                    labels.push(label);
+                }
+            }
+            BudgetKind::PromptChars => {}
+        }
+    }
+    if has_frames && frame_max > 0 {
+        let used = attachments
+            .iter()
+            .filter(|attachment| !attachment.pending && attachment.kind == ComposerMediaKind::Image)
+            .count() as u32;
+        labels.insert(0, format!("{used}/{frame_max} frames"));
+    }
+    labels
+}
+
 fn role_budget_noun(role: &str) -> Option<&'static str> {
     match role {
         ROLE_REFERENCE => Some("images"),
         ROLE_REFERENCE_VIDEO => Some("videos"),
         ROLE_REFERENCE_AUDIO => Some("audios"),
         _ => None,
+    }
+}
+
+pub(super) fn studio_drop_veil_copy(accept: &TrayAccept) -> &'static str {
+    let images = accept
+        .mime_types
+        .iter()
+        .any(|mime| mime.starts_with("image/"));
+    let videos = accept
+        .mime_types
+        .iter()
+        .any(|mime| mime.starts_with("video/"));
+    let audios = accept
+        .mime_types
+        .iter()
+        .any(|mime| mime.starts_with("audio/"));
+    match (images, videos, audios) {
+        (true, false, false) => "Drop images to attach",
+        (false, true, false) => "Drop videos to attach",
+        (false, false, true) => "Drop audio to attach",
+        (true, true, false) => "Drop images and videos to attach",
+        _ => "Drop files to attach",
     }
 }
 
@@ -709,20 +828,8 @@ fn too_large_message(name: &str) -> String {
 }
 
 fn tray_preview(bytes: &[u8], mime: &str) -> Option<Arc<Image>> {
-    image_format_for_mime(mime)?;
-    let decoded = image::load_from_memory(bytes).ok()?;
-    const MAX_EDGE: u32 = 88;
-    let image = if decoded.width() > MAX_EDGE || decoded.height() > MAX_EDGE {
-        decoded.thumbnail(MAX_EDGE, MAX_EDGE)
-    } else {
-        decoded
-    };
-    let mut encoded = Cursor::new(Vec::new());
-    image.write_to(&mut encoded, image::ImageFormat::Png).ok()?;
-    Some(Arc::new(Image::from_bytes(
-        ImageFormat::Png,
-        encoded.into_inner(),
-    )))
+    let format = image_format_for_mime(mime)?;
+    Some(Arc::new(Image::from_bytes(format, bytes.to_vec())))
 }
 
 async fn import_studio_asset(
@@ -929,7 +1036,7 @@ mod tests {
         assert!(
             budget_label(&LimitBudget {
                 kind: BudgetKind::Role {
-                    role: InputRole::new(zeron_studio::ROLE_SOURCE),
+                    role: InputRole::new(ROLE_SOURCE),
                 },
                 used: 1,
                 maximum: Some(1),
@@ -948,6 +1055,82 @@ mod tests {
                 remaining: None,
             })
             .is_none()
+        );
+    }
+
+    #[test]
+    fn i2v_budgets_print_combined_frames() {
+        let budgets = [
+            LimitBudget {
+                kind: BudgetKind::Role {
+                    role: InputRole::new(ROLE_SOURCE),
+                },
+                used: 0,
+                maximum: Some(1),
+                subjects: Vec::new(),
+                remaining: Some(1),
+            },
+            LimitBudget {
+                kind: BudgetKind::Role {
+                    role: InputRole::new(ROLE_LAST_FRAME),
+                },
+                used: 0,
+                maximum: Some(1),
+                subjects: Vec::new(),
+                remaining: Some(1),
+            },
+            LimitBudget {
+                kind: BudgetKind::Role {
+                    role: InputRole::new(ROLE_REFERENCE),
+                },
+                used: 0,
+                maximum: Some(30),
+                subjects: Vec::new(),
+                remaining: Some(30),
+            },
+        ];
+        assert_eq!(
+            tray_budget_labels(&budgets, &[]),
+            vec!["0/2 frames".to_owned(), "0/30 images".to_owned()]
+        );
+        let attached = [ComposerAttachment {
+            id: StudioAssetId::new(),
+            kind: ComposerMediaKind::Image,
+            pending: false,
+            origin: AttachmentOrigin::Asset,
+            mime_type: "image/png".into(),
+            byte_size: 12,
+            width: None,
+            height: None,
+            duration_seconds: None,
+            content_hash: "a".into(),
+            role_hint: None,
+        }];
+        assert_eq!(
+            tray_budget_labels(&budgets, &attached),
+            vec!["1/2 frames".to_owned(), "0/30 images".to_owned()]
+        );
+    }
+
+    #[test]
+    fn drop_veil_copy_matches_accepted_kinds() {
+        assert_eq!(
+            studio_drop_veil_copy(&TrayAccept {
+                mime_types: vec!["image/png".into()],
+            }),
+            "Drop images to attach"
+        );
+        assert_eq!(
+            studio_drop_veil_copy(&TrayAccept {
+                mime_types: vec!["image/png".into(), "video/mp4".into()],
+            }),
+            "Drop images and videos to attach"
+        );
+        assert_eq!(
+            studio_drop_veil_copy(&TrayAccept {
+                mime_types: vec!["image/png".into(), "video/mp4".into(), "audio/mpeg".into()],
+            }),
+            "Drop files to attach"
         );
     }
 

@@ -3,7 +3,6 @@
 use gpui::{AnyElement, Context, SharedString, div, prelude::*, px};
 use zeron_studio::{ComposerConflict, ConflictId, ResolveAction};
 
-use crate::popover;
 use crate::theme::Theme;
 
 use super::page::StudioPage;
@@ -51,74 +50,89 @@ impl StudioPage {
             2
         };
         let show_more = actions.len() > 2 && !self.conflict_more_open;
-        let mut buttons = div()
-            .mt(px(16.0))
-            .flex()
-            .flex_wrap()
-            .justify_end()
-            .gap(px(8.0));
+        let copy = conflict.title.clone();
+        let mut buttons = div().flex_none().flex().items_center().gap(px(6.0));
         for (index, offered) in actions.iter().take(visible).enumerate() {
             let conflict_id = conflict.id.clone();
             let action = offered.action.clone();
             let label = offered.label.clone();
             let primary = index == 0;
-            let button = if primary {
-                popover::btn_primary(theme, &label)
-            } else {
-                popover::btn_ghost(
-                    theme,
-                    &label,
-                    SharedString::from(format!("studio-conflict-action-{index}")),
-                )
-            };
             buttons = buttons.child(
-                button
-                    .id(SharedString::from(format!(
-                        "studio-conflict-action-{}",
-                        index
-                    )))
-                    .on_click(cx.listener(move |page, _, window, cx| {
-                        page.resolve_composer_conflict(
-                            conflict_id.clone(),
-                            action.clone(),
-                            window,
-                            cx,
-                        );
-                    })),
+                conflict_action_chip(
+                    SharedString::from(format!("studio-conflict-action-{index}")),
+                    label,
+                    primary,
+                    theme,
+                )
+                .on_click(cx.listener(move |page, _, window, cx| {
+                    page.resolve_composer_conflict(conflict_id.clone(), action.clone(), window, cx);
+                })),
             );
         }
         if show_more {
             buttons = buttons.child(
-                popover::btn_ghost(theme, "More", "studio-conflict-more")
-                    .id("studio-conflict-more")
-                    .on_click(cx.listener(|page, _, _, cx| {
+                conflict_action_chip("studio-conflict-more", "More", false, theme).on_click(
+                    cx.listener(|page, _, _, cx| {
                         page.conflict_more_open = true;
                         cx.notify();
-                    })),
+                    }),
+                ),
             );
         }
         Some(
             div()
                 .id("studio-conflict-popup")
-                .absolute()
-                .inset_0()
+                .w_full()
+                .max_w(px(768.0))
+                .h(px(40.0))
+                .px(px(12.0))
+                .rounded(px(14.0))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.surface_raised)
+                .shadow_md()
                 .flex()
                 .items_center()
-                .justify_center()
-                .px(px(16.0))
-                .bg(crate::theme::ink(0.45))
-                // Blocking conflicts stay until a typed action or a compensating edit.
-                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .gap(px(10.0))
                 .child(
-                    popover::dialog_card(theme)
-                        .id("studio-conflict-card")
-                        .child(popover::dialog_title(theme, &conflict.title))
-                        .child(
-                            popover::dialog_body(theme, conflict.explanation.clone()).mt(px(8.0)),
-                        )
-                        .child(buttons),
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(13.0))
+                        .text_color(theme.text)
+                        .child(SharedString::from(copy)),
                 )
+                .child(buttons)
                 .into_any_element(),
         )
     }
+}
+
+fn conflict_action_chip(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    primary: bool,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    let label = label.into();
+    div()
+        .id(id.into())
+        .h(px(26.0))
+        .px(px(10.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .rounded(px(8.0))
+        .bg(if primary {
+            theme.text
+        } else {
+            crate::theme::wash(0.06)
+        })
+        .text_size(px(12.0))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(if primary { theme.on_solid } else { theme.text })
+        .cursor_pointer()
+        .hover(|style| style.opacity(0.88))
+        .child(label)
 }
