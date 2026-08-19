@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Image, Pixels, Point, Render,
-    SharedString, Subscription, Task, Window, div, prelude::*, px,
+    Bounds, Context, DragMoveEvent, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable,
+    Image, Pixels, Point, Render, SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 use zeron_proto::{
     ListStudioConversationsResponse, ListStudioModelsResponse, ListStudioProvidersResponse,
@@ -86,7 +86,20 @@ pub struct StudioPage {
     pub(super) model_picker_focus: FocusHandle,
     pub(super) model_picker_favorites: bool,
     pub(super) model_picker_filters: BTreeSet<zeron_studio::ModelFeature>,
+    pub(super) model_picker_operations: BTreeSet<zeron_studio::MediaOperation>,
+    pub(super) model_chips_scroll: gpui::ScrollHandle,
+    pub(super) file_drag_active: bool,
+    pub(super) tray_preview: Option<crate::attachments::PreviewImage>,
+    pub(super) tray_preview_focus: FocusHandle,
+    pub(super) tray_preview_focus_pending: bool,
     pub(super) model_config_menu: popover::Popup<zeron_studio::ModelId>,
+    pub(super) duration_popup: popover::Popup<()>,
+    pub(super) duration_dragging: bool,
+    pub(super) duration_drag_from_chip: bool,
+    pub(super) duration_drag_origin_x: f32,
+    pub(super) duration_drag_start_index: usize,
+    pub(super) duration_drag_moved: bool,
+    pub(super) duration_track: Option<Bounds<Pixels>>,
     pub(super) feed_list: gpui::ListState,
     pub(super) feed_width: f32,
     pub(super) feed_columns: usize,
@@ -278,7 +291,20 @@ impl StudioPage {
             model_picker_focus: cx.focus_handle(),
             model_picker_favorites: false,
             model_picker_filters: BTreeSet::new(),
+            model_picker_operations: BTreeSet::new(),
+            model_chips_scroll: gpui::ScrollHandle::new(),
+            file_drag_active: false,
+            tray_preview: None,
+            tray_preview_focus: cx.focus_handle(),
+            tray_preview_focus_pending: false,
             model_config_menu: popover::Popup::default(),
+            duration_popup: popover::Popup::default(),
+            duration_dragging: false,
+            duration_drag_from_chip: false,
+            duration_drag_origin_x: 0.0,
+            duration_drag_start_index: 0,
+            duration_drag_moved: false,
+            duration_track: None,
             feed_list: new_feed_list(cx),
             feed_width: 0.0,
             feed_columns: 0,
@@ -1707,16 +1733,71 @@ impl Render for StudioPage {
         } else if self.selected_conversation.is_none() {
             self.render_gallery(window, &theme, cx)
         } else {
+            let drop_enabled = self.tray_add_enabled();
+            let file_drag_active = drop_enabled && self.file_drag_active && cx.has_active_drag();
+            let veil = file_drag_active.then(|| {
+                div()
+                    .absolute()
+                    .inset_0()
+                    .bg(theme.scrim().opacity(0.4 / 0.6))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(13.0))
+                    .text_color(theme.text)
+                    .child(SharedString::from(super::tray::studio_drop_veil_copy(
+                        &self.composer_view.attachments.accept,
+                    )))
+            });
             div()
+                .id("studio-dropzone")
                 .relative()
                 .flex_1()
                 .min_w_0()
                 .h_full()
                 .overflow_hidden()
+                .when(drop_enabled, |column| {
+                    column
+                        .on_drag_move::<ExternalPaths>(cx.listener(
+                            |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
+                                let inside = e.bounds.contains(&e.event.position);
+                                if this.file_drag_active != inside {
+                                    this.file_drag_active = inside;
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                        .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                            this.file_drag_active = false;
+                            this.add_dropped_paths(paths.paths().to_vec(), cx);
+                            cx.notify();
+                        }))
+                })
                 .child(self.render_conversation_feed(window, &theme, cx))
                 .child(self.render_composer(window, &theme, cx))
+                .children(veil)
                 .into_any_element()
         };
+        if std::mem::take(&mut self.tray_preview_focus_pending) {
+            window.focus(&self.tray_preview_focus, cx);
+        }
+        let tray_lightbox = self.tray_preview.clone().map(|preview| {
+            let weak = cx.weak_entity();
+            crate::attachments::lightbox(
+                window.viewport_size(),
+                &preview,
+                &self.tray_preview_focus,
+                move |window, cx| {
+                    if let Ok(focus) = weak.update(cx, |page, cx| {
+                        page.tray_preview = None;
+                        cx.notify();
+                        page.focus.clone()
+                    }) {
+                        window.focus(&focus, cx);
+                    }
+                },
+            )
+        });
         div()
             .relative()
             .size_full()
@@ -1750,6 +1831,7 @@ impl Render for StudioPage {
             .when_some(self.render_image_menu(&theme, cx), |el, menu| {
                 el.child(menu)
             })
+            .children(tray_lightbox)
     }
 }
 

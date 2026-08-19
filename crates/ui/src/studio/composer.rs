@@ -3,14 +3,14 @@
 use std::collections::BTreeSet;
 
 use gpui::{
-    AnyElement, Context, Focusable as _, KeyDownEvent, Point, SharedString, Window, div,
-    prelude::*, px,
+    AnyElement, Bounds, Context, Focusable as _, KeyDownEvent, MouseButton, Pixels, Point,
+    SharedString, Window, canvas, div, point, prelude::*, px, size,
 };
 use zeron_rpc::{RpcError, methods};
 use zeron_studio::{
-    AudioCapability, ChipView, ComposerEvent, ComposerMode, ComposerView, ControlValue, MediaKind,
-    MediaModel, ModelControl, ModelFeature, ModelId, SelectedModelRef, StudioValidationError,
-    apply_event, popup_conflict,
+    AudioCapability, ChipView, ComposerEvent, ComposerMode, ComposerView, ControlChoice,
+    ControlValue, MediaKind, MediaModel, MediaOperation, ModelControl, ModelFeature, ModelId,
+    ResolveAction, SelectedModelRef, StudioValidationError, apply_event, popup_conflict,
 };
 
 use crate::motion;
@@ -24,15 +24,19 @@ const IMAGE_PROMPT_PLACEHOLDER: &str = "Describe the image you want to create";
 const VIDEO_PROMPT_PLACEHOLDER: &str = "Describe the video you want to create";
 
 const COMPACT_ACTIONS_INSET: f32 = 205.0;
+const DURATION_DRAG_STEP_PX: f32 = 12.0;
+const MODEL_CHIPS_FADE: f32 = 24.0;
+const DURATION_CHIP_MIN_GLYPHS: &str = "30s";
 
 /// Catalog rows visible in the Studio model picker after favorites, feature
-/// filters, and search. Starred models stay floated to the top.
+/// filters, operation filters, and search. Starred models stay floated to the top.
 fn visible_model_indices(
     models: &[MediaModel],
     query: &str,
     favorites_only: bool,
     favorites: &[ModelId],
     filters: &BTreeSet<ModelFeature>,
+    operations: &BTreeSet<MediaOperation>,
 ) -> Vec<usize> {
     let is_favorite = |id: &ModelId| favorites.iter().any(|favorite| favorite == id);
     let candidates = models
@@ -40,6 +44,9 @@ fn visible_model_indices(
         .enumerate()
         .filter(|(_, model)| {
             if favorites_only && !is_favorite(&model.id) {
+                return false;
+            }
+            if !operations.is_empty() && !operations.contains(&model.operation) {
                 return false;
             }
             filters
@@ -180,10 +187,19 @@ impl StudioPage {
                 | ComposerEvent::CatalogUpdated { .. }
         );
         if self.composer_view.open_picker && selection_event && !self.model_picker.is_open() {
-            if let Some(window) = window {
-                self.toggle_model_picker(window, cx);
-            } else {
-                self.model_picker.open(());
+            let from_resolve = matches!(
+                event,
+                ComposerEvent::Resolve {
+                    action: ResolveAction::OpenModelPicker,
+                    ..
+                }
+            );
+            if from_resolve || self.popup_conflict.is_none() {
+                if let Some(window) = window {
+                    self.toggle_model_picker(window, cx);
+                } else {
+                    self.model_picker.open(());
+                }
             }
         }
         if self.composer_view.refresh_catalog {
@@ -200,6 +216,7 @@ impl StudioPage {
         if self.composer.mode == mode {
             return;
         }
+        self.close_duration_popup(cx);
         self.persist_composer_defaults(cx);
         if mode == ComposerMode::Video {
             self.composer.duration = self.remembered.video_duration.clone();
@@ -219,6 +236,76 @@ impl StudioPage {
             return;
         }
         self.apply_composer_event(ComposerEvent::SetDuration { value }, None, cx);
+    }
+
+    fn close_duration_popup(&mut self, cx: &mut Context<Self>) {
+        self.duration_dragging = false;
+        if self.duration_popup.begin_close() {
+            popover::reap_popup(cx, |page: &mut Self| &mut page.duration_popup);
+        }
+        cx.notify();
+    }
+
+    fn begin_duration_drag(&mut self, x: f32, from_chip: bool, cx: &mut Context<Self>) {
+        self.duration_popup.note_trigger_press();
+        if !self.duration_popup.is_open() {
+            self.duration_popup.open(());
+        }
+        self.duration_dragging = true;
+        self.duration_drag_from_chip = from_chip;
+        self.duration_drag_moved = false;
+        self.duration_drag_origin_x = x;
+        self.duration_drag_start_index = current_duration_index(
+            self.composer_view.globals.duration.as_ref(),
+            &self.composer_view.globals.duration_choices,
+        )
+        .unwrap_or(0);
+        cx.notify();
+    }
+
+    fn apply_duration_drag_x(&mut self, x: f32, cx: &mut Context<Self>) {
+        if !self.duration_dragging {
+            return;
+        }
+        let choices = &self.composer_view.globals.duration_choices;
+        if choices.is_empty() {
+            return;
+        }
+        if (x - self.duration_drag_origin_x).abs() > 3.0 {
+            self.duration_drag_moved = true;
+        }
+        let next = if !self.duration_drag_from_chip
+            && let Some(track) = self.duration_track
+        {
+            snap_duration_from_track(x, track, choices)
+        } else {
+            let delta = ((x - self.duration_drag_origin_x) / DURATION_DRAG_STEP_PX).round() as i32;
+            let index = (self.duration_drag_start_index as i32 + delta)
+                .clamp(0, choices.len().saturating_sub(1) as i32) as usize;
+            Some(choices[index].value.clone())
+        };
+        let Some(next) = next else {
+            return;
+        };
+        if self.composer_view.globals.duration.as_ref() == Some(&next) {
+            return;
+        }
+        self.set_composer_duration(next, cx);
+    }
+
+    fn end_duration_drag(&mut self, cx: &mut Context<Self>) {
+        if !self.duration_dragging {
+            return;
+        }
+        self.duration_dragging = false;
+        if self.duration_drag_from_chip
+            && !self.duration_drag_moved
+            && self.duration_popup.take_press_was_open()
+        {
+            self.close_duration_popup(cx);
+            return;
+        }
+        cx.notify();
     }
 
     pub(super) fn restore_refs_for(&self, mode: ComposerMode) -> Vec<SelectedModelRef> {
@@ -405,6 +492,7 @@ impl StudioPage {
         self.model_picker_active = None;
         self.model_picker_favorites = false;
         self.model_picker_filters.clear();
+        self.model_picker_operations.clear();
         self.model_picker_scroll.set_offset(Point::default());
         let search_focus = self.model_search.read(cx).focus_handle(cx);
         window.focus(&search_focus, cx);
@@ -422,6 +510,7 @@ impl StudioPage {
             self.model_picker_favorites,
             &self.remembered.favorites,
             &self.model_picker_filters,
+            &self.model_picker_operations,
         )
         .into_iter()
         .filter(|&index| self.models[index].output_kind == kind)
@@ -454,6 +543,19 @@ impl StudioPage {
     ) {
         if !self.model_picker_filters.remove(&feature) {
             self.model_picker_filters.insert(feature);
+        }
+        self.model_picker_active = None;
+        self.model_picker_scroll.set_offset(Point::default());
+        cx.notify();
+    }
+
+    pub(super) fn toggle_model_operation_filter(
+        &mut self,
+        operation: MediaOperation,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.model_picker_operations.remove(&operation) {
+            self.model_picker_operations.insert(operation);
         }
         self.model_picker_active = None;
         self.model_picker_scroll.set_offset(Point::default());
@@ -640,7 +742,11 @@ impl StudioPage {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let current = draft.controls.get(&control.id).or(control.default.as_ref());
+        let current = draft
+            .controls
+            .get(&control.id)
+            .or(control.default.as_ref())
+            .or_else(|| control.choices.first().map(|choice| &choice.value));
         let mut choices = div().flex().flex_wrap().gap(px(5.0));
         if control.kind == zeron_studio::ControlKind::Boolean {
             let on = current.is_some_and(|value| {
@@ -882,7 +988,12 @@ impl StudioPage {
             .find(|chip| chip.model_id == model.id);
         let aspect_label = chip_control_readout(&model, &draft, chip, "aspect_ratio");
         let resolution_label = chip_control_readout(&model, &draft, chip, "resolution");
-        let audio_label = chip_control_readout(&model, &draft, chip, "audio");
+        let audio_on = chip_audio_enabled(&model, &draft, chip);
+        let audio_toggleable = matches!(
+            model.video_capability().map(|cap| cap.generate_audio),
+            Some(AudioCapability::Configurable { .. })
+        );
+        let display_name = model.display_name.clone();
         let menu_here = self.model_config_menu.get() == Some(&model.id);
         let menu = menu_here.then(|| {
             popover::anchored_menu_above(
@@ -941,13 +1052,12 @@ impl StudioPage {
                     .truncate()
                     .text_size(px(11.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .child(SharedString::from(model.display_name)),
+                    .child(SharedString::from(display_name)),
             )
             .when_some(badge, |chip, badge| {
                 chip.child(
                     div()
-                        .max_w(px(92.0))
-                        .truncate()
+                        .flex_none()
                         .text_size(px(10.0))
                         .text_color(theme.warning)
                         .child(SharedString::from(badge)),
@@ -965,8 +1075,48 @@ impl StudioPage {
             .when_some(resolution_label, |chip, label| {
                 chip.child(config_readout(SharedString::from(label), theme))
             })
-            .when_some(audio_label, |chip, label| {
-                chip.child(config_readout(SharedString::from(label), theme))
+            .when_some(audio_on, |chip, on| {
+                let audio_id = model.id.clone();
+                chip.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "studio-model-audio-{}",
+                            audio_id.as_str()
+                        )))
+                        .size(px(22.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(5.0))
+                        .bg(crate::theme::wash(0.065))
+                        .when(audio_toggleable, |icon| {
+                            icon.cursor_pointer()
+                                .hover(|style| style.bg(crate::theme::wash(0.10)))
+                                .on_click(cx.listener(move |page, _, _, cx| {
+                                    cx.stop_propagation();
+                                    page.set_control(
+                                        &audio_id,
+                                        &zeron_studio::ControlId::from("audio"),
+                                        ControlValue::Boolean { value: !on },
+                                        cx,
+                                    );
+                                }))
+                        })
+                        .child(
+                            crate::icons::icon(if on {
+                                crate::icons::VOLUME_LOUD
+                            } else {
+                                crate::icons::VOLUME_CROSS
+                            })
+                            .size(px(13.0))
+                            .text_color(if on {
+                                theme.text
+                            } else {
+                                theme.text_muted
+                            }),
+                        ),
+                )
             })
             .child(
                 div()
@@ -1015,7 +1165,6 @@ impl StudioPage {
         for model in selected {
             model_configs.push(self.render_model_config(model, theme, cx));
         }
-        let has_model_configs = !model_configs.is_empty();
 
         let visible_model_indices = self.filtered_model_indices(cx);
         let favorites_view = self.model_picker_favorites;
@@ -1156,7 +1305,7 @@ impl StudioPage {
                         .child(self.model_search.clone()),
                 );
             let mut rail = div()
-                .w(px(112.0))
+                .w(px(140.0))
                 .flex_none()
                 .p(px(4.0))
                 .flex()
@@ -1192,13 +1341,37 @@ impl StudioPage {
                     )
                     .on_click(cx.listener(|page, _, _, cx| page.show_favorite_models(cx))),
                 );
-            rail = rail.child(
-                div()
-                    .h(px(1.0))
-                    .mx(px(-4.0))
-                    .my(px(1.0))
-                    .bg(crate::theme::hairline(0.08)),
-            );
+            if self.composer.mode == ComposerMode::Video {
+                rail = rail.child(filter_rail_divider());
+                for operation in MediaOperation::VIDEO_PICKER {
+                    let selected = self.model_picker_operations.contains(&operation);
+                    let label = operation.picker_label().unwrap_or_default();
+                    rail = rail.child(
+                        filter_rail_row(
+                            SharedString::from(format!("studio-model-rail-{}", label)),
+                            selected,
+                            theme,
+                            |row| {
+                                row.child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(if selected {
+                                            theme.text
+                                        } else {
+                                            theme.text_muted
+                                        })
+                                        .child(label),
+                                )
+                            },
+                        )
+                        .on_click(cx.listener(move |page, _, _, cx| {
+                            page.toggle_model_operation_filter(operation, cx)
+                        })),
+                    );
+                }
+            }
+            rail = rail.child(filter_rail_divider());
             for feature in ModelFeature::ALL {
                 let selected = self.model_picker_filters.contains(&feature);
                 rail = rail.child(
@@ -1260,7 +1433,7 @@ impl StudioPage {
                 .child(list);
             let card = popover::popover_card_flush(theme)
                 .id("studio-model-picker")
-                .w(px(428.0))
+                .w(px(456.0))
                 .h(px(346.0))
                 .track_focus(&self.model_picker_focus)
                 .on_mouse_down_out(cx.listener(|page, _, _, cx| page.close_model_picker(cx)))
@@ -1496,21 +1669,46 @@ impl StudioPage {
             .flex()
             .flex_col()
             .gap(px(6.0))
-            .when(has_model_configs, |composer| {
-                composer.child(
-                    div()
-                        .id("studio-model-configs")
-                        .flex()
-                        .flex_row()
-                        .gap(px(7.0))
-                        .overflow_x_scroll()
-                        .children(model_configs),
-                )
-            })
-            .child(self.render_mode_bar(theme, cx))
+            .child(
+                div()
+                    .id("studio-model-configs")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(7.0))
+                    .when(
+                        self.composer.mode == ComposerMode::Video
+                            && !self.composer_view.globals.duration_choices.is_empty(),
+                        |row| row.child(self.render_duration_control(theme, cx)),
+                    )
+                    .child(self.render_mode_segment(theme, cx))
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            crate::edge_fade::edge_faded(
+                                MODEL_CHIPS_FADE,
+                                false,
+                                false,
+                                div()
+                                    .id("studio-model-chips")
+                                    .size_full()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(7.0))
+                                    .overflow_x_scroll()
+                                    .track_scroll(&self.model_chips_scroll)
+                                    .children(model_configs),
+                            )
+                            .fade_left(true)
+                            .fade_right(true)
+                            .fade_overflow_x(&self.model_chips_scroll),
+                        ),
+                    )
+                    .when_some(self.render_prompt_budget(theme), |row, budget| {
+                        row.child(budget)
+                    }),
+            )
             .children(self.render_attachment_tray(theme, cx))
-            .child(body)
-            .children(self.render_conflict_popup(theme, cx));
+            .child(body);
 
         div()
             .absolute()
@@ -1521,30 +1719,15 @@ impl StudioPage {
             .flex_col()
             .items_center()
             .gap(px(10.0))
-            .children(self.render_generate_more_pill(theme, cx))
+            .children(self.render_conflict_popup(theme, cx))
+            .children(
+                self.popup_conflict
+                    .is_none()
+                    .then(|| self.render_generate_more_pill(theme, cx))
+                    .flatten(),
+            )
             .child(crate::frost::frosted(26.0, 16.0, composer))
             .into_any_element()
-    }
-
-    fn render_mode_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let video = self.composer.mode == ComposerMode::Video;
-        let mut row = div()
-            .id("studio-mode-bar")
-            .w_full()
-            .px(px(6.0))
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .child(self.render_mode_segment(theme, cx));
-        if video {
-            row = row.child(self.render_duration_pills(theme, cx));
-        } else {
-            row = row.child(div().flex_1());
-        }
-        if let Some(budget) = self.render_prompt_budget(theme) {
-            row = row.child(budget);
-        }
-        row
     }
 
     fn render_mode_segment(
@@ -1554,18 +1737,19 @@ impl StudioPage {
     ) -> gpui::Stateful<gpui::Div> {
         div()
             .id("studio-mode-segment")
-            .h(px(28.0))
+            .h(px(34.0))
             .flex_none()
             .flex()
             .items_center()
-            .rounded(px(8.0))
+            .rounded(px(14.0))
             .border_1()
             .border_color(theme.border)
             .bg(crate::theme::wash(0.035))
-            .p(px(2.0))
+            .p(px(3.0))
+            .gap(px(2.0))
             .child(mode_segment_chip(
                 "studio-mode-image",
-                "Image",
+                crate::icons::CAMERA,
                 self.composer.mode == ComposerMode::Image,
                 theme,
                 ComposerMode::Image,
@@ -1573,7 +1757,7 @@ impl StudioPage {
             ))
             .child(mode_segment_chip(
                 "studio-mode-video",
-                "Video",
+                crate::icons::VIDEOCAMERA,
                 self.composer.mode == ComposerMode::Video,
                 theme,
                 ComposerMode::Video,
@@ -1581,36 +1765,194 @@ impl StudioPage {
             ))
     }
 
-    fn render_duration_pills(
-        &self,
+    fn render_duration_control(
+        &mut self,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let current = self.composer_view.globals.duration.as_ref();
-        let mut pills = div()
-            .id("studio-duration-pills")
-            .flex_1()
-            .min_w_0()
+        let current = self.composer_view.globals.duration.clone();
+        let label = current
+            .as_ref()
+            .map(duration_chip_label)
+            .unwrap_or_else(|| "Duration".into());
+        let sizer = duration_chip_sizer(&self.composer_view.globals.duration_choices);
+        let open = self.duration_popup.get().is_some();
+        let slider = open.then(|| {
+            popover::anchored_menu_above(
+                "studio-duration-menu",
+                self.render_duration_slider(theme, cx),
+                self.duration_popup.closing_since(),
+            )
+        });
+        div()
+            .id("studio-duration")
+            .relative()
+            .h(px(34.0))
+            .px(px(10.0))
+            .flex_none()
             .flex()
             .items_center()
-            .gap(px(5.0))
-            .overflow_x_scroll();
-        for choice in &self.composer_view.globals.duration_choices {
-            let active = current == Some(&choice.value);
-            let value = choice.value.clone();
-            pills = pills.child(
-                config_choice(
-                    SharedString::from(format!("studio-duration-{}", choice.label)),
-                    choice.label.clone(),
-                    active,
-                    theme,
+            .justify_center()
+            .rounded(px(14.0))
+            .border_1()
+            .border_color(if open {
+                theme.border_strong
+            } else {
+                theme.border
+            })
+            .cursor_pointer()
+            .hover(|style| style.bg(crate::theme::wash(0.075)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|page, event: &gpui::MouseDownEvent, _, cx| {
+                    page.begin_duration_drag(f32::from(event.position.x), true, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_move(cx.listener(|page, event: &gpui::MouseMoveEvent, _, cx| {
+                if page.duration_dragging && event.dragging() {
+                    page.apply_duration_drag_x(f32::from(event.position.x), cx);
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|page, _, _, cx| page.end_duration_drag(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|page, _, _, cx| page.end_duration_drag(cx)),
+            )
+            .when_some(slider, |chip, slider| chip.child(slider))
+            .child(
+                div()
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .opacity(0.0)
+                            .text_size(px(12.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(SharedString::from(sizer)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(12.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(SharedString::from(label)),
+                    ),
+            )
+    }
+
+    fn render_duration_slider(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let choices = self.composer_view.globals.duration_choices.clone();
+        let current = self.composer_view.globals.duration.clone();
+        let t = duration_slider_t(current.as_ref(), &choices);
+        let ink = theme.text;
+        let entity = cx.weak_entity();
+        let has_seconds = choices
+            .iter()
+            .any(|choice| matches!(choice.value, ControlValue::DurationSeconds { .. }));
+        let has_auto = choices
+            .iter()
+            .any(|choice| matches!(choice.value, ControlValue::DurationAuto));
+        popover::popover_card(theme)
+            .id("studio-duration-slider")
+            .w(px(220.0))
+            .p(px(12.0))
+            .on_mouse_down_out(cx.listener(|page, _, _, cx| {
+                if !page.duration_dragging {
+                    page.close_duration_popup(cx);
+                }
+            }))
+            .child(
+                div()
+                    .mb(px(8.0))
+                    .text_size(px(11.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(
+                        current
+                            .as_ref()
+                            .map(duration_chip_label)
+                            .unwrap_or_else(|| "Duration".into()),
+                    )),
+            )
+            .when(has_seconds, |card| {
+                card.child(
+                    div()
+                        .id("studio-duration-track")
+                        .relative()
+                        .w_full()
+                        .h(px(24.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|page, event: &gpui::MouseDownEvent, _, cx| {
+                                page.begin_duration_drag(f32::from(event.position.x), false, cx);
+                                page.apply_duration_drag_x(f32::from(event.position.x), cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .child(
+                            canvas(
+                                |_, _, _| {},
+                                move |bounds, (), window, cx| {
+                                    let _ = entity.update(cx, |page, _| {
+                                        page.duration_track = Some(bounds);
+                                    });
+                                    paint_duration_track(bounds, t, ink, window);
+                                    let entity_move = entity.clone();
+                                    window.on_mouse_event(
+                                        move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                                            if phase != gpui::DispatchPhase::Bubble
+                                                || !event.dragging()
+                                            {
+                                                return;
+                                            }
+                                            let _ = entity_move.update(cx, |page, cx| {
+                                                page.apply_duration_drag_x(
+                                                    f32::from(event.position.x),
+                                                    cx,
+                                                );
+                                            });
+                                        },
+                                    );
+                                    let entity_up = entity.clone();
+                                    window.on_mouse_event(
+                                        move |event: &gpui::MouseUpEvent, phase, _, cx| {
+                                            if phase != gpui::DispatchPhase::Bubble
+                                                || event.button != MouseButton::Left
+                                            {
+                                                return;
+                                            }
+                                            let _ = entity_up.update(cx, |page, cx| {
+                                                page.end_duration_drag(cx);
+                                            });
+                                        },
+                                    );
+                                },
+                            )
+                            .size_full(),
+                        ),
                 )
-                .on_click(cx.listener(move |page, _, _, cx| {
-                    page.set_composer_duration(value.clone(), cx);
-                })),
-            );
-        }
-        pills
+            })
+            .when(has_auto, |card| {
+                let active = matches!(current, Some(ControlValue::DurationAuto));
+                card.child(
+                    config_choice("studio-duration-auto", "Auto", active, theme)
+                        .mt(px(8.0))
+                        .on_click(cx.listener(|page, _, _, cx| {
+                            page.set_composer_duration(ControlValue::DurationAuto, cx);
+                        })),
+                )
+            })
+            .into_any_element()
     }
 
     /// "Generate more" chip — same chrome as the agent-chat jump-to-bottom
@@ -1670,7 +2012,7 @@ impl StudioPage {
 
 fn mode_segment_chip(
     id: impl Into<SharedString>,
-    label: &'static str,
+    icon: &'static str,
     active: bool,
     theme: &Theme,
     mode: ComposerMode,
@@ -1678,29 +2020,26 @@ fn mode_segment_chip(
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id.into())
-        .h(px(24.0))
-        .px(px(10.0))
+        .size(px(28.0))
         .flex()
         .items_center()
-        .rounded(px(6.0))
+        .justify_center()
+        .rounded(px(10.0))
         .bg(if active {
             crate::theme::card_selected_bg()
         } else {
             gpui::transparent_black()
         })
-        .text_size(px(11.0))
-        .font_weight(if active {
-            gpui::FontWeight::SEMIBOLD
-        } else {
-            gpui::FontWeight::MEDIUM
-        })
-        .text_color(if active { theme.text } else { theme.text_muted })
         .cursor_pointer()
         .hover(|style| style.bg(crate::theme::wash(0.08)))
         .on_click(cx.listener(move |page, _, window, cx| {
             page.set_composer_mode(mode, window, cx);
         }))
-        .child(label)
+        .child(
+            crate::icons::icon(icon)
+                .size(px(15.0))
+                .text_color(if active { theme.text } else { theme.text_muted }),
+        )
 }
 
 fn config_section(label: impl Into<SharedString>, theme: &Theme) -> gpui::Div {
@@ -1858,7 +2197,158 @@ fn chip_control_readout(
         .get(&control.id)
         .or(control.default.as_ref())
         .or_else(|| chip.and_then(|chip| chip.values.get(&control.id)))
+        .or_else(|| control.choices.first().map(|choice| &choice.value))
         .map(control_value_label)
+}
+
+fn chip_audio_enabled(
+    model: &MediaModel,
+    draft: &DraftRunConfig,
+    chip: Option<&ChipView>,
+) -> Option<bool> {
+    match model.video_capability().map(|cap| cap.generate_audio)? {
+        AudioCapability::None => None,
+        AudioCapability::ForcedOn => Some(true),
+        AudioCapability::Configurable { default } => {
+            let value = draft
+                .controls
+                .get(&zeron_studio::ControlId::from("audio"))
+                .or_else(|| {
+                    chip.and_then(|chip| chip.values.get(&zeron_studio::ControlId::from("audio")))
+                })
+                .cloned()
+                .or_else(|| Some(ControlValue::Boolean { value: default }));
+            Some(matches!(value, Some(ControlValue::Boolean { value: true })))
+        }
+    }
+}
+
+fn duration_chip_label(value: &ControlValue) -> String {
+    match value {
+        ControlValue::DurationSeconds { value } if value.fract() == 0.0 => {
+            format!("{}s", *value as i64)
+        }
+        ControlValue::DurationSeconds { value } => format!("{value}s"),
+        ControlValue::DurationAuto => "Auto".into(),
+        _ => "Duration".into(),
+    }
+}
+
+/// Invisible sizer so `4s` → `30s` (or `Auto`) does not shift the mode bar.
+fn duration_chip_sizer(choices: &[ControlChoice]) -> String {
+    let mut widest = DURATION_CHIP_MIN_GLYPHS.to_owned();
+    for choice in choices {
+        let label = duration_chip_label(&choice.value);
+        if label.chars().count() > widest.chars().count() {
+            widest = label;
+        }
+    }
+    widest
+}
+
+fn current_duration_index(
+    current: Option<&ControlValue>,
+    choices: &[ControlChoice],
+) -> Option<usize> {
+    let current = current?;
+    choices.iter().position(|choice| &choice.value == current)
+}
+
+fn duration_seconds_span(choices: &[ControlChoice]) -> Option<(f64, f64)> {
+    let mut min = f64::MAX;
+    let mut max = f64::MIN;
+    for choice in choices {
+        if let ControlValue::DurationSeconds { value } = choice.value {
+            min = min.min(value);
+            max = max.max(value);
+        }
+    }
+    (min.is_finite() && max.is_finite() && max >= min).then_some((min, max))
+}
+
+fn snap_duration_from_track(
+    x: f32,
+    track: Bounds<Pixels>,
+    choices: &[ControlChoice],
+) -> Option<ControlValue> {
+    let (min, max) = duration_seconds_span(choices)?;
+    let left = f32::from(track.origin.x);
+    let width = f32::from(track.size.width).max(1.0);
+    let t = ((x - left) / width).clamp(0.0, 1.0) as f64;
+    let seconds = if (max - min).abs() < f64::EPSILON {
+        min
+    } else {
+        min + t * (max - min)
+    };
+    choices
+        .iter()
+        .filter_map(|choice| match choice.value {
+            ControlValue::DurationSeconds { value } => Some((value, choice.value.clone())),
+            _ => None,
+        })
+        .min_by(|left, right| {
+            (left.0 - seconds)
+                .abs()
+                .partial_cmp(&(right.0 - seconds).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(_, value)| value)
+}
+
+fn duration_slider_t(current: Option<&ControlValue>, choices: &[ControlChoice]) -> f32 {
+    let Some((min, max)) = duration_seconds_span(choices) else {
+        return 0.0;
+    };
+    let seconds = match current {
+        Some(ControlValue::DurationSeconds { value }) => *value,
+        _ => min,
+    };
+    if (max - min).abs() < f64::EPSILON {
+        return 0.0;
+    }
+    ((seconds - min) / (max - min)).clamp(0.0, 1.0) as f32
+}
+
+fn paint_duration_track(bounds: Bounds<Pixels>, t: f32, ink: gpui::Hsla, window: &mut Window) {
+    let mid_y = bounds.origin.y + bounds.size.height / 2.0;
+    let left = bounds.origin.x + px(8.0);
+    let right = bounds.origin.x + bounds.size.width - px(8.0);
+    let width = right - left;
+    window.paint_quad(gpui::quad(
+        Bounds {
+            origin: point(left, mid_y - px(1.0)),
+            size: size(width, px(2.0)),
+        },
+        px(1.0),
+        ink.opacity(0.28),
+        px(0.0),
+        gpui::transparent_black(),
+        gpui::BorderStyle::default(),
+    ));
+    let fill = width * t.clamp(0.0, 1.0);
+    window.paint_quad(gpui::quad(
+        Bounds {
+            origin: point(left, mid_y - px(1.0)),
+            size: size(fill, px(2.0)),
+        },
+        px(1.0),
+        ink,
+        px(0.0),
+        gpui::transparent_black(),
+        gpui::BorderStyle::default(),
+    ));
+    let thumb_x = left + fill;
+    window.paint_quad(gpui::quad(
+        Bounds {
+            origin: point(thumb_x - px(7.0), mid_y - px(7.0)),
+            size: size(px(14.0), px(14.0)),
+        },
+        px(7.0),
+        ink,
+        px(0.0),
+        gpui::transparent_black(),
+        gpui::BorderStyle::default(),
+    ));
 }
 
 fn config_readout(label: SharedString, theme: &Theme) -> gpui::Div {
@@ -1902,6 +2392,14 @@ fn feature_badge(theme: &Theme, feature: ModelFeature) -> gpui::Div {
         .text_size(px(10.0))
         .text_color(theme.text_muted)
         .child(SharedString::from(feature.label()))
+}
+
+fn filter_rail_divider() -> gpui::Div {
+    div()
+        .h(px(1.0))
+        .mx(px(-4.0))
+        .my(px(1.0))
+        .bg(crate::theme::hairline(0.08))
 }
 
 fn filter_rail_row(
@@ -2008,31 +2506,101 @@ mod tests {
         let favorites = [ModelId::new("gpt")];
 
         assert_eq!(
-            visible_model_indices(&models, "", false, &favorites, &BTreeSet::new()),
+            visible_model_indices(
+                &models,
+                "",
+                false,
+                &favorites,
+                &BTreeSet::new(),
+                &BTreeSet::new()
+            ),
             vec![1, 0, 2]
         );
         assert_eq!(
-            visible_model_indices(&models, "", true, &favorites, &BTreeSet::new()),
+            visible_model_indices(
+                &models,
+                "",
+                true,
+                &favorites,
+                &BTreeSet::new(),
+                &BTreeSet::new()
+            ),
             vec![1]
         );
 
         let uncensored = BTreeSet::from([ModelFeature::Uncensored]);
         assert_eq!(
-            visible_model_indices(&models, "", false, &favorites, &uncensored),
+            visible_model_indices(
+                &models,
+                "",
+                false,
+                &favorites,
+                &uncensored,
+                &BTreeSet::new()
+            ),
             vec![0, 2]
         );
 
         let uncensored_anon = BTreeSet::from([ModelFeature::Uncensored, ModelFeature::Anon]);
         assert_eq!(
-            visible_model_indices(&models, "", false, &favorites, &uncensored_anon),
+            visible_model_indices(
+                &models,
+                "",
+                false,
+                &favorites,
+                &uncensored_anon,
+                &BTreeSet::new()
+            ),
             vec![2]
         );
 
         assert_eq!(
-            visible_model_indices(&models, "gpt", false, &favorites, &BTreeSet::new()),
+            visible_model_indices(
+                &models,
+                "gpt",
+                false,
+                &favorites,
+                &BTreeSet::new(),
+                &BTreeSet::new()
+            ),
             vec![1]
         );
-        assert!(visible_model_indices(&models, "gpt", false, &favorites, &uncensored).is_empty());
+        assert!(
+            visible_model_indices(
+                &models,
+                "gpt",
+                false,
+                &favorites,
+                &uncensored,
+                &BTreeSet::new()
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn picker_filters_video_operations() {
+        let mut t2v = model("t2v", "Seedance T2V", &[]);
+        t2v.output_kind = zeron_studio::MediaKind::Video;
+        t2v.operation = MediaOperation::TextToVideo;
+        let mut i2v = model("i2v", "Seedance I2V", &[]);
+        i2v.output_kind = zeron_studio::MediaKind::Video;
+        i2v.operation = MediaOperation::ImageToVideo;
+        let mut r2v = model("r2v", "Seedance R2V", &[]);
+        r2v.output_kind = zeron_studio::MediaKind::Video;
+        r2v.operation = MediaOperation::ReferenceToVideo;
+        let models = [t2v, i2v, r2v];
+        let favorites = [];
+        let t2v_only = BTreeSet::from([MediaOperation::TextToVideo]);
+        assert_eq!(
+            visible_model_indices(&models, "", false, &favorites, &BTreeSet::new(), &t2v_only),
+            vec![0]
+        );
+        let t2v_i2v = BTreeSet::from([MediaOperation::TextToVideo, MediaOperation::ImageToVideo]);
+        assert_eq!(
+            visible_model_indices(&models, "", false, &favorites, &BTreeSet::new(), &t2v_i2v),
+            vec![0, 1]
+        );
     }
 
     fn video_model(
@@ -2140,5 +2708,75 @@ mod tests {
             .map(|control| control.id.as_str().to_owned())
             .collect();
         assert_eq!(forced_ids, vec!["resolution"]);
+    }
+
+    #[test]
+    fn duration_chip_label_is_compact() {
+        assert_eq!(
+            duration_chip_label(&ControlValue::DurationSeconds { value: 6.0 }),
+            "6s"
+        );
+        assert_eq!(duration_chip_label(&ControlValue::DurationAuto), "Auto");
+    }
+
+    #[test]
+    fn duration_chip_sizer_holds_three_glyphs() {
+        let short = [
+            ControlChoice {
+                value: ControlValue::DurationSeconds { value: 4.0 },
+                label: "4s".into(),
+            },
+            ControlChoice {
+                value: ControlValue::DurationSeconds { value: 8.0 },
+                label: "8s".into(),
+            },
+        ];
+        assert_eq!(duration_chip_sizer(&short), "30s");
+        let with_auto = [
+            ControlChoice {
+                value: ControlValue::DurationSeconds { value: 4.0 },
+                label: "4s".into(),
+            },
+            ControlChoice {
+                value: ControlValue::DurationAuto,
+                label: "Auto".into(),
+            },
+        ];
+        assert_eq!(duration_chip_sizer(&with_auto), "Auto");
+    }
+
+    #[test]
+    fn duration_slider_snaps_to_nearest_choice() {
+        let choices = [
+            ControlChoice {
+                value: ControlValue::DurationSeconds { value: 4.0 },
+                label: "4s".into(),
+            },
+            ControlChoice {
+                value: ControlValue::DurationSeconds { value: 6.0 },
+                label: "6s".into(),
+            },
+            ControlChoice {
+                value: ControlValue::DurationSeconds { value: 12.0 },
+                label: "12s".into(),
+            },
+        ];
+        let track = Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(px(100.0), px(24.0)),
+        };
+        assert_eq!(
+            snap_duration_from_track(0.0, track, &choices),
+            Some(ControlValue::DurationSeconds { value: 4.0 })
+        );
+        assert_eq!(
+            snap_duration_from_track(25.0, track, &choices),
+            Some(ControlValue::DurationSeconds { value: 6.0 })
+        );
+        assert_eq!(
+            snap_duration_from_track(100.0, track, &choices),
+            Some(ControlValue::DurationSeconds { value: 12.0 })
+        );
+        assert!((duration_slider_t(Some(&choices[1].value), &choices) - 0.25).abs() < 0.001);
     }
 }
