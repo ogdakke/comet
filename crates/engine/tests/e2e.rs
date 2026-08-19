@@ -437,17 +437,24 @@ async fn interrupt_stamps_streaming_entry_aborted() {
         MessagePart::Text { text, .. } => assert_eq!(text, "partial output"),
         other => panic!("unexpected part {other:?}"),
     }
-    assert_eq!(
-        command_status(&core, "cmd-int-1"),
-        Some((SessionCommandStatus::Applied, None))
-    );
+    // The command outcome write and the Idle stamp can lag the doc's
+    // Aborted stamp (separate writes, host-side) — poll, don't assert blind.
+    wait_for(
+        || {
+            command_status(&core, "cmd-int-1")
+                == Some((SessionCommandStatus::Applied, None))
+        },
+        "interrupt command resolution",
+    )
+    .await;
     // Journal closed with a Done — nothing left to recover.
     let journal = RunJournal::open(dir.path().join("orgs/dev-org/dev-user/journals")).unwrap();
     assert!(journal.stale_sessions().unwrap().is_empty());
-    assert_eq!(
-        core.sessions.session_status(CHAT).map(|s| s.status),
-        Some(SessionStatus::Idle)
-    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "session back to idle",
+    )
+    .await;
 }
 
 #[tokio::test]

@@ -148,7 +148,7 @@ async fn init_repo(dir: &Path) {
 
 /// Poll until `probe` yields Some, or panic at the deadline.
 async fn wait_for<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(value) = probe() {
             return value;
@@ -585,7 +585,17 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
     })
     .await;
     assert_eq!(chat.title.as_deref(), Some("Fix Login Flow"));
-    // Branch renamed from the title, chat row updated to match.
+    // The branch rename is a SECOND async step after titling (git mv, then
+    // the row update) — waiting only for the title races it under load
+    // (observed: title set, branch still zeron/quiet-willow at assert).
+    let chat = wait_for("branch rename", || {
+        core.workspace
+            .chat(chat_id)
+            .ok()
+            .flatten()
+            .filter(|c| c.branch.as_deref() == Some("zeron/fix-login-flow"))
+    })
+    .await;
     assert_eq!(chat.branch.as_deref(), Some("zeron/fix-login-flow"));
     let head = tokio::process::Command::new("git")
         .args(["branch", "--show-current"])

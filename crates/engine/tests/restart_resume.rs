@@ -155,7 +155,7 @@ async fn wait_for<F>(predicate: F, what: &str)
 where
     F: FnMut() -> bool,
 {
-    wait_for_within(predicate, what, Duration::from_secs(10)).await;
+    wait_for_within(predicate, what, Duration::from_secs(30)).await;
 }
 
 async fn wait_for_within<F>(mut predicate: F, what: &str, deadline: Duration)

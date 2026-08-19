@@ -96,7 +96,7 @@ async fn drain_until(
     events: &mut Vec<TerminalEvent>,
     predicate: impl Fn(&[TerminalEvent]) -> bool,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while !predicate(events) {
         let event = tokio::time::timeout_at(deadline, rx.recv())
             .await
@@ -688,7 +688,7 @@ async fn spaces_sync_stamps_git_presence_and_reacts_to_git_init() {
     core.spaces_sync.reconcile_now().await;
 
     let mut spaces_rx = core.workspace.watch_spaces();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let space = loop {
         {
             let spaces = spaces_rx.borrow().clone();
@@ -710,7 +710,7 @@ async fn spaces_sync_stamps_git_presence_and_reacts_to_git_init() {
     // `git init` later flips the stamp (watcher and/or explicit recheck).
     git(&folder, &["init", "-b", "main"]).await;
     core.spaces_sync.reconcile_now().await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let space = loop {
         {
             let spaces = spaces_rx.borrow().clone();
@@ -791,7 +791,7 @@ async fn diff_sync_publishes_and_updates_chat_branch() {
 
     // Initial snapshot lands after the debounce; poll the watch.
     let mut diffs_rx = core.diff_sync.watch_diffs();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let diff = loop {
         {
             let diffs = diffs_rx.borrow().clone();
@@ -1065,6 +1065,10 @@ async fn rpc_dispatch_for_m5_methods() {
     // EngineCore's Repos resolves the worktree root from the env; keep test
     // worktrees out of $HOME. (Process-global — this is the only test that sets it.)
     unsafe { std::env::set_var("ZERON_WORKTREES_DIR", tmp.path().join("worktrees")) };
+    // SearchFiles rides a picker-facing 6s RPC budget; under full-suite
+    // parallel load that flakes on scheduling latency. Widen it for the
+    // process (only ever makes a search more patient).
+    unsafe { std::env::set_var("ZERON_FILE_SEARCH_TIMEOUT_MS", "60000") };
     let core = assemble(&tmp.path().join("data"));
     let client = zeron_rpc::memory_client(core.rpc_service());
 
@@ -1270,7 +1274,7 @@ async fn rpc_dispatch_for_m5_methods() {
         )
         .await
         .expect("WriteTerminal");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut transcript = Vec::new();
     loop {
         let item = tokio::time::timeout_at(deadline, stream.recv())

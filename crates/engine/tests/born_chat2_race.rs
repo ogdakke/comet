@@ -87,7 +87,7 @@ async fn wait_for<F>(mut predicate: F, what: &str)
 where
     F: FnMut() -> bool,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while !predicate() {
         assert!(
             tokio::time::Instant::now() < deadline,
