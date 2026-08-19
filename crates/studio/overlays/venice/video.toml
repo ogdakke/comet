@@ -61,6 +61,20 @@ per_reference_image_bytes = 31457280
 source_matched_duration = true
 
 [[family]]
+id_prefix = "seedance-2-0-text-to-video"
+operation = "text_to_video"
+adapter_family = "seedance"
+source = "https://docs.venice.ai/guides/media/seedance-2-0"
+reviewed = "2026-08-19"
+# no reference_* keys → T2V stays input_constraints: []
+
+[[family]]
+id_prefix = "seedance-2-5-text-to-video"
+inherit = "seedance-2-0-text-to-video"
+source = "https://docs.venice.ai/guides/media/seedance-2-0"
+reviewed = "2026-08-19"
+
+[[family]]
 id_prefix = "seedance-2-0-image-to-video"
 operation = "image_to_video"
 adapter_family = "seedance"

@@ -465,7 +465,7 @@ fn insert_duration_auto(model: &mut MediaModel) {
         description: None,
         kind: ControlKind::Duration,
         required: true,
-        default: None,
+        default: Some(ControlValue::DurationAuto),
         minimum: None,
         maximum: None,
         step: None,
@@ -499,7 +499,7 @@ fn insert_aspect_adaptive(model: &mut MediaModel) {
         description: None,
         kind: ControlKind::AspectRatio,
         required: false,
-        default: None,
+        default: Some(ControlValue::AspectRatioAdaptive),
         minimum: None,
         maximum: None,
         step: None,
@@ -624,7 +624,11 @@ reviewed = "2026-08-18"
         );
         assert_eq!(
             overlay.adapter_family("seedance-2-0-text-to-video-basic"),
-            AdapterFamily::Hidden
+            AdapterFamily::Seedance
+        );
+        assert_eq!(
+            overlay.adapter_family("seedance-2-5-text-to-video-basic"),
+            AdapterFamily::Seedance
         );
     }
 

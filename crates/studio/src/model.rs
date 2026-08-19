@@ -54,7 +54,7 @@ pub enum MediaKind {
     Video,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaOperation {
     TextToImage,
@@ -65,6 +65,26 @@ pub enum MediaOperation {
     ImageToVideo,
     ReferenceToVideo,
     VideoToVideo,
+}
+
+impl MediaOperation {
+    /// Video-mode picker filters, input-light to input-heavy.
+    pub const VIDEO_PICKER: [Self; 4] = [
+        Self::TextToVideo,
+        Self::ImageToVideo,
+        Self::ReferenceToVideo,
+        Self::VideoToVideo,
+    ];
+
+    pub fn picker_label(self) -> Option<&'static str> {
+        match self {
+            Self::TextToVideo => Some("Text to video"),
+            Self::ImageToVideo => Some("Image to video"),
+            Self::ReferenceToVideo => Some("Reference to video"),
+            Self::VideoToVideo => Some("Video to video"),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

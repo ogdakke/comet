@@ -60,6 +60,35 @@ fn real_catalog_fixtures_render_as_provider_neutral_controls() {
     assert_control(&text_video, "duration", ControlKind::Duration, 9);
     assert_control(&text_video, "audio", ControlKind::Boolean, 0);
     assert_eq!(
+        text_video
+            .controls
+            .iter()
+            .find(|control| control.id == ControlId::from("aspect_ratio"))
+            .and_then(|control| control.default.clone()),
+        Some(ControlValue::AspectRatio {
+            width: 16,
+            height: 9
+        })
+    );
+    assert_eq!(
+        text_video
+            .controls
+            .iter()
+            .find(|control| control.id == ControlId::from("resolution"))
+            .and_then(|control| control.default.clone()),
+        Some(ControlValue::Resolution {
+            value: "1080p".into()
+        })
+    );
+    assert_eq!(
+        text_video
+            .controls
+            .iter()
+            .find(|control| control.id == ControlId::from("duration"))
+            .and_then(|control| control.default.clone()),
+        Some(ControlValue::DurationSeconds { value: 6.0 })
+    );
+    assert_eq!(
         text_video.features,
         vec![ModelFeature::Uncensored, ModelFeature::Anon]
     );
@@ -762,6 +791,21 @@ fn unlisted_live_video_defaults_to_hidden() {
 }
 
 #[test]
+fn seedance_2_5_text_to_video_is_selectable() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(TEXT_TO_VIDEO).unwrap();
+    fixture["data"][0]["id"] = "seedance-2-5-text-to-video-basic".into();
+    fixture["data"][0]["model_spec"]["name"] = "Seedance 2.5".into();
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(model.operation, MediaOperation::TextToVideo);
+    assert_eq!(model.video.adapter_family, AdapterFamily::Seedance);
+    assert!(model.input_constraints.is_empty());
+    assert!(model.is_picker_visible());
+    assert!(picker_models(std::slice::from_ref(&model)).len() == 1);
+}
+
+#[test]
 fn grok_id_prefix_matches_private_variants() {
     let mut fixture: serde_json::Value = serde_json::from_slice(IMAGE_TO_VIDEO).unwrap();
     fixture["data"][0]["id"] = "grok-imagine-reference-to-video-private".into();
@@ -865,6 +909,23 @@ fn video_global_intersection_keeps_shared_durations() {
     );
     assert!(!intersection.durations.contains(&ControlValue::DurationAuto));
     assert_eq!(intersection.prompt_maximum_chars, Some(3500));
+}
+
+#[test]
+fn colliding_video_display_names_get_an_operation_suffix() {
+    let mut text: serde_json::Value = serde_json::from_slice(TEXT_TO_VIDEO).unwrap();
+    let image: serde_json::Value = serde_json::from_slice(IMAGE_TO_VIDEO).unwrap();
+    text["data"]
+        .as_array_mut()
+        .unwrap()
+        .push(image["data"][0].clone());
+    let models =
+        normalize_model_catalog(&serde_json::to_vec(&text).unwrap(), fetched_at()).unwrap();
+    let names: Vec<_> = models
+        .iter()
+        .map(|model| model.display_name.as_str())
+        .collect();
+    assert_eq!(names, vec!["Seedance 1.5 Pro T2V", "Seedance 1.5 Pro I2V"]);
 }
 
 fn assert_control(
