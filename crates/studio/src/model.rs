@@ -85,6 +85,14 @@ impl MediaOperation {
             _ => None,
         }
     }
+
+    /// `(r|v|i)2(v|i)` generate ops: the composer + button is for these only.
+    pub fn accepts_reference_assets(self) -> bool {
+        matches!(
+            self,
+            Self::ImageToImage | Self::ImageToVideo | Self::ReferenceToVideo | Self::VideoToVideo
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

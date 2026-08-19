@@ -162,6 +162,8 @@ pub struct ChipView {
 pub struct AttachmentTrayView {
     pub items: Vec<ComposerAttachment>,
     pub accept: TrayAccept,
+    /// + button: an `(r|v|i)2(v|i)` model is selected. Paste/drop still work
+    /// when this is false.
     pub add_enabled: bool,
 }
 
@@ -482,7 +484,9 @@ pub fn map_tray(
     model: &MediaModel,
 ) -> Result<Vec<GenerationInput>, ComposerConflict> {
     match model.operation {
-        MediaOperation::TextToImage | MediaOperation::ImageToImage => return Ok(Vec::new()),
+        MediaOperation::TextToImage | MediaOperation::ImageToImage => {
+            return image_generate_leftovers(snapshot, model);
+        }
         MediaOperation::ImageEdit | MediaOperation::Upscale => {
             return Err(incompatible_mode_conflict(std::slice::from_ref(&model)));
         }
@@ -1065,7 +1069,6 @@ fn evaluate_composer_inner(
         enabled: blocking.is_none() && !pending,
         blocked_reason: blocking.map(|conflict| conflict.code),
     };
-    let empty_usable = usable.is_empty();
     let empty_selected = snapshot.selected.is_empty();
     let phase = if blocking.is_some() {
         ComposerPhase::NeedsResolution
@@ -1092,8 +1095,10 @@ fn evaluate_composer_inner(
         models: chips,
         attachments: AttachmentTrayView {
             items: snapshot.attachments.clone(),
-            accept: tray_accept(&usable),
-            add_enabled: !empty_usable,
+            accept: tray_accept(),
+            add_enabled: usable
+                .iter()
+                .any(|model| model.operation.accepts_reference_assets()),
         },
         budgets,
         hints,
@@ -2048,18 +2053,37 @@ fn hints(
     hints
 }
 
-fn tray_accept(usable: &[&MediaModel]) -> TrayAccept {
-    let mut mime_types = Vec::new();
-    for model in usable {
-        for constraint in &model.input_constraints {
-            for mime in &constraint.mime.accepted {
-                if !mime_types.iter().any(|existing: &String| existing == mime) {
-                    mime_types.push(mime.clone());
-                }
-            }
-        }
+fn tray_accept() -> TrayAccept {
+    TrayAccept {
+        mime_types: crate::STUDIO_INPUT_MIMES
+            .iter()
+            .map(|mime| (*mime).to_owned())
+            .collect(),
     }
-    TrayAccept { mime_types }
+}
+
+#[allow(clippy::result_large_err)]
+fn image_generate_leftovers(
+    snapshot: &ComposerSnapshot,
+    model: &MediaModel,
+) -> Result<Vec<GenerationInput>, ComposerConflict> {
+    let leftover: Vec<&ComposerAttachment> = snapshot
+        .attachments
+        .iter()
+        .filter(|attachment| !attachment.pending && attachment.kind == ComposerMediaKind::Image)
+        .collect();
+    if leftover.is_empty() {
+        return Ok(Vec::new());
+    }
+    let leftover_kinds: Vec<ComposerMediaKind> = leftover.iter().map(|item| item.kind).collect();
+    let asset_ids: Vec<StudioAssetId> = leftover.iter().map(|item| item.id).collect();
+    Err(make_conflict(
+        ConflictCode::UnsupportedReferences,
+        leftover_title(model, &leftover_kinds),
+        "Remove the leftover attachments or choose a compatible model.",
+        subjects(vec![model.id.clone()], asset_ids.clone(), Vec::new()),
+        unsupported_actions(model, snapshot, &asset_ids),
+    ))
 }
 
 fn usable_models<'a>(

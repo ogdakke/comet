@@ -12,13 +12,13 @@ use gpui::{
 use zeron_proto::{
     ListStudioConversationsResponse, ListStudioModelsResponse, ListStudioProvidersResponse,
     QuoteStudioBatchResponse, StudioConversationSummary, StudioConversationView, StudioGalleryItem,
-    StudioProviderBalanceResponse, StudioProviderConnection, StudioRunState, StudioTurnView,
-    UNTITLED_STUDIO_TITLE,
+    StudioProviderBalanceResponse, StudioProviderConnection, StudioRunState, StudioRunView,
+    StudioTurnView, UNTITLED_STUDIO_TITLE,
 };
 use zeron_rpc::methods;
 use zeron_studio::{
-    ComposerEvent, ComposerMode, ComposerSnapshot, ComposerView, ConflictId, StudioArtifactId,
-    StudioAssetId, StudioConversationId, evaluate_composer,
+    ComposerEvent, ComposerMode, ComposerSnapshot, ComposerView, ConflictId, MediaOperation,
+    StudioArtifactId, StudioAssetId, StudioConversationId, evaluate_composer,
 };
 
 use crate::composer::{PromptHistory, PromptHistoryItem};
@@ -28,6 +28,7 @@ use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme::Theme;
 
 use super::StudioEvent;
+use super::artifact::{render_run_error_chip, run_error_message};
 use super::defaults::StudioDefaults;
 use super::draft::{
     DraftRunConfig, apply_remembered_drafts, draft_aspect, snapshot_from_committed_turn,
@@ -229,6 +230,8 @@ impl StudioPage {
             TextInputEvent::Submitted => page.submit(cx),
             TextInputEvent::Edited => page.on_prompt_edited(cx),
             TextInputEvent::HistoryNavigate(dir) => page.on_history_navigate(*dir, cx),
+            TextInputEvent::PastedImages(images) => page.add_pasted_images(images.clone(), cx),
+            TextInputEvent::PastedPaths(paths) => page.add_dropped_paths(paths.clone(), cx),
             _ => {}
         });
         let edit_prompt_events =
@@ -751,6 +754,11 @@ impl StudioPage {
                             .scroll_after_turn_count
                             .is_some_and(|before| view.turns.len() > before);
                         let last_turn_id = view.turns.last().map(|turn| turn.id);
+                        if let Some(previous) = page.conversation.as_ref()
+                            && let Some(message) = first_newly_failed_message(previous, &view)
+                        {
+                            page.error = Some(message);
+                        }
                         page.observe_upscale_view(&view, cx);
                         page.apply_conversation_summary(view.conversation.clone(), cx);
                         page.conversation = Some(view.clone());
@@ -1650,6 +1658,44 @@ fn newly_settled_runs(previous: &StudioConversationView, next: &StudioConversati
     terminal_run_ids(next).difference(&before).next().is_some()
 }
 
+fn first_newly_failed_message(
+    previous: &StudioConversationView,
+    next: &StudioConversationView,
+) -> Option<SharedString> {
+    let before: HashMap<zeron_studio::StudioRunId, StudioRunState> = previous
+        .turns
+        .iter()
+        .flat_map(|turn| turn.runs.iter())
+        .map(|run| (run.id, run.state))
+        .collect();
+    next.turns
+        .iter()
+        .flat_map(|turn| turn.runs.iter())
+        .find(|run| {
+            run.state == StudioRunState::Failed
+                && before.get(&run.id).copied() != Some(StudioRunState::Failed)
+        })
+        .map(format_run_failure)
+}
+
+fn format_run_failure(run: &StudioRunView) -> SharedString {
+    let detail = run_error_message(run.error.as_deref());
+    match run.model.operation {
+        MediaOperation::Upscale => match detail {
+            Some(message) => format!("Upscale failed: {message}").into(),
+            None => "Upscale failed".into(),
+        },
+        MediaOperation::ImageEdit => match detail {
+            Some(message) => format!("Edit failed: {message}").into(),
+            None => "Edit failed".into(),
+        },
+        _ => match detail {
+            Some(message) => message.to_string().into(),
+            None => "Generation failed".into(),
+        },
+    }
+}
+
 fn terminal_run_ids(view: &StudioConversationView) -> HashSet<zeron_studio::StudioRunId> {
     view.turns
         .iter()
@@ -1754,8 +1800,7 @@ impl Render for StudioPage {
         } else if self.selected_conversation.is_none() {
             self.render_gallery(window, &theme, cx)
         } else {
-            let drop_enabled = self.tray_add_enabled();
-            let file_drag_active = drop_enabled && self.file_drag_active && cx.has_active_drag();
+            let file_drag_active = self.file_drag_active && cx.has_active_drag();
             let veil = file_drag_active.then(|| {
                 div()
                     .absolute()
@@ -1777,23 +1822,20 @@ impl Render for StudioPage {
                 .min_w_0()
                 .h_full()
                 .overflow_hidden()
-                .when(drop_enabled, |column| {
-                    column
-                        .on_drag_move::<ExternalPaths>(cx.listener(
-                            |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
-                                let inside = e.bounds.contains(&e.event.position);
-                                if this.file_drag_active != inside {
-                                    this.file_drag_active = inside;
-                                    cx.notify();
-                                }
-                            },
-                        ))
-                        .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                            this.file_drag_active = false;
-                            this.add_dropped_paths(paths.paths().to_vec(), cx);
+                .on_drag_move::<ExternalPaths>(cx.listener(
+                    |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
+                        let inside = e.bounds.contains(&e.event.position);
+                        if this.file_drag_active != inside {
+                            this.file_drag_active = inside;
                             cx.notify();
-                        }))
-                })
+                        }
+                    },
+                ))
+                .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                    this.file_drag_active = false;
+                    this.add_dropped_paths(paths.paths().to_vec(), cx);
+                    cx.notify();
+                }))
                 .child(self.render_conversation_feed(window, &theme, cx))
                 .child(self.render_composer(window, &theme, cx))
                 .children(veil)
@@ -1838,15 +1880,18 @@ impl Render for StudioPage {
             .when_some(self.error.clone(), |el, error| {
                 el.child(
                     div()
+                        .id("studio-error")
                         .absolute()
                         .top(px(12.0))
                         .right(px(12.0))
-                        .rounded(px(8.0))
-                        .bg(theme.danger)
-                        .text_color(theme.bg)
-                        .px(px(10.0))
-                        .py(px(6.0))
-                        .child(error),
+                        .w(px(420.0))
+                        .max_w(gpui::relative(0.92))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|page, _, _, cx| {
+                            page.error = None;
+                            cx.notify();
+                        }))
+                        .child(render_run_error_chip(&theme, error.as_ref())),
                 )
             })
             .when_some(self.render_image_menu(&theme, cx), |el, menu| {
@@ -1916,5 +1961,125 @@ mod tests {
         let fill = hist.down(&items, "").unwrap();
         assert_eq!(fill.text, "unsent draft");
         assert!(!fill.caret_at_start);
+    }
+
+    fn conversation_with_run(
+        run_id: zeron_studio::StudioRunId,
+        state: StudioRunState,
+        operation: MediaOperation,
+        error: Option<&str>,
+    ) -> StudioConversationView {
+        StudioConversationView {
+            conversation: StudioConversationSummary {
+                id: StudioConversationId::new(),
+                title: "one".into(),
+                turn_count: 1,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                archived: false,
+                forked_from_turn_id: None,
+                creating: false,
+                done: false,
+            },
+            turns: vec![StudioTurnView {
+                id: StudioTurnId::new(),
+                position: 0,
+                prompt: "a clip".into(),
+                source_turn_id: None,
+                batch_id: StudioBatchId::new(),
+                created_at: Utc::now(),
+                runs: vec![StudioRunView {
+                    id: run_id,
+                    position: 0,
+                    provider_id: "venice".into(),
+                    model: zeron_studio::MediaModel {
+                        provider_id: "venice".into(),
+                        id: "seedance".into(),
+                        display_name: "Seedance".into(),
+                        description: None,
+                        operation,
+                        output_kind: zeron_studio::MediaKind::Video,
+                        output_mime_types: vec!["video/mp4".into()],
+                        input_constraints: Vec::new(),
+                        prompt_maximum_chars: None,
+                        negative_prompt_maximum_chars: None,
+                        maximum_output_count: 1,
+                        controls: Vec::new(),
+                        pricing: None,
+                        features: Vec::new(),
+                        video: zeron_studio::VideoModelMeta::default(),
+                        manifest_version: "test".into(),
+                        fetched_at: Utc::now(),
+                    },
+                    controls: Default::default(),
+                    output_count: 1,
+                    display_aspect_ratio: (9, 16),
+                    state,
+                    progress: None,
+                    error: error.map(str::to_string),
+                    quote: None,
+                    prompt: None,
+                    inputs: Vec::new(),
+                    artifacts: Vec::new(),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn newly_failed_run_surfaces_the_provider_message() {
+        let run_id = zeron_studio::StudioRunId::new();
+        let previous = conversation_with_run(
+            run_id,
+            StudioRunState::Running,
+            MediaOperation::ReferenceToVideo,
+            None,
+        );
+        let next = conversation_with_run(
+            run_id,
+            StudioRunState::Failed,
+            MediaOperation::ReferenceToVideo,
+            Some("Your prompt violates the content policy of Venice.ai or the model provider"),
+        );
+        assert_eq!(
+            first_newly_failed_message(&previous, &next).as_deref(),
+            Some("Your prompt violates the content policy of Venice.ai or the model provider")
+        );
+        assert_eq!(first_newly_failed_message(&next, &next), None);
+    }
+
+    #[test]
+    fn newly_failed_upscale_keeps_its_prefix() {
+        let run_id = zeron_studio::StudioRunId::new();
+        let previous = conversation_with_run(
+            run_id,
+            StudioRunState::Running,
+            MediaOperation::Upscale,
+            None,
+        );
+        let next = conversation_with_run(
+            run_id,
+            StudioRunState::Failed,
+            MediaOperation::Upscale,
+            Some("pixel limit"),
+        );
+        assert_eq!(
+            first_newly_failed_message(&previous, &next).as_deref(),
+            Some("Upscale failed: pixel limit")
+        );
+    }
+
+    #[test]
+    fn failed_run_without_provider_copy_uses_a_generic_label() {
+        let run = conversation_with_run(
+            zeron_studio::StudioRunId::new(),
+            StudioRunState::Failed,
+            MediaOperation::TextToImage,
+            None,
+        );
+        assert_eq!(
+            format_run_failure(&run.turns[0].runs[0]).as_ref(),
+            "Generation failed"
+        );
     }
 }

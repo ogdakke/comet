@@ -478,27 +478,15 @@ impl StudioPage {
                 ) {
                     return None;
                 }
-                Some((*source_id, run.state, run.error.clone()))
+                Some((*source_id, run.state))
             })
             .collect::<Vec<_>>();
 
         let had_completed = !completed.is_empty();
-        for (source_id, state, error) in completed {
+        for (source_id, state) in completed {
             self.upscale_jobs.remove(&source_id);
             match state {
-                StudioRunState::Succeeded => {}
-                StudioRunState::Failed => {
-                    self.error = Some(
-                        format!(
-                            "Upscale failed{}",
-                            error
-                                .as_deref()
-                                .map(|message| format!(": {message}"))
-                                .unwrap_or_default()
-                        )
-                        .into(),
-                    );
-                }
+                StudioRunState::Succeeded | StudioRunState::Failed => {}
                 StudioRunState::Cancelled => {
                     self.error = Some("Upscale did not complete".into());
                 }

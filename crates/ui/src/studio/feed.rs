@@ -5,15 +5,18 @@
 //! paint the visible window plus overdraw. Off-screen tiles load 512 previews;
 //! tiles that intersect the reading band fetch the original and paint a 1280px
 //! display frame so large thread images stay sharp without 4K GPU textures.
+//! Drag a still or clip onto the composer to attach it as a reference.
 
 use std::collections::HashSet;
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
 use gpui::{
-    AnyElement, ClipboardItem, Context, ListAlignment, ListOffset, ListScrollEvent, ListState,
-    SharedString, Window, canvas, div, list, prelude::*, px,
+    AnyElement, ClipboardItem, Context, Image, ListAlignment, ListOffset, ListScrollEvent,
+    ListState, Pixels, Point, Render, SharedString, WeakEntity, Window, canvas, div, list,
+    prelude::*, px,
 };
 use zeron_proto::{StudioRunState, StudioRunView, StudioTurnView};
 use zeron_studio::{MediaKind, StudioArtifactId};
@@ -28,7 +31,9 @@ use crate::state::format_time_ago;
 use crate::theme::Theme;
 use crate::transcript::{self, format_timestamp};
 
-use super::artifact::{StudioPaint, contain_layers};
+use super::artifact::{
+    StudioPaint, contain_layers, render_run_error_chip, render_run_failed_overlay, run_error_message,
+};
 use super::page::StudioPage;
 
 /// Scroll runway below the final Studio turn. The composer floats 18px above
@@ -730,6 +735,84 @@ fn video_duration_badge(theme: &Theme, seconds: Option<f64>) -> AnyElement {
         .into_any_element()
 }
 
+/// Long edge of the floating tile that follows the cursor during a thread
+/// drag. Large enough to read, small enough to keep the composer visible.
+const ARTIFACT_DRAG_GHOST_MAX_EDGE: f32 = 168.0;
+
+/// In-window drag of a generated thread still or clip onto the composer.
+#[derive(Clone)]
+pub(super) struct StudioArtifactDrag {
+    pub artifact_id: StudioArtifactId,
+    image: Arc<Image>,
+    width: f32,
+    height: f32,
+    video: bool,
+    duration_seconds: Option<f64>,
+    page: WeakEntity<StudioPage>,
+}
+
+struct ArtifactDragGhost {
+    image: Arc<Image>,
+    grab: Point<Pixels>,
+    width: f32,
+    height: f32,
+    video: bool,
+    duration_seconds: Option<f64>,
+}
+
+pub(super) fn artifact_drag_ghost_size(width: f32, height: f32) -> (f32, f32) {
+    let long = width.max(height).max(1.0);
+    let scale = (ARTIFACT_DRAG_GHOST_MAX_EDGE / long).min(1.0);
+    ((width * scale).max(36.0), (height * scale).max(36.0))
+}
+
+/// Place the shrunken ghost so the grab point stays under the cursor.
+pub(super) fn artifact_drag_ghost_offset(
+    tile_width: f32,
+    tile_height: f32,
+    grab: Point<Pixels>,
+    ghost_width: f32,
+    ghost_height: f32,
+) -> (f32, f32) {
+    let grab_x = f32::from(grab.x).clamp(0.0, tile_width.max(0.0));
+    let grab_y = f32::from(grab.y).clamp(0.0, tile_height.max(0.0));
+    let scale_x = ghost_width / tile_width.max(1.0);
+    let scale_y = ghost_height / tile_height.max(1.0);
+    (grab_x - grab_x * scale_x, grab_y - grab_y * scale_y)
+}
+
+impl Render for ArtifactDragGhost {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        let (ghost_w, ghost_h) = artifact_drag_ghost_size(self.width, self.height);
+        let (left, top) =
+            artifact_drag_ghost_offset(self.width, self.height, self.grab, ghost_w, ghost_h);
+        let video = self.video;
+        let duration = self.duration_seconds;
+        div()
+            .w(px((left + ghost_w).max(1.0)))
+            .h(px((top + ghost_h).max(1.0)))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .top(px(top))
+                    .w(px(ghost_w))
+                    .h(px(ghost_h))
+                    .rounded(px(10.0))
+                    .border_1()
+                    .border_color(theme.border_strong)
+                    .bg(crate::theme::ink(0.10))
+                    .shadow_lg()
+                    .opacity(0.92)
+                    .child(contain_layers(self.image.clone(), None, px(10.0), None))
+                    .when(video, |ghost| {
+                        ghost.child(video_duration_badge(&theme, duration))
+                    }),
+            )
+    }
+}
+
 fn lattice_seed(turn_ix: usize, run_ix: usize, output_ix: usize) -> u32 {
     let mut x = (turn_ix as u32).wrapping_mul(0x9E37_79B9)
         ^ (run_ix as u32).wrapping_mul(0x85EB_CA6B)
@@ -754,6 +837,7 @@ impl StudioPage {
         progress: Option<f32>,
         media_kind: MediaKind,
         duration_seconds: Option<f64>,
+        error: Option<&str>,
         theme: &Theme,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -772,14 +856,23 @@ impl StudioPage {
             } else {
                 0.045
             }));
-        if let Some(id) = artifact_id
-            && let Some(conversation_id) = self.selected_conversation
-        {
-            base = self.bind_image_menu(
+        if let Some(id) = artifact_id {
+            if let Some(conversation_id) = self.selected_conversation {
+                base = self.bind_image_menu(
+                    base,
+                    id,
+                    conversation_id,
+                    super::image_menu::ImageSurface::ThreadTile,
+                    cx,
+                );
+            }
+            base = self.bind_thread_artifact_drag(
                 base,
                 id,
-                conversation_id,
-                super::image_menu::ImageSurface::ThreadTile,
+                width,
+                height,
+                video,
+                duration_seconds,
                 cx,
             );
         }
@@ -904,7 +997,7 @@ impl StudioPage {
                 |tile, layer| tile.child(layer),
             )
             .when(state == StudioRunState::Failed, |tile| {
-                tile.child("Generation failed")
+                tile.child(render_run_failed_overlay(theme, error))
             })
             .when_some(badge, |tile, badge| tile.child(badge))
             .when_some(
@@ -912,6 +1005,58 @@ impl StudioPage {
                 |tile, ring| tile.child(ring),
             )
             .into_any_element()
+    }
+
+    fn bind_thread_artifact_drag<E>(
+        &self,
+        element: E,
+        artifact_id: StudioArtifactId,
+        width: f32,
+        height: f32,
+        video: bool,
+        duration_seconds: Option<f64>,
+        cx: &mut Context<Self>,
+    ) -> E
+    where
+        E: StatefulInteractiveElement,
+    {
+        let Some(image) = self
+            .images
+            .get_display(&artifact_id)
+            .or_else(|| self.images.get_thumb(&artifact_id))
+            .or_else(|| self.images.get_placeholder(&artifact_id))
+        else {
+            return element;
+        };
+        element.on_drag(
+            StudioArtifactDrag {
+                artifact_id,
+                image,
+                width,
+                height,
+                video,
+                duration_seconds,
+                page: cx.weak_entity(),
+            },
+            |payload, grab, _, cx| {
+                cx.stop_propagation();
+                let artifact_id = payload.artifact_id;
+                payload
+                    .page
+                    .update(cx, |page, cx| {
+                        page.disarm_hover_autoplay(artifact_id, cx);
+                    })
+                    .ok();
+                cx.new(|_| ArtifactDragGhost {
+                    image: payload.image.clone(),
+                    grab,
+                    width: payload.width,
+                    height: payload.height,
+                    video: payload.video,
+                    duration_seconds: payload.duration_seconds,
+                })
+            },
+        )
     }
 
     fn artifact_focus_ring(
@@ -1781,6 +1926,7 @@ impl StudioPage {
                         tile.progress,
                         tile.media_kind,
                         tile.duration_seconds,
+                        tile.error.as_deref(),
                         theme,
                         window,
                         cx,
@@ -1809,6 +1955,16 @@ impl StudioPage {
                         .is_some_and(|error| error.contains("may have completed")),
                 )
             })
+            .collect::<Vec<_>>();
+        let mut seen_errors = HashSet::new();
+        let error_chips = turn
+            .runs
+            .iter()
+            .filter(|run| run.state == StudioRunState::Failed)
+            .filter_map(|run| {
+                run_error_message(run.error.as_deref()).map(|message| message.to_string())
+            })
+            .filter(|message| seen_errors.insert(message.clone()))
             .collect::<Vec<_>>();
         let show_more = clampable.then(|| {
             show_more_action(
@@ -1880,6 +2036,11 @@ impl StudioPage {
                                     .children(show_more)
                                 }),
                         ),
+                    )
+                    .children(
+                        error_chips
+                            .into_iter()
+                            .map(|message| render_run_error_chip(theme, &message)),
                     )
                     .child(
                         div()
@@ -2139,6 +2300,30 @@ mod tests {
     use chrono::{DateTime, TimeZone, Utc};
     use std::collections::BTreeMap;
     use zeron_proto::StudioTurnView;
+
+    #[test]
+    fn artifact_drag_ghost_shrinks_around_the_long_edge() {
+        assert_eq!(artifact_drag_ghost_size(336.0, 336.0), (168.0, 168.0));
+        assert_eq!(artifact_drag_ghost_size(336.0, 168.0), (168.0, 84.0));
+        assert_eq!(artifact_drag_ghost_size(120.0, 80.0), (120.0, 80.0));
+    }
+
+    #[test]
+    fn artifact_drag_ghost_keeps_the_grab_point_under_the_cursor() {
+        let (width, height) = artifact_drag_ghost_size(400.0, 400.0);
+        let (left, top) = artifact_drag_ghost_offset(
+            400.0,
+            400.0,
+            gpui::point(px(200.0), px(200.0)),
+            width,
+            height,
+        );
+        assert!((left - 200.0 + 200.0 * (width / 400.0)).abs() < 0.01);
+        assert!((top - left).abs() < 0.01);
+        let (origin_left, origin_top) =
+            artifact_drag_ghost_offset(400.0, 400.0, gpui::point(px(0.0), px(0.0)), width, height);
+        assert_eq!((origin_left, origin_top), (0.0, 0.0));
+    }
 
     #[test]
     fn feed_breakpoints_follow_the_plan() {

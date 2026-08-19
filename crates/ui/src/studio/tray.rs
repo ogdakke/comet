@@ -1,4 +1,4 @@
-//! Composer attachment tray: file pick, ImportStudioAsset, budgets, Make video.
+//! Composer attachment tray: file pick, paste, ImportStudioAsset, budgets, Make video.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,7 +51,6 @@ pub(super) struct ArtifactReferenceMeta {
 impl StudioPage {
     pub(super) fn tray_add_enabled(&self) -> bool {
         self.composer_view.attachments.add_enabled
-            && !self.composer_view.attachments.accept.mime_types.is_empty()
     }
 
     pub(super) fn open_tray_picker(&mut self, cx: &mut Context<Self>) {
@@ -76,11 +75,36 @@ impl StudioPage {
     }
 
     pub(super) fn add_dropped_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        if !self.tray_add_enabled() || paths.is_empty() {
+        if paths.is_empty() {
             return;
         }
         let accept = self.composer_view.attachments.accept.clone();
         self.import_tray_paths(paths, accept, cx);
+    }
+
+    /// Stage clipboard images (screenshots / copied image data) as references.
+    /// Mirrors the chat composer's `PastedImages` path; files copied from a
+    /// file manager arrive as `PastedPaths` and reuse [`Self::add_dropped_paths`].
+    pub(super) fn add_pasted_images(&mut self, images: Vec<Image>, cx: &mut Context<Self>) {
+        if images.is_empty() {
+            return;
+        }
+        let accept = self.composer_view.attachments.accept.clone();
+        let mut first_error = None;
+        for image in images {
+            match stage_studio_clipboard_image(image, &accept) {
+                Ok(file) => self.begin_tray_import(file, cx),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            self.error = Some(error.into());
+        }
+        cx.notify();
     }
 
     fn import_tray_paths(
@@ -756,6 +780,7 @@ pub(super) fn mime_for_path(path: &Path) -> Option<&'static str> {
         "jpg" | "jpeg" => Some("image/jpeg"),
         "png" => Some("image/png"),
         "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
         "mp4" => Some("video/mp4"),
         "mov" => Some("video/quicktime"),
         "wav" => Some("audio/wav"),
@@ -824,17 +849,33 @@ fn stage_studio_file(path: &Path, accept: &TrayAccept) -> Result<StagedStudioFil
         return Err(format!("{name} is empty."));
     }
     let bytes = std::fs::read(path).map_err(|_| format!("{name} could not be read."))?;
+    stage_studio_bytes(&name, bytes, mime_for_path(path), accept)
+}
+
+fn stage_studio_clipboard_image(
+    image: Image,
+    accept: &TrayAccept,
+) -> Result<StagedStudioFile, String> {
+    stage_studio_bytes("image", image.bytes, Some(image.format.mime_type()), accept)
+}
+
+fn stage_studio_bytes(
+    name: &str,
+    bytes: Vec<u8>,
+    mime_hint: Option<&'static str>,
+    accept: &TrayAccept,
+) -> Result<StagedStudioFile, String> {
     if bytes.len() as u64 > MAX_IMPORT_BYTES {
-        return Err(too_large_message(&name));
+        return Err(too_large_message(name));
     }
     if bytes.is_empty() {
         return Err(format!("{name} is empty."));
     }
     let mime = sniff_media_mime(&bytes)
-        .or_else(|| mime_for_path(path))
+        .or(mime_hint)
         .ok_or_else(|| format!("{name} is not a supported reference."))?;
     if !accepts_mime(accept, mime) {
-        return Err(format!("{name} is not accepted by the selected models."));
+        return Err(format!("{name} is not a supported reference."));
     }
     let Some(kind) = kind_for_mime(mime) else {
         return Err(format!("{name} is not a supported reference."));
@@ -986,6 +1027,7 @@ mod tests {
     #[test]
     fn path_mime_covers_r2v_kinds() {
         assert_eq!(mime_for_path(Path::new("ref.JPG")), Some("image/jpeg"));
+        assert_eq!(mime_for_path(Path::new("still.gif")), Some("image/gif"));
         assert_eq!(
             mime_for_path(Path::new("clip.mov")),
             Some("video/quicktime")
@@ -1266,7 +1308,42 @@ mod tests {
             mime_types: vec!["video/mp4".into()],
         };
         let rejected = stage_studio_file(&path, &video_only).err().expect("reject");
-        assert!(rejected.contains("not accepted"), "{rejected}");
+        assert!(rejected.contains("not a supported reference"), "{rejected}");
+    }
+
+    #[test]
+    fn stage_clipboard_image_sniffs_and_accepts() {
+        let image = Image::from_bytes(ImageFormat::Png, b"\x89PNG\r\n\x1a\nrest".to_vec());
+        let accept = TrayAccept {
+            mime_types: vec!["image/png".into()],
+        };
+        let staged = stage_studio_clipboard_image(image, &accept).unwrap();
+        assert_eq!(staged.mime, "image/png");
+        assert_eq!(staged.kind, ComposerMediaKind::Image);
+        assert!(staged.preview.is_some());
+    }
+
+    #[test]
+    fn stage_clipboard_image_rejects_unaccepted_mime() {
+        let image = Image::from_bytes(ImageFormat::Png, b"\x89PNG\r\n\x1a\nrest".to_vec());
+        let video_only = TrayAccept {
+            mime_types: vec!["video/mp4".into()],
+        };
+        let rejected = stage_studio_clipboard_image(image, &video_only)
+            .err()
+            .expect("reject");
+        assert!(rejected.contains("not a supported reference"), "{rejected}");
+    }
+
+    #[test]
+    fn stage_clipboard_image_uses_format_when_sniff_fails() {
+        let image = Image::from_bytes(ImageFormat::Jpeg, b"not a real jpeg".to_vec());
+        let accept = TrayAccept {
+            mime_types: vec!["image/jpeg".into()],
+        };
+        let staged = stage_studio_clipboard_image(image, &accept).unwrap();
+        assert_eq!(staged.mime, "image/jpeg");
+        assert_eq!(staged.kind, ComposerMediaKind::Image);
     }
 
     #[test]

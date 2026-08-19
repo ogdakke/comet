@@ -1,5 +1,19 @@
 //! Magic-byte sniffing for generated media.
 
+/// Media types the studio composer can import as references, independent of
+/// which models are selected. Model-specific MIME constraints surface as
+/// composer conflicts after attach.
+pub const STUDIO_INPUT_MIMES: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+    "video/mp4",
+    "video/quicktime",
+    "audio/wav",
+    "audio/mpeg",
+];
+
 /// Identify a persistable media type from file contents.
 pub fn sniff_media_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {

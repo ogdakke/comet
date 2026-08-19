@@ -29,6 +29,7 @@ pub(super) struct LineageTile {
     pub progress: Option<f32>,
     pub media_kind: MediaKind,
     pub duration_seconds: Option<f64>,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -44,6 +45,7 @@ struct Slot {
     progress: Option<f32>,
     media_kind: MediaKind,
     duration_seconds: Option<f64>,
+    error: Option<String>,
 }
 
 pub(super) fn run_source_artifact(run: &StudioRunView) -> Option<StudioArtifactId> {
@@ -149,6 +151,7 @@ fn collect_slots(view: &StudioConversationView) -> Vec<Slot> {
                     progress: run.progress,
                     media_kind: slot_media_kind(run, artifact_id),
                     duration_seconds: slot_duration(run, artifact_id),
+                    error: run.error.clone(),
                 });
             }
         }
@@ -331,6 +334,7 @@ impl LineageIndex {
                 progress: slot.progress,
                 media_kind: slot.media_kind,
                 duration_seconds: slot.duration_seconds,
+                error: slot.error.clone(),
             });
             if let Some(artifact_id) = slot.artifact_id
                 && let Some(kids) = children.get(&artifact_id)
@@ -833,5 +837,30 @@ mod tests {
         assert!(turn_has_root_outputs(&conversation, generate_id));
         assert!(turn_has_root_outputs(&conversation, other_id));
         assert_eq!(visible_root_turns(&conversation).len(), 2);
+    }
+
+    #[test]
+    fn failed_run_tiles_keep_the_provider_error() {
+        let mut failed = run(
+            MediaOperation::ReferenceToVideo,
+            "seedance",
+            Vec::new(),
+            None,
+            StudioRunState::Failed,
+            1,
+        );
+        failed.error = Some(
+            "Your prompt violates the content policy of Venice.ai or the model provider".into(),
+        );
+        failed.model.output_kind = MediaKind::Video;
+        let generate = turn("a comet", vec![failed]);
+        let generate_id = generate.id;
+        let tiles = lineage_tiles_for_turn(&view(vec![generate]), generate_id);
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(tiles[0].state, StudioRunState::Failed);
+        assert_eq!(
+            tiles[0].error.as_deref(),
+            Some("Your prompt violates the content policy of Venice.ai or the model provider")
+        );
     }
 }

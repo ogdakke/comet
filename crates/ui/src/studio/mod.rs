@@ -2,7 +2,7 @@
 //!
 //! - [`page`] — conversation load/submit and the feed/lightbox outlet;
 //! - [`gallery`] — profile-wide image grid, multi-select, and bulk actions;
-//! - [`feed`] — tiles, turns, and the tick rail;
+//! - [`feed`] — tiles, turns, the tick rail, and drag-to-composer references;
 //! - [`composer`] — model picker, per-model controls, and generate;
 //! - [`tray`] — reference attach, ImportStudioAsset, budgets, Make video;
 //! - [`artifact`] — full-bleed image/video strip, filmstrip, and inspector;

@@ -20,7 +20,7 @@ mod venice_video;
 pub use catalog::{CapabilityIntersection, intersect_video_globals, picker_models};
 pub use composer::*;
 pub use fake::{FakeMediaProvider, FakeSubmissionMode};
-pub use mime::{accepted_output_mime, sniff_media_mime};
+pub use mime::{STUDIO_INPUT_MIMES, accepted_output_mime, sniff_media_mime};
 pub use model::*;
 pub use probe::{MediaProbe, probe_media};
 pub use provider::*;

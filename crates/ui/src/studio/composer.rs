@@ -18,6 +18,7 @@ use crate::popover;
 use crate::theme::Theme;
 
 use super::draft::{DraftRunConfig, control_value_label, restore_refs};
+use super::feed::StudioArtifactDrag;
 use super::page::StudioPage;
 
 const IMAGE_PROMPT_PLACEHOLDER: &str = "Describe the image you want to create";
@@ -1652,7 +1653,6 @@ impl StudioPage {
                             ),
                     ),
             );
-        let drop_enabled = self.tray_add_enabled();
         let composer = div()
             .relative()
             .w_full()
@@ -1664,22 +1664,28 @@ impl StudioPage {
             .border_color(theme.border)
             .bg(theme.input_glass_bg())
             .when(!theme.is_glass(), |composer| composer.shadow_lg())
-            .when(drop_enabled, |composer| {
-                composer
-                    .on_drag_move::<ExternalPaths>(cx.listener(
-                        |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
-                            let inside = e.bounds.contains(&e.event.position);
-                            if this.file_drag_active != inside {
-                                this.file_drag_active = inside;
-                                cx.notify();
-                            }
-                        },
-                    ))
-                    .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                        this.file_drag_active = false;
-                        this.add_dropped_paths(paths.paths().to_vec(), cx);
+            .on_drag_move::<ExternalPaths>(cx.listener(
+                |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
+                    let inside = e.bounds.contains(&e.event.position);
+                    if this.file_drag_active != inside {
+                        this.file_drag_active = inside;
                         cx.notify();
-                    }))
+                    }
+                },
+            ))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                this.file_drag_active = false;
+                this.add_dropped_paths(paths.paths().to_vec(), cx);
+                cx.notify();
+            }))
+            .on_drop(cx.listener(|this, drag: &StudioArtifactDrag, _, cx| {
+                this.file_drag_active = false;
+                this.attach_artifact_reference(drag.artifact_id, cx);
+                cx.notify();
+            }))
+            .drag_over::<StudioArtifactDrag>(|style, _, _, cx| {
+                let theme = Theme::of(cx);
+                style.border_color(theme.text.opacity(0.5))
             })
             .px(px(8.0))
             .pt(px(8.0))
@@ -1694,12 +1700,12 @@ impl StudioPage {
                     .flex_row()
                     .items_center()
                     .gap(px(7.0))
+                    .child(self.render_mode_segment(theme, cx))
                     .when(
                         self.composer.mode == ComposerMode::Video
                             && !self.composer_view.globals.duration_choices.is_empty(),
                         |row| row.child(self.render_duration_control(theme, cx)),
                     )
-                    .child(self.render_mode_segment(theme, cx))
                     .child(
                         div().flex_1().min_w_0().child(
                             crate::edge_fade::edge_faded(
@@ -1737,23 +1743,25 @@ impl StudioPage {
             .flex_col()
             .items_center()
             .gap(px(10.0))
-            .when(drop_enabled, |stack| {
-                stack
-                    .on_drag_move::<ExternalPaths>(cx.listener(
-                        |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
-                            let inside = e.bounds.contains(&e.event.position);
-                            if this.file_drag_active != inside {
-                                this.file_drag_active = inside;
-                                cx.notify();
-                            }
-                        },
-                    ))
-                    .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                        this.file_drag_active = false;
-                        this.add_dropped_paths(paths.paths().to_vec(), cx);
+            .on_drag_move::<ExternalPaths>(cx.listener(
+                |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
+                    let inside = e.bounds.contains(&e.event.position);
+                    if this.file_drag_active != inside {
+                        this.file_drag_active = inside;
                         cx.notify();
-                    }))
-            })
+                    }
+                },
+            ))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                this.file_drag_active = false;
+                this.add_dropped_paths(paths.paths().to_vec(), cx);
+                cx.notify();
+            }))
+            .on_drop(cx.listener(|this, drag: &StudioArtifactDrag, _, cx| {
+                this.file_drag_active = false;
+                this.attach_artifact_reference(drag.artifact_id, cx);
+                cx.notify();
+            }))
             .children(self.render_conflict_popup(theme, cx))
             .children(
                 self.popup_conflict

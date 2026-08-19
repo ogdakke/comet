@@ -452,25 +452,105 @@ fn i2v_plus_r2v_one_image_is_ready() {
 }
 
 #[test]
-fn image_mode_ignores_stills_after_a_video_visit() {
+fn image_mode_stills_are_unsupported_on_t2i() {
     let (r2v, _, _, t2i) = catalog_models();
     let images = vec![still("keep-a"), still("keep-b")];
     let video = video_snapshot(&[&r2v], images, 5.0);
     let catalog = catalog(&[&r2v, &t2i]);
-    let (image, view) = apply_event(
-        video.clone(),
-        &catalog,
-        ComposerEvent::SetMode {
-            mode: ComposerMode::Image,
-            restore: vec![selected(&t2i)],
-        },
-    );
+    let event = ComposerEvent::SetMode {
+        mode: ComposerMode::Image,
+        restore: vec![selected(&t2i)],
+    };
+    let (image, view) = apply_event(video.clone(), &catalog, event.clone());
     assert_eq!(image.attachments.len(), 2);
     assert_eq!(image.mode, ComposerMode::Image);
     assert!(image.duration.is_none());
-    assert_eq!(map_tray(&image, &t2i).unwrap(), Vec::new());
-    assert!(view.send.enabled, "{:?}", codes(&view));
-    assert_eq!(view.phase, ComposerPhase::Editing);
+    let leftover = map_tray(&image, &t2i).unwrap_err();
+    assert_eq!(leftover.code, ConflictCode::UnsupportedReferences);
+    assert!(!view.send.enabled, "{:?}", codes(&view));
+    assert_eq!(view.phase, ComposerPhase::NeedsResolution);
+    assert_eq!(codes(&view), vec![ConflictCode::UnsupportedReferences]);
+    let blocked = conflict(&view, ConflictCode::UnsupportedReferences);
+    assert!(blocked.title.contains("doesn’t accept reference images"));
+    assert_eq!(popup_conflict(&view, &event).as_ref(), Some(&blocked.id));
+}
+
+#[test]
+fn t2i_does_not_silently_ignore_stills() {
+    let t2i = t2i("flux");
+    let snapshot = ComposerSnapshot {
+        mode: ComposerMode::Image,
+        prompt: "hello".to_owned(),
+        attachments: vec![still("ref")],
+        selected: vec![selected(&t2i)],
+        ..ComposerSnapshot::default()
+    };
+    let view = evaluate_composer(&snapshot, std::slice::from_ref(&t2i));
+    assert!(!view.send.enabled);
+    assert!(!view.attachments.add_enabled);
+    assert_eq!(codes(&view), vec![ConflictCode::UnsupportedReferences]);
+    let blocked = conflict(&view, ConflictCode::UnsupportedReferences);
+    assert!(blocked.title.contains("doesn’t accept reference images"));
+    assert_eq!(
+        popup_conflict(
+            &view,
+            &ComposerEvent::Attach {
+                attachment: snapshot.attachments[0].clone(),
+            }
+        )
+        .as_ref(),
+        Some(&blocked.id)
+    );
+}
+
+#[test]
+fn add_button_only_for_reference_ops() {
+    let t2i = t2i("flux");
+    let t2v = t2v("t2v", &[5.0, 8.0]);
+    let r2v = r2v("r2v", 9, &[5.0, 8.0]);
+    let i2v = i2v("i2v", false);
+    let empty = ComposerSnapshot {
+        mode: ComposerMode::Image,
+        ..ComposerSnapshot::default()
+    };
+    let view = evaluate_composer(&empty, std::slice::from_ref(&t2i));
+    assert!(!view.attachments.add_enabled);
+    for mime in ["image/png", "video/mp4", "audio/wav"] {
+        assert!(
+            view.attachments
+                .accept
+                .mime_types
+                .iter()
+                .any(|accepted| accepted == mime),
+            "missing {mime} in {:?}",
+            view.attachments.accept.mime_types
+        );
+    }
+
+    let with_t2i = ComposerSnapshot {
+        mode: ComposerMode::Image,
+        selected: vec![selected(&t2i)],
+        ..ComposerSnapshot::default()
+    };
+    let view = evaluate_composer(&with_t2i, std::slice::from_ref(&t2i));
+    assert!(!view.attachments.add_enabled);
+
+    let with_t2v = video_snapshot(&[&t2v], Vec::new(), 5.0);
+    let view = evaluate_composer(&with_t2v, std::slice::from_ref(&t2v));
+    assert!(!view.attachments.add_enabled);
+
+    let with_r2v = video_snapshot(&[&r2v], Vec::new(), 5.0);
+    let view = evaluate_composer(&with_r2v, std::slice::from_ref(&r2v));
+    assert!(view.attachments.add_enabled);
+
+    let with_i2v = video_snapshot(&[&i2v], Vec::new(), 6.0);
+    let view = evaluate_composer(&with_i2v, std::slice::from_ref(&i2v));
+    assert!(view.attachments.add_enabled);
+
+    assert!(MediaOperation::ImageToImage.accepts_reference_assets());
+    assert!(MediaOperation::VideoToVideo.accepts_reference_assets());
+    assert!(!MediaOperation::ImageEdit.accepts_reference_assets());
+    assert!(!MediaOperation::Upscale.accepts_reference_assets());
 }
 
 #[test]
@@ -1329,7 +1409,8 @@ fn set_mode_revert_mode_restores_image_chips() {
         restored.attachments[0].content_hash,
         attachments[0].content_hash
     );
-    assert!(view.send.enabled, "{:?}", codes(&view));
+    assert!(!view.send.enabled, "{:?}", codes(&view));
+    assert_eq!(codes(&view), vec![ConflictCode::UnsupportedReferences]);
     assert_eq!(view.mode, ComposerMode::Image);
 }
 

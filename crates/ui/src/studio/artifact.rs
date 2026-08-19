@@ -103,6 +103,115 @@ pub(super) struct ArtifactFrame {
     pub progress: Option<f32>,
     pub media_kind: MediaKind,
     pub duration_seconds: Option<f64>,
+    pub error: Option<String>,
+}
+
+/// Provider message on a failed run. Empty strings are treated as missing so
+/// the UI can fall back to a generic "Generation failed" label.
+pub(super) fn run_error_message(error: Option<&str>) -> Option<&str> {
+    error.map(str::trim).filter(|message| !message.is_empty())
+}
+
+/// Full-width wrapping chip used under a turn prompt and in the inspector.
+pub(super) fn render_run_error_chip(theme: &Theme, message: &str) -> AnyElement {
+    let red = theme.danger_muted;
+    let danger = theme.danger;
+    div()
+        .w_full()
+        .flex()
+        .items_start()
+        .gap(px(8.0))
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(danger.opacity(0.16))
+        .bg(danger.opacity(0.05))
+        .px(px(8.0))
+        .py(px(7.0))
+        .text_size(px(12.0))
+        .child(
+            div()
+                .flex_none()
+                .size(px(20.0))
+                .rounded(px(6.0))
+                .bg(danger.opacity(0.12))
+                .flex()
+                .items_center()
+                .justify_center()
+                .mt(px(1.0))
+                .child(
+                    crate::icons::icon(crate::icons::DANGER_TRIANGLE)
+                        .size(px(12.0))
+                        .text_color(red.opacity(0.8)),
+                ),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(red.opacity(0.8))
+                        .child(SharedString::from("Error")),
+                )
+                .child(
+                    div()
+                        .text_color(theme.text.opacity(0.8))
+                        .child(SharedString::from(message.to_string())),
+                ),
+        )
+        .into_any_element()
+}
+
+/// Centered overlay for a failed feed tile or lightbox stage.
+pub(super) fn render_run_failed_overlay(theme: &Theme, error: Option<&str>) -> AnyElement {
+    let red = theme.danger_muted;
+    let danger = theme.danger;
+    let message = run_error_message(error).map(|message| SharedString::from(message.to_string()));
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .px(px(16.0))
+        .gap(px(8.0))
+        .child(
+            div()
+                .flex_none()
+                .size(px(28.0))
+                .rounded(px(8.0))
+                .bg(danger.opacity(0.12))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    crate::icons::icon(crate::icons::DANGER_TRIANGLE)
+                        .size(px(14.0))
+                        .text_color(red.opacity(0.8)),
+                ),
+        )
+        .child(
+            div()
+                .text_size(px(12.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(red.opacity(0.9))
+                .text_center()
+                .child(SharedString::from("Generation failed")),
+        )
+        .when_some(message, |el, message| {
+            el.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.text.opacity(0.8))
+                    .text_center()
+                    .child(message),
+            )
+        })
+        .into_any_element()
 }
 
 impl ArtifactFrame {
@@ -195,6 +304,7 @@ pub(super) fn frames_from_gallery(items: &[StudioGalleryItem]) -> Vec<ArtifactFr
             progress: None,
             media_kind: item.media_kind,
             duration_seconds: item.duration_seconds,
+            error: None,
         })
         .collect()
 }
@@ -237,6 +347,7 @@ pub(super) fn frames_from_conversation(view: &StudioConversationView) -> Vec<Art
                     duration_seconds: artifact
                         .duration_seconds
                         .or_else(|| run_duration_seconds(run)),
+                    error: run.error.clone(),
                 });
             }
             if !matches!(
@@ -269,6 +380,7 @@ pub(super) fn frames_from_conversation(view: &StudioConversationView) -> Vec<Art
                 progress: run.progress,
                 media_kind: tile.media_kind,
                 duration_seconds: tile.duration_seconds.or_else(|| run_duration_seconds(run)),
+                error: run.error.clone(),
             })
         })
         .collect()
@@ -2344,9 +2456,9 @@ impl StudioPage {
                             .justify_center()
                             .when_some(loading, |box_, fill| box_.child(fill))
                             .when(failed, |box_| {
-                                box_.text_size(px(12.0))
-                                    .text_color(theme.text_faint)
-                                    .child("Generation failed")
+                                let error = slot.and_then(|slot| slot.error.as_deref());
+                                box_.size_full()
+                                    .child(render_run_failed_overlay(theme, error))
                             })
                             .when(show_fallback, |box_| {
                                 box_.text_size(px(12.0))
@@ -2394,6 +2506,13 @@ impl StudioPage {
             .overflow_hidden()
             .rounded(px(12.0))
             .bg(crate::theme::ink(0.04));
+        if slot.is_some_and(|slot| slot.state == StudioRunState::Failed) {
+            let theme = Theme::of(cx);
+            let error = slot.and_then(|slot| slot.error.as_deref());
+            return frame
+                .child(stage.child(render_run_failed_overlay(&theme, error)))
+                .into_any_element();
+        }
         if let Some(base) = base {
             stage = stage.child(contain_layers(base, overlay, px(0.0), None));
         }
@@ -2494,6 +2613,9 @@ impl StudioPage {
                 frame.is_video(),
             )
         });
+        let failed_error = selected
+            .filter(|frame| frame.state == StudioRunState::Failed)
+            .and_then(|frame| run_error_message(frame.error.as_deref()).map(str::to_string));
         let compare_source = id.and_then(|id| {
             self.compare_pressed
                 .then(|| self.upscaled_source_for(id))
@@ -2975,6 +3097,14 @@ impl StudioPage {
                             )
                     },
                 )
+                .when_some(failed_error, |inspector, message| {
+                    inspector.child(
+                        div()
+                            .flex_none()
+                            .mt(px(12.0))
+                            .child(render_run_error_chip(theme, &message)),
+                    )
+                })
                 .child(div().flex_1())
                 .when_some(id, |inspector, id| {
                     let video = self.artifact_is_video(id);
@@ -3353,6 +3483,17 @@ mod tests {
     }
 
     #[test]
+    fn run_error_message_drops_blank_provider_copy() {
+        assert_eq!(run_error_message(None), None);
+        assert_eq!(run_error_message(Some("")), None);
+        assert_eq!(run_error_message(Some("   ")), None);
+        assert_eq!(
+            run_error_message(Some("  policy violation  ")),
+            Some("policy violation")
+        );
+    }
+
+    #[test]
     fn reapplying_the_route_does_not_steal_a_loading_frame() {
         let ready = StudioArtifactId::new();
         assert!(should_reapply_artifact_selection(None, ready));
@@ -3462,6 +3603,7 @@ mod tests {
             progress: None,
             media_kind: MediaKind::Image,
             duration_seconds: None,
+            error: None,
         }
     }
 
@@ -3644,6 +3786,7 @@ mod tests {
         assert_eq!(frames[0].width, Some(2));
         assert_eq!(frames[0].height, Some(3));
         assert!(frames[0].is_loading());
+        assert_eq!(frames[0].error, None);
         assert_eq!(
             resolve_frame_key(
                 ArtifactFrameKey::Loading {
@@ -3654,6 +3797,80 @@ mod tests {
             ),
             Some(frames[0].key)
         );
+    }
+
+    #[test]
+    fn conversation_frames_keep_a_failed_provider_error() {
+        use chrono::Utc;
+        use std::collections::BTreeMap;
+        let run_id = StudioRunId::new();
+        let view = StudioConversationView {
+            conversation: zeron_proto::StudioConversationSummary {
+                id: StudioConversationId::new(),
+                title: "one".into(),
+                turn_count: 1,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                archived: false,
+                forked_from_turn_id: None,
+                creating: false,
+                done: false,
+            },
+            turns: vec![zeron_proto::StudioTurnView {
+                id: StudioTurnId::new(),
+                position: 0,
+                prompt: "a clip".into(),
+                source_turn_id: None,
+                batch_id: zeron_studio::StudioBatchId::new(),
+                created_at: Utc::now(),
+                runs: vec![zeron_proto::StudioRunView {
+                    id: run_id,
+                    position: 0,
+                    provider_id: "venice".into(),
+                    model: zeron_studio::MediaModel {
+                        provider_id: "venice".into(),
+                        id: "seedance".into(),
+                        display_name: "Seedance".into(),
+                        description: None,
+                        operation: zeron_studio::MediaOperation::ReferenceToVideo,
+                        output_kind: MediaKind::Video,
+                        output_mime_types: vec!["video/mp4".into()],
+                        input_constraints: Vec::new(),
+                        prompt_maximum_chars: None,
+                        negative_prompt_maximum_chars: None,
+                        maximum_output_count: 1,
+                        controls: Vec::new(),
+                        pricing: None,
+                        features: Vec::new(),
+                        video: zeron_studio::VideoModelMeta::default(),
+                        manifest_version: "test".into(),
+                        fetched_at: Utc::now(),
+                    },
+                    controls: BTreeMap::new(),
+                    output_count: 1,
+                    display_aspect_ratio: (9, 16),
+                    state: StudioRunState::Failed,
+                    progress: None,
+                    error: Some(
+                        "Your prompt violates the content policy of Venice.ai or the model provider"
+                            .into(),
+                    ),
+                    quote: None,
+                    prompt: None,
+                    inputs: Vec::new(),
+                    artifacts: Vec::new(),
+                }],
+            }],
+        };
+        let frames = frames_from_conversation(&view);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].state, StudioRunState::Failed);
+        assert_eq!(
+            frames[0].error.as_deref(),
+            Some("Your prompt violates the content policy of Venice.ai or the model provider")
+        );
+        assert!(frames[0].is_video());
+        assert!(!frames[0].is_loading());
     }
 
     #[test]

@@ -921,13 +921,7 @@ mod tests {
             false,
             CHROME_IDLE - Duration::from_millis(1)
         ));
-        assert!(!chrome_visible(
-            true,
-            false,
-            true,
-            false,
-            CHROME_IDLE
-        ));
+        assert!(!chrome_visible(true, false, true, false, CHROME_IDLE));
         assert!(!chrome_visible(
             true,
             false,
