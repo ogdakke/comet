@@ -161,7 +161,14 @@ fn audio_capability_for(
     controls: &BTreeMap<crate::ControlId, ControlValue>,
 ) -> AudioCapability {
     match family {
-        AdapterFamily::Grok | AdapterFamily::Hidden => AudioCapability::None,
+        AdapterFamily::Hidden => AudioCapability::None,
+        AdapterFamily::Grok => match controls.get(&crate::ControlId::from("audio")) {
+            Some(ControlValue::Boolean { value }) => {
+                AudioCapability::Configurable { default: *value }
+            }
+            // Grok R2V has no audio toggle; sending true/false 400s.
+            _ => AudioCapability::None,
+        },
         AdapterFamily::Seedance => match controls.get(&crate::ControlId::from("audio")) {
             Some(ControlValue::Boolean { value }) => {
                 AudioCapability::Configurable { default: *value }
@@ -268,24 +275,29 @@ fn apply_grok_references(
     if let Some(input) = context
         .inputs
         .iter()
-        .find(|input| input.role.as_str() != ROLE_REFERENCE)
+        .find(|input| !matches!(input.role.as_str(), ROLE_REFERENCE | ROLE_SOURCE))
     {
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidRequest,
             format!(
-                "Grok reference-to-video only accepts reference images, not {}",
+                "Grok video only accepts a source clip and reference images, not {}",
                 input.role.as_str()
             ),
         ));
     }
+    if let Some(url) = single_role_data_url(context, ROLE_SOURCE)? {
+        payload.insert("video_url".into(), url.into());
+    }
     let urls = role_data_urls(context, ROLE_REFERENCE)?;
-    if urls.is_empty() {
+    if !urls.is_empty() {
+        payload.insert("referenceImageUrls".into(), urls.into());
+    }
+    if !payload.contains_key("video_url") && !payload.contains_key("referenceImageUrls") {
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidRequest,
-            "Grok reference-to-video requires reference images",
+            "Grok video requires a source clip or reference images",
         ));
     }
-    payload.insert("referenceImageUrls".into(), urls.into());
     Ok(())
 }
 
@@ -435,12 +447,21 @@ mod tests {
                         height: 9,
                     },
                 ),
-                ("audio".into(), ControlValue::Boolean { value: true }),
             ]),
             inputs: Vec::new(),
             manifest_version: "v1".into(),
             display_aspect_ratio: (16, 9),
         }
+    }
+
+    fn grok_v2v_request() -> GenerationRequest {
+        let mut request = grok_request();
+        request.model_id = "grok-imagine-video-to-video-private".into();
+        request.operation = MediaOperation::VideoToVideo;
+        request
+            .controls
+            .insert("audio".into(), ControlValue::Boolean { value: true });
+        request
     }
 
     #[test]
@@ -683,6 +704,55 @@ mod tests {
         assert!(value.get("audio").is_none());
         assert_eq!(value["referenceImageUrls"].as_array().unwrap().len(), 1);
         assert!(value.get("reference_image_urls").is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn grok_v2v_queue_sends_video_url_and_audio() {
+        let (path, input) = file_input(ROLE_SOURCE, 0, "video/mp4", b"mp4");
+        let request = grok_v2v_request();
+        let context = SubmitContext {
+            idempotency_key: "key".into(),
+            inputs: vec![input],
+        };
+        let value = video_queue_payload(&request, &context, AdapterFamily::Grok).unwrap();
+        assert_eq!(value["duration"], "8");
+        assert_eq!(value["audio"], true);
+        assert!(
+            value["video_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:video/mp4;base64,")
+        );
+        assert!(value.get("referenceImageUrls").is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn grok_v2v_quote_sends_audio() {
+        let value = video_quote_payload(&grok_v2v_request(), None).unwrap();
+        assert_eq!(value["duration"], "8");
+        assert_eq!(value["audio"], true);
+    }
+
+    #[test]
+    fn seedance_v2v_queue_sends_video_url() {
+        let (path, input) = file_input(ROLE_SOURCE, 0, "video/mp4", b"mp4");
+        let mut request = seedance_request();
+        request.model_id = "wan-2-7-video-to-video".into();
+        request.operation = MediaOperation::VideoToVideo;
+        let context = SubmitContext {
+            idempotency_key: "key".into(),
+            inputs: vec![input],
+        };
+        let value = video_queue_payload(&request, &context, AdapterFamily::Seedance).unwrap();
+        assert!(
+            value["video_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:video/mp4;base64,")
+        );
+        assert!(value.get("image_url").is_none());
         let _ = std::fs::remove_file(path);
     }
 

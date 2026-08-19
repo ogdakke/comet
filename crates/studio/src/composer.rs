@@ -1975,7 +1975,7 @@ fn budgets(
             .max()
             .unwrap_or(0);
         let used = if used == 0 {
-            tray_kind_count(snapshot, role)
+            tray_kind_count(snapshot, role, usable)
         } else {
             used
         };
@@ -1992,8 +1992,9 @@ fn budgets(
     budgets
 }
 
-fn tray_kind_count(snapshot: &ComposerSnapshot, role: &str) -> u32 {
+fn tray_kind_count(snapshot: &ComposerSnapshot, role: &str, usable: &[&MediaModel]) -> u32 {
     let kind = match role {
+        ROLE_SOURCE if source_role_is_video(usable) => ComposerMediaKind::Video,
         ROLE_SOURCE | ROLE_LAST_FRAME | ROLE_REFERENCE => ComposerMediaKind::Image,
         ROLE_REFERENCE_VIDEO => ComposerMediaKind::Video,
         ROLE_AUDIO | ROLE_REFERENCE_AUDIO => ComposerMediaKind::Audio,
@@ -2004,6 +2005,15 @@ fn tray_kind_count(snapshot: &ComposerSnapshot, role: &str) -> u32 {
         .iter()
         .filter(|attachment| !attachment.pending && attachment.kind == kind)
         .count() as u32
+}
+
+fn source_role_is_video(usable: &[&MediaModel]) -> bool {
+    usable
+        .iter()
+        .any(|model| model.operation == MediaOperation::VideoToVideo)
+        && !usable
+            .iter()
+            .any(|model| model.operation == MediaOperation::ImageToVideo)
 }
 
 fn hints(

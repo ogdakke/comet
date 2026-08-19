@@ -831,6 +831,102 @@ fn grok_id_prefix_matches_private_variants() {
     assert!(model.is_picker_visible());
 }
 
+fn video_source_mimes(model: &zeron_studio::MediaModel) -> Vec<String> {
+    model
+        .input_constraints
+        .iter()
+        .find(|constraint| constraint.role.as_str() == ROLE_SOURCE)
+        .map(|constraint| constraint.mime.accepted.clone())
+        .unwrap_or_default()
+}
+
+#[test]
+fn wan_video_to_video_is_selectable() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(IMAGE_TO_VIDEO).unwrap();
+    fixture["data"][0]["id"] = "wan-2-7-video-to-video".into();
+    fixture["data"][0]["model_spec"]["name"] = "Wan 2.7 Edit".into();
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(model.operation, MediaOperation::VideoToVideo);
+    assert_eq!(model.video.adapter_family, AdapterFamily::Seedance);
+    assert!(
+        video_source_mimes(&model)
+            .iter()
+            .any(|mime| mime.starts_with("video/"))
+    );
+    let references = model
+        .input_constraints
+        .iter()
+        .find(|constraint| constraint.role.as_str() == ROLE_REFERENCE)
+        .unwrap();
+    assert_eq!(references.minimum_count, 0);
+    assert_eq!(references.maximum_count, 1);
+    assert!(model.is_picker_visible());
+}
+
+#[test]
+fn happyhorse_video_to_video_is_selectable() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(IMAGE_TO_VIDEO).unwrap();
+    fixture["data"][0]["id"] = "happyhorse-1-0-video-to-video".into();
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(model.operation, MediaOperation::VideoToVideo);
+    assert_eq!(model.video.adapter_family, AdapterFamily::Seedance);
+    let references = model
+        .input_constraints
+        .iter()
+        .find(|constraint| constraint.role.as_str() == ROLE_REFERENCE)
+        .unwrap();
+    assert_eq!(references.minimum_count, 0);
+    assert_eq!(references.maximum_count, 9);
+    assert!(model.is_picker_visible());
+}
+
+#[test]
+fn grok_video_to_video_keeps_audio_and_is_selectable() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(IMAGE_TO_VIDEO).unwrap();
+    fixture["data"][0]["id"] = "grok-imagine-video-to-video-private".into();
+    fixture["data"][0]["model_spec"]["name"] = "Grok Imagine".into();
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(model.operation, MediaOperation::VideoToVideo);
+    assert_eq!(model.video.adapter_family, AdapterFamily::Grok);
+    assert_ne!(model.video.generate_audio, AudioCapability::None);
+    assert!(
+        model
+            .controls
+            .iter()
+            .any(|control| control.id.as_str() == "audio")
+    );
+    assert!(
+        video_source_mimes(&model)
+            .iter()
+            .any(|mime| mime.starts_with("video/"))
+    );
+    assert!(model.is_picker_visible());
+}
+
+#[test]
+fn live_video_model_type_is_video_to_video() {
+    let mut fixture: serde_json::Value = serde_json::from_slice(TEXT_TO_VIDEO).unwrap();
+    fixture["data"][0]["id"] = "wan-2-7-video-to-video".into();
+    fixture["data"][0]["model_spec"]["constraints"]["model_type"] = "video".into();
+    let model = normalize_model_catalog(&serde_json::to_vec(&fixture).unwrap(), fetched_at())
+        .unwrap()
+        .remove(0);
+    assert_eq!(model.operation, MediaOperation::VideoToVideo);
+    assert_eq!(model.video.adapter_family, AdapterFamily::Seedance);
+    assert!(
+        video_source_mimes(&model)
+            .iter()
+            .any(|mime| mime.starts_with("video/"))
+    );
+    assert!(model.is_picker_visible());
+}
+
 #[test]
 fn invalid_duration_choices_are_skipped() {
     let mut fixture: serde_json::Value = serde_json::from_slice(TEXT_TO_VIDEO).unwrap();

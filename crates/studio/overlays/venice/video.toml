@@ -98,6 +98,31 @@ requires_visual_reference = true
 reference_images = { min = 1, max = 7 }
 # matches grok-imagine-reference-to-video and *-private (download_url path)
 
+[[family]]
+id_prefix = "grok-imagine-video-to-video"
+operation = "video_to_video"
+adapter_family = "grok"
+source = "https://docs.venice.ai/api-reference/endpoint/video/queue"
+reviewed = "2026-08-19"
+reference_images = { min = 0, max = 7 }
+# matches grok-imagine-video-to-video and *-private; source clip is required
+
+[[family]]
+id_prefix = "wan-2-7-video-to-video"
+operation = "video_to_video"
+adapter_family = "seedance"
+source = "https://docs.venice.ai/api-reference/endpoint/video/queue"
+reviewed = "2026-08-19"
+reference_images = { min = 0, max = 1 }
+
+[[family]]
+id_prefix = "happyhorse-1-0-video-to-video"
+operation = "video_to_video"
+adapter_family = "seedance"
+source = "https://docs.venice.ai/api-reference/endpoint/video/queue"
+reviewed = "2026-08-19"
+reference_images = { min = 0, max = 9 }
+
 [[model]]
 id = "kling-o3-pro-reference-to-video"
 operation = "reference_to_video"

@@ -3,13 +3,15 @@
 use crate::{
     AdapterFamily, AudioCapability, ControlChoice, ControlId, ControlKind, ControlValue,
     InputConstraint, InputRole, MediaModel, MediaOperation, MimeConstraint, ModelControl,
-    ROLE_LAST_FRAME, ROLE_REFERENCE, ROLE_REFERENCE_AUDIO, ROLE_REFERENCE_VIDEO, VideoModelMeta,
+    ROLE_LAST_FRAME, ROLE_REFERENCE, ROLE_REFERENCE_AUDIO, ROLE_REFERENCE_VIDEO, ROLE_SOURCE,
+    VideoModelMeta,
 };
 
 const BUNDLED_OVERLAY: &str = include_str!("../overlays/venice/video.toml");
 
 const IMAGE_ACCEPT: &[&str] = &["image/jpeg", "image/png", "image/webp"];
 const VIDEO_ACCEPT: &[&str] = &["video/mp4", "video/quicktime"];
+const SOURCE_VIDEO_ACCEPT: &[&str] = &["video/mp4", "video/quicktime", "video/webm"];
 const AUDIO_ACCEPT: &[&str] = &["audio/wav", "audio/mpeg"];
 
 #[derive(Debug, thiserror::Error)]
@@ -28,8 +30,11 @@ pub enum OverlayError {
     DuplicateKey { key: String },
     #[error("overlay prefix tie between {left} and {right}")]
     PrefixTie { left: String, right: String },
-    #[error("overlay promotes {model_id} to reference_to_video without its own reviewed date")]
-    UnreviewedPromotion { model_id: String },
+    #[error("overlay promotes {model_id} to {operation} without its own reviewed date")]
+    UnreviewedPromotion {
+        model_id: String,
+        operation: &'static str,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -326,12 +331,18 @@ impl VeniceVideoOverlay {
             return Ok(());
         };
         let spec = &row.spec;
+        let promoted = match spec.operation {
+            Some(MediaOperation::ReferenceToVideo) => Some("reference_to_video"),
+            Some(MediaOperation::VideoToVideo) => Some("video_to_video"),
+            _ => None,
+        };
         if live_model_type == "image-to-video"
-            && spec.operation == Some(MediaOperation::ReferenceToVideo)
+            && let Some(operation) = promoted
             && !row.own_reviewed
         {
             return Err(OverlayError::UnreviewedPromotion {
                 model_id: model.id.as_str().to_owned(),
+                operation,
             });
         }
         if let Some(operation) = spec.operation {
@@ -342,6 +353,14 @@ impl VeniceVideoOverlay {
                 .input_constraints
                 .retain(|constraint| constraint.role.as_str() != crate::ROLE_SOURCE);
         }
+        if model.operation == MediaOperation::VideoToVideo {
+            upsert_role(
+                model,
+                ROLE_SOURCE,
+                CountRange { min: 1, max: 1 },
+                MimeConstraint::accepting(SOURCE_VIDEO_ACCEPT.iter().copied()),
+            );
+        }
 
         model.video = VideoModelMeta {
             adapter_family: spec.adapter_family.unwrap_or(AdapterFamily::Hidden),
@@ -351,7 +370,9 @@ impl VeniceVideoOverlay {
             source_matched_aspect: spec.source_matched_aspect.unwrap_or(false),
             generate_audio: model.video.generate_audio,
         };
-        if model.video.adapter_family == AdapterFamily::Grok {
+        if model.video.adapter_family == AdapterFamily::Grok
+            && model.operation == MediaOperation::ReferenceToVideo
+        {
             model.video.generate_audio = AudioCapability::None;
             model
                 .controls
@@ -629,6 +650,26 @@ reviewed = "2026-08-18"
         assert_eq!(
             overlay.adapter_family("seedance-2-5-text-to-video-basic"),
             AdapterFamily::Seedance
+        );
+        assert_eq!(
+            overlay.adapter_family("wan-2-7-video-to-video"),
+            AdapterFamily::Seedance
+        );
+        assert_eq!(
+            overlay.adapter_family("happyhorse-1-0-video-to-video"),
+            AdapterFamily::Seedance
+        );
+        assert_eq!(
+            overlay.adapter_family("grok-imagine-video-to-video-private"),
+            AdapterFamily::Grok
+        );
+        assert_eq!(
+            overlay.adapter_family("topaz-video-upscale"),
+            AdapterFamily::Hidden
+        );
+        assert_eq!(
+            overlay.adapter_family("kling-v3-pro-motion-control"),
+            AdapterFamily::Hidden
         );
     }
 
