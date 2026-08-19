@@ -1056,13 +1056,7 @@ impl StudioPage {
                     .child(SharedString::from(display_name)),
             )
             .when_some(badge, |chip, badge| {
-                chip.child(
-                    div()
-                        .flex_none()
-                        .text_size(px(10.0))
-                        .text_color(theme.warning)
-                        .child(SharedString::from(badge)),
-                )
+                chip.child(chip_status_badge(SharedString::from(badge), theme))
             })
             .when(self.composer.mode != ComposerMode::Video, |chip| {
                 chip.child(config_readout(
@@ -1980,11 +1974,11 @@ impl StudioPage {
             .when(has_auto, |card| {
                 let active = matches!(current, Some(ControlValue::DurationAuto));
                 card.child(
-                    config_choice("studio-duration-auto", "Auto", active, theme)
-                        .mt(px(8.0))
-                        .on_click(cx.listener(|page, _, _, cx| {
+                    config_choice("studio-duration-auto", "Auto", active, theme).on_click(
+                        cx.listener(|page, _, _, cx| {
                             page.set_composer_duration(ControlValue::DurationAuto, cx);
-                        })),
+                        }),
+                    ),
                 )
             })
             .into_any_element()
@@ -2384,6 +2378,20 @@ fn config_readout(label: SharedString, theme: &Theme) -> gpui::Div {
         .bg(crate::theme::wash(0.065))
         .text_size(px(10.0))
         .text_color(theme.text_muted)
+        .child(label)
+}
+
+/// Warning chip on a selected model (e.g. "No audio"): same amber as the
+/// label, washed so the text still contrasts on the pill.
+fn chip_status_badge(label: SharedString, theme: &Theme) -> gpui::Div {
+    div()
+        .flex_none()
+        .px(px(5.0))
+        .py(px(2.0))
+        .rounded(px(5.0))
+        .bg(theme.warning.opacity(0.14))
+        .text_size(px(10.0))
+        .text_color(theme.warning)
         .child(label)
 }
 
