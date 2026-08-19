@@ -320,10 +320,12 @@ exit 1
             let dir = tempfile::tempdir().unwrap();
             // Simulates rc files that wedge only in interactive mode (`exec
             // tmux` and friends): sleep forever when -i is present.
+            // The fallback PATH keeps /usr/bin so the probe's own `env`
+            // still resolves (macOS has no /bin/env).
             let shell = fake_shell(
                 dir.path(),
                 &format!(
-                    "#!/bin/sh\ncase \" $* \" in *\" -i \"*) sleep 60;; esac\nPATH=\"/zeron-test/fallback/bin:/bin\"; export PATH\n{RUN_PAYLOAD}"
+                    "#!/bin/sh\ncase \" $* \" in *\" -i \"*) sleep 60;; esac\nPATH=\"/zeron-test/fallback/bin:/usr/bin:/bin\"; export PATH\n{RUN_PAYLOAD}"
                 ),
             );
             let start = Instant::now();

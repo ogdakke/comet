@@ -175,7 +175,11 @@ async fn wait_for<F>(mut predicate: F, what: &str)
 where
     F: FnMut() -> bool,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // 30s, not a snappy 10: the whole e2e binary shares the machine with
+    // cargo's parallel test binaries, and under that load a 10s deadline
+    // flakes on engine-scheduling latency, not on real regressions (the
+    // predicate is an "eventually" condition either way).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while !predicate() {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -353,7 +357,8 @@ async fn session_status_transitions_idle_working_idle() {
     );
 
     let mut seen = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Same load-bearing headroom as wait_for (parallel-suite flakes).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let status = tokio::time::timeout_at(deadline, watch.changed())
             .await
