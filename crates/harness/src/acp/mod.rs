@@ -928,7 +928,8 @@ impl Harness for AcpHarness {
     /// engine's 120s / 20s self-continued quiesce would otherwise park a
     /// long think / subagent wait (execute-plan: chime, timestamp, then
     /// "parked session resumed") the same way the harness 30s quiet-settle
-    /// used to. Hermes / Pi keep the watchdog.
+    /// used to. Hermes keeps the watchdog (pi left for the native
+    /// PiHarness, which settles deterministically on `agent_settled`).
     fn deterministic_turn_end(&self) -> bool {
         self.spec.prompt_complete_extension
     }
@@ -1353,10 +1354,10 @@ fn prompt_turn(
 }
 
 /// Hermes (and other agents without an authoritative turn-end
-/// notification) get a 30s quiet window; Pi and Grok do not — long silent
+/// notification) get a 30s quiet window; Grok does not — long silent
 /// reasoning / plan writes look finished and a false settle orphans the
 /// real `session/prompt` response. `ZERON_ACP_QUIET_SETTLE_MS` overrides
-/// (0 disables) except for Pi, which stays exempt.
+/// (0 disables).
 fn quiet_settle_window(prompt_complete_extension: bool) -> Option<Duration> {
     if prompt_complete_extension {
         return None;

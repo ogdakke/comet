@@ -34,6 +34,10 @@ if has "$line" '"type":"get_available_models"'; then
   ok "$(rid "$line")" '{"models":[{"id":"claude-sonnet-4-5","name":"Claude Sonnet 4.5","provider":"anthropic","reasoning":true,"contextWindow":200000},{"id":"gemini-2.5-flash","name":"Gemini 2.5 Flash","provider":"google","reasoning":false,"contextWindow":1000000}]}'
   exit 0
 fi
+if has "$line" '"type":"get_commands"'; then
+  ok "$(rid "$line")" '{"commands":[{"name":"fix-tests","description":"Fix failing tests","source":"prompt"},{"name":"skill:brave-search","description":"Web search","source":"skill"},{"name":"no-description","source":"extension"}]}'
+  exit 0
+fi
 has "$line" '"type":"get_state"' || exit 1
 STATE_ID=$(rid "$line")
 ok "$STATE_ID" '{"sessionId":"pi-s-1","model":{"id":"claude-sonnet-4-5","name":"Claude Sonnet 4.5","provider":"anthropic"},"thinkingLevel":"medium","isStreaming":false}'

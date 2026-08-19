@@ -14,7 +14,10 @@
 //!
 //! - `pi --mode rpc [--session <id>]`: newline-framed JSONL over stdio.
 //!   Commands carry an id; responses resolve by id; agent events (`message_
-//!   update`, `tool_execution_*`, …) stream bare (see [`wire`]).
+//!   update`, `tool_execution_*`, …) stream bare (see [`wire`]). Extension
+//!   UI dialogs (`extension_ui_request` select/confirm/input/editor) block
+//!   the agent until answered — with no dialog surface to route them to,
+//!   they are auto-cancelled so a run can never wedge on one.
 //! - SETUP: `get_state` (session id + model for SessionStarted), optional
 //!   `set_model` (`provider/id` catalog ids split on the slash) and
 //!   `set_thinking_level`, then `prompt`. The prompt RESPONSE means
@@ -52,8 +55,8 @@ use tokio::sync::mpsc;
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
 use wire::PiClient;
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode, ToolCall,
-    ToolDiff,
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
+    SteeringMode, ToolCall, ToolDiff,
 };
 
 mod wire;
@@ -126,6 +129,12 @@ pub struct PiHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
+    /// Slash-command cache behind `commands()` — one `get_commands` probe
+    /// per harness instance (the ACP pattern). Project-level commands
+    /// (`./.pi/agent/`) are cwd-dependent; the probe inherits zeron's
+    /// process cwd, so those are only right for the home project — the
+    /// same limitation the ACP discovery probe has.
+    commands_cache: tokio::sync::OnceCell<Vec<SlashCommand>>,
 }
 
 impl Default for PiHarness {
@@ -134,6 +143,7 @@ impl Default for PiHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
+            commands_cache: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -168,6 +178,86 @@ impl PiHarness {
                     .into(),
             )
         })
+    }
+
+    /// Short-lived `pi --mode rpc --no-session` answering ONE command
+    /// (model and slash-command discovery). Bounded so a wedged pi can't
+    /// hang the pickers; the child is always shut down before returning.
+    async fn rpc_probe(&self, command: Value, timeout_error: &str) -> Result<Value, HarnessError> {
+        let exe = self.resolve_executable()?;
+        let mut cmd = Command::new(&exe);
+        cmd.args(["--mode", "rpc", "--no-session"]);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                HarnessError::NotInstalled(exe.display().to_string())
+            } else {
+                HarnessError::Io(e)
+            }
+        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| HarnessError::Protocol("pi child has no stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| HarnessError::Protocol("pi child has no stdout".into()))?;
+        let (client, mut events) = PiClient::new(stdin, stdout);
+
+        // Catalog/extension loading can take a beat on first run; bounded
+        // so a wedged pi can't hang the picker.
+        let data = tokio::select! {
+            res = client.request(command) => match res {
+                Ok(data) => data,
+                Err(e) => {
+                    shutdown_child(&mut child, Duration::from_secs(2)).await;
+                    return Err(e);
+                }
+            },
+            _ = tokio::time::sleep(Duration::from_secs(20)) => {
+                shutdown_child(&mut child, Duration::from_secs(2)).await;
+                return Err(HarnessError::Protocol(timeout_error.into()));
+            }
+        };
+        shutdown_child(&mut child, Duration::from_secs(2)).await;
+        // Drain the event channel so the reader task exits.
+        while events.try_recv().is_ok() {}
+        Ok(data)
+    }
+
+    /// pi's `get_commands` (extension commands, prompt templates, skills —
+    /// skills ride as `skill:name`, invoked with `/skill:name`) mapped onto
+    /// the composer's slash list. `input_hint` has no pi equivalent.
+    async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+        let data = self
+            .rpc_probe(json!({"type": "get_commands"}), "pi get_commands timed out")
+            .await?;
+        let empty = Vec::new();
+        let commands = data
+            .get("commands")
+            .and_then(Value::as_array)
+            .map(|a| a.as_slice())
+            .unwrap_or(&empty);
+        Ok(commands
+            .iter()
+            .filter_map(|c| {
+                let name = c.get("name").and_then(Value::as_str)?;
+                let description = c
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                Some(SlashCommand {
+                    name: name.to_owned(),
+                    description,
+                    input_hint: None,
+                })
+            })
+            .collect())
     }
 
     /// Build the `pi --mode rpc` command for one run.
@@ -221,56 +311,12 @@ impl Harness for PiHarness {
     /// so [`run`] can split them back into `set_model`'s provider/modelId
     /// pair. Models without reasoning support advertise an empty ladder.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        let exe = self.resolve_executable()?;
-        let mut cmd = Command::new(&exe);
-        cmd.args(["--mode", "rpc", "--no-session"]);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(exe.display().to_string())
-            } else {
-                HarnessError::Io(e)
-            }
-        })?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| HarnessError::Protocol("pi child has no stdin".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| HarnessError::Protocol("pi child has no stdout".into()))?;
-        let (client, mut events) = PiClient::new(stdin, stdout);
-
-        let discovery = async {
-            let data = client
-                .request(json!({"type": "get_available_models"}))
-                .await?;
-            Ok::<Value, HarnessError>(data)
-        };
-        // Catalog refresh can take a beat on first run; bounded so a wedged
-        // pi can't hang the model picker.
-        let data = tokio::select! {
-            res = discovery => match res {
-                Ok(data) => data,
-                Err(e) => {
-                    shutdown_child(&mut child, Duration::from_secs(2)).await;
-                    return Err(e);
-                }
-            },
-            _ = tokio::time::sleep(Duration::from_secs(20)) => {
-                shutdown_child(&mut child, Duration::from_secs(2)).await;
-                return Err(HarnessError::Protocol(
-                    "pi get_available_models timed out".into(),
-                ));
-            }
-        };
-        shutdown_child(&mut child, Duration::from_secs(2)).await;
-        // Drain the event channel so the reader task exits.
-        while events.try_recv().is_ok() {}
+        let data = self
+            .rpc_probe(
+                json!({"type": "get_available_models"}),
+                "pi get_available_models timed out",
+            )
+            .await?;
 
         let empty = Vec::new();
         let models = data
@@ -302,6 +348,13 @@ impl Harness for PiHarness {
                 })
             })
             .collect())
+    }
+
+    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+        self.commands_cache
+            .get_or_try_init(|| self.discover_commands())
+            .await
+            .cloned()
     }
 
     async fn run(
@@ -509,7 +562,7 @@ async fn run_session(session: Session) {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned();
-        let model_label = state
+        let mut model_label = state
             .pointer("/model/name")
             .and_then(Value::as_str)
             .unwrap_or("")
@@ -521,13 +574,19 @@ async fn run_session(session: Session) {
         if let Some(model) = &request.model
             && let Some((provider, model_id)) = model.split_once('/')
         {
-            client
+            let switched = client
                 .request(json!({
                     "type": "set_model",
                     "provider": provider,
                     "modelId": model_id,
                 }))
                 .await?;
+            // get_state ran BEFORE the switch: the label must come from the
+            // set_model response (the full Model object) or SessionStarted
+            // names the pre-switch model.
+            if let Some(name) = switched.get("name").and_then(Value::as_str) {
+                model_label = name.to_owned();
+            }
         }
         // Thinking level: our ladder maps 1:1; harness-specific levels have
         // no pi equivalent and are skipped.
@@ -796,6 +855,35 @@ async fn run_session(session: Session) {
                             }
                         }
 
+                        "extension_ui_request" => {
+                            // Extension UI sub-protocol: fire-and-forget
+                            // methods (notify/setStatus/setWidget/setTitle/
+                            // set_editor_text) are display noise — ignored.
+                            // DIALOG methods (select/confirm/input/editor)
+                            // BLOCK the agent until an extension_ui_response
+                            // arrives; without one the turn hangs forever
+                            // (dialogs without a timeout never auto-resolve).
+                            // zeron has no dialog surface for pi today, so
+                            // answer every dialog with cancelled — a refused
+                            // prompt beats a wedged run.
+                            let is_dialog = matches!(
+                                frame.get("method").and_then(Value::as_str),
+                                Some("select" | "confirm" | "input" | "editor")
+                            );
+                            if is_dialog {
+                                let id = frame.get("id").cloned().unwrap_or(Value::Null);
+                                tracing::debug!(
+                                    target: "zeron_harness::pi",
+                                    "auto-cancelling extension dialog {id}"
+                                );
+                                client.fire(json!({
+                                    "type": "extension_ui_response",
+                                    "id": id,
+                                    "cancelled": true,
+                                }));
+                            }
+                        }
+
                         "extension_error" => {
                             let message = frame
                                 .get("error")
@@ -935,8 +1023,8 @@ async fn run_session(session: Session) {
 
 /// Start a new turn on the live session (a post-settle steer, or the
 /// redelivery of one that lost the settle race). Emits the Steered marker
-/// first so post-steer output folds into a fresh assistant message.
-/// Returns false when the loop should end.
+/// once the prompt is accepted so post-steer output folds into a fresh
+/// assistant message. Returns false when the loop should end.
 async fn start_turn(
     client: &PiClient,
     text: &str,
@@ -946,25 +1034,26 @@ async fn start_turn(
     assistant_message_id: &mut String,
 ) -> bool {
     *turn = TurnState::default();
-    let (prev, next) = rotate(assistant_message_id);
-    if !send(
-        event_tx,
-        AgentEvent::Steered {
-            assistant_message_id: Some(prev),
-            next_assistant_message_id: Some(next),
-        },
-    )
-    .await
-    {
-        return false;
-    }
+    // Prompt first, THEN the Steered rotation (codex's steer_as_new_turn
+    // ordering): a rejected prompt must not rotate the message id for a
+    // turn that never started. Events arriving during the await sit in the
+    // channel until the loop resumes, so the marker still lands before any
+    // of the new turn's deltas.
     match client
         .request(json!({"type": "prompt", "message": text}))
         .await
     {
         Ok(_) => {
             *turn_active = true;
-            true
+            let (prev, next) = rotate(assistant_message_id);
+            send(
+                event_tx,
+                AgentEvent::Steered {
+                    assistant_message_id: Some(prev),
+                    next_assistant_message_id: Some(next),
+                },
+            )
+            .await
         }
         Err(e) => {
             let _ = send(

@@ -542,6 +542,19 @@ async fn models_discovered_over_rpc() {
 }
 
 #[tokio::test]
+async fn commands_discovered_over_rpc() {
+    // pi's get_commands (extension commands, prompt templates, skills)
+    // feeds the composer's `/` popup; an entry without a description still
+    // lists (empty string).
+    let commands = harness().commands().await.expect("commands resolve");
+    let by_name = |name: &str| commands.iter().find(|c| c.name == name);
+    let fix = by_name("fix-tests").expect("prompt template listed");
+    assert_eq!(fix.description, "Fix failing tests");
+    assert!(by_name("skill:brave-search").is_some());
+    assert_eq!(by_name("no-description").unwrap().description, "");
+}
+
+#[tokio::test]
 async fn missing_binary_is_not_installed() {
     let harness = PiHarness::new().with_executable("/nonexistent/never-a-pi".into());
     // An explicit executable overrides resolution (installed() trusts it);

@@ -44,7 +44,10 @@ async fn live_turn_settles() {
         attachments: Vec::new(),
         resume: None,
     };
-    let stream = PiHarness::new().run(req, controls).await.expect("run starts");
+    let stream = PiHarness::new()
+        .run(req, controls)
+        .await
+        .expect("run starts");
     drop(steer_tx); // one turn, then teardown
     let events: Vec<AgentEvent> = tokio::time::timeout(
         Duration::from_secs(120),
@@ -54,19 +57,35 @@ async fn live_turn_settles() {
     .expect("live turn settles in time");
     for ev in &events {
         match ev {
-            AgentEvent::SessionStarted { model, session_id, .. } =>
-                println!("SessionStarted: model={model} session={session_id}"),
+            AgentEvent::SessionStarted {
+                model, session_id, ..
+            } => println!("SessionStarted: model={model} session={session_id}"),
             AgentEvent::TextDelta { text } => print!("{text}"),
-            AgentEvent::Usage { input_tokens, output_tokens } =>
-                println!("\nUsage: {input_tokens} in / {output_tokens} out"),
-            AgentEvent::Done { status, error, session_id, .. } =>
-                println!("Done: {status:?} err={error:?} session={session_id:?}"),
+            AgentEvent::Usage {
+                input_tokens,
+                output_tokens,
+            } => println!("\nUsage: {input_tokens} in / {output_tokens} out"),
+            AgentEvent::Done {
+                status,
+                error,
+                session_id,
+                ..
+            } => println!("Done: {status:?} err={error:?} session={session_id:?}"),
             _ => {}
         }
     }
-    let done = events.iter().rev().find(|e| matches!(e, AgentEvent::Done { .. }));
+    let done = events
+        .iter()
+        .rev()
+        .find(|e| matches!(e, AgentEvent::Done { .. }));
     assert!(
-        matches!(done, Some(AgentEvent::Done { status: zeron_proto::DoneStatus::Completed, .. })),
+        matches!(
+            done,
+            Some(AgentEvent::Done {
+                status: zeron_proto::DoneStatus::Completed,
+                ..
+            })
+        ),
         "live turn must complete: {done:?}"
     );
 }
