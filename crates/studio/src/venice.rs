@@ -35,19 +35,6 @@ pub const VIDEO_CONSTRAINT_KEYS: &[&str] = &[
     "reference_image_max_aspect_ratio",
 ];
 
-/// Swagger *Video Model Constraints* properties (version `20260818.121409`).
-/// Live extras (`audio_input`, geometry floors, …) are parsed too but are not
-/// in this swagger object; they stay on [`VIDEO_CONSTRAINT_KEYS`].
-pub const SWAGGER_VIDEO_CONSTRAINT_KEYS: &[&str] = &[
-    "model_type",
-    "aspect_ratios",
-    "resolutions",
-    "durations",
-    "audio",
-    "audio_configurable",
-    "prompt_character_limit",
-];
-
 /// Overlay `source` values the design allows. Anything else is drift.
 pub const ALLOWED_OVERLAY_SOURCES: &[&str] = &[
     "live fixture + swagger",

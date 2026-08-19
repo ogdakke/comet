@@ -12,8 +12,8 @@ use chrono::{TimeZone, Utc};
 use zeron_studio::{
     MediaOperation,
     venice::{
-        ALLOWED_OVERLAY_SOURCES, SWAGGER_VIDEO_CONSTRAINT_KEYS, VIDEO_CONSTRAINT_KEYS,
-        normalize_model_catalog, unknown_video_constraint_keys,
+        ALLOWED_OVERLAY_SOURCES, VIDEO_CONSTRAINT_KEYS, normalize_model_catalog,
+        unknown_video_constraint_keys,
     },
     venice_overlay::bundled_video_overlay,
 };
@@ -22,6 +22,8 @@ const TEXT_TO_VIDEO: &[u8] = include_bytes!("fixtures/venice/text-to-video-model
 const IMAGE_TO_VIDEO: &[u8] = include_bytes!("fixtures/venice/image-to-video-model.json");
 const SEEDANCE_2_5_R2V: &[u8] =
     include_bytes!("fixtures/venice/seedance-2-5-reference-to-video-model.json");
+const SWAGGER_VIDEO_CONSTRAINTS: &[u8] =
+    include_bytes!("fixtures/venice/swagger-video-model-constraints.json");
 
 fn fetched_at() -> chrono::DateTime<Utc> {
     Utc.timestamp_opt(1_777_000_000, 0).unwrap()
@@ -55,9 +57,17 @@ fn live_fixture_constraint_keys_are_known_to_the_parser() {
 
 #[test]
 fn swagger_video_constraint_keys_are_known_to_the_parser() {
-    for key in SWAGGER_VIDEO_CONSTRAINT_KEYS {
+    let snippet: serde_json::Value = serde_json::from_slice(SWAGGER_VIDEO_CONSTRAINTS).unwrap();
+    let properties = snippet["properties"]
+        .as_object()
+        .expect("swagger fixture must list Video Model Constraints properties");
+    assert!(
+        !properties.is_empty(),
+        "swagger Video Model Constraints fixture has no properties"
+    );
+    for key in properties.keys() {
         assert!(
-            VIDEO_CONSTRAINT_KEYS.contains(key),
+            VIDEO_CONSTRAINT_KEYS.contains(&key.as_str()),
             "swagger Video Model Constraints key {key} is unknown to the parser"
         );
     }
