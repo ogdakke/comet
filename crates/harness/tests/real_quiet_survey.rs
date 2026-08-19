@@ -15,9 +15,10 @@
 use std::time::Duration;
 
 use futures::StreamExt;
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
-use zeron_harness::{AcpHarness, CancellationToken, Harness, RunControls, SteerMessage};
+use zeron_harness::{AcpHarness, CancellationToken, Harness, PiHarness, RunControls, SteerMessage};
 use zeron_proto::{
     AgentEvent, DoneStatus, RunRequest, SandboxLevel, UserInputAnswer, UserInputQuestion,
 };
@@ -54,7 +55,7 @@ struct ProbeOutcome {
     started_err: Option<String>,
 }
 
-async fn probe_once(harness: AcpHarness) -> ProbeOutcome {
+async fn probe_once(harness: Arc<dyn Harness>) -> ProbeOutcome {
     let (controls, steer_tx, _token) = controls();
     let req = RunRequest {
         prompt: "Use your shell tool to run `echo probe-one`. After you see its output, \
@@ -199,10 +200,10 @@ async fn real_all_harnesses_quiet_survey() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
-    let agents: Vec<(&str, fn() -> AcpHarness)> = vec![
-        ("grok", AcpHarness::grok),
-        ("hermes", AcpHarness::hermes),
-        ("pi", AcpHarness::pi),
+    let agents: Vec<(&str, fn() -> Arc<dyn Harness>)> = vec![
+        ("grok", || Arc::new(AcpHarness::grok())),
+        ("hermes", || Arc::new(AcpHarness::hermes())),
+        ("pi", || Arc::new(PiHarness::new())),
     ];
     let mut failures: Vec<String> = Vec::new();
     for (name, ctor) in agents {

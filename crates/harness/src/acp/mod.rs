@@ -2,12 +2,12 @@
 //! stdio, protocol v1) and maps its session updates onto [`AgentEvent`]s.
 //!
 //! KEPT ONLY for agents built ground-up on ACP: Grok ([`AcpHarness::grok`],
-//! `grok agent stdio`) and Hermes ([`AcpHarness::hermes`], `hermes acp`) —
-//! plus pi ([`AcpHarness::pi`]) via the community `pi-acp` adapter until a
-//! native driver exists. Claude, Codex and Cursor moved to native drivers
-//! ([`crate::ClaudeHarness`], [`crate::CodexHarness`], [`crate::CursorHarness`])
-//! after adapter-mediated ACP kept manufacturing done-status bugs the native
-//! wires don't have (turn-hold bookkeeping vs the CLI's own eager result).
+//! `grok agent stdio`) and Hermes ([`AcpHarness::hermes`], `hermes acp`).
+//! Claude, Codex, Cursor, and pi moved to native drivers
+//! ([`crate::ClaudeHarness`], [`crate::CodexHarness`], [`crate::CursorHarness`],
+//! [`crate::PiHarness`]) after adapter-mediated ACP kept manufacturing
+//! done-status bugs the native wires don't have (turn-hold bookkeeping vs
+//! the CLI's own eager result).
 //!
 //! - `initialize` (protocolVersion 1, fs/terminal capabilities declined) →
 //!   `session/new`, or `session/load` with a fresh-session fallback when
@@ -74,7 +74,7 @@ struct AcpAgentSpec {
     extra_paths: fn() -> Vec<PathBuf>,
     /// The agent's own CLI binary (`claude`, `codex`, …) — what "installed"
     /// means to the user. Distinct from `executable` where the spawned adapter
-    /// wraps the CLI (`claude-agent-acp`, `codex-acp`, `pi-acp`), and the npx
+    /// wraps the CLI (`claude-agent-acp`, `codex-acp`), and the npx
     /// fallback deliberately doesn't count: npx can fetch an adapter on
     /// demand, but an absent CLI still means no logins/config to drive.
     cli_executable: &'static str,
@@ -164,15 +164,7 @@ fn default_effort_values(
 }
 
 /// npm-global bin dirs for an adapter binary (`npm i -g` installs).
-fn npm_global_paths(exe: &'static str) -> fn() -> Vec<PathBuf> {
-    // fn pointers can't capture; probe the fixed npm-global locations and
-    // append the exe at call time via a small per-exe shim table.
-    match exe {
-        "pi-acp" => || npm_global_bins("pi-acp"),
-        _ => || Vec::new(),
-    }
-}
-
+#[cfg(test)]
 fn npm_global_bins(exe: &str) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -315,61 +307,6 @@ fn hermes_spec() -> AcpAgentSpec {
     }
 }
 
-fn pi_spec() -> AcpAgentSpec {
-    AcpAgentSpec {
-        id: HarnessId::Pi,
-        display_name: "Pi",
-        executable: "pi-acp",
-        env_override: "PI_ACP_EXECUTABLE",
-        args: &[],
-        npm_package: Some("pi-acp@0.0.33"),
-        extra_paths: npm_global_paths("pi-acp"),
-        cli_executable: "pi",
-        cli_extra_paths: || npm_global_bins("pi"),
-        install_hint: "pi-acp (searched PATH, the login shell's PATH, npm global bins, \
-             and fnm/nvm/volta/pnpm/bun install dirs; zeron installs the pinned \
-             pi-acp automatically when npm is available — the pi CLI itself is \
-             still required, `npm install -g --ignore-scripts \
-             @earendil-works/pi-coding-agent`; set PI_ACP_EXECUTABLE to override)",
-        // pi routes models through its own provider config (~/.pi); the picker
-        // advertises the pass-through entry and pi keeps whatever the user set
-        // up. Unknown ids are skipped by the config-option set.
-        models: || {
-            vec![Model {
-                id: "default".into(),
-                label: "pi default".into(),
-                description: Some("Runs the model configured in pi (`pi` settings)".into()),
-                reasoning_levels: vec![
-                    ReasoningLevel::Minimal,
-                    ReasoningLevel::Low,
-                    ReasoningLevel::Medium,
-                    ReasoningLevel::High,
-                    ReasoningLevel::XHigh,
-                    ReasoningLevel::Max,
-                ],
-                options: Vec::new(),
-            }]
-        },
-        // The adapter has no `_session/steering` extension: turn boundaries.
-        steering_mode: SteeringMode::TurnBoundary,
-        // pi's thinking ladder (minimal→max; its extra "off" tier has no zeron
-        // equivalent and is left to the agent default).
-        reasoning_levels: &[
-            ReasoningLevel::Minimal,
-            ReasoningLevel::Low,
-            ReasoningLevel::Medium,
-            ReasoningLevel::High,
-            ReasoningLevel::XHigh,
-            ReasoningLevel::Max,
-        ],
-        prompt_transform: identity_transform,
-        effort_values: default_effort_values,
-        ladder_extras: &[],
-        prompt_complete_extension: false,
-        prompt_stall: None,
-    }
-}
-
 /// Background-install managed npm adapters for agents whose CLI is present
 /// on this device, so a first chat never pays (or trips over) an npm run.
 /// Skips agents whose adapter is already resolvable; failures are logged and
@@ -379,7 +316,7 @@ pub fn prewarm_managed_adapters() {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
-    for spec in [grok_spec(), pi_spec()] {
+    for spec in [grok_spec()] {
         let Some(pkg) = spec.npm_package else {
             continue;
         };
@@ -462,12 +399,6 @@ impl AcpHarness {
     /// Hermes Agent (`hermes acp`) — Nous Research's native ACP server.
     pub fn hermes() -> Self {
         Self::with_spec(hermes_spec())
-    }
-
-    /// The pi coding agent over ACP — the community `pi-acp` adapter wrapping
-    /// pi's RPC mode.
-    pub fn pi() -> Self {
-        Self::with_spec(pi_spec())
     }
 
     /// Use a fixed agent binary instead of PATH/known-location resolution.
@@ -1426,8 +1357,8 @@ fn prompt_turn(
 /// reasoning / plan writes look finished and a false settle orphans the
 /// real `session/prompt` response. `ZERON_ACP_QUIET_SETTLE_MS` overrides
 /// (0 disables) except for Pi, which stays exempt.
-fn quiet_settle_window(prompt_complete_extension: bool, harness: HarnessId) -> Option<Duration> {
-    if prompt_complete_extension || matches!(harness, HarnessId::Pi) {
+fn quiet_settle_window(prompt_complete_extension: bool) -> Option<Duration> {
+    if prompt_complete_extension {
         return None;
     }
     match std::env::var("ZERON_ACP_QUIET_SETTLE_MS")
@@ -2237,19 +2168,17 @@ async fn run_session(session: Session) {
     // Done ever comes, and the session strands Working until the engine's
     // quiesce watchdog parks it.
     //
-    // Pi is EXEMPT, even from the env knob: pi-acp can leave long silent
-    // reasoning stretches after content has streamed and every tool has
-    // resolved. That "looks finished" state is indistinguishable from a
-    // dropped reply — 30s of quiet falsely settled live turns mid-thought
-    // (Pi 2026-08-17), producing both a premature Done and the stuck-Working
-    // orphan above. Grok is exempt too: it advertises
+    // Grok is exempt: it advertises
     // `_x.ai/session/prompt_complete` as the AUTHORITATIVE turn end, and a
     // 30s think / long plan-file write looks identical to a dropped reply
     // (Grok 2026-08-18: timestamp landed, then the session self-continued
-    // when more output arrived). Hermes uses this blanket window; the
-    // engine watchdog backstops Pi and Grok. `ZERON_ACP_QUIET_SETTLE_MS`
+    // when more output arrived). Hermes uses this blanket window.
+    // (pi-acp was exempt too — long silent reasoning stretches — but the
+    // adapter is retired; the native PiHarness settles deterministically on
+    // pi's own agent_settled and never consults this window.)
+    // `ZERON_ACP_QUIET_SETTLE_MS`
     // overrides; 0 disables.
-    let quiet_settle: Option<Duration> = quiet_settle_window(prompt_complete_extension, harness);
+    let quiet_settle: Option<Duration> = quiet_settle_window(prompt_complete_extension);
     let mut last_update_at = tokio::time::Instant::now();
     let mut turn_content_seen = false;
     // A steering injection makes the cost hint unsafe for the REST of the
@@ -3440,13 +3369,9 @@ mod tests {
     }
 
     #[test]
-    fn grok_and_pi_skip_the_quiet_settle_window() {
-        assert!(quiet_settle_window(true, HarnessId::Grok).is_none());
-        assert!(quiet_settle_window(false, HarnessId::Pi).is_none());
-        assert_eq!(
-            quiet_settle_window(false, HarnessId::Hermes),
-            Some(Duration::from_secs(30))
-        );
+    fn grok_skips_the_quiet_settle_window() {
+        assert!(quiet_settle_window(true).is_none());
+        assert_eq!(quiet_settle_window(false), Some(Duration::from_secs(30)));
     }
 
     #[test]

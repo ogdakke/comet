@@ -1,9 +1,8 @@
 //! Blanket dropped-reply settle (`ZERON_ACP_QUIET_SETTLE_MS`), tested with
 //! the Hermes spec so no adapter-specific evidence (Grok's prompt_complete,
 //! `noRunningTurn` steering reasons) is in play — this is the path every
-//! non-exempt ACP agent gets. Pi ignores the blanket settle. Own test
-//! binary: the env knob is process-global, and every test here shares the
-//! one value.
+//! non-exempt ACP agent gets. Own test binary: the env knob is
+//! process-global, and every test here shares the one value.
 
 use std::path::PathBuf;
 use std::sync::Once;
@@ -174,38 +173,5 @@ async fn open_tool_call_holds_the_quiet_settle_off() {
     assert!(
         finished < done,
         "the turn must survive the quiet stretch intact: {events:?}"
-    );
-}
-
-/// Pi has the same silent-reasoning shape the old Claude/Codex ACP adapters
-/// did. The blanket settle used to manufacture Done mid-turn, after which
-/// the real tail was misclassified as self-continued output and repeatedly
-/// parked. Pi must ignore the blanket settle — even with the env knob set,
-/// as it is process-wide in this binary.
-#[tokio::test]
-async fn pi_thinking_silence_never_settles_the_turn() {
-    init_env();
-    let events = run_and_collect(
-        AcpHarness::pi(),
-        "scenario:quiet-thinking",
-        Duration::from_secs(20),
-    )
-    .await;
-    assert_eq!(
-        dones(&events),
-        vec![(DoneStatus::Completed, None)],
-        "{events:?}"
-    );
-    let finished = events
-        .iter()
-        .position(|(_, e)| matches!(e, AgentEvent::TextDelta { text } if text == "finished"))
-        .unwrap_or_else(|| panic!("post-quiet text must fold into the SAME turn: {events:?}"));
-    let done = events
-        .iter()
-        .position(|(_, e)| matches!(e, AgentEvent::Done { .. }))
-        .expect("done asserted above");
-    assert!(
-        finished < done,
-        "the turn must survive silent thinking intact: {events:?}"
     );
 }

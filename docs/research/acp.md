@@ -38,13 +38,18 @@
   `_session/steering` extension and no effort config advertised (Hermes 4's
   hybrid reasoning is model-internal) → turn-boundary steering, empty ladder;
   the model list is discovered over ACP (below), with the Nous flagships as
-  the static fallback. `AcpHarness::pi()` runs the pi coding
-  agent (pi.dev) through the community `pi-acp` adapter (pinned 0.0.33,
-  managed-install fallback; requires the pi CLI itself,
-  `@earendil-works/pi-coding-agent`; `PI_ACP_EXECUTABLE` overrides). Models
-  ride pi's own provider config (catalog advertises a `default` pass-through
-  entry); thinking ladder minimal→max maps onto zeron's levels via the
-  generic `thought_level` preference ladder ("off" has no zeron tier).
+  the static fallback. Pi originally rode the same harness through the
+  community `pi-acp` adapter (pinned 0.0.33, managed-install fallback;
+  `PI_ACP_EXECUTABLE` overrides) — **pi moved to a native driver
+  (2026-08-19)**: `PiHarness` (crates/harness/src/pi/) spawns
+  `pi --mode rpc` and speaks pi's own JSONL command/response protocol
+  directly, the same class as the codex/claude native wires. Reasons: the
+  adapter's `_session/steering` absence capped pi at turn-boundary steering
+  while pi's own `steer` command IS step-boundary injection (its strongest
+  feature); the adapter's internal turn queue re-derived done-status from
+  pi's events; and model lists can be discovered live over the RPC
+  (`get_available_models`) instead of a `default` pass-through entry.
+  Decision record: docs/research/harness.md.
 - **ACP is the source of truth for model lists** (2026-08-08; preference
   order inverted 2026-08-09): `models()` runs a short-lived probe
   (initialize → `session/new`, the `discover_commands` pattern) and reads
