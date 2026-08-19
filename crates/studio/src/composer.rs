@@ -1130,6 +1130,7 @@ pub fn apply_event(
         ComposerEvent::SetMode { mode, restore } => {
             snapshot.mode = mode;
             snapshot.selected = filter_restore(mode, restore, catalog);
+            dedupe_selected(&mut snapshot.selected);
             match mode {
                 ComposerMode::Image => {
                     if snapshot.selected.is_empty() {
@@ -1205,6 +1206,7 @@ pub fn apply_event(
         }
         ComposerEvent::ReplaceModels { selected } => {
             snapshot.selected = selected;
+            dedupe_selected(&mut snapshot.selected);
             force_video_output_counts(&mut snapshot, catalog);
             seed_or_keep_duration(&mut snapshot, catalog);
             copy_duration_to_chips(&mut snapshot, catalog);
@@ -1239,6 +1241,7 @@ pub fn apply_event(
         }
         ComposerEvent::RestoreDraft { snapshot: restored } => {
             snapshot = restored;
+            dedupe_selected(&mut snapshot.selected);
             force_video_output_counts(&mut snapshot, catalog);
             seed_or_keep_duration(&mut snapshot, catalog);
             copy_duration_to_chips(&mut snapshot, catalog);
@@ -2503,6 +2506,14 @@ fn first_concrete_aspect(model: &MediaModel) -> Option<ControlValue> {
                 })
             })
     })
+}
+
+/// The composer keeps at most one selected entry per model: chips, drafts,
+/// and per-model edits all key by model id. A duplicate would display one
+/// entry while edits and sends touch another. Keep the first occurrence.
+fn dedupe_selected(selected: &mut Vec<SelectedModelRef>) {
+    let mut seen = std::collections::HashSet::new();
+    selected.retain(|entry| seen.insert(entry.model_id.clone()));
 }
 
 fn seed_selected_control_defaults(snapshot: &mut ComposerSnapshot, catalog: &[MediaModel]) {

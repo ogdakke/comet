@@ -155,7 +155,7 @@ pub(super) fn snapshot_from_committed_turn(
     } else {
         ComposerMode::Image
     };
-    let mut selected = Vec::new();
+    let mut selected: Vec<SelectedModelRef> = Vec::new();
     for run in &turn.runs {
         let Some(model) = catalog.iter().find(|model| model.id == run.model.id) else {
             continue;
@@ -164,12 +164,31 @@ pub(super) fn snapshot_from_committed_turn(
             continue;
         }
         let draft = overlay_draft(model, run.output_count, &run.controls);
-        selected.push(SelectedModelRef {
-            provider_id: model.provider_id.clone(),
-            model_id: model.id.clone(),
-            output_count: if video { 1 } else { draft.output_count },
-            controls: draft.controls,
-        });
+        // Generate-more extends a turn with another run for the same model,
+        // but the composer keeps one chip per model. Merge the runs: sum the
+        // counts (capped at the model maximum) and keep the latest controls.
+        // Duplicate entries would show one run's count while a send
+        // regenerates every run, and chip edits would land on an entry the
+        // UI does not display.
+        if let Some(existing) = selected
+            .iter_mut()
+            .find(|existing| existing.model_id == model.id)
+        {
+            let total = existing.output_count.saturating_add(run.output_count);
+            existing.output_count = if video {
+                1
+            } else {
+                total.clamp(1, model.maximum_output_count.max(1))
+            };
+            existing.controls = draft.controls;
+        } else {
+            selected.push(SelectedModelRef {
+                provider_id: model.provider_id.clone(),
+                model_id: model.id.clone(),
+                output_count: if video { 1 } else { draft.output_count },
+                controls: draft.controls,
+            });
+        }
     }
     if selected.is_empty() {
         return None;
@@ -752,6 +771,50 @@ mod tests {
             )]),
         );
         assert_eq!(drafts[&ModelId::new("flux")].output_count, 3);
+    }
+
+    #[test]
+    fn committed_turn_merges_generate_more_runs_into_one_chip() {
+        let flux = test_model("flux", vec![aspect_control((1, 1), &[(16, 9)])]);
+        let run = |count, width, height| {
+            test_run(
+                flux.clone(),
+                count,
+                BTreeMap::from([(
+                    ControlId::new("aspect_ratio"),
+                    ControlValue::AspectRatio { width, height },
+                )]),
+            )
+        };
+        // Generate-more appended a second run for the same model: 6 + 6 images
+        // where the model allows at most 8 per batch.
+        let turn = test_turn(vec![run(6, 1, 1), run(6, 16, 9)]);
+        let snapshot =
+            snapshot_from_committed_turn(&turn, std::slice::from_ref(&flux), &[]).unwrap();
+        assert_eq!(snapshot.selected.len(), 1);
+        // The count is the summed truth of the turn, capped at the model
+        // maximum; the latest run's controls win.
+        assert_eq!(snapshot.selected[0].output_count, 8);
+        assert_eq!(
+            snapshot.selected[0].controls[&ControlId::new("aspect_ratio")],
+            ControlValue::AspectRatio {
+                width: 16,
+                height: 9
+            }
+        );
+    }
+
+    #[test]
+    fn committed_turn_merged_count_sums_without_clamping_below_the_cap() {
+        let flux = test_model("flux", Vec::new());
+        let turn = test_turn(vec![
+            test_run(flux.clone(), 2, BTreeMap::new()),
+            test_run(flux.clone(), 2, BTreeMap::new()),
+        ]);
+        let snapshot =
+            snapshot_from_committed_turn(&turn, std::slice::from_ref(&flux), &[]).unwrap();
+        assert_eq!(snapshot.selected.len(), 1);
+        assert_eq!(snapshot.selected[0].output_count, 4);
     }
 
     #[test]

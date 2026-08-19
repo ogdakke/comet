@@ -1734,3 +1734,61 @@ fn mime_mismatch_is_unsupported_references() {
     assert!(codes(&view).contains(&ConflictCode::UnsupportedReferences));
     assert!(!codes(&view).contains(&ConflictCode::AttachmentGeometry));
 }
+
+#[test]
+fn restore_draft_dedupes_models_so_edits_match_the_displayed_chip() {
+    let image = t2i("flux");
+    let catalog = catalog(&[&image]);
+    // A legacy/buggy restore can carry the same model twice (one entry per
+    // generate-more run). The composer keeps one chip per model.
+    let mut doubled = selected(&image);
+    doubled.output_count = 4;
+    let restored = ComposerSnapshot {
+        mode: ComposerMode::Image,
+        prompt: "a comet over a quiet lake".to_owned(),
+        selected: vec![doubled.clone(), doubled],
+        ..ComposerSnapshot::default()
+    };
+    let (snapshot, view) = apply_event(
+        ComposerSnapshot::default(),
+        &catalog,
+        ComposerEvent::RestoreDraft { snapshot: restored },
+    );
+    assert_eq!(snapshot.selected.len(), 1);
+    assert_eq!(view.models.len(), 1);
+
+    // Editing the count updates the same entry the chip displays.
+    let (snapshot, view) = apply_event(
+        snapshot,
+        &catalog,
+        ComposerEvent::SetOutputCount {
+            model_id: image.id.clone(),
+            output_count: 2,
+        },
+    );
+    assert_eq!(snapshot.selected.len(), 1);
+    assert_eq!(snapshot.selected[0].output_count, 2);
+    assert_eq!(view.models[0].output_count, 2);
+}
+
+#[test]
+fn set_mode_and_replace_models_drop_duplicate_entries() {
+    let image = t2i("flux");
+    let catalog = catalog(&[&image]);
+    let doubled = vec![selected(&image), selected(&image)];
+    let (snapshot, _) = apply_event(
+        ComposerSnapshot::default(),
+        &catalog,
+        ComposerEvent::SetMode {
+            mode: ComposerMode::Image,
+            restore: doubled.clone(),
+        },
+    );
+    assert_eq!(snapshot.selected.len(), 1);
+    let (snapshot, _) = apply_event(
+        snapshot,
+        &catalog,
+        ComposerEvent::ReplaceModels { selected: doubled },
+    );
+    assert_eq!(snapshot.selected.len(), 1);
+}
