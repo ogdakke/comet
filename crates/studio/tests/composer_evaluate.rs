@@ -1152,6 +1152,44 @@ fn v2v_first_clip_is_source() {
 }
 
 #[test]
+fn v2v_missing_source_asks_for_a_video() {
+    let v2v = video_model(
+        "v2v",
+        "Grok Imagine V2V",
+        MediaOperation::VideoToVideo,
+        &[4.0, 6.0, 8.0],
+        vec![InputConstraint {
+            role: InputRole::from(ROLE_SOURCE),
+            minimum_count: 1,
+            maximum_count: 1,
+            mime: MimeConstraint::accepting(["video/mp4"]),
+        }],
+        seedance_meta(),
+    );
+    let view = evaluate_composer(
+        &video_snapshot(&[&v2v], Vec::new(), 6.0),
+        std::slice::from_ref(&v2v),
+    );
+    let blocked = conflict(&view, ConflictCode::MissingRequiredInput);
+    assert_eq!(blocked.title, "Grok Imagine V2V needs a source video");
+    assert_eq!(
+        blocked.actions[0].label, "Remove this model",
+        "a single-model missing-input should not say “these models”"
+    );
+}
+
+#[test]
+fn i2v_missing_source_still_asks_for_a_start_frame() {
+    let i2v = i2v("i2v", false);
+    let view = evaluate_composer(
+        &video_snapshot(&[&i2v], Vec::new(), 6.0),
+        std::slice::from_ref(&i2v),
+    );
+    let blocked = conflict(&view, ConflictCode::MissingRequiredInput);
+    assert!(blocked.title.contains("needs a start frame"));
+}
+
+#[test]
 fn incompatible_upscale_is_not_on_this_composer() {
     let upscale = fixture(UPSCALE);
     let t2i = t2i("flux");

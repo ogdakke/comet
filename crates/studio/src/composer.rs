@@ -2606,15 +2606,24 @@ fn missing_required_conflict(
     snapshot: &ComposerSnapshot,
     role: &InputRole,
 ) -> ComposerConflict {
-    let title = if role.as_str() == ROLE_SOURCE {
-        format!("{} needs a start frame", model.display_name)
-    } else {
-        format!("{} needs a visual reference", model.display_name)
+    let (title, explanation) = match (role.as_str(), model.operation) {
+        (ROLE_SOURCE, MediaOperation::VideoToVideo) => (
+            format!("{} needs a source video", model.display_name),
+            "Drop or attach a video, or remove this model.",
+        ),
+        (ROLE_SOURCE, _) => (
+            format!("{} needs a start frame", model.display_name),
+            "Attach a start frame, or remove this model.",
+        ),
+        _ => (
+            format!("{} needs a visual reference", model.display_name),
+            "Attach a compatible reference, or remove this model.",
+        ),
     };
     make_conflict(
         ConflictCode::MissingRequiredInput,
         title,
-        "Attach a compatible reference or remove this model.",
+        explanation,
         subjects(vec![model.id.clone()], Vec::new(), Vec::new()),
         missing_required_actions(model, snapshot),
     )
@@ -2729,7 +2738,13 @@ fn action_label(action: &ResolveAction) -> String {
     match action {
         ResolveAction::RemoveUnsupportedReferences { .. } => "Remove references".to_owned(),
         ResolveAction::RemoveAllAttachments => "Remove all attachments".to_owned(),
-        ResolveAction::DeselectIncompatibleModels { .. } => "Remove these models".to_owned(),
+        ResolveAction::DeselectIncompatibleModels { model_ids } => {
+            if model_ids.len() == 1 {
+                "Remove this model".to_owned()
+            } else {
+                "Remove these models".to_owned()
+            }
+        }
         ResolveAction::KeepModelsDropOthers { .. } => "Keep compatible models".to_owned(),
         ResolveAction::ClampDuration { value } => format!("Use {}", duration_label(value)),
         ResolveAction::ClearDuration => "Clear duration".to_owned(),
