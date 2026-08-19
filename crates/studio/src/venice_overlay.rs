@@ -37,12 +37,34 @@ pub struct VeniceVideoOverlay {
     rows: Vec<ResolvedRow>,
 }
 
+/// Public view of one overlay row for catalog drift CI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OverlayRowInfo {
+    pub key: String,
+    pub exact: bool,
+    pub own_reviewed: bool,
+    pub source: Option<String>,
+    pub operation: Option<MediaOperation>,
+}
+
 #[derive(Clone, Debug)]
 struct ResolvedRow {
     key: String,
     exact: bool,
     own_reviewed: bool,
     spec: OverlaySpec,
+}
+
+impl ResolvedRow {
+    fn info(&self) -> OverlayRowInfo {
+        OverlayRowInfo {
+            key: self.key.clone(),
+            exact: self.exact,
+            own_reviewed: self.own_reviewed,
+            source: self.spec.source.clone(),
+            operation: self.spec.operation,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -244,6 +266,16 @@ impl VeniceVideoOverlay {
             });
         }
         Ok(Self { rows })
+    }
+
+    /// Every loaded row (exact `id` and `id_prefix` families).
+    pub fn rows(&self) -> Vec<OverlayRowInfo> {
+        self.rows.iter().map(ResolvedRow::info).collect()
+    }
+
+    /// Matching overlay row for `model_id` (exact id, else longest prefix).
+    pub fn match_info(&self, model_id: &str) -> Result<Option<OverlayRowInfo>, OverlayError> {
+        Ok(self.match_model(model_id)?.map(ResolvedRow::info))
     }
 
     fn match_model(&self, model_id: &str) -> Result<Option<&ResolvedRow>, OverlayError> {

@@ -3755,6 +3755,12 @@ async fn create_studio_turn_composer_video_completes_via_queue() {
         .unwrap();
     assert!(remote_job_id.starts_with("fake-job-"));
     assert_eq!(provider.complete_call_count(), 1);
+    engine.resume_queued_video_runs().await;
+    assert_eq!(
+        provider.complete_call_count(),
+        1,
+        "a finished video job must not complete a second time"
+    );
     engine.shutdown().await;
 }
 
@@ -3828,6 +3834,12 @@ async fn restart_resumes_queued_video_and_completes_once() {
             )
             .unwrap(),
         1
+    );
+    engine.resume_queued_video_runs().await;
+    assert_eq!(
+        provider.complete_call_count(),
+        1,
+        "resume after success must not complete again"
     );
     engine.shutdown().await;
 }

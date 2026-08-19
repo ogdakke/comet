@@ -16,6 +16,58 @@ use crate::{
 };
 
 pub const VENICE_PROVIDER_ID: &str = "venice";
+
+/// Live `model_spec.constraints` keys the video parser understands.
+/// Drift CI fails if a checked-in fixture introduces a key outside this set.
+pub const VIDEO_CONSTRAINT_KEYS: &[&str] = &[
+    "model_type",
+    "aspect_ratios",
+    "resolutions",
+    "durations",
+    "audio",
+    "audio_configurable",
+    "audio_input",
+    "per_reference_audio",
+    "video_input",
+    "prompt_character_limit",
+    "reference_image_min_short_side_pixels",
+    "reference_image_min_aspect_ratio",
+    "reference_image_max_aspect_ratio",
+];
+
+/// Swagger *Video Model Constraints* properties (version `20260818.121409`).
+/// Live extras (`audio_input`, geometry floors, …) are parsed too but are not
+/// in this swagger object; they stay on [`VIDEO_CONSTRAINT_KEYS`].
+pub const SWAGGER_VIDEO_CONSTRAINT_KEYS: &[&str] = &[
+    "model_type",
+    "aspect_ratios",
+    "resolutions",
+    "durations",
+    "audio",
+    "audio_configurable",
+    "prompt_character_limit",
+];
+
+/// Overlay `source` values the design allows. Anything else is drift.
+pub const ALLOWED_OVERLAY_SOURCES: &[&str] = &[
+    "live fixture + swagger",
+    "https://docs.venice.ai/guides/media/seedance-2-0",
+    "https://docs.venice.ai/guides/media/reference-to-video",
+    "https://docs.venice.ai/api-reference/endpoint/video/queue",
+];
+
+/// Constraint keys present on a live model object that the parser does not know.
+pub fn unknown_video_constraint_keys(constraints: &serde_json::Value) -> Vec<String> {
+    let Some(object) = constraints.as_object() else {
+        return Vec::new();
+    };
+    object
+        .keys()
+        .filter(|key| !VIDEO_CONSTRAINT_KEYS.contains(&key.as_str()))
+        .cloned()
+        .collect()
+}
+
 const DEFAULT_IMAGE_OUTPUT_MIMES: &[&str] = &["image/webp", "image/png", "image/jpeg"];
 /// Venice `POST /image/generate` documents these `format` values. Used when a
 /// model honors that field and the catalog does not list a narrower set.

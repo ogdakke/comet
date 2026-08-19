@@ -15,22 +15,6 @@ const SEEDANCE_2_5_R2V: &[u8] =
 const UPSCALE: &[u8] = include_bytes!("fixtures/venice/upscale-model.json");
 const INPAINT: &[u8] = include_bytes!("fixtures/venice/inpaint-model.json");
 
-const VIDEO_CONSTRAINT_KEYS: &[&str] = &[
-    "model_type",
-    "aspect_ratios",
-    "resolutions",
-    "durations",
-    "audio",
-    "audio_configurable",
-    "audio_input",
-    "per_reference_audio",
-    "video_input",
-    "prompt_character_limit",
-    "reference_image_min_short_side_pixels",
-    "reference_image_min_aspect_ratio",
-    "reference_image_max_aspect_ratio",
-];
-
 fn fetched_at() -> chrono::DateTime<Utc> {
     Utc.timestamp_opt(1_777_000_000, 0).unwrap()
 }
@@ -863,38 +847,6 @@ fn adaptive_aspect_ratio_is_a_first_class_choice() {
         .unwrap();
     assert_eq!(aspect.choices[0].value, ControlValue::AspectRatioAdaptive);
     assert_eq!(aspect.choices[0].label, "Adaptive");
-}
-
-#[test]
-fn live_video_fixture_keys_are_known_to_the_parser() {
-    for bytes in [TEXT_TO_VIDEO, IMAGE_TO_VIDEO, SEEDANCE_2_5_R2V] {
-        let fixture: serde_json::Value = serde_json::from_slice(bytes).unwrap();
-        let constraints = fixture["data"][0]["model_spec"]["constraints"]
-            .as_object()
-            .unwrap();
-        for key in constraints.keys() {
-            assert!(
-                VIDEO_CONSTRAINT_KEYS.contains(&key.as_str()),
-                "unknown live video constraint key {key}"
-            );
-        }
-    }
-}
-
-#[test]
-fn i2v_to_r2v_promotions_have_their_own_reviewed_date() {
-    for bytes in [IMAGE_TO_VIDEO, SEEDANCE_2_5_R2V] {
-        let fixture: serde_json::Value = serde_json::from_slice(bytes).unwrap();
-        let live_type = fixture["data"][0]["model_spec"]["constraints"]["model_type"]
-            .as_str()
-            .unwrap();
-        let model = normalize_model_catalog(bytes, fetched_at())
-            .unwrap()
-            .remove(0);
-        if live_type == "image-to-video" && model.operation == MediaOperation::ReferenceToVideo {
-            assert_eq!(model.video.adapter_family, AdapterFamily::Seedance);
-        }
-    }
 }
 
 #[test]
