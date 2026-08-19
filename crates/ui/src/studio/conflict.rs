@@ -90,7 +90,7 @@ impl StudioPage {
                 .border_1()
                 .border_b_0()
                 .border_color(theme.border)
-                .bg(theme.surface_card)
+                .bg(theme.surface_overlay)
                 .when(!theme.is_glass(), |bar| bar.shadow_md())
                 .flex()
                 .items_center()
