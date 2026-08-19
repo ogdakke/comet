@@ -44,6 +44,8 @@ const ARTIFACT_FILMSTRIP_THUMB: f32 = 50.0;
 const ARTIFACT_FILMSTRIP_HEIGHT: f32 = 78.0;
 const ARTIFACT_FILMSTRIP_WIDTH_FRACTION: f32 = 0.94;
 const ARTIFACT_FILMSTRIP_FADE: f32 = 28.0;
+/// Breathing room between the filmstrip's top edge and the video pill.
+const ARTIFACT_FILMSTRIP_CLEARANCE: f32 = 12.0;
 const ARTIFACT_ZOOM_MAX: f32 = 24.0;
 /// Hard floor on the rubber-banded display zoom so the image cannot collapse.
 const ARTIFACT_ZOOM_MIN: f32 = 0.55;
@@ -474,6 +476,23 @@ fn filmstrip_visible_range(selected: usize, count: usize, viewport: f32) -> std:
     let start = selected.saturating_sub(pad);
     let end = (selected + pad + 1).min(count);
     start..end
+}
+
+/// Bottom lift for the video control pill so it clears the filmstrip. The
+/// pill rests at [`crate::video::CONTROLS_INSET`] above the video box, which
+/// is vertically centered in the stage — lift only the deficit, and none at
+/// all when the strip is hidden (edit mode) or the video already sits above
+/// it.
+fn filmstrip_controls_lift(filmstrip_visible: bool, stage_height: f32, video_height: f32) -> f32 {
+    if !filmstrip_visible {
+        return 0.0;
+    }
+    let bottom_gap = (stage_height - video_height).max(0.0) / 2.0;
+    (ARTIFACT_FILMSTRIP_HEIGHT
+        + ARTIFACT_FILMSTRIP_CLEARANCE
+        - bottom_gap
+        - crate::video::CONTROLS_INSET)
+        .max(0.0)
 }
 
 /// Neighbor slides only while a swipe is in flight. The resting image fills
@@ -2541,7 +2560,16 @@ impl StudioPage {
                 .or_else(|| slot.and_then(|slot| slot.duration_seconds)),
         };
         let entity = cx.weak_entity();
+        let controls_inset = gpui::Edges {
+            bottom: filmstrip_controls_lift(
+                self.edit_target.is_none(),
+                self.lightbox_stage_height,
+                self.video_stage_size(slot).1,
+            ),
+            ..Default::default()
+        };
         let player = crate::video::player("studio-video", chrome)
+            .controls_inset(controls_inset)
             .on_toggle_play({
                 let entity = entity.clone();
                 move |_, cx| {
@@ -3545,6 +3573,21 @@ mod tests {
     fn filmstrip_viewport_uses_most_of_the_stage() {
         assert!((filmstrip_viewport_width(1000.0) - 940.0).abs() < 0.01);
         assert!((filmstrip_viewport_width(0.0) - 1128.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn video_pill_lifts_only_the_filmstrip_deficit() {
+        let full = ARTIFACT_FILMSTRIP_HEIGHT
+            + ARTIFACT_FILMSTRIP_CLEARANCE
+            - crate::video::CONTROLS_INSET;
+        // Video fills the stage: the pill clears the strip plus clearance.
+        assert!((filmstrip_controls_lift(true, 800.0, 800.0) - full).abs() < 0.01);
+        // Partial overlap: only the deficit below the strip's top edge.
+        assert!((filmstrip_controls_lift(true, 800.0, 700.0) - (full - 50.0)).abs() < 0.01);
+        // Video already ends above the strip: no lift.
+        assert_eq!(filmstrip_controls_lift(true, 800.0, 600.0), 0.0);
+        // Strip hidden (edit mode): never lift.
+        assert_eq!(filmstrip_controls_lift(false, 800.0, 800.0), 0.0);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, DispatchPhase, ElementId, IntoElement, MouseButton,
+    AnyElement, App, Bounds, ClickEvent, DispatchPhase, Edges, ElementId, IntoElement, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, RenderOnce,
     SharedString, Window, canvas, div, point, prelude::*, px, quad, size,
 };
@@ -216,6 +216,7 @@ pub struct VideoPlayer {
     id: SharedString,
     chrome: VideoChrome,
     parts: VideoParts,
+    inset: Edges<f32>,
     children: Vec<AnyElement>,
     on_toggle_play: Option<Handler>,
     on_toggle_mute: Option<Handler>,
@@ -238,6 +239,7 @@ pub fn player(id: impl Into<SharedString>, chrome: VideoChrome) -> VideoPlayer {
         id: id.into(),
         chrome,
         parts: VideoParts::ALL,
+        inset: Edges::default(),
         children: Vec::new(),
         on_toggle_play: None,
         on_toggle_mute: None,
@@ -259,6 +261,16 @@ pub fn controls(id: impl Into<SharedString>, chrome: VideoChrome) -> VideoContro
 impl VideoPlayer {
     pub fn parts(mut self, parts: VideoParts) -> Self {
         self.parts = parts;
+        self
+    }
+
+    /// Extra inset for the control pill on top of the default
+    /// [`CONTROLS_INSET`] placement. `bottom` lifts the pill off the video's
+    /// bottom edge (e.g. to clear a sibling overlay like a filmstrip);
+    /// `left`/`right` widen the horizontal gutters. `top` is accepted for
+    /// symmetry but unused — the pill is bottom-anchored.
+    pub fn controls_inset(mut self, inset: Edges<f32>) -> Self {
+        self.inset = inset;
         self
     }
 
@@ -312,6 +324,7 @@ impl RenderOnce for VideoPlayer {
             id,
             chrome,
             parts,
+            inset,
             children,
             on_toggle_play,
             on_toggle_mute,
@@ -461,8 +474,9 @@ impl RenderOnce for VideoPlayer {
                     .absolute()
                     .left_0()
                     .right_0()
-                    .bottom(px(CONTROLS_INSET))
-                    .px(px(CONTROLS_INSET))
+                    .bottom(px(CONTROLS_INSET + inset.bottom))
+                    .pl(px(CONTROLS_INSET + inset.left))
+                    .pr(px(CONTROLS_INSET + inset.right))
                     .flex()
                     .justify_center()
                     .opacity(fade)
