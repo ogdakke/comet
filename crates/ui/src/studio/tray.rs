@@ -538,6 +538,10 @@ impl StudioPage {
         let labels = tray_budget_labels(
             &self.composer_view.budgets,
             &self.composer_view.attachments.items,
+            self.composer_view
+                .models
+                .iter()
+                .any(|chip| chip.operation == MediaOperation::ImageToVideo),
         );
         if labels.is_empty() {
             return None;
@@ -655,18 +659,33 @@ pub(super) fn budget_label(budget: &LimitBudget) -> Option<String> {
 pub(super) fn tray_budget_labels(
     budgets: &[LimitBudget],
     attachments: &[ComposerAttachment],
+    source_is_frame: bool,
 ) -> Vec<String> {
     let mut labels = Vec::new();
     let mut frame_max = 0u32;
+    let mut video_max = 0u32;
     let mut has_frames = false;
+    let mut has_videos = false;
     for budget in budgets {
         match &budget.kind {
-            BudgetKind::Role { role } if matches!(role.as_str(), ROLE_SOURCE | ROLE_LAST_FRAME) => {
+            BudgetKind::Role { role }
+                if source_is_frame && matches!(role.as_str(), ROLE_SOURCE | ROLE_LAST_FRAME) =>
+            {
                 let Some(maximum) = budget.maximum else {
                     continue;
                 };
                 has_frames = true;
                 frame_max += maximum;
+            }
+            BudgetKind::Role { role }
+                if !source_is_frame
+                    && matches!(role.as_str(), ROLE_SOURCE | ROLE_REFERENCE_VIDEO) =>
+            {
+                let Some(maximum) = budget.maximum else {
+                    continue;
+                };
+                has_videos = true;
+                video_max += maximum;
             }
             BudgetKind::Role { .. } => {
                 if let Some(label) = budget_label(budget) {
@@ -675,6 +694,13 @@ pub(super) fn tray_budget_labels(
             }
             BudgetKind::PromptChars => {}
         }
+    }
+    if has_videos && video_max > 0 {
+        let used = attachments
+            .iter()
+            .filter(|attachment| !attachment.pending && attachment.kind == ComposerMediaKind::Video)
+            .count() as u32;
+        labels.insert(0, format!("{used}/{video_max} videos"));
     }
     if has_frames && frame_max > 0 {
         let used = attachments
@@ -1090,7 +1116,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            tray_budget_labels(&budgets, &[]),
+            tray_budget_labels(&budgets, &[], true),
             vec!["0/2 frames".to_owned(), "0/30 images".to_owned()]
         );
         let attached = [ComposerAttachment {
@@ -1107,8 +1133,49 @@ mod tests {
             role_hint: None,
         }];
         assert_eq!(
-            tray_budget_labels(&budgets, &attached),
+            tray_budget_labels(&budgets, &attached, true),
             vec!["1/2 frames".to_owned(), "0/30 images".to_owned()]
+        );
+    }
+
+    #[test]
+    fn v2v_budgets_print_source_as_videos() {
+        let clip = ComposerAttachment {
+            id: StudioAssetId::new(),
+            kind: ComposerMediaKind::Video,
+            pending: false,
+            origin: AttachmentOrigin::Asset,
+            mime_type: "video/mp4".into(),
+            byte_size: 12,
+            width: None,
+            height: None,
+            duration_seconds: Some(4.0),
+            content_hash: "v".into(),
+            role_hint: None,
+        };
+        let budgets = [
+            LimitBudget {
+                kind: BudgetKind::Role {
+                    role: InputRole::new(ROLE_SOURCE),
+                },
+                used: 1,
+                maximum: Some(1),
+                subjects: Vec::new(),
+                remaining: Some(0),
+            },
+            LimitBudget {
+                kind: BudgetKind::Role {
+                    role: InputRole::new(ROLE_REFERENCE),
+                },
+                used: 0,
+                maximum: Some(1),
+                subjects: Vec::new(),
+                remaining: Some(1),
+            },
+        ];
+        assert_eq!(
+            tray_budget_labels(&budgets, std::slice::from_ref(&clip), false),
+            vec!["1/1 videos".to_owned(), "0/1 images".to_owned()]
         );
     }
 
