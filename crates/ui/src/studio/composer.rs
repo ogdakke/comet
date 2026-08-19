@@ -1111,9 +1111,9 @@ impl StudioPage {
                             })
                             .size(px(13.0))
                             .text_color(if on {
-                                theme.text
-                            } else {
                                 theme.text_muted
+                            } else {
+                                theme.text_faint
                             }),
                         ),
                 )
@@ -1779,7 +1779,7 @@ impl StudioPage {
             .rounded(px(14.0))
             .border_1()
             .border_color(theme.border)
-            .bg(crate::theme::wash(0.035))
+            .bg(gpui::transparent_black())
             .p(px(3.0))
             .gap(px(2.0))
             .child(mode_segment_chip(
@@ -1889,7 +1889,6 @@ impl StudioPage {
         let choices = self.composer_view.globals.duration_choices.clone();
         let current = self.composer_view.globals.duration.clone();
         let t = duration_slider_t(current.as_ref(), &choices);
-        let ink = theme.text;
         let entity = cx.weak_entity();
         let has_seconds = choices
             .iter()
@@ -1899,26 +1898,14 @@ impl StudioPage {
             .any(|choice| matches!(choice.value, ControlValue::DurationAuto));
         popover::popover_card(theme)
             .id("studio-duration-slider")
+            .bg(crate::theme::wash(0.06))
             .w(px(220.0))
-            .p(px(12.0))
+            .p(px(2.0))
             .on_mouse_down_out(cx.listener(|page, _, _, cx| {
                 if !page.duration_dragging {
                     page.close_duration_popup(cx);
                 }
             }))
-            .child(
-                div()
-                    .mb(px(8.0))
-                    .text_size(px(11.0))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(
-                        current
-                            .as_ref()
-                            .map(duration_chip_label)
-                            .unwrap_or_else(|| "Duration".into()),
-                    )),
-            )
             .when(has_seconds, |card| {
                 card.child(
                     div()
@@ -1941,7 +1928,12 @@ impl StudioPage {
                                     let _ = entity.update(cx, |page, _| {
                                         page.duration_track = Some(bounds);
                                     });
-                                    paint_duration_track(bounds, t, ink, window);
+                                    paint_duration_track(
+                                        bounds,
+                                        t,
+                                        crate::theme::wash(0.6),
+                                        window,
+                                    );
                                     let entity_move = entity.clone();
                                     window.on_mouse_event(
                                         move |event: &gpui::MouseMoveEvent, phase, _, cx| {
@@ -2055,7 +2047,8 @@ fn mode_segment_chip(
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id.into())
-        .size(px(28.0))
+        .h(px(28.0))
+        .w(px(36.0))
         .flex()
         .items_center()
         .justify_center()
@@ -2351,10 +2344,10 @@ fn paint_duration_track(bounds: Bounds<Pixels>, t: f32, ink: gpui::Hsla, window:
     let width = right - left;
     window.paint_quad(gpui::quad(
         Bounds {
-            origin: point(left, mid_y - px(1.0)),
-            size: size(width, px(2.0)),
+            origin: point(left, mid_y - px(4.0)),
+            size: size(width, px(8.0)),
         },
-        px(1.0),
+        px(4.0),
         ink.opacity(0.28),
         px(0.0),
         gpui::transparent_black(),
@@ -2363,22 +2356,10 @@ fn paint_duration_track(bounds: Bounds<Pixels>, t: f32, ink: gpui::Hsla, window:
     let fill = width * t.clamp(0.0, 1.0);
     window.paint_quad(gpui::quad(
         Bounds {
-            origin: point(left, mid_y - px(1.0)),
-            size: size(fill, px(2.0)),
+            origin: point(left, mid_y - px(4.0)),
+            size: size(fill, px(8.0)),
         },
-        px(1.0),
-        ink,
-        px(0.0),
-        gpui::transparent_black(),
-        gpui::BorderStyle::default(),
-    ));
-    let thumb_x = left + fill;
-    window.paint_quad(gpui::quad(
-        Bounds {
-            origin: point(thumb_x - px(7.0), mid_y - px(7.0)),
-            size: size(px(14.0), px(14.0)),
-        },
-        px(7.0),
+        px(4.0),
         ink,
         px(0.0),
         gpui::transparent_black(),

@@ -770,12 +770,13 @@ impl StudioStore {
                         FROM studio_run_inputs
                         WHERE run_id = r.id AND role = 'source' AND ordinal = 0
                         LIMIT 1
-                    )
+                    ),
+                    a.duration_seconds
              FROM studio_artifacts a
              JOIN studio_runs r ON r.id = a.run_id
              JOIN studio_batches b ON b.id = r.batch_id
              JOIN studio_turns t ON t.id = b.turn_id
-             WHERE a.deleted_at IS NULL AND a.media_kind = 'image'
+             WHERE a.deleted_at IS NULL AND a.media_kind IN ('image', 'video')
              ORDER BY a.created_at DESC, a.id DESC",
         )?;
         let rows = statement.query_map([], gallery_item_from_row)?;
@@ -1490,7 +1491,7 @@ impl StudioStore {
         let (existing_path, existing_hash): (Option<String>, Option<String>) =
             match self.connection()?.query_row(
                 "SELECT preview_relative_path, thumbhash FROM studio_artifacts
-                 WHERE id = ?1 AND deleted_at IS NULL AND media_kind = 'image'",
+                 WHERE id = ?1 AND deleted_at IS NULL AND media_kind IN ('image', 'video')",
                 [artifact_id.0.to_string()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             ) {
@@ -1540,7 +1541,7 @@ impl StudioStore {
         );
         let mut statement = connection.prepare(
             "SELECT id FROM studio_artifacts
-             WHERE deleted_at IS NULL AND media_kind = 'image'
+             WHERE deleted_at IS NULL AND media_kind IN ('image', 'video')
                AND (
                  preview_relative_path IS NULL
                  OR thumbhash IS NULL
@@ -1919,9 +1920,12 @@ impl StudioStore {
             })?;
             match self.artifacts.publish(id, extension, &artifact.bytes) {
                 Ok(path) => {
-                    let preview = matches!(artifact.media_kind, zeron_studio::MediaKind::Image)
-                        .then(|| self.artifacts.persist_preview(id, &artifact.bytes))
-                        .flatten();
+                    let preview = matches!(
+                        artifact.media_kind,
+                        zeron_studio::MediaKind::Image | zeron_studio::MediaKind::Video
+                    )
+                    .then(|| self.artifacts.persist_preview(id, &artifact.bytes))
+                    .flatten();
                     published.push((id, path, extension, artifact, mime_type, preview));
                 }
                 Err(error) => {
@@ -2935,6 +2939,7 @@ fn gallery_item_from_row(row: &rusqlite::Row<'_>) -> Result<StudioGalleryItem, r
             .map(|value| parse_uuid(13, value))
             .transpose()?
             .map(StudioArtifactId),
+        duration_seconds: row.get(14)?,
     })
 }
 

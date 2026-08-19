@@ -8,25 +8,124 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use gpui::{Context, Window};
+use gpui::{AnyElement, Context, Hsla, ObjectFit, SharedString, Window, div, hsla, prelude::*, px};
 use zeron_studio::{MediaKind, StudioArtifactId};
+
+use crate::theme::Theme;
 
 use super::page::StudioPage;
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// Hover must dwell this long before we fetch bytes and spin up a player.
+pub(super) const HOVER_AUTOPLAY_DELAY: Duration = Duration::from_millis(200);
+/// Matches gallery and thread tile rounding. GPUI surfaces ignore `rounded`
+/// (they paint a square), so hover playback covers these corners itself.
+pub(super) const TILE_CORNER_RADIUS: f32 = 10.0;
+
+/// Overlay plate for a duration chip sitting on media. Always a dark fill
+/// with light type — `ink()` + `theme.text` both go dark in light mode, so
+/// a themed plate would paint dark-on-dark over the poster.
+pub(super) fn duration_overlay_badge(theme: &Theme, seconds: Option<f64>) -> gpui::Div {
+    div()
+        .px(px(6.0))
+        .py(px(2.0))
+        .rounded(px(4.0))
+        .bg(if theme.is_glass() {
+            theme.glass_overlay()
+        } else {
+            theme.surface_overlay
+        })
+        .text_size(px(11.0))
+        .line_height(px(14.0))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(hsla(0.0, 0.0, 1.0, 0.96))
+        .child(SharedString::from(format_duration_badge(seconds)))
+}
+
 /// Badge / inspector clock for a duration in seconds (`0:06`, `1:05`).
 pub(super) fn format_duration_badge(seconds: Option<f64>) -> String {
-    let total = seconds.unwrap_or(0.0).max(0.0).round() as u64;
-    let hours = total / 3600;
-    let minutes = (total % 3600) / 60;
-    let secs = total % 60;
-    if hours > 0 {
-        format!("{hours}:{minutes:02}:{secs:02}")
-    } else {
-        format!("{minutes}:{secs:02}")
+    crate::video::format_timecode(seconds)
+}
+
+/// First-frame JPEG for a feed / filmstrip poster. macOS uses AVFoundation;
+/// other platforms return `None` and the tile keeps a play plate.
+pub(super) fn poster_jpeg_from_video_bytes(bytes: Vec<u8>) -> Option<Vec<u8>> {
+    zeron_engine::studio_preview::poster_jpeg_from_video_bytes(&bytes)
+}
+
+pub(super) fn hover_autoplay_supported() -> bool {
+    cfg!(target_os = "macos")
+}
+
+#[cfg(test)]
+fn hover_autoplay_ready(hovered_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(hovered_at) >= HOVER_AUTOPLAY_DELAY
+}
+
+/// Square-minus-quarter-circle ears at each corner of `bounds`.
+///
+/// `gpui::surface` paints a rectangle and does not honor `corner_radii`
+/// (upstream TODO). Parent `overflow_hidden` is also a rectangular mask,
+/// so hover playback would otherwise square off the tile. These fills sit
+/// on the video and restore the page color in the four ears.
+#[cfg(target_os = "macos")]
+fn paint_rounded_corner_covers(
+    bounds: gpui::Bounds<gpui::Pixels>,
+    radius: f32,
+    color: Hsla,
+    window: &mut Window,
+) {
+    let max_r = f32::from(bounds.size.width).min(f32::from(bounds.size.height)) / 2.0;
+    let r = px(radius.min(max_r));
+    if f32::from(r) <= 0.0 {
+        return;
+    }
+    let origin = bounds.origin;
+    let right = origin.x + bounds.size.width;
+    let bottom = origin.y + bounds.size.height;
+    let radii = gpui::point(r, r);
+    let mut builder = gpui::PathBuilder::fill();
+    // Each ear: outer corner → along the horizontal toward the tile →
+    // short arc along the rounded edge → close.
+    builder.move_to(origin);
+    builder.line_to(gpui::point(origin.x + r, origin.y));
+    builder.arc_to(
+        radii,
+        px(0.0),
+        false,
+        false,
+        gpui::point(origin.x, origin.y + r),
+    );
+    builder.close();
+    builder.move_to(gpui::point(right, origin.y));
+    builder.line_to(gpui::point(right - r, origin.y));
+    builder.arc_to(
+        radii,
+        px(0.0),
+        false,
+        true,
+        gpui::point(right, origin.y + r),
+    );
+    builder.close();
+    builder.move_to(gpui::point(right, bottom));
+    builder.line_to(gpui::point(right - r, bottom));
+    builder.arc_to(radii, px(0.0), false, false, gpui::point(right, bottom - r));
+    builder.close();
+    builder.move_to(gpui::point(origin.x, bottom));
+    builder.line_to(gpui::point(origin.x + r, bottom));
+    builder.arc_to(
+        radii,
+        px(0.0),
+        false,
+        true,
+        gpui::point(origin.x, bottom - r),
+    );
+    builder.close();
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, color);
     }
 }
 
@@ -97,12 +196,17 @@ pub(super) struct StudioVideoPlayback {
     pub loading: bool,
     pub error: Option<String>,
     pub playing: bool,
+    pub muted: bool,
     pub duration: Option<f64>,
     pub position: f64,
     pub pending_os_open: bool,
     keep_temp: bool,
     started: Option<Instant>,
     native: Option<NativePlayer>,
+    /// Extra frame pulls after a seek so a paused player still shows the new picture.
+    seek_settle: u8,
+    /// Hover previews restart at the end instead of pausing on the last frame.
+    looping: bool,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -121,12 +225,15 @@ impl StudioVideoPlayback {
             loading: true,
             error: None,
             playing: false,
+            muted: false,
             duration,
             position: 0.0,
             pending_os_open: false,
             keep_temp: false,
             started: None,
             native: None,
+            seek_settle: 0,
+            looping: false,
             _not_send: PhantomData,
         }
     }
@@ -147,12 +254,15 @@ impl StudioVideoPlayback {
             loading: false,
             error: None,
             playing: false,
+            muted: false,
             duration,
             position: 0.0,
             pending_os_open: false,
             keep_temp: false,
             started: None,
             native,
+            seek_settle: 0,
+            looping: false,
             _not_send: PhantomData,
         }
     }
@@ -169,12 +279,15 @@ impl StudioVideoPlayback {
             loading: false,
             error: None,
             playing: false,
+            muted: false,
             duration,
             position: 0.0,
             pending_os_open: false,
             keep_temp: false,
             started: None,
             native: None,
+            seek_settle: 0,
+            looping: false,
             _not_send: PhantomData,
         }
     }
@@ -186,12 +299,15 @@ impl StudioVideoPlayback {
             loading: false,
             error: Some(error),
             playing: false,
+            muted: false,
             duration: None,
             position: 0.0,
             pending_os_open: false,
             keep_temp: false,
             started: None,
             native: None,
+            seek_settle: 0,
+            looping: false,
             _not_send: PhantomData,
         }
     }
@@ -283,6 +399,33 @@ impl StudioVideoPlayback {
         }
     }
 
+    pub(super) fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
+        if let Some(native) = self.native.as_mut() {
+            native.set_muted(muted);
+        }
+    }
+
+    pub(super) fn set_looping(&mut self, looping: bool) {
+        self.looping = looping;
+    }
+
+    pub(super) fn toggle_mute(&mut self) {
+        self.set_muted(!self.muted);
+    }
+
+    pub(super) fn seek(&mut self, seconds: f64) {
+        let seconds = match self.duration {
+            Some(duration) if duration > 0.0 => seconds.clamp(0.0, duration),
+            _ => seconds.max(0.0),
+        };
+        self.position = seconds;
+        self.seek_settle = crate::video::seek_settle_frames();
+        if let Some(native) = self.native.as_mut() {
+            native.seek(seconds);
+        }
+    }
+
     /// Inspector Open / deferred fetch. Loading is not a user-facing error.
     pub(super) fn request_os_open(&mut self) -> Result<(), String> {
         if self.loading || self.path.is_none() {
@@ -317,7 +460,10 @@ impl StudioVideoPlayback {
     }
 
     pub(super) fn needs_frame(&self) -> bool {
-        self.playing && self.can_play_in_app()
+        if !self.can_play_in_app() {
+            return false;
+        }
+        self.playing || self.frame().is_none() || self.seek_settle > 0
     }
 
     pub(super) fn step(&mut self) -> bool {
@@ -325,16 +471,30 @@ impl StudioVideoPlayback {
             return false;
         };
         let changed = native.pull_frame();
-        if let Some(position) = native.position() {
-            self.position = position;
+        if changed {
+            self.seek_settle = 0;
+        } else if self.seek_settle > 0 {
+            self.seek_settle -= 1;
+        }
+        if self.seek_settle == 0 {
+            if let Some(position) = native.position() {
+                self.position = position;
+            }
         }
         if let Some(duration) = native.duration().or(self.duration) {
             self.duration = Some(duration);
             if self.playing && should_restart_from_start(self.position, Some(duration)) {
-                native.pause();
-                self.playing = false;
-                self.started = None;
-                self.position = duration;
+                if self.looping {
+                    native.seek_zero();
+                    native.play();
+                    self.position = 0.0;
+                    self.seek_settle = crate::video::seek_settle_frames();
+                } else {
+                    native.pause();
+                    self.playing = false;
+                    self.started = None;
+                    self.position = duration;
+                }
             }
         }
         changed || self.playing
@@ -399,8 +559,21 @@ impl NativePlayer {
     }
 
     fn seek_zero(&mut self) {
+        self.seek(0.0);
+    }
+
+    fn seek(&mut self, seconds: f64) {
         #[cfg(target_os = "macos")]
-        self.inner.seek_zero();
+        self.inner.seek(seconds);
+        #[cfg(not(target_os = "macos"))]
+        let _ = seconds;
+    }
+
+    fn set_muted(&mut self, muted: bool) {
+        #[cfg(target_os = "macos")]
+        self.inner.set_muted(muted);
+        #[cfg(not(target_os = "macos"))]
+        let _ = muted;
     }
 
     fn duration(&self) -> Option<f64> {
@@ -447,7 +620,7 @@ mod macos {
     use std::ffi::CString;
     use std::marker::PhantomData;
     use std::path::Path;
-    use std::ptr::{self, null_mut};
+    use std::ptr::null_mut;
 
     use core_foundation::base::{CFType, TCFType};
     use core_foundation::dictionary::CFDictionary;
@@ -473,7 +646,7 @@ mod macos {
     #[link(name = "CoreMedia", kind = "framework")]
     unsafe extern "C" {
         fn CMTimeGetSeconds(time: CmTime) -> f64;
-        fn CMTimeMake(value: i64, timescale: i32) -> CmTime;
+        fn CMTimeMakeWithSeconds(seconds: f64, preferredTimescale: i32) -> CmTime;
     }
 
     pub(super) struct AvPlayer {
@@ -556,11 +729,18 @@ mod macos {
             }
         }
 
-        pub(super) fn seek_zero(&mut self) {
+        pub(super) fn seek(&mut self, seconds: f64) {
             assert_ui_thread();
             unsafe {
-                let time = CMTimeMake(0, 1);
+                let time = CMTimeMakeWithSeconds(seconds.max(0.0), 600);
                 let _: () = msg_send![self.player, seekToTime: time];
+            }
+        }
+
+        pub(super) fn set_muted(&mut self, muted: bool) {
+            assert_ui_thread();
+            unsafe {
+                let _: () = msg_send![self.player, setMuted: muted];
             }
         }
 
@@ -593,7 +773,7 @@ mod macos {
                 let buffer: CVPixelBufferRef = msg_send![
                     self.output,
                     copyPixelBufferForItemTime: time
-                    itemTimeForDisplay: ptr::null_mut::<CmTime>()
+                    itemTimeForDisplay: null_mut::<CmTime>()
                 ];
                 if buffer.is_null() {
                     return false;
@@ -652,6 +832,9 @@ impl StudioPage {
             || self
                 .artifact_frame(id)
                 .is_some_and(super::artifact::ArtifactFrame::is_video)
+            || self
+                .gallery_item(id)
+                .is_some_and(|item| item.media_kind == MediaKind::Video)
             || self.conversation.as_ref().is_some_and(|view| {
                 view.turns.iter().any(|turn| {
                     turn.runs.iter().any(|run| {
@@ -670,6 +853,7 @@ impl StudioPage {
     }
 
     pub fn leave(&mut self) {
+        self.stop_hover_playback();
         self.stop_video_playback();
     }
 
@@ -683,6 +867,190 @@ impl StudioPage {
         self.video_task = None;
         self.video_frame_scheduled = false;
         Self::close_lightbox_session(&mut self.video);
+    }
+
+    pub(super) fn stop_hover_playback(&mut self) {
+        self.hover_generation = self.hover_generation.saturating_add(1);
+        self.hover_target = None;
+        self.hover_task = None;
+        self.hover_play = None;
+    }
+
+    pub(super) fn arm_hover_autoplay(&mut self, id: StudioArtifactId, cx: &mut Context<Self>) {
+        if !hover_autoplay_supported() || crate::motion::reduced_motion(cx) {
+            return;
+        }
+        if self.selected_frame.is_some() {
+            return;
+        }
+        if self.hover_target == Some(id) {
+            return;
+        }
+        self.stop_hover_playback();
+        self.hover_target = Some(id);
+        self.hover_generation = self.hover_generation.saturating_add(1);
+        let generation = self.hover_generation;
+        self.hover_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(HOVER_AUTOPLAY_DELAY).await;
+            this.update(cx, |page, cx| {
+                if page.hover_generation != generation || page.hover_target != Some(id) {
+                    return;
+                }
+                if page.selected_frame.is_some() || crate::motion::reduced_motion(cx) {
+                    return;
+                }
+                page.start_hover_playback(id, cx);
+            })
+            .ok();
+        }));
+    }
+
+    pub(super) fn disarm_hover_autoplay(&mut self, id: StudioArtifactId, cx: &mut Context<Self>) {
+        if self.hover_target == Some(id) {
+            self.stop_hover_playback();
+            cx.notify();
+        }
+    }
+
+    fn start_hover_playback(&mut self, artifact_id: StudioArtifactId, cx: &mut Context<Self>) {
+        if self
+            .hover_play
+            .as_ref()
+            .is_some_and(|player| player.artifact_id == artifact_id && player.error.is_none())
+        {
+            if let Some(player) = self.hover_play.as_mut()
+                && !player.playing
+                && !player.loading
+            {
+                player.set_muted(true);
+                player.set_looping(true);
+                let _ = player.autoplay();
+            }
+            cx.notify();
+            return;
+        }
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        let (mime, duration) = self.hover_video_meta(artifact_id);
+        let mut loading = StudioVideoPlayback::loading(artifact_id, duration);
+        loading.set_muted(true);
+        loading.set_looping(true);
+        self.hover_play = Some(loading);
+        self.hover_task = Some(cx.spawn(async move |this, cx| {
+            let loaded = super::artifact::read_artifact_bytes(&engine, artifact_id).await;
+            this.update(cx, |page, cx| {
+                if page.hover_target != Some(artifact_id) {
+                    return;
+                }
+                match loaded {
+                    Ok((_, mime_type, bytes)) => {
+                        let mime = if mime_type.is_empty() {
+                            mime
+                        } else {
+                            mime_type
+                        };
+                        let path = video_temp_path(artifact_id, &mime);
+                        match std::fs::write(&path, bytes) {
+                            Ok(()) => {
+                                let mut session = StudioVideoPlayback::ready_from_file(
+                                    artifact_id,
+                                    path,
+                                    duration,
+                                );
+                                session.set_muted(true);
+                                session.set_looping(true);
+                                page.hover_play = Some(session);
+                                if let Some(player) = page.hover_play.as_mut() {
+                                    let _ = player.autoplay();
+                                }
+                            }
+                            Err(_) => {
+                                page.hover_play = None;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        page.hover_play = None;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn hover_video_meta(&self, id: StudioArtifactId) -> (String, Option<f64>) {
+        if let Some(item) = self.gallery_item(id) {
+            return (item.mime_type.clone(), item.duration_seconds);
+        }
+        if let Some(frame) = self.artifact_frame(id) {
+            return (frame.mime_type.clone(), frame.duration_seconds);
+        }
+        let from_conversation = self.conversation.as_ref().and_then(|view| {
+            view.turns
+                .iter()
+                .flat_map(|turn| &turn.runs)
+                .flat_map(|run| &run.artifacts)
+                .find(|artifact| artifact.id == id)
+        });
+        match from_conversation {
+            Some(artifact) => (artifact.mime_type.clone(), artifact.duration_seconds),
+            None => ("video/mp4".into(), None),
+        }
+    }
+
+    pub(super) fn hover_video_layer(
+        &self,
+        id: StudioArtifactId,
+        fit: ObjectFit,
+        cover: Hsla,
+    ) -> Option<AnyElement> {
+        let player = self.hover_play.as_ref()?;
+        if player.artifact_id != id {
+            return None;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let buffer = player.frame()?;
+            let radius = px(TILE_CORNER_RADIUS);
+            Some(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .overflow_hidden()
+                    .rounded(radius)
+                    .child(
+                        gpui::surface(buffer)
+                            .object_fit(fit)
+                            .size_full()
+                            .rounded(radius),
+                    )
+                    .child(
+                        gpui::canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _| {
+                                paint_rounded_corner_covers(
+                                    bounds,
+                                    TILE_CORNER_RADIUS,
+                                    cover,
+                                    window,
+                                );
+                            },
+                        )
+                        .absolute()
+                        .inset_0()
+                        .size_full(),
+                    )
+                    .into_any_element(),
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (fit, cover);
+            None
+        }
     }
 
     pub(super) fn sync_video_playback(&mut self, cx: &mut Context<Self>) {
@@ -741,8 +1109,13 @@ impl StudioPage {
             .video
             .as_ref()
             .is_some_and(|player| player.artifact_id == artifact_id && player.pending_os_open);
+        let muted = self
+            .video
+            .as_ref()
+            .is_some_and(|player| player.artifact_id == artifact_id && player.muted);
         let mut loading = StudioVideoPlayback::loading(artifact_id, duration);
         loading.pending_os_open = pending_os_open;
+        loading.set_muted(muted);
         self.video = Some(loading);
         self.video_task = Some(cx.spawn(async move |this, cx| {
             let loaded = super::artifact::read_artifact_bytes(&engine, artifact_id).await;
@@ -769,11 +1142,14 @@ impl StudioPage {
                                     .video
                                     .as_ref()
                                     .is_some_and(|player| player.pending_os_open);
-                                page.video = Some(StudioVideoPlayback::ready_from_file(
+                                let muted = page.video.as_ref().is_some_and(|player| player.muted);
+                                let mut session = StudioVideoPlayback::ready_from_file(
                                     artifact_id,
                                     path,
                                     duration,
-                                ));
+                                );
+                                session.set_muted(muted);
+                                page.video = Some(session);
                                 if pending {
                                     page.open_ready_os_player(cx);
                                 } else {
@@ -830,6 +1206,26 @@ impl StudioPage {
         cx.notify();
     }
 
+    pub(super) fn toggle_selected_video_mute(&mut self, cx: &mut Context<Self>) {
+        if !self.selected_is_video() {
+            return;
+        }
+        if let Some(player) = self.video.as_mut() {
+            player.toggle_mute();
+        }
+        cx.notify();
+    }
+
+    pub(super) fn seek_selected_video(&mut self, seconds: f64, cx: &mut Context<Self>) {
+        if !self.selected_is_video() {
+            return;
+        }
+        if let Some(player) = self.video.as_mut() {
+            player.seek(seconds);
+        }
+        cx.notify();
+    }
+
     fn open_ready_os_player(&mut self, cx: &mut Context<Self>) {
         let Some(player) = self.video.as_mut() else {
             return;
@@ -879,11 +1275,19 @@ impl StudioPage {
         self.video
             .as_ref()
             .is_some_and(StudioVideoPlayback::needs_frame)
+            || self
+                .hover_play
+                .as_ref()
+                .is_some_and(StudioVideoPlayback::needs_frame)
     }
 
     pub(super) fn step_video_frame(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let changed = self.video.as_mut().is_some_and(StudioVideoPlayback::step);
-        if changed {
+        let lightbox = self.video.as_mut().is_some_and(StudioVideoPlayback::step);
+        let hover = self
+            .hover_play
+            .as_mut()
+            .is_some_and(StudioVideoPlayback::step);
+        if lightbox || hover {
             cx.notify();
         }
     }
@@ -1033,5 +1437,56 @@ mod tests {
         assert!(should_restart_from_start(6.0, Some(6.0)));
         assert!(should_restart_from_start(5.97, Some(6.0)));
         assert!(!should_restart_from_start(1.0, None));
+    }
+
+    #[test]
+    fn mute_toggles_without_a_native_player() {
+        let mut session = StudioVideoPlayback::loading(StudioArtifactId::new(), Some(6.0));
+        assert!(!session.muted);
+        session.toggle_mute();
+        assert!(session.muted);
+        session.toggle_mute();
+        assert!(!session.muted);
+    }
+
+    #[test]
+    fn seek_clamps_to_duration() {
+        let mut session = StudioVideoPlayback::loading(StudioArtifactId::new(), Some(6.0));
+        session.seek(2.5);
+        assert_eq!(session.position, 2.5);
+        session.seek(-1.0);
+        assert_eq!(session.position, 0.0);
+        session.seek(9.0);
+        assert_eq!(session.position, 6.0);
+        session.seek(0.0);
+        assert_eq!(session.position, 0.0);
+    }
+
+    #[test]
+    fn hover_autoplay_waits_200ms() {
+        let start = Instant::now();
+        assert!(!hover_autoplay_ready(start, start));
+        assert!(!hover_autoplay_ready(
+            start,
+            start + Duration::from_millis(199)
+        ));
+        assert!(hover_autoplay_ready(
+            start,
+            start + Duration::from_millis(200)
+        ));
+        assert_eq!(HOVER_AUTOPLAY_DELAY, Duration::from_millis(200));
+        assert_eq!(hover_autoplay_supported(), cfg!(target_os = "macos"));
+        assert_eq!(TILE_CORNER_RADIUS, 10.0);
+    }
+
+    #[test]
+    fn hover_preview_is_muted_and_looping() {
+        let mut session = StudioVideoPlayback::loading(StudioArtifactId::new(), Some(6.0));
+        assert!(!session.muted);
+        assert!(!session.looping);
+        session.set_muted(true);
+        session.set_looping(true);
+        assert!(session.muted);
+        assert!(session.looping);
     }
 }

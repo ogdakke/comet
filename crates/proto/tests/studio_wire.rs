@@ -178,6 +178,7 @@ fn gallery_items_use_camel_case_wire_shape() {
             created_at: chrono::Utc::now(),
             thumbhash: Some("3OcRJYB4d3h/iIeHeEh3eIhw+j3A".into()),
             source_artifact_id: None,
+            duration_seconds: None,
         }],
     };
     let json = serde_json::to_value(response).unwrap();
@@ -192,6 +193,7 @@ fn gallery_items_use_camel_case_wire_shape() {
             .and_then(|v| v.as_str()),
         Some("3OcRJYB4d3h/iIeHeEh3eIhw+j3A")
     );
+    assert!(json["artifacts"][0].get("durationSeconds").is_none());
     assert!(json["artifacts"][0].get("conversation_id").is_none());
 }
 

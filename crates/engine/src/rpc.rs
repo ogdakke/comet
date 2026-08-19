@@ -2564,6 +2564,16 @@ fn project_composer_specs(
         let inputs = zeron_studio::map_tray(snapshot, model)
             .map_err(|conflict| studio_validation_error(std::slice::from_ref(&conflict)))?;
         let mut controls = selected.controls.clone();
+        for control in &model.controls {
+            if control.id.as_str() == "duration" {
+                continue;
+            }
+            if !controls.contains_key(&control.id)
+                && let Some(default) = &control.default
+            {
+                controls.insert(control.id.clone(), default.clone());
+            }
+        }
         if snapshot.mode == zeron_studio::ComposerMode::Video
             && let Some(duration) = snapshot.duration.clone()
         {

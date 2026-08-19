@@ -17,6 +17,9 @@ use crate::{
 
 pub const VENICE_PROVIDER_ID: &str = "venice";
 
+const SENSIBLE_VIDEO_ASPECT: &str = "16:9";
+const SENSIBLE_VIDEO_RESOLUTION: &str = "1080p";
+
 /// Live `model_spec.constraints` keys the video parser understands.
 /// Drift CI fails if a checked-in fixture introduces a key outside this set.
 pub const VIDEO_CONSTRAINT_KEYS: &[&str] = &[
@@ -179,7 +182,7 @@ pub fn normalize_model_catalog(
 ) -> Result<Vec<MediaModel>, VeniceCatalogError> {
     let overlay = bundled_video_overlay()?;
     let response: CatalogResponse = serde_json::from_slice(json)?;
-    Ok(response
+    let mut models = response
         .data
         .into_iter()
         .filter(|model| {
@@ -189,7 +192,9 @@ pub fn normalize_model_catalog(
             )
         })
         .filter_map(|model| normalize_model(model, fetched_at, &overlay).ok())
-        .collect())
+        .collect::<Vec<_>>();
+    disambiguate_video_display_names(&mut models);
+    Ok(models)
 }
 
 fn normalize_model(
@@ -621,7 +626,9 @@ fn normalize_video(
     };
 
     let mut controls = Vec::new();
-    if let Some(control) = aspect_ratio_control(&constraints.aspect_ratios, None) {
+    if let Some(control) =
+        aspect_ratio_control(&constraints.aspect_ratios, Some(SENSIBLE_VIDEO_ASPECT))
+    {
         controls.push(control);
     }
     if !constraints.resolutions.is_empty() {
@@ -630,7 +637,7 @@ fn normalize_video(
             "Resolution",
             ControlKind::Resolution,
             &constraints.resolutions,
-            None,
+            Some(SENSIBLE_VIDEO_RESOLUTION),
         ));
     }
     if !constraints.durations.is_empty() {
@@ -755,12 +762,15 @@ fn aspect_ratio_control(values: &[String], default: Option<&str>) -> Option<Mode
     if choices.is_empty() {
         return None;
     }
-    let default = default.and_then(parse_aspect_ratio).and_then(|parsed| {
-        choices
-            .iter()
-            .find(|choice| choice.value == parsed)
-            .map(|choice| choice.value.clone())
-    });
+    let default = default
+        .and_then(parse_aspect_ratio)
+        .and_then(|parsed| {
+            choices
+                .iter()
+                .find(|choice| choice.value == parsed)
+                .map(|choice| choice.value.clone())
+        })
+        .or_else(|| first_concrete_aspect(&choices));
     Some(ModelControl {
         id: ControlId::from("aspect_ratio"),
         label: "Aspect ratio".to_owned(),
@@ -774,6 +784,14 @@ fn aspect_ratio_control(values: &[String], default: Option<&str>) -> Option<Mode
         choices,
         visible_when: Vec::new(),
     })
+}
+
+fn first_concrete_aspect(choices: &[ControlChoice]) -> Option<ControlValue> {
+    choices
+        .iter()
+        .find(|choice| matches!(choice.value, ControlValue::AspectRatio { .. }))
+        .or(choices.first())
+        .map(|choice| choice.value.clone())
 }
 
 fn parse_duration(value: &str) -> Option<(ControlValue, String)> {
@@ -815,13 +833,31 @@ fn duration_control(model_id: &str, values: &[String]) -> Result<ModelControl, V
         description: None,
         kind: ControlKind::Duration,
         required: true,
-        default: None,
+        default: sensible_duration_default(&choices),
         minimum: None,
         maximum: None,
         step: None,
         choices,
         visible_when: Vec::new(),
     })
+}
+
+fn sensible_duration_default(choices: &[ControlChoice]) -> Option<ControlValue> {
+    for prefer in [6.0, 5.0, 10.0] {
+        if let Some(choice) = choices.iter().find(|choice| {
+            matches!(
+                choice.value,
+                ControlValue::DurationSeconds { value } if (value - prefer).abs() < f64::EPSILON
+            )
+        }) {
+            return Some(choice.value.clone());
+        }
+    }
+    choices
+        .iter()
+        .find(|choice| matches!(choice.value, ControlValue::DurationSeconds { .. }))
+        .or(choices.first())
+        .map(|choice| choice.value.clone())
 }
 
 fn normalize_image_format(value: &str) -> Option<String> {
@@ -903,25 +939,45 @@ fn choice_control(
             value: value.to_owned(),
         },
     };
+    let choices: Vec<ControlChoice> = values
+        .iter()
+        .map(|value| ControlChoice {
+            value: make_value(value),
+            label: value.clone(),
+        })
+        .collect();
+    let default = default
+        .filter(|value| values.iter().any(|choice| choice == value))
+        .map(make_value)
+        .or_else(|| preferred_choice_default(kind, &choices));
     ModelControl {
         id: ControlId::from(id),
         label: label.to_owned(),
         description: None,
         kind,
         required: false,
-        default: default.map(make_value),
+        default,
         minimum: None,
         maximum: None,
         step: None,
-        choices: values
-            .iter()
-            .map(|value| ControlChoice {
-                value: make_value(value),
-                label: value.clone(),
-            })
-            .collect(),
+        choices,
         visible_when: Vec::new(),
     }
+}
+
+fn preferred_choice_default(kind: ControlKind, choices: &[ControlChoice]) -> Option<ControlValue> {
+    if kind == ControlKind::Resolution {
+        for prefer in ["1080p", "720p", "480p", "1K"] {
+            if let Some(choice) = choices.iter().find(|choice| match &choice.value {
+                ControlValue::Resolution { value } => value == prefer,
+                ControlValue::Enum { value } => value == prefer,
+                _ => false,
+            }) {
+                return Some(choice.value.clone());
+            }
+        }
+    }
+    choices.first().map(|choice| choice.value.clone())
 }
 
 fn input_constraint(role: &'static str, mime_types: &[&str]) -> InputConstraint {
@@ -1080,6 +1136,51 @@ fn usd_amount(value: &serde_json::Value) -> Option<f64> {
 
 /// Hash the schema a request must satisfy. Display copy, pricing, and fetch
 /// time can change without invalidating an already-valid form.
+fn operation_picker_suffix(operation: MediaOperation) -> Option<&'static str> {
+    match operation {
+        MediaOperation::TextToVideo => Some("T2V"),
+        MediaOperation::ImageToVideo => Some("I2V"),
+        MediaOperation::ReferenceToVideo => Some("R2V"),
+        MediaOperation::VideoToVideo => Some("V2V"),
+        _ => None,
+    }
+}
+
+fn name_already_tagged(name: &str, suffix: &str) -> bool {
+    name.split_whitespace()
+        .any(|word| word.eq_ignore_ascii_case(suffix))
+}
+
+/// Live T2V and I2V rows often share a display name ("Seedance 1.5 Pro").
+/// Qualify colliding video names with the operation so the picker is readable.
+fn disambiguate_video_display_names(models: &mut [MediaModel]) {
+    let mut groups: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (index, model) in models.iter().enumerate() {
+        if model.output_kind != MediaKind::Video {
+            continue;
+        }
+        groups
+            .entry(model.display_name.clone())
+            .or_default()
+            .push(index);
+    }
+    for indexes in groups.into_values() {
+        if indexes.len() < 2 {
+            continue;
+        }
+        for index in indexes {
+            let Some(suffix) = operation_picker_suffix(models[index].operation) else {
+                continue;
+            };
+            if name_already_tagged(&models[index].display_name, suffix) {
+                continue;
+            }
+            models[index].display_name = format!("{} {suffix}", models[index].display_name);
+        }
+    }
+}
+
 fn finish_manifest(mut model: MediaModel) -> Result<MediaModel, VeniceCatalogError> {
     let mut submit_relevant = serde_json::to_value(&model)?;
     if let Some(object) = submit_relevant.as_object_mut() {

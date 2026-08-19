@@ -194,7 +194,7 @@ pub(super) fn frames_from_gallery(items: &[StudioGalleryItem]) -> Vec<ArtifactFr
             state: StudioRunState::Succeeded,
             progress: None,
             media_kind: item.media_kind,
-            duration_seconds: None,
+            duration_seconds: item.duration_seconds,
         })
         .collect()
 }
@@ -1325,6 +1325,7 @@ impl StudioPage {
         self.close_image_menu(cx);
         self.close_upscale_settings_menu(cx);
         self.close_artifact_actions_menu(cx);
+        self.stop_hover_playback();
         self.lightbox_frames = frames;
         if !self.lightbox_frames.iter().any(|frame| frame.key == key) {
             let recovered = self.surface_artifact_frames();
@@ -2244,6 +2245,9 @@ impl StudioPage {
         let transformed = page.is_none()
             && (self.lightbox_zoom_spring.is_some()
                 || lightbox_viewer_transformed(zoom, self.lightbox_pan));
+        if video {
+            return self.render_video_slide(frame, slot, base, overlay, cx);
+        }
         let image_size = artifact_id.and_then(|id| self.photo_pixel_size(id, window, cx));
         let stack = |base: Arc<Image>, overlay: Option<Arc<Image>>| {
             // Once the sharp frame has a GPU tile, drop the ThumbHash. A 2:3
@@ -2299,13 +2303,7 @@ impl StudioPage {
             layer.child(contain_layers(paint, None, px(0.0), None))
         };
         match base {
-            Some(base) => {
-                let mut slide = frame.child(stack(base, overlay));
-                if video {
-                    slide = slide.child(self.render_video_stage_overlay(slot, theme, cx));
-                }
-                slide.into_any_element()
-            }
+            Some(base) => frame.child(stack(base, overlay)).into_any_element(),
             None => {
                 let loading = slot.and_then(|slot| {
                     let seed = slot.run_id.0.as_u128() as u32 ^ slot.output_ix as u32;
@@ -2337,15 +2335,6 @@ impl StudioPage {
                 });
                 let failed = slot.is_some_and(|slot| slot.state == StudioRunState::Failed);
                 let show_fallback = loading.is_none() && !failed;
-                let fallback = if video {
-                    if self.video.as_ref().is_some_and(|player| player.loading) {
-                        "Loading video…"
-                    } else {
-                        "Video"
-                    }
-                } else {
-                    "Loading image…"
-                };
                 frame
                     .child(
                         div()
@@ -2362,10 +2351,7 @@ impl StudioPage {
                             .when(show_fallback, |box_| {
                                 box_.text_size(px(12.0))
                                     .text_color(theme.text_faint)
-                                    .child(fallback)
-                            })
-                            .when(video, |box_| {
-                                box_.child(self.render_video_stage_overlay(slot, theme, cx))
+                                    .child("Loading image…")
                             }),
                     )
                     .into_any_element()
@@ -2373,81 +2359,111 @@ impl StudioPage {
         }
     }
 
+    fn video_stage_size(&self, slot: Option<&ArtifactFrame>) -> (f32, f32) {
+        let (aw, ah) = slot
+            .and_then(|slot| slot.width.zip(slot.height))
+            .filter(|(width, height)| *width > 0 && *height > 0)
+            .unwrap_or((16, 9));
+        if self.lightbox_stage_width > 1.0 && self.lightbox_stage_height > 1.0 {
+            lightbox_contain_size(
+                self.lightbox_stage_width,
+                self.lightbox_stage_height,
+                aw as f32,
+                ah as f32,
+            )
+        } else {
+            let height = 360.0;
+            (height * aw as f32 / ah.max(1) as f32, height)
+        }
+    }
+
+    fn render_video_slide(
+        &self,
+        frame: gpui::Stateful<gpui::Div>,
+        slot: Option<&ArtifactFrame>,
+        base: Option<Arc<Image>>,
+        overlay: Option<Arc<Image>>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (width, height) = self.video_stage_size(slot);
+        let mut stage = div()
+            .relative()
+            .flex_none()
+            .w(px(width))
+            .h(px(height))
+            .overflow_hidden()
+            .rounded(px(12.0))
+            .bg(crate::theme::ink(0.04));
+        if let Some(base) = base {
+            stage = stage.child(contain_layers(base, overlay, px(0.0), None));
+        }
+        stage = stage.child(self.render_video_stage_overlay(slot, cx));
+        frame.child(stage).into_any_element()
+    }
+
     fn render_video_stage_overlay(
         &self,
         slot: Option<&ArtifactFrame>,
-        theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let playing = self.video.as_ref().is_some_and(|player| player.playing);
-        let loading = self.video.as_ref().is_some_and(|player| player.loading);
-        let duration = self
-            .video
-            .as_ref()
-            .and_then(|player| player.duration)
-            .or_else(|| slot.and_then(|slot| slot.duration_seconds));
-        let mut overlay = div().absolute().inset_0();
+        let chrome = crate::video::VideoChrome {
+            playing: self.video.as_ref().is_some_and(|player| player.playing),
+            muted: self.video.as_ref().is_some_and(|player| player.muted),
+            loading: self.video.as_ref().is_some_and(|player| player.loading),
+            position: self
+                .video
+                .as_ref()
+                .map(|player| player.position)
+                .unwrap_or(0.0),
+            duration: self
+                .video
+                .as_ref()
+                .and_then(|player| player.duration)
+                .or_else(|| slot.and_then(|slot| slot.duration_seconds)),
+        };
+        let entity = cx.weak_entity();
+        let player = crate::video::player("studio-video", chrome)
+            .on_toggle_play({
+                let entity = entity.clone();
+                move |_, cx| {
+                    let _ = entity.update(cx, |page, cx| page.toggle_selected_video(cx));
+                }
+            })
+            .on_toggle_mute({
+                let entity = entity.clone();
+                move |_, cx| {
+                    let _ = entity.update(cx, |page, cx| page.toggle_selected_video_mute(cx));
+                }
+            })
+            .on_seek({
+                let entity = entity.clone();
+                move |seconds, _, cx| {
+                    let _ = entity.update(cx, |page, cx| page.seek_selected_video(seconds, cx));
+                }
+            });
         #[cfg(target_os = "macos")]
-        {
+        let player = {
             if let Some(buffer) = self
                 .video
                 .as_ref()
                 .and_then(super::video::StudioVideoPlayback::frame)
             {
-                overlay = overlay.child(
+                player.child(
                     gpui::surface(buffer)
                         .object_fit(gpui::ObjectFit::Contain)
+                        .size_full()
                         .absolute()
                         .inset_0(),
-                );
+                )
+            } else {
+                player
             }
-        }
-        overlay
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                div()
-                    .id("studio-video-play")
-                    .size(px(56.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .bg(crate::theme::ink(if playing { 0.28 } else { 0.55 }))
-                    .text_size(px(18.0))
-                    .text_color(theme.text)
-                    .opacity(if playing { 0.0 } else { 1.0 })
-                    .cursor_pointer()
-                    .hover(|style| style.opacity(1.0).bg(crate::theme::ink(0.62)))
-                    .on_click(cx.listener(|page, _, _, cx| {
-                        page.toggle_selected_video(cx);
-                        cx.stop_propagation();
-                    }))
-                    .child(SharedString::from(if playing {
-                        "❚❚"
-                    } else if loading {
-                        "…"
-                    } else {
-                        "▶"
-                    })),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .right(px(16.0))
-                    .bottom(px(16.0))
-                    .px(px(8.0))
-                    .py(px(3.0))
-                    .rounded(px(5.0))
-                    .bg(crate::theme::ink(0.72))
-                    .text_size(px(12.0))
-                    .text_color(theme.text)
-                    .child(SharedString::from(super::video::format_duration_badge(
-                        duration,
-                    ))),
-            )
+        };
+        div()
+            .absolute()
+            .inset_0()
+            .size_full()
+            .child(player)
             .into_any_element()
     }
 
@@ -2660,7 +2676,6 @@ impl StudioPage {
             .on_click(cx.listener(|page, event: &gpui::ClickEvent, window, cx| {
                 if event.click_count() >= 2 {
                     if page.selected_is_video() {
-                        page.toggle_selected_video(cx);
                         return;
                     }
                     if page.lightbox_zoom > 1.001 || page.lightbox_zoom < 0.999 {
@@ -2678,7 +2693,6 @@ impl StudioPage {
                     if page.selected_is_video()
                         && !page.lightbox_click_is_empty(event.position(), window, cx)
                     {
-                        page.toggle_selected_video(cx);
                         return;
                     }
                     if page.lightbox_click_is_empty(event.position(), window, cx) {
@@ -3321,6 +3335,16 @@ mod tests {
             previous = position;
         }
         assert!((snap_offset_at(from, to, 0.22, 0.22) - to).abs() < 0.01);
+    }
+
+    #[test]
+    fn video_stage_fills_the_lightbox_using_aspect() {
+        let (width, height) = lightbox_contain_size(1200.0, 800.0, 16.0, 9.0);
+        assert!((width - 1200.0).abs() < 0.01);
+        assert!((height - 675.0).abs() < 0.01);
+        let (width, height) = lightbox_contain_size(800.0, 800.0, 16.0, 9.0);
+        assert!((width - 800.0).abs() < 0.01);
+        assert!((height - 450.0).abs() < 0.01);
     }
 
     #[test]

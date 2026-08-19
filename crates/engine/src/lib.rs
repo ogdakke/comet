@@ -31,7 +31,7 @@ pub mod sessions;
 pub mod spaces;
 pub mod studio;
 pub mod studio_credentials;
-mod studio_preview;
+pub mod studio_preview;
 pub mod terminals;
 pub mod titles;
 pub mod uploads;

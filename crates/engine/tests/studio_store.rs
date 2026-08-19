@@ -759,6 +759,46 @@ fn complete_run_persists_a_preview_and_thumbhash() {
 }
 
 #[test]
+fn gallery_lists_videos_and_queues_them_for_preview_backfill() {
+    let root = tempdir().unwrap();
+    let store = StudioStore::open(root.path(), 1024 * 1024).unwrap();
+    let conversation = store.create_conversation("video gallery", None).unwrap();
+    let stored = store
+        .create_turn(
+            conversation.id,
+            "a comet",
+            None,
+            &[prepared_run(&seedance_t2v_model("fake"), "a comet")],
+            "device-a",
+        )
+        .unwrap();
+    store
+        .complete_run(
+            &stored[0],
+            &[ProviderArtifact {
+                media_kind: MediaKind::Video,
+                mime_type: "video/mp4".into(),
+                bytes: ftyp_mp4(),
+                width: Some(64),
+                height: Some(36),
+                duration_seconds: Some(6.0),
+                metadata: serde_json::json!({}),
+            }],
+        )
+        .unwrap();
+    let gallery = store.list_gallery().unwrap();
+    assert_eq!(gallery.len(), 1);
+    assert_eq!(gallery[0].media_kind, MediaKind::Video);
+    assert_eq!(gallery[0].mime_type, "video/mp4");
+    assert_eq!(gallery[0].duration_seconds, Some(6.0));
+    assert!(gallery[0].thumbhash.is_none());
+    assert_eq!(
+        store.artifacts_missing_previews().unwrap(),
+        vec![gallery[0].id]
+    );
+}
+
+#[test]
 fn preview_read_backfills_legacy_artifacts() {
     let root = tempdir().unwrap();
     let store = StudioStore::open(root.path(), 1024 * 1024).unwrap();

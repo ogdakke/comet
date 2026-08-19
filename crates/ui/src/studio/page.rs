@@ -203,6 +203,11 @@ pub struct StudioPage {
     pub(super) video: Option<super::video::StudioVideoPlayback>,
     pub(super) video_task: Option<Task<()>>,
     pub(super) video_frame_scheduled: bool,
+    /// Tile currently armed for muted hover autoplay. Distinct from lightbox.
+    pub(super) hover_target: Option<StudioArtifactId>,
+    pub(super) hover_generation: u64,
+    pub(super) hover_play: Option<super::video::StudioVideoPlayback>,
+    pub(super) hover_task: Option<Task<()>>,
     pub(super) _observe: Subscription,
     pub(super) _prompt_events: Subscription,
     pub(super) _edit_prompt_events: Subscription,
@@ -398,6 +403,10 @@ impl StudioPage {
             video: None,
             video_task: None,
             video_frame_scheduled: false,
+            hover_target: None,
+            hover_generation: 0,
+            hover_play: None,
+            hover_task: None,
             _observe: observe,
             _prompt_events: prompt_events,
             _edit_prompt_events: edit_prompt_events,
@@ -683,6 +692,7 @@ impl StudioPage {
         let Some(engine) = self.engine(cx) else {
             return;
         };
+        self.stop_hover_playback();
         self.close_image_menu(cx);
         if self.selected_conversation != Some(id) {
             self.focused_artifact = None;
@@ -908,6 +918,14 @@ impl StudioPage {
             .is_some_and(|player| player.artifact_id == artifact_id)
         {
             self.stop_video_playback();
+        }
+        if self.hover_target == Some(artifact_id)
+            || self
+                .hover_play
+                .as_ref()
+                .is_some_and(|player| player.artifact_id == artifact_id)
+        {
+            self.stop_hover_playback();
         }
         self.gallery.retain(|item| item.id != artifact_id);
         self.gallery_selected.remove(&artifact_id);

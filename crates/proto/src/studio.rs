@@ -403,6 +403,9 @@ pub struct StudioGalleryItem {
         alias = "upscaledFromArtifactId"
     )]
     pub source_artifact_id: Option<StudioArtifactId>,
+    /// Clip length for video tiles. Images omit this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

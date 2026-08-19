@@ -30,7 +30,6 @@ use crate::transcript::{self, format_timestamp};
 
 use super::artifact::{StudioPaint, contain_layers};
 use super::page::StudioPage;
-use super::video::format_duration_badge;
 
 /// Scroll runway below the final Studio turn. The composer floats 18px above
 /// the viewport and is 191px tall at its largest first-release configuration;
@@ -691,6 +690,10 @@ fn feed_output_slots(run: &StudioRunView) -> Vec<(usize, Option<StudioArtifactId
     }
 }
 
+fn previewable_feed_kind(kind: MediaKind) -> bool {
+    matches!(kind, MediaKind::Image | MediaKind::Video)
+}
+
 pub(super) fn loading_effect(
     seed: u32,
     state: StudioRunState,
@@ -719,19 +722,11 @@ pub(super) fn feed_tile_element_id(
     }
 }
 
-fn video_duration_badge(seconds: Option<f64>, theme: &Theme) -> AnyElement {
-    div()
+fn video_duration_badge(theme: &Theme, seconds: Option<f64>) -> AnyElement {
+    super::video::duration_overlay_badge(theme, seconds)
         .absolute()
         .right(px(8.0))
         .bottom(px(8.0))
-        .px(px(6.0))
-        .py(px(2.0))
-        .rounded(px(4.0))
-        .bg(crate::theme::ink(0.72))
-        .text_size(px(11.0))
-        .line_height(px(14.0))
-        .text_color(theme.text)
-        .child(SharedString::from(format_duration_badge(seconds)))
         .into_any_element()
 }
 
@@ -788,7 +783,7 @@ impl StudioPage {
                 cx,
             );
         }
-        let badge = video.then(|| video_duration_badge(duration_seconds, theme));
+        let badge = video.then(|| video_duration_badge(theme, duration_seconds));
         if let Some(id) = artifact_id {
             let paint = if !video && self.feed_viewport_fulls.contains(&id) {
                 StudioPaint::Display
@@ -801,8 +796,14 @@ impl StudioPage {
                     .relative()
                     .cursor_pointer()
                     .on_hover(cx.listener(move |page, hovered: &bool, window, cx| {
-                        if *hovered && !page.artifact_is_video(id) {
-                            page.prefetch_gallery_full(id, window, cx);
+                        if *hovered {
+                            if page.artifact_is_video(id) {
+                                page.arm_hover_autoplay(id, cx);
+                            } else {
+                                page.prefetch_gallery_full(id, window, cx);
+                            }
+                        } else {
+                            page.disarm_hover_autoplay(id, cx);
                         }
                     }))
                     .on_click(cx.listener(move |page, _, window, cx| {
@@ -823,6 +824,10 @@ impl StudioPage {
                             Some(SharedString::from(format!("studio-thumb-ready-{}", id.0))),
                         )),
                     ))
+                    .when_some(
+                        self.hover_video_layer(id, gpui::ObjectFit::Contain, theme.bg),
+                        |tile, layer| tile.child(layer),
+                    )
                     .when_some(badge, |tile, badge| tile.child(badge))
                     .when_some(self.artifact_focus_ring(id, theme), |tile, ring| {
                         tile.child(ring)
@@ -841,17 +846,25 @@ impl StudioPage {
                 .h(px(height))
                 .rounded(px(10.0))
         });
-        // Succeeded video without a poster keeps the aspect skeleton.
-        let fill = fill.or_else(|| {
-            (video && state == StudioRunState::Succeeded).then(|| {
-                shader(Effect::SoftNoise { seed, amount: 0.55 })
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .w(px(width))
-                    .h(px(height))
-                    .rounded(px(10.0))
-            })
+        let play = (video && state == StudioRunState::Succeeded).then(|| {
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .size(px(44.0))
+                        .rounded_full()
+                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.55))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(16.0))
+                        .text_color(gpui::hsla(0.0, 0.0, 1.0, 0.96))
+                        .child(SharedString::from("▶")),
+                )
         });
         let open_key = artifact_id
             .map(super::artifact::ArtifactFrameKey::Ready)
@@ -863,6 +876,17 @@ impl StudioPage {
             .text_size(px(11.0))
             .text_color(theme.text_faint)
             .cursor_pointer()
+            .when_some(artifact_id, |tile, id| {
+                tile.on_hover(cx.listener(move |page, hovered: &bool, _, cx| {
+                    if *hovered {
+                        if page.artifact_is_video(id) {
+                            page.arm_hover_autoplay(id, cx);
+                        }
+                    } else {
+                        page.disarm_hover_autoplay(id, cx);
+                    }
+                }))
+            })
             .on_click(cx.listener(move |page, _, window, cx| {
                 let frames = page
                     .conversation
@@ -873,6 +897,12 @@ impl StudioPage {
                 window.focus(&page.focus, cx);
             }))
             .when_some(fill, |tile, fill| tile.child(fill))
+            .when_some(play, |tile, play| tile.child(play))
+            .when_some(
+                artifact_id
+                    .and_then(|id| self.hover_video_layer(id, gpui::ObjectFit::Contain, theme.bg)),
+                |tile, layer| tile.child(layer),
+            )
             .when(state == StudioRunState::Failed, |tile| {
                 tile.child("Generation failed")
             })
@@ -1213,7 +1243,7 @@ impl StudioPage {
         let visible = feed_visible_or_tail(self.feed_visible_rows.clone(), count);
         let have_cull = self.feed_cull_bottom > self.feed_cull_top;
         if !have_cull {
-            return self.lineage_image_ids_for_feed_range(visible, max);
+            return self.lineage_preview_ids_for_feed_range(visible, max);
         }
         let extra = (overdraw - FEED_OVERDRAW_PX).max(0.0);
         let band_top = self.feed_cull_top - extra;
@@ -1246,7 +1276,7 @@ impl StudioPage {
                 let Some(id) = tile.artifact_id else {
                     continue;
                 };
-                if tile.media_kind != MediaKind::Image {
+                if !previewable_feed_kind(tile.media_kind) {
                     continue;
                 }
                 let (aw, ah) = tile.aspect;
@@ -1257,15 +1287,32 @@ impl StudioPage {
             }
         }
         if !any_bounds {
-            return self.lineage_image_ids_for_feed_range(visible, max);
+            return self.lineage_preview_ids_for_feed_range(visible, max);
         }
         feed_display_ids_in_band(&tiles, band_top, band_bottom.max(band_top + 1.0), max)
+    }
+
+    fn lineage_preview_ids_for_feed_range(
+        &self,
+        range: Range<usize>,
+        max: usize,
+    ) -> Vec<StudioArtifactId> {
+        self.lineage_ids_for_feed_range(range, max, previewable_feed_kind)
     }
 
     fn lineage_image_ids_for_feed_range(
         &self,
         range: Range<usize>,
         max: usize,
+    ) -> Vec<StudioArtifactId> {
+        self.lineage_ids_for_feed_range(range, max, |kind| kind == MediaKind::Image)
+    }
+
+    fn lineage_ids_for_feed_range(
+        &self,
+        range: Range<usize>,
+        max: usize,
+        accept: impl Fn(MediaKind) -> bool,
     ) -> Vec<StudioArtifactId> {
         let end = range.end.min(self.feed_turn_count());
         let start = range.start.min(end);
@@ -1275,7 +1322,7 @@ impl StudioPage {
                 continue;
             };
             for tile in self.lineage.tiles_for_root(turn_id) {
-                if tile.media_kind != MediaKind::Image {
+                if !accept(tile.media_kind) {
                     continue;
                 }
                 if let Some(id) = tile.artifact_id {
@@ -2331,8 +2378,14 @@ mod tests {
 
     #[test]
     fn video_duration_badge_uses_clock_style() {
-        assert_eq!(format_duration_badge(Some(6.2)), "0:06");
-        assert_eq!(format_duration_badge(Some(75.0)), "1:15");
+        assert_eq!(
+            crate::studio::video::format_duration_badge(Some(6.2)),
+            "0:06"
+        );
+        assert_eq!(
+            crate::studio::video::format_duration_badge(Some(75.0)),
+            "1:15"
+        );
     }
 
     #[test]

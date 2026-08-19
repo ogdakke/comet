@@ -35,6 +35,7 @@ impl DraftRunConfig {
                     control
                         .default
                         .clone()
+                        .or_else(|| control.choices.first().map(|choice| choice.value.clone()))
                         .map(|value| (control.id.clone(), value))
                 })
                 .collect(),
