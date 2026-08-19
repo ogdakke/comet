@@ -908,7 +908,14 @@ async fn run_session(session: Session) {
 
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
-                    if turn_active {
+                    if msg.follow_up && turn_active {
+                        // Queued prompt ("send after this turn"): park it —
+                        // agent_settled delivers it as the next prompt via
+                        // start_turn, which resets the turn state and
+                        // rotates the assistant message id. Never injected
+                        // mid-turn, by definition.
+                        queued_steers.push_back(msg.prompt);
+                    } else if turn_active {
                         // Native mid-turn injection.
                         match client
                             .request(json!({"type": "steer", "message": msg.prompt}))

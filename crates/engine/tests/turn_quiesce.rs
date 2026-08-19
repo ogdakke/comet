@@ -335,7 +335,7 @@ async fn missing_turn_end_settles_instead_of_working_forever() {
     let outcome = rig
         .core
         .sessions
-        .steer(CHAT, "what about now", None)
+        .steer(CHAT, "what about now", None, false)
         .await
         .expect("steer");
     assert!(matches!(outcome, SteerOutcome::Accepted));

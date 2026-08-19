@@ -107,6 +107,24 @@ case "$line" in
   ev '{"type":"agent_settled"}'
   ;;
 
+*scenario:follow-up*)
+  # A follow_up steer must NOT ride pi's steer command: the turn streams
+  # and settles untouched; the parked message arrives as the next prompt.
+  ev '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"one"}}'
+  ev '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"one"}],"stopReason":"stop","usage":{"input":3,"output":1}}}'
+  # Give the harness a beat to (wrongly) send a steer; a well-behaved
+  # harness parks it and says nothing until the settle lands.
+  sleep 1
+  ev '{"type":"agent_settled"}'
+  read -r line2 || exit 1
+  has "$line2" '"type":"prompt"' || exit 1
+  has "$line2" '"message":"queued for later"' || exit 1
+  ok "$(rid "$line2")"
+  ev '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"second turn"}}'
+  ev '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"second turn"}],"stopReason":"stop","usage":{"input":4,"output":2}}}'
+  ev '{"type":"agent_settled"}'
+  ;;
+
 *scenario:steer-race*)
   # The steer command loses the settle race: pi already settled and answers
   # "not streaming". The harness must queue it and deliver it as the next

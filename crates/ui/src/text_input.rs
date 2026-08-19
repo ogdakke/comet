@@ -235,6 +235,7 @@ actions!(
         Paste,
         Newline,
         Submit,
+        SubmitQueued,
         Undo,
         Redo,
         MentionTab,
@@ -780,7 +781,9 @@ fn editor_bindings(
         KeyBinding::new("enter", Submit, ctx),
         KeyBinding::new("shift-enter", Newline, ctx),
         KeyBinding::new("cmd-enter", Submit, ctx),
-        KeyBinding::new("ctrl-enter", Submit, ctx),
+        // Queue-for-next-turn (composer: deliver after the live turn instead
+        // of steering it). Inputs without a queue concept treat it as Submit.
+        KeyBinding::new("ctrl-enter", SubmitQueued, ctx),
         KeyBinding::new("backspace", Backspace, ctx),
         KeyBinding::new("delete", Delete, ctx),
         KeyBinding::new("left", Left, ctx),
@@ -857,6 +860,10 @@ fn editor_bindings(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TextInputEvent {
     Submitted,
+    /// Ctrl+Enter — "queue for after the current turn" where the host
+    /// supports it (the chat composer); every other input treats it as
+    /// Submit.
+    SubmitQueued,
     Edited,
     CursorMoved,
     ViewportChanged,
@@ -1861,6 +1868,14 @@ impl TextInput {
             TextInputEvent::MentionAccept
         } else {
             TextInputEvent::Submitted
+        });
+    }
+
+    fn submit_queued(&mut self, _: &SubmitQueued, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(if self.mention_has_selection {
+            TextInputEvent::MentionAccept
+        } else {
+            TextInputEvent::SubmitQueued
         });
     }
 
@@ -2950,6 +2965,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(Self::submit_queued))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))

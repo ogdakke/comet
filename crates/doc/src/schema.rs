@@ -1443,6 +1443,7 @@ mod tests {
             payload: SessionCommandPayload::Steer {
                 prompt: "focus".into(),
                 message_id: None,
+                follow_up: false,
             },
             issued_by: "dev-b".into(),
             issued_at: 10,

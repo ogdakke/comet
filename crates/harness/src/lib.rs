@@ -39,6 +39,11 @@ pub enum HarnessError {
 pub struct SteerMessage {
     pub prompt: String,
     pub message_id: Option<String>,
+    /// "Send after the current turn" (composer Ctrl+Enter): the harness must
+    /// NOT inject mid-turn — it delivers the prompt as the next turn once the
+    /// live one settles. Drivers with a queued-steer fallback (pi, codex)
+    /// park it there; drivers without one treat it as a plain steer.
+    pub follow_up: bool,
 }
 
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.

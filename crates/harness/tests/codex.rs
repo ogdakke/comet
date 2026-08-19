@@ -281,6 +281,7 @@ async fn steering_uses_turn_steer_with_expected_turn_id() {
         .send(SteerMessage {
             prompt: "redirect please".into(),
             message_id: None,
+            follow_up: false,
         })
         .await
         .expect("steer queued");
@@ -324,6 +325,7 @@ async fn rejected_steer_falls_back_to_a_follow_up_turn() {
         .send(SteerMessage {
             prompt: "redirect please".into(),
             message_id: None,
+            follow_up: false,
         })
         .await
         .expect("steer queued");

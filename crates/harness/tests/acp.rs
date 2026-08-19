@@ -349,6 +349,7 @@ async fn steering_extension_injects_mid_turn() {
                     .send(SteerMessage {
                         prompt: "redirect please".into(),
                         message_id: None,
+                        follow_up: false,
                     })
                     .await
                     .expect("steer sent");
@@ -395,6 +396,7 @@ async fn steer_racing_the_turn_end_never_emits_steered_after_done() {
                     .send(SteerMessage {
                         prompt: "redirect please".into(),
                         message_id: None,
+                        follow_up: false,
                     })
                     .await
                     .expect("steer sent");
@@ -446,6 +448,7 @@ async fn rejected_steer_queues_and_delivers_at_the_turn_boundary() {
                     .send(SteerMessage {
                         prompt: "redirect please".into(),
                         message_id: None,
+                        follow_up: false,
                     })
                     .await
                     .expect("steer sent");

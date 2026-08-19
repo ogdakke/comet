@@ -2037,7 +2037,10 @@ impl Changes {
     ) {
         let input = cx.new(|cx| ComposerInput::new("Request a change…", cx));
         let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
-            ComposerInputEvent::Submitted => this.commit_draft(cx),
+            // No queue concept here: Ctrl+Enter is Submit.
+            ComposerInputEvent::Submitted | ComposerInputEvent::SubmitQueued => {
+                this.commit_draft(cx)
+            }
             ComposerInputEvent::Edited => cx.notify(),
             _ => {}
         });

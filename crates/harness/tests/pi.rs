@@ -295,6 +295,7 @@ async fn mid_turn_steer_injects_and_boundary_steer_starts_next_turn() {
         .send(SteerMessage {
             prompt: "change course".into(),
             message_id: None,
+            follow_up: false,
         })
         .await
         .expect("steer delivered");
@@ -326,6 +327,7 @@ async fn mid_turn_steer_injects_and_boundary_steer_starts_next_turn() {
         .send(SteerMessage {
             prompt: "after the boundary".into(),
             message_id: None,
+            follow_up: false,
         })
         .await
         .expect("boundary steer delivered");
@@ -414,6 +416,7 @@ async fn steer_that_lost_the_settle_race_becomes_the_next_prompt() {
         .send(SteerMessage {
             prompt: "late steer".into(),
             message_id: None,
+            follow_up: false,
         })
         .await
         .expect("steer delivered");
@@ -440,6 +443,83 @@ async fn steer_that_lost_the_settle_race_becomes_the_next_prompt() {
     // steer's turn.
     assert_eq!(recovered_text, "quickrecovered turn");
     drop(steer_tx);
+}
+
+#[tokio::test]
+async fn follow_up_queues_for_the_next_turn_never_steers() {
+    // Ctrl+Enter semantics: the message is delivered as the NEXT prompt
+    // after the live turn settles — pi never sees a `steer` command (the
+    // fake dies if one arrives), no Steered rotation happens mid-turn, and
+    // the follow-up turn rotates the message id when it starts.
+    let (controls, steer_tx, _token) = controls();
+    let harness = harness();
+    let stream = harness
+        .run(request("scenario:follow-up"), controls)
+        .await
+        .expect("run starts");
+    let mut stream = std::pin::pin!(stream);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+    // First text of the live turn → queue the follow-up.
+    let mut events = Vec::new();
+    loop {
+        let ev = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .expect("timed out waiting for text")
+            .expect("stream ended early")
+            .expect("stream event");
+        let is_text = matches!(ev, AgentEvent::TextDelta { .. });
+        events.push(ev);
+        if is_text {
+            break;
+        }
+    }
+    steer_tx
+        .send(SteerMessage {
+            prompt: "queued for later".into(),
+            message_id: None,
+            follow_up: true,
+        })
+        .await
+        .expect("follow-up delivered");
+
+    let mut dones = 0;
+    while dones < 2 {
+        let ev = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .expect("timed out waiting for dones")
+            .expect("stream ended before both dones")
+            .expect("stream event");
+        if matches!(ev, AgentEvent::Done { .. }) {
+            dones += 1;
+        }
+        events.push(ev);
+    }
+    drop(steer_tx);
+
+    let first_done = events
+        .iter()
+        .position(|ev| matches!(ev, AgentEvent::Done { .. }))
+        .unwrap();
+    // Nothing rotated before the settle: no Steered in the first segment,
+    // exactly one Steered overall (the follow-up turn's start).
+    assert!(
+        !events[..first_done]
+            .iter()
+            .any(|ev| matches!(ev, AgentEvent::Steered { .. })),
+        "a queued follow-up must not steer the live turn: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|ev| matches!(ev, AgentEvent::Steered { .. }))
+            .count(),
+        1,
+        "the follow-up turn must rotate the message id once: {events:?}"
+    );
+    let all_text = text(&events);
+    assert!(all_text.contains("one"), "{all_text}");
+    assert!(all_text.contains("second turn"), "{all_text}");
 }
 
 #[tokio::test]

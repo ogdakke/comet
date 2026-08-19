@@ -493,6 +493,7 @@ async fn steer_with_no_live_run_falls_back_to_new_turn() {
         SessionCommandPayload::Steer {
             prompt: "also do this".into(),
             message_id: Some("m-2".into()),
+            follow_up: false,
         },
     );
     wait_for(
@@ -2025,6 +2026,7 @@ async fn parked_steer_restamps_started_at_and_idle_clears_it() {
         SessionCommandPayload::Steer {
             prompt: "next".into(),
             message_id: Some("m-2".into()),
+            follow_up: false,
         },
     );
     wait_for(
