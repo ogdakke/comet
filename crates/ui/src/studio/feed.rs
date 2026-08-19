@@ -32,7 +32,8 @@ use crate::theme::Theme;
 use crate::transcript::{self, format_timestamp};
 
 use super::artifact::{
-    StudioPaint, contain_layers, render_run_error_chip, render_run_failed_overlay, run_error_message,
+    StudioPaint, contain_layers, render_run_error_chip, render_run_failed_overlay,
+    run_error_message,
 };
 use super::page::StudioPage;
 

@@ -145,6 +145,32 @@ fn t2v(id: &str, durations: &[f64]) -> MediaModel {
     )
 }
 
+fn t2v_auto(id: &str) -> MediaModel {
+    let mut model = t2v(id, &[5.0]);
+    if let Some(control) = model
+        .controls
+        .iter_mut()
+        .find(|control| control.id.as_str() == "duration")
+    {
+        control.choices = vec![ControlChoice {
+            value: ControlValue::DurationAuto,
+            label: "Auto".to_owned(),
+        }];
+        control.default = Some(ControlValue::DurationAuto);
+    }
+    model
+}
+
+fn chip_duration<'a>(
+    view: &'a zeron_studio::ComposerView,
+    model_id: &str,
+) -> Option<&'a ControlValue> {
+    view.models
+        .iter()
+        .find(|chip| chip.model_id.as_str() == model_id)
+        .and_then(|chip| chip.values.get(&ControlId::from("duration")))
+}
+
 fn r2v(id: &str, image_max: u32, durations: &[f64]) -> MediaModel {
     let mut meta = seedance_meta();
     meta.requires_visual_reference = true;
@@ -822,6 +848,148 @@ fn set_duration_ignores_values_outside_the_intersection() {
             .iter()
             .any(|choice| choice.value == ControlValue::DurationSeconds { value: 15.0 })
     );
+}
+
+#[test]
+fn all_auto_only_models_force_auto_and_hide_seconds() {
+    let auto = t2v_auto("auto");
+    let snapshot = video_snapshot(&[&auto], Vec::new(), 5.0);
+    let view = evaluate_composer(&snapshot, std::slice::from_ref(&auto));
+    assert_eq!(view.globals.duration, Some(ControlValue::DurationAuto));
+    assert_eq!(
+        view.globals
+            .duration_choices
+            .iter()
+            .map(|choice| &choice.value)
+            .collect::<Vec<_>>(),
+        vec![&ControlValue::DurationAuto]
+    );
+    assert_eq!(
+        chip_duration(&view, "auto"),
+        Some(&ControlValue::DurationAuto)
+    );
+    assert!(codes(&view).is_empty(), "{:?}", codes(&view));
+
+    let (next, view) = apply_event(
+        snapshot,
+        std::slice::from_ref(&auto),
+        ComposerEvent::ReplaceModels {
+            selected: vec![selected(&auto)],
+        },
+    );
+    assert_eq!(next.duration, Some(ControlValue::DurationAuto));
+    assert_eq!(view.globals.duration, Some(ControlValue::DurationAuto));
+}
+
+#[test]
+fn mixed_auto_only_keeps_auto_on_locked_models_and_popover_on_the_rest() {
+    let auto = t2v_auto("auto");
+    let t2v = t2v("t2v", &[5.0, 8.0, 10.0]);
+    let catalog = catalog(&[&auto, &t2v]);
+    let snapshot = video_snapshot(&[&auto, &t2v], Vec::new(), 8.0);
+    let view = evaluate_composer(&snapshot, &catalog);
+    assert_eq!(
+        view.globals.duration,
+        Some(ControlValue::DurationSeconds { value: 8.0 })
+    );
+    let seconds: Vec<f64> = view
+        .globals
+        .duration_choices
+        .iter()
+        .filter_map(|choice| match choice.value {
+            ControlValue::DurationSeconds { value } => Some(value),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(seconds, vec![5.0, 8.0, 10.0]);
+    assert_eq!(
+        chip_duration(&view, "auto"),
+        Some(&ControlValue::DurationAuto)
+    );
+    assert_eq!(
+        chip_duration(&view, "t2v"),
+        Some(&ControlValue::DurationSeconds { value: 8.0 })
+    );
+    assert!(codes(&view).is_empty(), "{:?}", codes(&view));
+
+    let (next, view) = apply_event(
+        snapshot,
+        &catalog,
+        ComposerEvent::SetDuration {
+            value: ControlValue::DurationSeconds { value: 5.0 },
+        },
+    );
+    assert_eq!(
+        next.duration,
+        Some(ControlValue::DurationSeconds { value: 5.0 })
+    );
+    assert_eq!(
+        chip_duration(&view, "auto"),
+        Some(&ControlValue::DurationAuto)
+    );
+    assert_eq!(
+        chip_duration(&view, "t2v"),
+        Some(&ControlValue::DurationSeconds { value: 5.0 })
+    );
+}
+
+#[test]
+fn adding_a_seconds_model_to_auto_only_seeds_the_popover() {
+    let auto = t2v_auto("auto");
+    let t2v = t2v("t2v", &[5.0, 8.0, 10.0]);
+    let catalog = catalog(&[&auto, &t2v]);
+    let (snapshot, view) = apply_event(
+        video_snapshot(&[&auto], Vec::new(), 5.0),
+        &catalog,
+        ComposerEvent::ReplaceModels {
+            selected: vec![selected(&auto)],
+        },
+    );
+    assert_eq!(snapshot.duration, Some(ControlValue::DurationAuto));
+    assert_eq!(view.globals.duration, Some(ControlValue::DurationAuto));
+
+    let (snapshot, view) = apply_event(
+        snapshot,
+        &catalog,
+        ComposerEvent::SelectModel {
+            provider_id: t2v.provider_id.clone(),
+            model_id: t2v.id.clone(),
+        },
+    );
+    assert_eq!(
+        snapshot.duration,
+        Some(ControlValue::DurationSeconds { value: 10.0 })
+    );
+    assert_eq!(
+        chip_duration(&view, "auto"),
+        Some(&ControlValue::DurationAuto)
+    );
+    assert_eq!(
+        chip_duration(&view, "t2v"),
+        Some(&ControlValue::DurationSeconds { value: 10.0 })
+    );
+}
+
+#[test]
+fn disjoint_seconds_models_keep_auto_only_when_resolving() {
+    let auto = t2v_auto("auto");
+    let short = t2v("short", &[4.0, 6.0]);
+    let long = t2v("long", &[8.0, 12.0]);
+    let catalog = catalog(&[&auto, &short, &long]);
+    let snapshot = video_snapshot(&[&auto, &short, &long], Vec::new(), 4.0);
+    let view = evaluate_composer(&snapshot, &catalog);
+    assert_eq!(codes(&view), vec![ConflictCode::DisjointDurations]);
+    let keep = actions(conflict(&view, ConflictCode::DisjointDurations))
+        .into_iter()
+        .find_map(|action| match action {
+            ResolveAction::KeepModelsDropOthers { model_ids } => Some(model_ids),
+            _ => None,
+        })
+        .unwrap();
+    let names: Vec<&str> = keep.iter().map(|id| id.as_str()).collect();
+    assert!(names.contains(&"auto"), "{names:?}");
+    assert!(names.contains(&"short"), "{names:?}");
+    assert!(!names.contains(&"long"), "{names:?}");
 }
 
 type ClassBuild = (ComposerSnapshot, Vec<MediaModel>, Vec<ConflictCode>, bool);

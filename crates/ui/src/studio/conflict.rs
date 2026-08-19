@@ -80,35 +80,32 @@ impl StudioPage {
             );
         }
         Some(
-            crate::frost::frosted(
-                14.0,
-                16.0,
-                div()
-                    .id("studio-conflict-popup")
-                    .w_full()
-                    .max_w(px(768.0))
-                    .h(px(48.0))
-                    .px(px(12.0))
-                    .rounded(px(18.0))
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.input_glass_bg())
-                    .when(!theme.is_glass(), |bar| bar.shadow_md())
-                    .flex()
-                    .items_center()
-                    .gap(px(10.0))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(13.0))
-                            .text_color(theme.text)
-                            .child(SharedString::from(copy)),
-                    )
-                    .child(buttons),
-            )
-            .into_any_element(),
+            div()
+                .id("studio-conflict-popup")
+                .w_full()
+                .max_w(px(768.0 - 42.0))
+                .h(px(48.0))
+                .px(px(12.0))
+                .rounded_t(px(18.0))
+                .border_1()
+                .border_b_0()
+                .border_color(theme.border)
+                .bg(theme.surface_card)
+                .when(!theme.is_glass(), |bar| bar.shadow_md())
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(13.0))
+                        .text_color(theme.text)
+                        .child(SharedString::from(copy)),
+                )
+                .child(buttons)
+                .into_any_element(),
         )
     }
 }

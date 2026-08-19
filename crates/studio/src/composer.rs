@@ -1078,8 +1078,7 @@ fn evaluate_composer_inner(
         ComposerPhase::Editing
     };
 
-    let intersection = video_intersection(&usable);
-    let duration_choices = duration_choices(&usable, &intersection);
+    let (duration, duration_choices) = global_duration_view(snapshot, &usable);
     let chips = chip_views(snapshot, catalog, &mapped, &conflicts);
     let budgets = budgets(snapshot, &usable, &mapped);
     let hints = hints(&usable, &mapped, &conflicts);
@@ -1089,7 +1088,7 @@ fn evaluate_composer_inner(
         mode: snapshot.mode,
         send,
         globals: GlobalControls {
-            duration: snapshot.duration.clone(),
+            duration,
             duration_choices,
         },
         models: chips,
@@ -1142,17 +1141,16 @@ pub fn apply_event(
                 ComposerMode::Video => {
                     seed_or_keep_duration(&mut snapshot, catalog);
                     force_video_output_counts(&mut snapshot, catalog);
-                    copy_duration_to_chips(&mut snapshot);
+                    copy_duration_to_chips(&mut snapshot, catalog);
                 }
             }
             seed_selected_control_defaults(&mut snapshot, catalog);
         }
         ComposerEvent::SetPrompt { text } => snapshot.prompt = text,
         ComposerEvent::SetDuration { value } => {
-            let intersection = video_intersection(&usable_models(&snapshot, catalog));
-            if duration_allowed(&value, &intersection.durations) {
+            if duration_value_allowed(&snapshot, catalog, &value) {
                 snapshot.duration = Some(value);
-                copy_duration_to_chips(&mut snapshot);
+                copy_duration_to_chips(&mut snapshot, catalog);
             }
         }
         ComposerEvent::Attach { attachment } => {
@@ -1194,7 +1192,7 @@ pub fn apply_event(
                 snapshot.selected.push(selected);
                 seed_or_keep_duration(&mut snapshot, catalog);
                 force_video_output_counts(&mut snapshot, catalog);
-                copy_duration_to_chips(&mut snapshot);
+                copy_duration_to_chips(&mut snapshot, catalog);
                 seed_selected_control_defaults(&mut snapshot, catalog);
             }
         }
@@ -1203,13 +1201,13 @@ pub fn apply_event(
                 .selected
                 .retain(|selected| selected.model_id != model_id);
             seed_or_keep_duration(&mut snapshot, catalog);
-            copy_duration_to_chips(&mut snapshot);
+            copy_duration_to_chips(&mut snapshot, catalog);
         }
         ComposerEvent::ReplaceModels { selected } => {
             snapshot.selected = selected;
             force_video_output_counts(&mut snapshot, catalog);
             seed_or_keep_duration(&mut snapshot, catalog);
-            copy_duration_to_chips(&mut snapshot);
+            copy_duration_to_chips(&mut snapshot, catalog);
             seed_selected_control_defaults(&mut snapshot, catalog);
         }
         ComposerEvent::SetModelControl {
@@ -1243,7 +1241,7 @@ pub fn apply_event(
             snapshot = restored;
             force_video_output_counts(&mut snapshot, catalog);
             seed_or_keep_duration(&mut snapshot, catalog);
-            copy_duration_to_chips(&mut snapshot);
+            copy_duration_to_chips(&mut snapshot, catalog);
             seed_selected_control_defaults(&mut snapshot, catalog);
         }
         ComposerEvent::CatalogUpdated { fetched_at } => {
@@ -1323,18 +1321,18 @@ pub fn apply_resolve(
                 .selected
                 .retain(|selected| !model_ids.contains(&selected.model_id));
             seed_or_keep_duration(&mut snapshot, catalog);
-            copy_duration_to_chips(&mut snapshot);
+            copy_duration_to_chips(&mut snapshot, catalog);
         }
         ResolveAction::KeepModelsDropOthers { model_ids } => {
             snapshot
                 .selected
                 .retain(|selected| model_ids.contains(&selected.model_id));
             seed_or_keep_duration(&mut snapshot, catalog);
-            copy_duration_to_chips(&mut snapshot);
+            copy_duration_to_chips(&mut snapshot, catalog);
         }
         ResolveAction::ClampDuration { value } => {
             snapshot.duration = Some(value.clone());
-            copy_duration_to_chips(&mut snapshot);
+            copy_duration_to_chips(&mut snapshot, catalog);
         }
         ResolveAction::ClearDuration => {
             snapshot.duration = None;
@@ -1354,7 +1352,7 @@ pub fn apply_resolve(
             snapshot.selected = selected.clone();
             force_video_output_counts(&mut snapshot, catalog);
             seed_or_keep_duration(&mut snapshot, catalog);
-            copy_duration_to_chips(&mut snapshot);
+            copy_duration_to_chips(&mut snapshot, catalog);
         }
         ResolveAction::OpenModelPicker
         | ResolveAction::RefreshCatalog
@@ -1364,7 +1362,7 @@ pub fn apply_resolve(
                 .selected
                 .retain(|selected| !model_ids.contains(&selected.model_id));
             seed_or_keep_duration(&mut snapshot, catalog);
-            copy_duration_to_chips(&mut snapshot);
+            copy_duration_to_chips(&mut snapshot, catalog);
         }
         ResolveAction::ShortenPrompt { maximum_chars } => {
             snapshot.prompt = snapshot
@@ -1403,7 +1401,7 @@ pub fn apply_resolve(
             {
                 if control_id.as_str() == DURATION_CONTROL {
                     snapshot.duration = Some(value.clone());
-                    copy_duration_to_chips(&mut snapshot);
+                    copy_duration_to_chips(&mut snapshot, catalog);
                 } else {
                     selected.controls.insert(control_id.clone(), value.clone());
                 }
@@ -1529,19 +1527,29 @@ fn collect_duration_conflicts(
     if video.is_empty() {
         return;
     }
-    let intersection = intersect_video_globals(video.iter().copied());
+    let popover = duration_popover_models(&video);
+    if popover.is_empty() {
+        return;
+    }
+    let auto_only: Vec<ModelId> = video
+        .iter()
+        .filter(|model| duration_is_auto_only(model))
+        .map(|model| model.id.clone())
+        .collect();
+    let intersection = intersect_video_globals(popover.iter().copied());
     if intersection.durations.is_empty() {
-        let clique = duration_clique(&video, snapshot.duration.as_ref());
+        let mut keep = duration_clique(&popover, snapshot.duration.as_ref());
+        keep.extend(auto_only);
         conflicts.push(make_conflict(
             ConflictCode::DisjointDurations,
             "These models don't share a duration",
             "Keep a compatible set of models.",
             subjects(
-                video.iter().map(|model| model.id.clone()).collect(),
+                popover.iter().map(|model| model.id.clone()).collect(),
                 Vec::new(),
                 vec![ControlId::from(DURATION_CONTROL)],
             ),
-            vec![ResolveAction::KeepModelsDropOthers { model_ids: clique }],
+            vec![ResolveAction::KeepModelsDropOthers { model_ids: keep }],
         ));
         return;
     }
@@ -1552,7 +1560,7 @@ fn collect_duration_conflicts(
         return;
     }
     let clamp = closest_duration(current, &intersection.durations);
-    let lacking: Vec<ModelId> = video
+    let lacking: Vec<ModelId> = popover
         .iter()
         .filter(|model| {
             !model
@@ -1820,7 +1828,7 @@ fn collect_queue_conflicts(
         let mut controls = selected
             .map(|selected| selected.controls.clone())
             .unwrap_or_default();
-        if let Some(duration) = snapshot.duration.clone() {
+        if let Some(duration) = assigned_duration(snapshot, model) {
             controls.insert(ControlId::from(DURATION_CONTROL), duration);
         }
         let estimate =
@@ -1876,7 +1884,7 @@ fn chip_views(
             }
         }
         if snapshot.mode == ComposerMode::Video {
-            if let Some(duration) = snapshot.duration.clone() {
+            if let Some(duration) = assigned_duration(snapshot, model) {
                 values.insert(ControlId::from(DURATION_CONTROL), duration);
             } else {
                 values.remove(&ControlId::from(DURATION_CONTROL));
@@ -2180,7 +2188,21 @@ fn seed_or_keep_duration(snapshot: &mut ComposerSnapshot, catalog: &[MediaModel]
     if snapshot.mode != ComposerMode::Video {
         return;
     }
-    let intersection = video_intersection(&usable_models(snapshot, catalog));
+    let usable = usable_models(snapshot, catalog);
+    let video: Vec<&MediaModel> = usable
+        .iter()
+        .copied()
+        .filter(|model| model.output_kind == MediaKind::Video)
+        .collect();
+    if video.is_empty() {
+        return;
+    }
+    let popover = duration_popover_models(&video);
+    if popover.is_empty() {
+        snapshot.duration = Some(ControlValue::DurationAuto);
+        return;
+    }
+    let intersection = intersect_video_globals(popover.into_iter());
     if intersection.durations.is_empty() {
         return;
     }
@@ -2191,7 +2213,8 @@ fn seed_or_keep_duration(snapshot: &mut ComposerSnapshot, catalog: &[MediaModel]
     {
         return;
     }
-    if snapshot.duration.is_none() {
+    if snapshot.duration.is_none() || matches!(snapshot.duration, Some(ControlValue::DurationAuto))
+    {
         snapshot.duration = seed_duration(&intersection.durations);
     }
 }
@@ -2205,7 +2228,7 @@ fn apply_mode_duration(snapshot: &mut ComposerSnapshot, catalog: &[MediaModel]) 
         ComposerMode::Video => {
             force_video_output_counts(snapshot, catalog);
             seed_or_keep_duration(snapshot, catalog);
-            copy_duration_to_chips(snapshot);
+            copy_duration_to_chips(snapshot, catalog);
         }
     }
 }
@@ -2331,12 +2354,86 @@ fn duration_allowed(value: &ControlValue, choices: &[ControlValue]) -> bool {
     choices.iter().any(|choice| choice == value)
 }
 
-fn video_intersection(usable: &[&MediaModel]) -> CapabilityIntersection {
-    intersect_video_globals(
-        usable
-            .iter()
-            .copied()
-            .filter(|model| model.output_kind == MediaKind::Video),
+/// True when every advertised duration is Auto — the model has no picker.
+pub fn duration_is_auto_only(model: &MediaModel) -> bool {
+    model.video_capability().is_some_and(|capability| {
+        !capability.durations.is_empty()
+            && capability
+                .durations
+                .iter()
+                .all(|duration| matches!(duration, ControlValue::DurationAuto))
+    })
+}
+
+/// Duration written onto a selected model for evaluate, quote, and queue.
+pub fn assigned_duration(snapshot: &ComposerSnapshot, model: &MediaModel) -> Option<ControlValue> {
+    if snapshot.mode != ComposerMode::Video || model.output_kind != MediaKind::Video {
+        return None;
+    }
+    if duration_is_auto_only(model) {
+        return Some(ControlValue::DurationAuto);
+    }
+    snapshot.duration.clone()
+}
+
+fn duration_popover_models<'a>(video: &[&'a MediaModel]) -> Vec<&'a MediaModel> {
+    video
+        .iter()
+        .copied()
+        .filter(|model| !duration_is_auto_only(model))
+        .collect()
+}
+
+fn duration_value_allowed(
+    snapshot: &ComposerSnapshot,
+    catalog: &[MediaModel],
+    value: &ControlValue,
+) -> bool {
+    let usable = usable_models(snapshot, catalog);
+    let video: Vec<&MediaModel> = usable
+        .iter()
+        .copied()
+        .filter(|model| model.output_kind == MediaKind::Video)
+        .collect();
+    let popover = duration_popover_models(&video);
+    if popover.is_empty() {
+        return matches!(value, ControlValue::DurationAuto) && !video.is_empty();
+    }
+    duration_allowed(
+        value,
+        &intersect_video_globals(popover.into_iter()).durations,
+    )
+}
+
+fn global_duration_view(
+    snapshot: &ComposerSnapshot,
+    usable: &[&MediaModel],
+) -> (Option<ControlValue>, Vec<ControlChoice>) {
+    if snapshot.mode != ComposerMode::Video {
+        return (None, Vec::new());
+    }
+    let video: Vec<&MediaModel> = usable
+        .iter()
+        .copied()
+        .filter(|model| model.output_kind == MediaKind::Video)
+        .collect();
+    if video.is_empty() {
+        return (snapshot.duration.clone(), Vec::new());
+    }
+    let popover = duration_popover_models(&video);
+    if popover.is_empty() {
+        return (
+            Some(ControlValue::DurationAuto),
+            vec![ControlChoice {
+                value: ControlValue::DurationAuto,
+                label: "Auto".to_owned(),
+            }],
+        );
+    }
+    let intersection = intersect_video_globals(popover.iter().copied());
+    (
+        snapshot.duration.clone(),
+        duration_choices(&popover, &intersection),
     )
 }
 
@@ -2443,12 +2540,28 @@ fn force_video_output_counts(snapshot: &mut ComposerSnapshot, catalog: &[MediaMo
     }
 }
 
-fn copy_duration_to_chips(snapshot: &mut ComposerSnapshot) {
-    if let Some(duration) = snapshot.duration.clone() {
-        for selected in &mut snapshot.selected {
+fn copy_duration_to_chips(snapshot: &mut ComposerSnapshot, catalog: &[MediaModel]) {
+    let assignments: Vec<(usize, Option<ControlValue>)> = snapshot
+        .selected
+        .iter()
+        .enumerate()
+        .map(|(index, selected)| {
+            let value = find_model(catalog, &selected.provider_id, &selected.model_id)
+                .and_then(|model| assigned_duration(snapshot, model))
+                .or_else(|| snapshot.duration.clone());
+            (index, value)
+        })
+        .collect();
+    for (index, value) in assignments {
+        let Some(selected) = snapshot.selected.get_mut(index) else {
+            continue;
+        };
+        if let Some(value) = value {
             selected
                 .controls
-                .insert(ControlId::from(DURATION_CONTROL), duration.clone());
+                .insert(ControlId::from(DURATION_CONTROL), value);
+        } else {
+            selected.controls.remove(&ControlId::from(DURATION_CONTROL));
         }
     }
 }

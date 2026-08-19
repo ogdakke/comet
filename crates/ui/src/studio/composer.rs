@@ -206,6 +206,11 @@ impl StudioPage {
         if self.composer_view.refresh_catalog {
             self.refresh_studio_catalog(true, cx);
         }
+        if !duration_popover_openable(&self.composer_view.globals.duration_choices)
+            && self.duration_popup.is_open()
+        {
+            self.close_duration_popup(cx);
+        }
     }
 
     pub(super) fn set_composer_mode(
@@ -248,6 +253,9 @@ impl StudioPage {
     }
 
     fn begin_duration_drag(&mut self, x: f32, from_chip: bool, cx: &mut Context<Self>) {
+        if !duration_popover_openable(&self.composer_view.globals.duration_choices) {
+            return;
+        }
         self.duration_popup.note_trigger_press();
         if !self.duration_popup.is_open() {
             self.duration_popup.open(());
@@ -1736,7 +1744,7 @@ impl StudioPage {
             .flex()
             .flex_col()
             .items_center()
-            .gap(px(10.0))
+            .when(self.popup_conflict.is_none(), |this| this.gap(px(10.0)))
             .on_drag_move::<ExternalPaths>(cx.listener(
                 |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
                     let inside = e.bounds.contains(&e.event.position);
@@ -1813,7 +1821,8 @@ impl StudioPage {
             .map(duration_chip_label)
             .unwrap_or_else(|| "Duration".into());
         let sizer = duration_chip_sizer(&self.composer_view.globals.duration_choices);
-        let open = self.duration_popup.get().is_some();
+        let interactive = duration_popover_openable(&self.composer_view.globals.duration_choices);
+        let open = interactive && self.duration_popup.get().is_some();
         let slider = open.then(|| {
             popover::anchored_menu_above(
                 "studio-duration-menu",
@@ -1837,28 +1846,30 @@ impl StudioPage {
             } else {
                 theme.border
             })
-            .cursor_pointer()
-            .hover(|style| style.bg(crate::theme::wash(0.075)))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|page, event: &gpui::MouseDownEvent, _, cx| {
-                    page.begin_duration_drag(f32::from(event.position.x), true, cx);
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_move(cx.listener(|page, event: &gpui::MouseMoveEvent, _, cx| {
-                if page.duration_dragging && event.dragging() {
-                    page.apply_duration_drag_x(f32::from(event.position.x), cx);
-                }
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|page, _, _, cx| page.end_duration_drag(cx)),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|page, _, _, cx| page.end_duration_drag(cx)),
-            )
+            .when(interactive, |chip| {
+                chip.cursor_pointer()
+                    .hover(|style| style.bg(crate::theme::wash(0.075)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|page, event: &gpui::MouseDownEvent, _, cx| {
+                            page.begin_duration_drag(f32::from(event.position.x), true, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|page, event: &gpui::MouseMoveEvent, _, cx| {
+                        if page.duration_dragging && event.dragging() {
+                            page.apply_duration_drag_x(f32::from(event.position.x), cx);
+                        }
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|page, _, _, cx| page.end_duration_drag(cx)),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|page, _, _, cx| page.end_duration_drag(cx)),
+                    )
+            })
             .when_some(slider, |chip, slider| chip.child(slider))
             .child(
                 div()
@@ -2262,6 +2273,12 @@ fn duration_chip_label(value: &ControlValue) -> String {
         ControlValue::DurationAuto => "Auto".into(),
         _ => "Duration".into(),
     }
+}
+
+fn duration_popover_openable(choices: &[ControlChoice]) -> bool {
+    choices
+        .iter()
+        .any(|choice| matches!(choice.value, ControlValue::DurationSeconds { .. }))
 }
 
 /// Invisible sizer so `4s` → `30s` (or `Auto`) does not shift the mode bar.
@@ -2740,6 +2757,26 @@ mod tests {
             .map(|control| control.id.as_str().to_owned())
             .collect();
         assert_eq!(forced_ids, vec!["resolution"]);
+    }
+
+    #[test]
+    fn duration_popover_stays_closed_when_only_auto() {
+        let auto_only = [ControlChoice {
+            value: ControlValue::DurationAuto,
+            label: "Auto".into(),
+        }];
+        assert!(!duration_popover_openable(&auto_only));
+        let with_seconds = [
+            ControlChoice {
+                value: ControlValue::DurationSeconds { value: 5.0 },
+                label: "5s".into(),
+            },
+            ControlChoice {
+                value: ControlValue::DurationAuto,
+                label: "Auto".into(),
+            },
+        ];
+        assert!(duration_popover_openable(&with_seconds));
     }
 
     #[test]

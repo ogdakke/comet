@@ -2575,7 +2575,7 @@ fn project_composer_specs(
             }
         }
         if snapshot.mode == zeron_studio::ComposerMode::Video
-            && let Some(duration) = snapshot.duration.clone()
+            && let Some(duration) = zeron_studio::assigned_duration(snapshot, model)
         {
             controls.insert(zeron_studio::ControlId::from("duration"), duration);
         }
