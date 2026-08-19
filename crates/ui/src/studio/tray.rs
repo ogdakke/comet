@@ -854,8 +854,14 @@ fn too_large_message(name: &str) -> String {
 }
 
 fn tray_preview(bytes: &[u8], mime: &str) -> Option<Arc<Image>> {
-    let format = image_format_for_mime(mime)?;
-    Some(Arc::new(Image::from_bytes(format, bytes.to_vec())))
+    if let Some(format) = image_format_for_mime(mime) {
+        return Some(Arc::new(Image::from_bytes(format, bytes.to_vec())));
+    }
+    if !mime.starts_with("video/") {
+        return None;
+    }
+    let jpeg = super::video::poster_jpeg_from_video_bytes(bytes.to_vec())?;
+    Some(Arc::new(Image::from_bytes(ImageFormat::Jpeg, jpeg)))
 }
 
 async fn import_studio_asset(

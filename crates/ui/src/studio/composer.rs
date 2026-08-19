@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 
 use gpui::{
-    AnyElement, Bounds, Context, Focusable as _, KeyDownEvent, MouseButton, Pixels, Point,
-    SharedString, Window, canvas, div, point, prelude::*, px, size,
+    AnyElement, Bounds, Context, DragMoveEvent, ExternalPaths, Focusable as _, KeyDownEvent,
+    MouseButton, Pixels, Point, SharedString, Window, canvas, div, point, prelude::*, px, size,
 };
 use zeron_rpc::{RpcError, methods};
 use zeron_studio::{
@@ -1652,6 +1652,7 @@ impl StudioPage {
                             ),
                     ),
             );
+        let drop_enabled = self.tray_add_enabled();
         let composer = div()
             .relative()
             .w_full()
@@ -1663,6 +1664,23 @@ impl StudioPage {
             .border_color(theme.border)
             .bg(theme.input_glass_bg())
             .when(!theme.is_glass(), |composer| composer.shadow_lg())
+            .when(drop_enabled, |composer| {
+                composer
+                    .on_drag_move::<ExternalPaths>(cx.listener(
+                        |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
+                            let inside = e.bounds.contains(&e.event.position);
+                            if this.file_drag_active != inside {
+                                this.file_drag_active = inside;
+                                cx.notify();
+                            }
+                        },
+                    ))
+                    .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                        this.file_drag_active = false;
+                        this.add_dropped_paths(paths.paths().to_vec(), cx);
+                        cx.notify();
+                    }))
+            })
             .px(px(8.0))
             .pt(px(8.0))
             .pb(px(8.0))
@@ -1719,6 +1737,23 @@ impl StudioPage {
             .flex_col()
             .items_center()
             .gap(px(10.0))
+            .when(drop_enabled, |stack| {
+                stack
+                    .on_drag_move::<ExternalPaths>(cx.listener(
+                        |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
+                            let inside = e.bounds.contains(&e.event.position);
+                            if this.file_drag_active != inside {
+                                this.file_drag_active = inside;
+                                cx.notify();
+                            }
+                        },
+                    ))
+                    .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                        this.file_drag_active = false;
+                        this.add_dropped_paths(paths.paths().to_vec(), cx);
+                        cx.notify();
+                    }))
+            })
             .children(self.render_conflict_popup(theme, cx))
             .children(
                 self.popup_conflict
