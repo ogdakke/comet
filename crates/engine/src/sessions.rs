@@ -139,6 +139,12 @@ struct Inner {
     /// chat_id → queued turns (composer tray). The doc's `queued` user
     /// entries are the source of truth; this mirror drives delivery order.
     queued_turns: Mutex<HashMap<String, std::collections::VecDeque<QueuedTurn>>>,
+    /// chat_id → run_id whose turn just ended with queued prompts waiting:
+    /// the settle-status write (Idle/Errored) was WITHHELD — a queue-draining
+    /// thread is still Working, not done (a done-chime per drained prompt
+    /// read as the run finishing over and over — user report). The turn-end
+    /// drain takes this marker (one-shot) and owns the next status write.
+    queue_held: Mutex<HashMap<String, String>>,
     /// Set by [`SessionsEngine::shutdown`]: turn-end queue drains must not
     /// fire while the engine is tearing down (they would spawn fresh runs
     /// into a dying runtime).
@@ -183,6 +189,7 @@ impl SessionsEngine {
                 last_requests: Mutex::new(HashMap::new()),
                 harness_sessions: Mutex::new(HashMap::new()),
                 queued_turns: Mutex::new(HashMap::new()),
+                queue_held: Mutex::new(HashMap::new()),
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 titles: OnceLock::new(),
                 turn_listener: OnceLock::new(),
@@ -592,27 +599,54 @@ impl SessionsEngine {
     /// delivery time — a replacement run may have started since the drain was
     /// scheduled (a user send racing the turn end); its turn owns the next
     /// queue slot. `Ok(false)` when the queue is empty or the chat is busy.
+    ///
+    /// A turn that ended with a waiting queue WITHHOLDS its settle status
+    /// (the thread isn't done — see [`Inner::queue_held`]); a drain carrying
+    /// that marker trusts only a DIFFERENT live run as busy (the held Working
+    /// is this drain's own delivery window), and releases the withheld Idle
+    /// itself when no delivery follows (queue emptied by racing tray removes,
+    /// or a failed dispatch — never leave a chat spinning Working with
+    /// nothing live).
     pub async fn dispatch_next_queued(&self, chat_id: &str) -> Result<bool, EngineError> {
-        if self.chat_busy(chat_id) {
+        let held = lock(&self.inner.queue_held).remove(chat_id);
+        let busy = match &held {
+            Some(ended) => lock(&self.inner.runs)
+                .get(chat_id)
+                .is_some_and(|h| h.run_id != *ended),
+            None => self.chat_busy(chat_id),
+        };
+        if busy {
+            // Another turn owns the chat now; its turn end re-drains, and its
+            // Working write already covers the status.
             return Ok(false);
         }
-        let next = lock(&self.inner.queued_turns)
-            .get_mut(chat_id)
-            .and_then(|q| q.pop_front());
-        let Some(turn) = next else {
-            return Ok(false);
-        };
-        match self.deliver_queued(chat_id, turn.clone()).await {
-            Ok(_) => Ok(true),
-            Err(err) => {
-                // Delivery failed (no run config, dispatch error): keep the
-                // prompt queued — the tray still shows it and the next
-                // turn end retries. Never drop a queued prompt.
-                lock(&self.inner.queued_turns)
-                    .entry(chat_id.to_string())
-                    .or_default()
-                    .push_front(turn);
-                Err(err)
+        loop {
+            let next = lock(&self.inner.queued_turns)
+                .get_mut(chat_id)
+                .and_then(|q| q.pop_front());
+            let Some(turn) = next else {
+                if held.is_some() {
+                    self.inner.set_status(chat_id, SessionStatus::Idle, false);
+                }
+                return Ok(false);
+            };
+            match self.deliver_queued(chat_id, turn.clone()).await {
+                // Deleted mid-delivery by a racing tray op — on to the next.
+                Ok(run_id) if run_id.is_empty() => continue,
+                Ok(_) => return Ok(true),
+                Err(err) => {
+                    // Delivery failed (no run config, dispatch error): keep the
+                    // prompt queued — the tray still shows it and the next
+                    // turn end retries. Never drop a queued prompt.
+                    lock(&self.inner.queued_turns)
+                        .entry(chat_id.to_string())
+                        .or_default()
+                        .push_front(turn);
+                    if held.is_some() {
+                        self.inner.set_status(chat_id, SessionStatus::Idle, false);
+                    }
+                    return Err(err);
+                }
             }
         }
     }
@@ -1764,7 +1798,12 @@ async fn drive_run(
                 segment_started = now_ms();
                 idle_since = Some(tokio::time::Instant::now());
                 self_continued_turn = false;
-                inner.set_status(&chat_id, SessionStatus::Idle, false);
+                // A quiesced turn is a turn END like any other: the queue
+                // drains here too (a queued prompt must not strand behind a
+                // harness that lost its Done), with the same withheld-Idle
+                // rule while prompts wait.
+                settle_status_for_turn_end(&inner, &chat_id, &run_id, SessionStatus::Idle, false);
+                spawn_queue_drain(&inner, &chat_id);
                 continue;
             }
         };
@@ -2248,11 +2287,11 @@ async fn drive_run(
                 saw_session_started = true;
                 idle_since = Some(tokio::time::Instant::now());
                 self_continued_turn = false;
-                inner.set_status(&chat_id, SessionStatus::Idle, false);
                 // Turn ended with queued prompts waiting: deliver the next
                 // one. The dispatch routes into this parked session's
                 // mailbox (zero respawn latency), exactly like a
                 // user-sent follow-up; the turn after THAT drains the next.
+                settle_status_for_turn_end(&inner, &chat_id, &run_id, SessionStatus::Idle, false);
                 spawn_queue_drain(&inner, &chat_id);
                 continue;
             }
@@ -2297,8 +2336,8 @@ async fn drive_run(
         .map(|h| std::mem::take(&mut *lock(&h.routed_steers)).into())
         .unwrap_or_default();
     inner.remove_run(&chat_id, &run_id);
-    inner.set_status(&chat_id, final_status, false);
     let has_orphans = !interrupted && !orphans.is_empty();
+    settle_status_for_turn_end(&inner, &chat_id, &run_id, final_status, has_orphans);
     if has_orphans {
         // The dying run accepted these into its mailbox but never confirmed a
         // Steered boundary (idle-reaper race, a mid-turn error discarding
@@ -2344,6 +2383,30 @@ async fn drive_run(
     }
 }
 
+/// Settle a just-ended turn's status. With queued prompts waiting (and no
+/// orphan steers owning the next turn) the settle write is WITHHELD and the
+/// drain marked responsible ([`Inner::queue_held`]): a queue-draining thread
+/// stays Working until the last prompt's turn ends — it is not done between
+/// turns, and per-drain Idle dips rang the done-chime once per queued prompt
+/// (user report). The drain releases the withheld Idle if no delivery
+/// follows (queue emptied by racing removes, or a failed dispatch).
+fn settle_status_for_turn_end(
+    inner: &Arc<Inner>,
+    chat_id: &str,
+    run_id: &str,
+    final_status: SessionStatus,
+    has_orphans: bool,
+) {
+    let queue_waiting = lock(&inner.queued_turns)
+        .get(chat_id)
+        .is_some_and(|q| !q.is_empty());
+    if queue_waiting && !has_orphans {
+        lock(&inner.queue_held).insert(chat_id.to_string(), run_id.to_string());
+    } else {
+        inner.set_status(chat_id, final_status, false);
+    }
+}
+
 /// Fire-and-forget delivery of a chat's next queued turn, if any. Deferred
 /// through `tokio::spawn` so the run task's exit path never blocks on doc
 /// writes or harness dispatch; `dispatch_next_queued` re-checks busyness at
@@ -2370,6 +2433,122 @@ fn spawn_queue_drain(inner: &Arc<Inner>, chat_id: &str) {
             tracing::warn!(chat = %chat, error = %err, "queued prompt delivery failed");
         }
     });
+}
+
+#[cfg(test)]
+mod queue_hold_tests {
+    use super::*;
+
+    fn engine() -> SessionsEngine {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(crate::RunJournal::open(dir.path()).unwrap());
+        // Leak the tempdir guard: the journal must not lose its directory
+        // mid-test (tests are short-lived; the process cleans up).
+        std::mem::forget(dir);
+        SessionsEngine::new("dev-test".into(), journal, Arc::new(HarnessRegistry::new()))
+    }
+
+    fn park_queued(engine: &SessionsEngine, chat_id: &str, message_id: &str) {
+        lock(&engine.inner.queued_turns)
+            .entry(chat_id.to_string())
+            .or_default()
+            .push_back(QueuedTurn {
+                message_id: message_id.into(),
+                prompt: "queued".into(),
+            });
+    }
+
+    fn fake_run(engine: &SessionsEngine, chat_id: &str, run_id: &str) {
+        let (steer_tx, _steer_rx) = mpsc::channel(1);
+        let (cancel, _cancel_rx) = watch::channel(false);
+        let (engine_tx, _engine_rx) = mpsc::unbounded_channel();
+        lock(&engine.inner.runs).insert(
+            chat_id.to_string(),
+            RunHandle {
+                run_id: run_id.into(),
+                steerable: true,
+                steer_tx,
+                interrupt_token: CancellationToken::new(),
+                cancel,
+                engine_tx,
+                pending_inputs: Arc::new(Mutex::new(HashMap::new())),
+                routed_steers: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            },
+        );
+    }
+
+    #[test]
+    fn turn_end_with_waiting_queue_withholds_the_settle_status() {
+        let engine = engine();
+        engine.inner.set_status("c1", SessionStatus::Working, true);
+        park_queued(&engine, "c1", "q-1");
+        settle_status_for_turn_end(&engine.inner, "c1", "run-1", SessionStatus::Idle, false);
+        assert_eq!(
+            engine.session_status("c1").map(|s| s.status),
+            Some(SessionStatus::Working),
+            "a queue-draining thread is not done between turns"
+        );
+        assert_eq!(
+            lock(&engine.inner.queue_held).get("c1").cloned(),
+            Some("run-1".to_string())
+        );
+    }
+
+    #[test]
+    fn turn_end_with_empty_queue_settles_normally() {
+        let engine = engine();
+        engine.inner.set_status("c1", SessionStatus::Working, true);
+        settle_status_for_turn_end(&engine.inner, "c1", "run-1", SessionStatus::Idle, false);
+        assert_eq!(
+            engine.session_status("c1").map(|s| s.status),
+            Some(SessionStatus::Idle)
+        );
+        assert!(lock(&engine.inner.queue_held).get("c1").is_none());
+    }
+
+    #[tokio::test]
+    async fn held_drain_with_emptied_queue_releases_the_held_idle() {
+        let engine = engine();
+        engine.inner.set_status("c1", SessionStatus::Working, true);
+        // The marker is set but the tray removed every row before the drain
+        // ran: the withheld settle must still land.
+        lock(&engine.inner.queue_held).insert("c1".into(), "run-1".into());
+        let delivered = engine.dispatch_next_queued("c1").await.unwrap();
+        assert!(!delivered);
+        assert_eq!(
+            engine.session_status("c1").map(|s| s.status),
+            Some(SessionStatus::Idle)
+        );
+    }
+
+    #[tokio::test]
+    async fn held_drain_yields_to_a_replacement_run() {
+        let engine = engine();
+        engine.inner.set_status("c1", SessionStatus::Working, true);
+        park_queued(&engine, "c1", "q-1");
+        lock(&engine.inner.queue_held).insert("c1".into(), "run-1".into());
+        // A user send raced the turn end and owns a DIFFERENT live run: the
+        // drain must not deliver (its turn end re-drains), and the status
+        // (that turn's Working) stays untouched.
+        fake_run(&engine, "c1", "run-2");
+        let delivered = engine.dispatch_next_queued("c1").await.unwrap();
+        assert!(!delivered);
+        assert_eq!(
+            engine.session_status("c1").map(|s| s.status),
+            Some(SessionStatus::Working)
+        );
+        assert_eq!(lock(&engine.inner.queued_turns)["c1"].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unheld_drain_respects_a_busy_status() {
+        let engine = engine();
+        engine.inner.set_status("c1", SessionStatus::Working, true);
+        park_queued(&engine, "c1", "q-1");
+        let delivered = engine.dispatch_next_queued("c1").await.unwrap();
+        assert!(!delivered, "no held marker: status says busy, as before");
+        assert_eq!(lock(&engine.inner.queued_turns)["c1"].len(), 1);
+    }
 }
 
 #[cfg(test)]

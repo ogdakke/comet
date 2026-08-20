@@ -489,3 +489,85 @@ async fn stale_tool_echo_stays_parked() {
 
     rig.core.sessions.shutdown().await;
 }
+
+/// Queue-drain parity for the watchdog park: a queued prompt must not strand
+/// behind a turn whose Done was lost — the quiesce park drains the queue
+/// exactly like a Done park (and with the queue waiting, the settle status
+/// stays withheld: the thread is not done between drained turns).
+#[tokio::test]
+async fn quiesced_turn_still_drains_the_queue() {
+    let rig = assemble("first prompt");
+    rig.core
+        .sessions
+        .dispatch(
+            CHAT,
+            HarnessId::Mock,
+            run_request("first prompt"),
+            Some("m-1".into()),
+        )
+        .await
+        .expect("dispatch");
+
+    // The prompt queues mid-turn, before ANY reply exists — parking it ahead
+    // of the turn's assistant entry (the interleave delivery must undo).
+    rig.core
+        .sessions
+        .queue_turn(CHAT, "and then", "q-1")
+        .await
+        .expect("queued");
+    wait_for(
+        || {
+            entries(&rig.core)
+                .iter()
+                .any(|e| e.id == "q-1" && e.status == Some(MessageStatus::Queued))
+        },
+        "queued entry parked",
+    )
+    .await;
+
+    // Turn 1 streams… then its Done is lost upstream (silence → watchdog).
+    rig.feed.send(session_started()).unwrap();
+    rig.feed.send(text("first answer")).unwrap();
+
+    // The watchdog park drains the queue: q-1 steers into the parked run
+    // (FeedHarness confirms with a Steered boundary), flipping its doc entry.
+    wait_for(
+        || {
+            entries(&rig.core)
+                .iter()
+                .any(|e| e.id == "q-1" && e.status == Some(MessageStatus::Complete))
+        },
+        "quiesce park drains the queued prompt",
+    )
+    .await;
+    assert_eq!(
+        status(&rig.core),
+        Some(SessionStatus::Working),
+        "the delivered prompt owns the next turn — no Idle dip in between"
+    );
+
+    // And it landed AFTER turn 1's reply, not in its parked slot.
+    let snapshot = entries(&rig.core);
+    let order: Vec<&str> = snapshot.iter().map(|e| e.id.as_str()).collect();
+    let a1 = snapshot
+        .iter()
+        .find(|e| e.role == MessageRole::Assistant)
+        .map(|e| e.id.clone())
+        .expect("turn-1 assistant entry");
+    let pos = |id: &str| order.iter().position(|e| *e == id).unwrap();
+    assert!(
+        pos("m-1") < pos(&a1) && pos(&a1) < pos("q-1"),
+        "delivered prompt follows the finished turn, got {order:?}"
+    );
+
+    // Turn 2 answers and ends: with the queue empty the Idle lands for real.
+    rig.feed.send(text("second answer")).unwrap();
+    rig.feed.send(done(DoneStatus::Completed)).unwrap();
+    wait_for(
+        || status(&rig.core) == Some(SessionStatus::Idle),
+        "settle after the last queued turn",
+    )
+    .await;
+
+    rig.core.sessions.shutdown().await;
+}
