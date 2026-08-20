@@ -977,7 +977,12 @@ async fn run_session(session: Session) {
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
                     let text = msg.prompt;
-                    if let Some(expected) = router.active.clone() {
+                    if msg.follow_up && router.active.is_some() {
+                        // Queued prompt ("send after this turn"): park it —
+                        // the expected turn's end redelivers it as a fresh
+                        // turn/start. Never injected mid-turn, by definition.
+                        queued_steers.push_back(text);
+                    } else if let Some(expected) = router.active.clone() {
                         let steer_params = json!({
                             "threadId": thread_id,
                             "expectedTurnId": expected,

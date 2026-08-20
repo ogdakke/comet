@@ -2076,8 +2076,15 @@ impl DocHost {
                     .await?;
                 Ok((SessionCommandStatus::Applied, None))
             }
-            SessionCommandPayload::Steer { prompt, message_id } => {
-                match sessions.steer(chat_id, prompt, message_id.clone()).await? {
+            SessionCommandPayload::Steer {
+                prompt,
+                message_id,
+                follow_up,
+            } => {
+                match sessions
+                    .steer(chat_id, prompt, message_id.clone(), *follow_up)
+                    .await?
+                {
                     SteerOutcome::Accepted => Ok((SessionCommandStatus::Applied, None)),
                     SteerOutcome::NotSteerable => {
                         // No live steerable run: the durable command still delivers —

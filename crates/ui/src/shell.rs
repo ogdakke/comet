@@ -2433,7 +2433,10 @@ impl Shell {
         let input = cx.new(|cx| TextInput::new("Session title", cx));
         input.update(cx, |input, cx| input.set_text(current, cx));
         let events = cx.subscribe(&input, |this: &mut Shell, _, event, cx| {
-            if matches!(event, TextInputEvent::Submitted) {
+            if matches!(
+                event,
+                TextInputEvent::Submitted | TextInputEvent::SubmitQueued
+            ) {
                 this.submit_rename_chat(cx);
             }
         });
@@ -2506,7 +2509,10 @@ impl Shell {
         let input = cx.new(|cx| TextInput::new("Thread title", cx));
         input.update(cx, |input, cx| input.set_text(current, cx));
         let events = cx.subscribe(&input, |this: &mut Shell, _, event, cx| {
-            if matches!(event, TextInputEvent::Submitted) {
+            if matches!(
+                event,
+                TextInputEvent::Submitted | TextInputEvent::SubmitQueued
+            ) {
                 this.submit_rename_studio(cx);
             }
         });
@@ -3013,7 +3019,10 @@ impl Shell {
         }
         let name_input = cx.new(|cx| TextInput::new("Workspace name", cx));
         let events = cx.subscribe(&name_input, |this: &mut Shell, _, event, cx| {
-            if matches!(event, TextInputEvent::Submitted) {
+            if matches!(
+                event,
+                TextInputEvent::Submitted | TextInputEvent::SubmitQueued
+            ) {
                 this.create_org(cx);
             }
         });

@@ -155,7 +155,7 @@ async fn wait_for<F>(predicate: F, what: &str)
 where
     F: FnMut() -> bool,
 {
-    wait_for_within(predicate, what, Duration::from_secs(10)).await;
+    wait_for_within(predicate, what, Duration::from_secs(30)).await;
 }
 
 async fn wait_for_within<F>(mut predicate: F, what: &str, deadline: Duration)
@@ -951,6 +951,7 @@ async fn steer_after_restart_dispatches_new_turn_with_resume() {
             SessionCommandPayload::Steer {
                 prompt: "actually, also add tests".into(),
                 message_id: Some("msg-user-2".into()),
+                follow_up: false,
             },
         )
         .expect("queue steer command");

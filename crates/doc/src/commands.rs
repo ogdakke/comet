@@ -47,6 +47,12 @@ pub enum SessionCommandPayload {
     Steer {
         prompt: String,
         message_id: Option<String>,
+        /// "Send after the current turn" (composer Ctrl+Enter): the host
+        /// delivers the prompt as the NEXT turn instead of steering the
+        /// live one. Additive: an old host ignores the flag and steers —
+        /// degraded, never lost.
+        #[serde(default)]
+        follow_up: bool,
     },
     Interrupt {},
     #[serde(rename_all = "camelCase")]
@@ -197,6 +203,7 @@ mod tests {
             SessionCommandPayload::Steer {
                 prompt: "go".into(),
                 message_id: None,
+                follow_up: false,
             },
             issued_at,
         )

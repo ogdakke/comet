@@ -12,7 +12,7 @@ pub enum HarnessId {
     Grok,
     /// Nous Research's Hermes Agent, driven over ACP (`hermes acp`).
     Hermes,
-    /// The pi coding agent (pi.dev), driven over ACP via the `pi-acp` adapter.
+    /// The pi coding agent (pi.dev), driven natively over its RPC mode.
     Pi,
     /// Test harness; never shown in production pickers.
     Mock,

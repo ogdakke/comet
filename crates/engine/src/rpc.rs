@@ -93,6 +93,17 @@ use crate::workspace_host::WorkspaceHost;
 const FILE_SEARCH_RPC_TIMEOUT: Duration = Duration::from_secs(6);
 const FILE_SEARCH_FEATURED_PATHS: usize = 32;
 
+/// The picker-facing search budget; `ZERON_FILE_SEARCH_TIMEOUT_MS` overrides
+/// (tests set it high: under a full-suite parallel run the default 6s
+/// flakes on scheduling latency, not on real regressions).
+fn file_search_timeout() -> Duration {
+    std::env::var("ZERON_FILE_SEARCH_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(FILE_SEARCH_RPC_TIMEOUT)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatParams {
@@ -2329,7 +2340,7 @@ impl RpcService for EngineRpc {
                         "SearchFiles query must not exceed 256 characters".into(),
                     ));
                 }
-                let matches = tokio::time::timeout(FILE_SEARCH_RPC_TIMEOUT, async {
+                let matches = tokio::time::timeout(file_search_timeout(), async {
                     let root = self.file_search_root(&p).await?;
                     let featured_paths = p
                         .chat_id

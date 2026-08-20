@@ -182,6 +182,7 @@ async fn steer_after_done_becomes_the_next_turn() {
                         .send(SteerMessage {
                             prompt: "follow up".into(),
                             message_id: None,
+                            follow_up: false,
                         })
                         .await
                         .expect("steer sent");

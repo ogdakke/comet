@@ -175,7 +175,11 @@ async fn wait_for<F>(mut predicate: F, what: &str)
 where
     F: FnMut() -> bool,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // 30s, not a snappy 10: the whole e2e binary shares the machine with
+    // cargo's parallel test binaries, and under that load a 10s deadline
+    // flakes on engine-scheduling latency, not on real regressions (the
+    // predicate is an "eventually" condition either way).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while !predicate() {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -353,7 +357,8 @@ async fn session_status_transitions_idle_working_idle() {
     );
 
     let mut seen = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Same load-bearing headroom as wait_for (parallel-suite flakes).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let status = tokio::time::timeout_at(deadline, watch.changed())
             .await
@@ -432,17 +437,24 @@ async fn interrupt_stamps_streaming_entry_aborted() {
         MessagePart::Text { text, .. } => assert_eq!(text, "partial output"),
         other => panic!("unexpected part {other:?}"),
     }
-    assert_eq!(
-        command_status(&core, "cmd-int-1"),
-        Some((SessionCommandStatus::Applied, None))
-    );
+    // The command outcome write and the Idle stamp can lag the doc's
+    // Aborted stamp (separate writes, host-side) — poll, don't assert blind.
+    wait_for(
+        || {
+            command_status(&core, "cmd-int-1")
+                == Some((SessionCommandStatus::Applied, None))
+        },
+        "interrupt command resolution",
+    )
+    .await;
     // Journal closed with a Done — nothing left to recover.
     let journal = RunJournal::open(dir.path().join("orgs/dev-org/dev-user/journals")).unwrap();
     assert!(journal.stale_sessions().unwrap().is_empty());
-    assert_eq!(
-        core.sessions.session_status(CHAT).map(|s| s.status),
-        Some(SessionStatus::Idle)
-    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "session back to idle",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -488,6 +500,7 @@ async fn steer_with_no_live_run_falls_back_to_new_turn() {
         SessionCommandPayload::Steer {
             prompt: "also do this".into(),
             message_id: Some("m-2".into()),
+            follow_up: false,
         },
     );
     wait_for(
@@ -2020,6 +2033,7 @@ async fn parked_steer_restamps_started_at_and_idle_clears_it() {
         SessionCommandPayload::Steer {
             prompt: "next".into(),
             message_id: Some("m-2".into()),
+            follow_up: false,
         },
     );
     wait_for(

@@ -310,6 +310,9 @@ impl SessionsEngine {
             let message = SteerMessage {
                 prompt: request.prompt.clone(),
                 message_id: message_id.clone(),
+                // A Run command routed into a live run's mailbox is the
+                // engine's own steering fallback — mid-turn injection.
+                follow_up: false,
             };
             if steerable && steer_tx.try_send(message).is_ok() {
                 // The run can vanish between the send and here (the idle
@@ -456,6 +459,7 @@ impl SessionsEngine {
         chat_id: &str,
         prompt: &str,
         message_id: Option<String>,
+        follow_up: bool,
     ) -> Result<SteerOutcome, EngineError> {
         let target = lock(&self.inner.runs)
             .get(chat_id)
@@ -473,6 +477,7 @@ impl SessionsEngine {
         let message = SteerMessage {
             prompt: prompt.to_string(),
             message_id: message_id.clone(),
+            follow_up,
         };
         if steer_tx.try_send(message).is_err() {
             return Ok(SteerOutcome::NotSteerable);

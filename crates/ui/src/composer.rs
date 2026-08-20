@@ -999,6 +999,9 @@ impl Composer {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
         let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => this.on_submit(cx),
+            // The input itself reroutes to MentionAccept when a completion
+            // popup owns the key, so this arm only fires on a real submit.
+            ComposerInputEvent::SubmitQueued => this.on_submit_queued(cx),
             ComposerInputEvent::Edited | ComposerInputEvent::CursorMoved => {
                 this.on_input_edited(cx)
             }
@@ -2127,8 +2130,33 @@ impl Composer {
             SendButtonMode::Stop => self.interrupt(cx),
             _ if no_content => {}
             _ if self.send_blocked(cx) => {}
-            SendButtonMode::Send => self.send(text, false, cx),
-            SendButtonMode::Steer => self.send(text, true, cx),
+            SendButtonMode::Send => self.send(text, false, false, cx),
+            SendButtonMode::Steer => self.send(text, true, false, cx),
+        }
+    }
+
+    /// Ctrl+Enter — "send after the current turn": against a live run the
+    /// message queues and is delivered as the NEXT turn instead of steering
+    /// the live one; with no run live it is just a send. Unlike on_submit,
+    /// an empty composer never reads as Stop — nothing to queue.
+    fn on_submit_queued(&mut self, cx: &mut Context<Self>) {
+        if self.wizard.is_some() {
+            let typed = self.input.read(cx).text().trim().to_string();
+            if let Some(w) = self.wizard.as_mut() {
+                w.set_typed(typed);
+            }
+            self.wizard_advance(cx);
+            return;
+        }
+        let text = self.input.read(cx).text().trim().to_string();
+        let no_content =
+            !composer_has_content(&text, self.staged().len(), self.staged_comments(cx).len());
+        if no_content || self.send_blocked(cx) {
+            return;
+        }
+        match self.button_mode(cx) {
+            SendButtonMode::Steer => self.send(text, true, true, cx),
+            _ => self.send(text, false, false, cx),
         }
     }
 
@@ -2136,7 +2164,7 @@ impl Composer {
     /// thread the picked config in: worktree creation (when the isolated toggle
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
-    fn send(&mut self, text: String, steer: bool, cx: &mut Context<Self>) {
+    fn send(&mut self, text: String, steer: bool, follow_up: bool, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.failure = Some("Engine not connected".into());
             cx.notify();
@@ -2460,6 +2488,7 @@ impl Composer {
                     SessionCommandPayload::Steer {
                         prompt: content.clone(),
                         message_id: Some(message_id.clone()),
+                        follow_up,
                     }
                 } else {
                     SessionCommandPayload::Run {
@@ -3412,6 +3441,23 @@ impl Render for Composer {
                     .line_height(px(15.0))
                     .text_color(theme.text_muted.opacity(0.8))
                     .child("This agent can't be steered mid-turn — your message will be queued and sent when the current turn finishes."),
+            )
+        });
+
+        // Queue affordance: mid-turn steerable agents also take Ctrl+Enter
+        // as "send after the current turn" — undiscoverable without a hint.
+        let steer_live = mode == SendButtonMode::Steer
+            && self.pickers.read(cx).resolved_steering_mode(cx)
+                == Some(zeron_proto::SteeringMode::StepBoundary);
+        let container = container.when(steer_live, |el| {
+            el.child(
+                div()
+                    .mt(px(6.0))
+                    .px(px(12.0))
+                    .text_size(px(11.0))
+                    .line_height(px(15.0))
+                    .text_color(theme.text_muted.opacity(0.8))
+                    .child("Enter steers the live turn · Ctrl+Enter queues for the next turn."),
             )
         });
 

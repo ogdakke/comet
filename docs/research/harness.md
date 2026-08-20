@@ -60,6 +60,41 @@
 Both reduce to: spawn child, frame JSONL stdout (+ id-multiplexing), write stdin lines, map to one
 AgentEvent enum, mpsc steering mailbox, cancellation token kills child.
 
+## pi RPC protocol (native driver, 2026-08-19)
+- `pi --mode rpc [--session <id>] [--no-session]`: NOT JSON-RPC 2.0 — commands are
+  `{"id":N,"type":"get_state",...}` one per line; responses
+  `{"type":"response","command":...,"id":N,"success":...,"data":...}` resolve by id;
+  agent events are bare `{"type":"agent_start"}` objects. Strict LF framing (docs call out
+  Node readline as non-compliant: it splits on U+2028/U+2029).
+- Setup: `get_state` (sessionId + model) → `set_model {provider, modelId}` (catalog ids are
+  `provider/id`) → `set_thinking_level {level: off|minimal|low|medium|high|xhigh|max}` →
+  `prompt {message, images?}`. The prompt RESPONSE means accepted, never done.
+- Turn settles on `agent_settled` — pi drains auto-retries, compaction, and queued follow-ups
+  first, so it is the deterministic terminal event (deterministic_turn_end = true). A final
+  assistant `message_end` with `stopReason:"error"` (after retries exhaust) maps to Errored;
+  `stopReason:"aborted"` to Interrupted. A clean message_end supersedes an earlier failed
+  attempt (pi strips the failed message on retry).
+- Steering: `steer {message}` — delivered after the current internal turn's tool calls, before
+  the next LLM call: StepBoundary. Rejected with "not streaming" when the turn already settled
+  → redeliver as the next `prompt` on the same session (the codex expectedTurnId fallback,
+  pi-shaped). Steers after a settled turn start new turns directly; multi-Done runs fold through
+  the engine's wake handling.
+- Interrupt: `abort`; pi settles and emits agent_settled; escalate SIGTERM → SIGKILL after
+  grace (pi handles SIGTERM itself: exit 143).
+- Events mapped: message_update.assistantMessageEvent text_delta/thinking_delta → Text/Reasoning
+  deltas; tool_execution_start/end → ToolCall/ToolResult (bash/read/write/edit/grep/find/ls;
+  edit diffs rebuilt from start-frame args — pi's `details.diff` is display-only line output);
+  message_end usage → Usage held to the settle boundary. queue_update/compaction/retry events
+  are lifecycle noise (tolerated, ignored).
+- Models: live `get_available_models` over a short-lived `--no-session` child, ids as
+  `provider/id`, per-model ladders from `reasoning` (pi's extra "off" tier has no zeron
+  equivalent).
+- Attachments: prompt `images` [{type:"image", data: base64, mimeType}] (5MB inline cap,
+  magic-byte media typing — same policy as the claude driver).
+- Retired: the `pi-acp` ACP adapter path (pi_spec/AcpHarness::pi, PI_ACP_EXECUTABLE, the
+  pi-acp quiet-settle exemption). Docs: pi's docs/rpc.md (validated against the installed
+  @earendil-works/pi-coding-agent; revalidate on bump).
+
 ## Capability matrix to replicate (from packages/harness)
 Normalized AgentEvent stream; typed ToolCall decoding (Bash/Read/Write/Edit/Grep/Glob/WebFetch/
 WebSearch/TodoWrite -> Exec/ReadFile/...; codex item types); model discovery + effort ladders +
