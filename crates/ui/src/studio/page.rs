@@ -203,6 +203,9 @@ pub struct StudioPage {
     pub(super) full_image_tasks: HashMap<StudioArtifactId, Task<()>>,
     pub(super) display_tasks: HashMap<StudioArtifactId, Task<()>>,
     pub(super) loading_displays: HashSet<StudioArtifactId>,
+    /// Most recent visible paint of an in-flight output. A ready image may
+    /// reveal only when it immediately replaces that paint, never on remount.
+    pub(super) visible_loading_tiles: HashMap<(zeron_studio::StudioRunId, usize), Instant>,
     pub(super) video: Option<super::video::StudioVideoPlayback>,
     pub(super) video_task: Option<Task<()>>,
     pub(super) video_frame_scheduled: bool,
@@ -405,6 +408,7 @@ impl StudioPage {
             full_image_tasks: HashMap::new(),
             display_tasks: HashMap::new(),
             loading_displays: HashSet::new(),
+            visible_loading_tiles: HashMap::new(),
             preview_failed: HashSet::new(),
             video: None,
             video_task: None,

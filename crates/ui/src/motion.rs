@@ -283,6 +283,8 @@ impl MotionSpec {
 pub const FADE_IN: MotionSpec = MotionSpec::new(500, EASE_OUT_EXPO);
 /// Quick fade: 0.15s.
 pub const FADE_QUICK: MotionSpec = MotionSpec::new(150, EASE);
+/// Studio output reveal: 1s opacity cross-fade over the standard entrance curve.
+pub const STUDIO_IMAGE_REVEAL: MotionSpec = MotionSpec::new(1000, EASE_OUT_EXPO);
 /// Popover-in: 0.14s (scale 0.96 approximated, translateY −2).
 pub const MENU_IN: MotionSpec = MotionSpec::new(140, EASE);
 /// Popover-out: 0.1s — quicker than the entrance (exits should get out of the
@@ -336,6 +338,14 @@ where
     E: Styled + IntoElement + 'static,
 {
     element.with_animation(id, FADE_QUICK.animation(), |el, t| el.opacity(t))
+}
+
+/// Opacity-only fade using an explicit spec.
+pub fn fade<E>(id: impl Into<ElementId>, spec: MotionSpec, element: E) -> AnimationElement<E>
+where
+    E: Styled + IntoElement + 'static,
+{
+    element.with_animation(id, spec.animation(), |el, t| el.opacity(t))
 }
 
 /// Popover entrance: fade + translateY −2→0 over [`MENU_IN`].

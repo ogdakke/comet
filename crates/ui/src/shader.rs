@@ -13,9 +13,8 @@ use gpui::{
 /// A catalogued fragment effect. Drop it in a layout with [`shader`].
 #[derive(Clone, Copy, Debug)]
 pub enum Effect {
-    /// Regular dot lattice whose brightness follows a slow flowing field.
-    /// `seed` desynchronizes neighboring tiles; `speed` is 1.0 for studio.
-    StarShimmer { seed: u32, speed: f32 },
+    /// Fixed dot lattice over a seeded, bubbling noise field.
+    StarShimmer { seed: u32, speed: f32, variant: u32 },
     /// The same lattice, quieter — queued tiles.
     SoftNoise { seed: u32, amount: f32 },
     /// Diagonal progress band. `t` is 0..=1.
@@ -24,7 +23,11 @@ pub enum Effect {
 
 impl Effect {
     pub fn star_shimmer(seed: u32) -> Self {
-        Self::StarShimmer { seed, speed: 1.0 }
+        Self::StarShimmer {
+            seed,
+            speed: 1.0,
+            variant: 0,
+        }
     }
 
     fn kind(self) -> EffectKind {
@@ -44,7 +47,9 @@ impl Effect {
 
     fn params(self) -> [f32; 8] {
         match self {
-            Self::StarShimmer { speed, .. } => [speed, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            Self::StarShimmer { speed, variant, .. } => {
+                [speed, 1.0, 0.0, 0.0, variant as f32, 0.0, 0.0, 0.0]
+            }
             Self::SoftNoise { amount, .. } => {
                 [0.28, amount.clamp(0.0, 1.0), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
             }

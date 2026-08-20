@@ -2439,8 +2439,12 @@ impl StudioPage {
             None => {
                 let loading = slot.and_then(|slot| {
                     let seed = slot.run_id.0.as_u128() as u32 ^ slot.output_ix as u32;
-                    let (effect, wash) =
-                        super::feed::loading_effect(seed, slot.state, slot.progress)?;
+                    let (effect, wash) = super::feed::loading_effect(
+                        seed,
+                        slot.output_ix as u32 % 4,
+                        slot.state,
+                        slot.progress,
+                    )?;
                     let (aw, ah) = slot
                         .width
                         .zip(slot.height)
@@ -2717,6 +2721,7 @@ impl StudioPage {
                 if let Some(slot) = self.frame_by_key(thumb_key)
                     && let Some((effect, wash)) = super::feed::loading_effect(
                         slot.run_id.0.as_u128() as u32 ^ slot.output_ix as u32,
+                        slot.output_ix as u32 % 4,
                         slot.state,
                         slot.progress,
                     )

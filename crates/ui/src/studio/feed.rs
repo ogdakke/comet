@@ -58,6 +58,9 @@ const FEED_OVERDRAW_PX: f32 = 720.0;
 /// Extra band around the reading window that decodes display frames. Smaller
 /// than [`FEED_OVERDRAW_PX`] — those pixels already have 512 previews.
 const FEED_FULL_OVERDRAW_PX: f32 = 200.0;
+/// A result must replace a visibly painted loader within this window to earn
+/// the one-shot image reveal. This excludes virtual-list remounts.
+const STUDIO_IMAGE_REVEAL_GRACE: Duration = Duration::from_millis(250);
 /// Hard cap so a layout miss cannot pin dozens of 1280px GPU tiles.
 const FEED_DISPLAY_MAX: usize = 12;
 /// Image elements mounted in one turn. Off-screen rows stay as height
@@ -702,13 +705,28 @@ fn previewable_feed_kind(kind: MediaKind) -> bool {
 
 pub(super) fn loading_effect(
     seed: u32,
+    variant: u32,
     state: StudioRunState,
     progress: Option<f32>,
 ) -> Option<(Effect, Option<f32>)> {
     match state {
         StudioRunState::Queued => Some((Effect::SoftNoise { seed, amount: 0.7 }, None)),
-        StudioRunState::Downloading => Some((Effect::StarShimmer { seed, speed: 1.0 }, progress)),
-        StudioRunState::Running => Some((Effect::StarShimmer { seed, speed: 1.0 }, None)),
+        StudioRunState::Downloading => Some((
+            Effect::StarShimmer {
+                seed,
+                speed: 0.85,
+                variant,
+            },
+            progress,
+        )),
+        StudioRunState::Running => Some((
+            Effect::StarShimmer {
+                seed,
+                speed: 0.85,
+                variant,
+            },
+            None,
+        )),
         _ => None,
     }
 }
@@ -826,7 +844,7 @@ fn lattice_seed(turn_ix: usize, run_ix: usize, output_ix: usize) -> u32 {
 
 impl StudioPage {
     pub(super) fn render_tile(
-        &self,
+        &mut self,
         turn_ix: usize,
         run_ix: usize,
         output_ix: usize,
@@ -845,6 +863,18 @@ impl StudioPage {
     ) -> AnyElement {
         let height = width * aspect.1 as f32 / aspect.0.max(1) as f32;
         let video = media_kind == MediaKind::Video;
+        let loading_key = (run_id, output_ix);
+        if artifact_id.is_none()
+            && matches!(
+                state,
+                StudioRunState::Queued | StudioRunState::Downloading | StudioRunState::Running
+            )
+        {
+            let now = Instant::now();
+            self.visible_loading_tiles
+                .retain(|_, painted| now.duration_since(*painted) <= STUDIO_IMAGE_REVEAL_GRACE);
+            self.visible_loading_tiles.insert(loading_key, now);
+        }
         let mut base = div()
             .id(feed_tile_element_id(artifact_id, run_id, output_ix))
             .w(px(width))
@@ -886,6 +916,39 @@ impl StudioPage {
             };
             let (image, full) = self.display_layers(id, paint, window, cx);
             if let Some(image) = image {
+                let reveal = self
+                    .visible_loading_tiles
+                    .remove(&loading_key)
+                    .is_some_and(|painted| painted.elapsed() <= STUDIO_IMAGE_REVEAL_GRACE);
+                let image_layer = div().size_full().child(contain_layers(
+                    image,
+                    full,
+                    px(10.0),
+                    Some(SharedString::from(format!("studio-thumb-ready-{}", id.0))),
+                ));
+                let content = if reveal {
+                    div()
+                        .size_full()
+                        .relative()
+                        .child(
+                            shader(Effect::StarShimmer {
+                                seed: lattice_seed(turn_ix, run_ix, output_ix),
+                                speed: 0.0,
+                                variant: output_ix as u32 % 4,
+                            })
+                            .absolute()
+                            .inset_0()
+                            .rounded(px(10.0)),
+                        )
+                        .child(crate::motion::fade(
+                            SharedString::from(format!("studio-image-reveal-{}", id.0)),
+                            motion::STUDIO_IMAGE_REVEAL,
+                            image_layer,
+                        ))
+                        .into_any_element()
+                } else {
+                    image_layer.into_any_element()
+                };
                 return base
                     .relative()
                     .cursor_pointer()
@@ -909,15 +972,7 @@ impl StudioPage {
                         page.open_artifact_viewer(id, frames, cx);
                         window.focus(&page.focus, cx);
                     }))
-                    .child(crate::motion::fade_quick(
-                        SharedString::from(format!("studio-image-reveal-{}", id.0)),
-                        div().size_full().child(contain_layers(
-                            image,
-                            full,
-                            px(10.0),
-                            Some(SharedString::from(format!("studio-thumb-ready-{}", id.0))),
-                        )),
-                    ))
+                    .child(content)
                     .when_some(
                         self.hover_video_layer(id, gpui::ObjectFit::Contain, theme.bg),
                         |tile, layer| tile.child(layer),
@@ -930,16 +985,17 @@ impl StudioPage {
             }
         }
         let seed = lattice_seed(turn_ix, run_ix, output_ix);
-        let fill = loading_effect(seed, state, progress).map(|(effect, wash)| {
-            shader(effect)
-                .progress(wash)
-                .absolute()
-                .top_0()
-                .left_0()
-                .w(px(width))
-                .h(px(height))
-                .rounded(px(10.0))
-        });
+        let fill =
+            loading_effect(seed, output_ix as u32 % 4, state, progress).map(|(effect, wash)| {
+                shader(effect)
+                    .progress(wash)
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(px(width))
+                    .h(px(height))
+                    .rounded(px(10.0))
+            });
         let play = (video && state == StudioRunState::Succeeded).then(|| {
             div()
                 .absolute()
@@ -1903,12 +1959,12 @@ impl StudioPage {
         let inner_width = (bubble_width - PROMPT_BUBBLE_PAD_X * 2.0).max(1.0);
         let clampable = prompt_exceeds_collapsed_lines(&turn.prompt, inner_width);
         let collapsed = clampable && !expanded;
-        let tiles = self.lineage.tiles_for_root(turn.id);
+        let tiles = self.lineage.tiles_for_root(turn.id).to_vec();
         let header = estimated_turn_header(turn, content_width, expanded);
         let columns = grid_columns_sticky(content_width, self.feed_columns).max(1);
         let mut grid = div().w_full().flex().flex_row().flex_wrap().gap(px(gap));
         let paint_rows =
-            self.feed_paint_rows_for_turn(turn_ix, tiles, tile_width, columns, gap, header);
+            self.feed_paint_rows_for_turn(turn_ix, &tiles, tile_width, columns, gap, header);
         let row_count = tiles.len().div_ceil(columns);
         for row in 0..row_count {
             let start = row * columns;

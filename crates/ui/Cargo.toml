@@ -42,7 +42,7 @@ core-video = "0.5"
 
 [dev-dependencies]
 tempfile.workspace = true
-gpui = { git = "https://github.com/ogdakke/zed", rev = "041a391d9149c37990e2a60f6481b3f780b688e5", features = [
+gpui = { workspace = true, features = [
     "test-support",
 ] }
 
