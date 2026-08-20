@@ -14,7 +14,7 @@ use gpui::{
 };
 use std::time::{Duration, Instant};
 
-use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
+use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
 
 use crate::motion;
 use crate::popover;
@@ -84,6 +84,10 @@ pub fn rail_ticks(
         if entry.role != MessageRole::User {
             continue;
         }
+        // Queued prompts haven't run — no turn exists to tick on the rail.
+        if entry.status == Some(MessageStatus::Queued) {
+            continue;
+        }
         ticks.push(RailTick {
             message_id: entry.id.clone(),
             prompt: user_text(entry),
@@ -91,7 +95,10 @@ pub fn rail_ticks(
         });
     }
     for echo in echoes {
-        if echo.role == MessageRole::User && !ticks.iter().any(|t| t.message_id == echo.id) {
+        if echo.role == MessageRole::User
+            && echo.status != Some(MessageStatus::Queued)
+            && !ticks.iter().any(|t| t.message_id == echo.id)
+        {
             ticks.push(RailTick {
                 message_id: echo.id.clone(),
                 prompt: user_text(echo),

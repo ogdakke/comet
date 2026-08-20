@@ -1,6 +1,7 @@
-//! Conflict popup over the studio composer.
+//! Conflict tray over the studio composer — built on the shared
+//! [`crate::tray`] component (also the agent-chat queued-prompt tray).
 
-use gpui::{AnyElement, Context, SharedString, div, prelude::*, px};
+use gpui::{AnyElement, Context, SharedString};
 use zeron_studio::{ComposerConflict, ConflictId, ResolveAction};
 
 use crate::theme::Theme;
@@ -51,89 +52,59 @@ impl StudioPage {
         };
         let show_more = actions.len() > 2 && !self.conflict_more_open;
         let copy = conflict.title.clone();
-        let mut buttons = div().flex_none().flex().items_center().gap(px(6.0));
+        let mut tray_actions = Vec::new();
         for (index, offered) in actions.iter().take(visible).enumerate() {
             let conflict_id = conflict.id.clone();
             let action = offered.action.clone();
             let label = offered.label.clone();
             let primary = index == 0;
-            buttons = buttons.child(
-                conflict_action_chip(
+            tray_actions.push(if primary {
+                crate::tray::TrayAction::primary(
                     SharedString::from(format!("studio-conflict-action-{index}")),
                     label,
-                    primary,
-                    theme,
+                    cx.listener(move |page, _, window, cx| {
+                        page.resolve_composer_conflict(
+                            conflict_id.clone(),
+                            action.clone(),
+                            window,
+                            cx,
+                        );
+                    }),
                 )
-                .on_click(cx.listener(move |page, _, window, cx| {
-                    page.resolve_composer_conflict(conflict_id.clone(), action.clone(), window, cx);
-                })),
-            );
+            } else {
+                crate::tray::TrayAction::label(
+                    SharedString::from(format!("studio-conflict-action-{index}")),
+                    label,
+                    cx.listener(move |page, _, window, cx| {
+                        page.resolve_composer_conflict(
+                            conflict_id.clone(),
+                            action.clone(),
+                            window,
+                            cx,
+                        );
+                    }),
+                )
+            });
         }
         if show_more {
-            buttons = buttons.child(
-                conflict_action_chip("studio-conflict-more", "More", false, theme).on_click(
-                    cx.listener(|page, _, _, cx| {
-                        page.conflict_more_open = true;
-                        cx.notify();
-                    }),
-                ),
-            );
+            tray_actions.push(crate::tray::TrayAction::label(
+                "studio-conflict-more",
+                "More",
+                cx.listener(|page, _, _, cx| {
+                    page.conflict_more_open = true;
+                    cx.notify();
+                }),
+            ));
         }
-        Some(
-            div()
-                .id("studio-conflict-popup")
-                .w_full()
-                .max_w(px(768.0 - 42.0))
-                .h(px(48.0))
-                .px(px(12.0))
-                .rounded_t(px(18.0))
-                .border_1()
-                .border_b_0()
-                .border_color(theme.border)
-                .bg(theme.surface_overlay)
-                .when(!theme.is_glass(), |bar| bar.shadow_md())
-                .flex()
-                .items_center()
-                .gap(px(10.0))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(13.0))
-                        .text_color(theme.text)
-                        .child(SharedString::from(copy)),
-                )
-                .child(buttons)
-                .into_any_element(),
+        crate::tray::render_tray(
+            "studio-conflict-tray",
+            self.tray_scroll.clone(),
+            vec![crate::tray::TrayItem {
+                id: "studio-conflict-row".into(),
+                label: SharedString::from(copy),
+                actions: tray_actions,
+            }],
+            theme,
         )
     }
-}
-
-fn conflict_action_chip(
-    id: impl Into<SharedString>,
-    label: impl Into<SharedString>,
-    primary: bool,
-    theme: &Theme,
-) -> gpui::Stateful<gpui::Div> {
-    let label = label.into();
-    div()
-        .id(id.into())
-        .h(px(26.0))
-        .px(px(10.0))
-        .flex_none()
-        .flex()
-        .items_center()
-        .rounded(px(8.0))
-        .bg(if primary {
-            theme.text
-        } else {
-            crate::theme::wash(0.06)
-        })
-        .text_size(px(12.0))
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(if primary { theme.on_solid } else { theme.text })
-        .cursor_pointer()
-        .hover(|style| style.opacity(0.88))
-        .child(label)
 }

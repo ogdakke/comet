@@ -56,6 +56,8 @@ pub struct StudioPage {
     pub(super) composer_view: ComposerView,
     pub(super) popup_conflict: Option<ConflictId>,
     pub(super) conflict_more_open: bool,
+    /// Scroll handle for the (shared) composer tray's row list.
+    pub(super) tray_scroll: gpui::ScrollHandle,
     pub(super) catalog_refresh_task: Option<Task<()>>,
     pub(super) import_tasks: HashMap<StudioAssetId, Task<()>>,
     pub(super) tray_picker_task: Option<Task<()>>,
@@ -269,6 +271,7 @@ impl StudioPage {
             composer_view: evaluate_composer(&ComposerSnapshot::default(), &[]),
             popup_conflict: None,
             conflict_more_open: false,
+            tray_scroll: gpui::ScrollHandle::new(),
             catalog_refresh_task: None,
             import_tasks: HashMap::new(),
             tray_picker_task: None,

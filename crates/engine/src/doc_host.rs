@@ -33,7 +33,7 @@ use zeron_doc::{
 use zeron_proto::{HarnessId, UserInputAnswer, UserInputQuestion};
 use zeron_sync::DocsStore;
 
-use crate::sessions::{SessionsEngine, SteerOutcome};
+use crate::sessions::{QueueSteerOutcome, SessionsEngine, SteerOutcome};
 use crate::workspace_host::WorkspaceHost;
 use crate::{EngineError, new_id, now_ms};
 
@@ -299,7 +299,14 @@ impl ChatDocHandle {
         text: &str,
         created_at: i64,
     ) -> Result<(), DocError> {
-        if self.doc.read_entries()?.iter().any(|e| e.id == message_id) {
+        if let Some(existing) = self.doc.read_entries()?.iter().find(|e| e.id == message_id) {
+            // A queued entry being re-written is being DELIVERED — move it
+            // to the transcript's END (it was parked mid-turn, ahead of the
+            // live turn's replies) and flip it visible, in one commit. The
+            // transcript takes over presentation from the composer tray.
+            if existing.status == Some(MessageStatus::Queued) {
+                self.doc.redeliver_queued_message(message_id)?;
+            }
             return Ok(());
         }
         self.doc.push_message(&SessionMessageEntry {
@@ -312,6 +319,33 @@ impl ChatDocHandle {
             created_at,
             device_id: self.device_id.clone(),
             status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+    }
+
+    /// Write a user entry with `queued` status — the durable representation
+    /// of a queued prompt ("send after the current turn"). The transcript
+    /// hides `queued` entries; the composer's queue tray renders them, and
+    /// delivery flips the status via [`Self::write_user_message`].
+    pub fn write_queued_user_message(
+        &self,
+        message_id: &str,
+        text: &str,
+        created_at: i64,
+    ) -> Result<(), DocError> {
+        if self.doc.read_entries()?.iter().any(|e| e.id == message_id) {
+            return Ok(());
+        }
+        self.doc.push_message(&SessionMessageEntry {
+            id: message_id.to_string(),
+            role: MessageRole::User,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: text.to_string(),
+            }],
+            created_at,
+            device_id: self.device_id.clone(),
+            status: Some(MessageStatus::Queued),
             continuation_of: None,
         })
     }
@@ -639,6 +673,12 @@ impl DocHost {
     /// The workspace host, once wired (tests may assemble a DocHost without one).
     pub fn workspace(&self) -> Option<&WorkspaceHost> {
         self.inner.workspace.get()
+    }
+
+    /// Read a chat doc's latest persisted snapshot bytes without opening a
+    /// handle (boot-time queue rehydration — no room join, no LRU pin).
+    pub fn peek_snapshot(&self, chat_id: &str) -> Result<Option<Vec<u8>>, EngineError> {
+        Ok(self.inner.store.load_snapshot(chat_id)?)
     }
 
     pub fn device_id(&self) -> &str {
@@ -2081,6 +2121,14 @@ impl DocHost {
                 message_id,
                 follow_up,
             } => {
+                // Old-wire queued sends (pre-tray clients still issue
+                // Steer{followUp}): route through the turn queue — same
+                // semantics as the Queue command.
+                if *follow_up {
+                    let message_id = message_id.clone().unwrap_or_else(|| crate::new_id());
+                    sessions.queue_turn(chat_id, prompt, &message_id).await?;
+                    return Ok((SessionCommandStatus::Applied, None));
+                }
                 match sessions
                     .steer(chat_id, prompt, message_id.clone(), *follow_up)
                     .await?
@@ -2118,6 +2166,31 @@ impl DocHost {
                             Some("queued as new turn".into()),
                         ))
                     }
+                }
+            }
+            SessionCommandPayload::Queue { prompt, message_id } => {
+                sessions.queue_turn(chat_id, prompt, message_id).await?;
+                Ok((SessionCommandStatus::Applied, None))
+            }
+            SessionCommandPayload::QueueRemove { message_id } => {
+                // `false` = no longer queued (already delivered or removed) —
+                // the tray row is already gone; the op is a no-op, not a
+                // failure.
+                let removed = sessions.queue_remove(chat_id, message_id)?;
+                Ok((
+                    SessionCommandStatus::Applied,
+                    (!removed).then(|| "not queued (already delivered)".to_string()),
+                ))
+            }
+            SessionCommandPayload::QueueSteerNow { message_id } => {
+                match sessions.queue_steering_now(chat_id, message_id).await? {
+                    QueueSteerOutcome::Steered | QueueSteerOutcome::Dispatched => {
+                        Ok((SessionCommandStatus::Applied, None))
+                    }
+                    QueueSteerOutcome::NotQueued => Ok((
+                        SessionCommandStatus::Applied,
+                        Some("not queued (already delivered)".to_string()),
+                    )),
                 }
             }
             SessionCommandPayload::Interrupt {} => {

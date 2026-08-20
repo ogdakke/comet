@@ -265,6 +265,63 @@ impl SessionDoc {
         Ok(())
     }
 
+    /// Move a `queued` user entry to the END of the transcript and stamp it
+    /// delivered (`Complete`). Queued entries are written when the prompt is
+    /// parked — mid-turn, so the parked row sits BEFORE the live turn's
+    /// assistant entries; on delivery the row must land where the turn
+    /// actually starts, not where the user happened to queue it. One commit:
+    /// observers see a single move, never a vanished-then-restored row.
+    /// `false` when no queued entry with that id exists (already delivered
+    /// or removed — the caller's write path then dedupes normally).
+    pub fn redeliver_queued_message(&self, message_id: &str) -> Result<bool, DocError> {
+        let Some(entry) = self
+            .read_entries()?
+            .into_iter()
+            .find(|e| e.id == message_id)
+        else {
+            return Ok(false);
+        };
+        if entry.status != Some(MessageStatus::Queued) {
+            return Ok(false);
+        }
+        let messages = self.doc.get_list("messages");
+        let mut index = None;
+        for i in 0..messages.len() {
+            if let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
+                messages.get(i)
+            {
+                let id_matches = matches!(
+                    map.get("id"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == message_id
+                );
+                if id_matches {
+                    index = Some(i);
+                    break;
+                }
+            }
+        }
+        let Some(index) = index else {
+            return Ok(false);
+        };
+        // Already last: a status flip in place is the whole delivery.
+        if index + 1 == messages.len() {
+            return self.set_message_status(message_id, MessageStatus::Complete);
+        }
+        messages.delete(index, 1)?;
+        let delivered = SessionMessageEntry {
+            status: Some(MessageStatus::Complete),
+            ..entry
+        };
+        let map = messages.push_container(LoroMap::new())?;
+        write_entry_scalar_fields(&map, &delivered)?;
+        let parts = map.insert_container("parts", LoroList::new())?;
+        for part in &delivered.parts {
+            push_part(&parts, part)?;
+        }
+        self.doc.commit();
+        Ok(true)
+    }
+
     /// Read all entries (continuations NOT joined — see `join_continuation_entries`).
     ///
     /// Malformed entries are SKIPPED, not fatal: a torn intermediate state
@@ -412,6 +469,30 @@ impl SessionDoc {
                 );
                 if id_matches {
                     map.insert("status", status_str(status))?;
+                    self.doc.commit();
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Remove a message entry by id (queue-tray delete: a queued prompt that
+    /// will never run should not linger in the transcript). Returns `false`
+    /// when no entry with that id exists. Only meaningful for entries this
+    /// host owns or queued entries whose run never started — callers gate it.
+    pub fn remove_message(&self, message_id: &str) -> Result<bool, DocError> {
+        let messages = self.doc.get_list("messages");
+        for i in 0..messages.len() {
+            if let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
+                messages.get(i)
+            {
+                let id_matches = matches!(
+                    map.get("id"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == message_id
+                );
+                if id_matches {
+                    messages.delete(i, 1)?;
                     self.doc.commit();
                     return Ok(true);
                 }
@@ -605,6 +686,7 @@ fn status_str(status: MessageStatus) -> &'static str {
         MessageStatus::Streaming => "streaming",
         MessageStatus::Complete => "complete",
         MessageStatus::Aborted => "aborted",
+        MessageStatus::Queued => "queued",
     }
 }
 
@@ -1124,6 +1206,58 @@ mod tests {
             }]
         );
         assert_eq!(doc.chat_id().as_deref(), Some("chat-1"));
+    }
+
+    #[test]
+    fn redeliver_queued_message_moves_the_entry_to_the_end() {
+        // The parked mid-turn layout: the queued prompt was written while the
+        // live turn's assistant entry already followed the first user message.
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.push_message(&user_entry("m1", "first")).unwrap();
+        let mut queued = user_entry("q1", "and then");
+        queued.status = Some(MessageStatus::Queued);
+        queued.created_at = 7; // authored at queue time — must survive the move
+        doc.push_message(&queued).unwrap();
+        let mut assistant = user_entry("a1", "reply");
+        assistant.role = MessageRole::Assistant;
+        doc.push_message(&assistant).unwrap();
+        // Sanity: the parked interleaving the fix undoes.
+        let parked = doc.read_entries().unwrap();
+        let ids: Vec<&str> = parked.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["m1", "q1", "a1"]);
+
+        assert!(doc.redeliver_queued_message("q1").unwrap());
+        let entries = doc.read_entries().unwrap();
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["m1", "a1", "q1"], "delivered prompt lands at the end");
+        let delivered = &entries[2];
+        assert_eq!(delivered.status, Some(MessageStatus::Complete));
+        assert_eq!(delivered.created_at, 7, "authoring time survives");
+        assert_eq!(
+            delivered.parts,
+            vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "and then".into()
+            }]
+        );
+
+        // Re-delivery is a no-op (already Complete), as is an unknown id.
+        assert!(!doc.redeliver_queued_message("q1").unwrap());
+        assert!(!doc.redeliver_queued_message("nope").unwrap());
+    }
+
+    #[test]
+    fn redeliver_queued_message_flips_in_place_when_already_last() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.push_message(&user_entry("m1", "first")).unwrap();
+        let mut queued = user_entry("q1", "and then");
+        queued.status = Some(MessageStatus::Queued);
+        doc.push_message(&queued).unwrap();
+        assert!(doc.redeliver_queued_message("q1").unwrap());
+        let entries = doc.read_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].id, "q1");
+        assert_eq!(entries[1].status, Some(MessageStatus::Complete));
     }
 
     #[test]

@@ -21,6 +21,14 @@ pub enum SessionCommandKind {
     Steer,
     Interrupt,
     RespondInput,
+    /// Queue a prompt for delivery after the current turn (composer tray).
+    /// Deliberately NOT in the supersede rule: queued prompts stack, one
+    /// command per tray row, delivered sequentially turn after turn.
+    Queue,
+    /// Remove a queued prompt from the tray (delete or edit-to-composer).
+    QueueRemove,
+    /// Promote a queued prompt to a mid-turn steer right now.
+    QueueSteerNow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +68,25 @@ pub enum SessionCommandPayload {
         request_id: String,
         answers: Vec<UserInputAnswer>,
     },
+    /// "Send after the current turn": the host parks the prompt in the
+    /// per-chat turn queue (a `queued` user entry in the doc) instead of
+    /// steering the live run; it is dispatched as the next turn when the
+    /// live one settles. Additive: an old host never sees this payload kind
+    /// (unknown kinds are skipped by the command reader's tolerant parse).
+    #[serde(rename_all = "camelCase")]
+    Queue {
+        prompt: String,
+        /// Client-minted id for the doc's queued user entry (dedup key).
+        message_id: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    QueueRemove {
+        message_id: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    QueueSteerNow {
+        message_id: String,
+    },
 }
 
 impl SessionCommandPayload {
@@ -69,6 +96,9 @@ impl SessionCommandPayload {
             SessionCommandPayload::Steer { .. } => SessionCommandKind::Steer,
             SessionCommandPayload::Interrupt {} => SessionCommandKind::Interrupt,
             SessionCommandPayload::RespondInput { .. } => SessionCommandKind::RespondInput,
+            SessionCommandPayload::Queue { .. } => SessionCommandKind::Queue,
+            SessionCommandPayload::QueueRemove { .. } => SessionCommandKind::QueueRemove,
+            SessionCommandPayload::QueueSteerNow { .. } => SessionCommandKind::QueueSteerNow,
         }
     }
 }

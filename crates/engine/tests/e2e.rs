@@ -440,10 +440,7 @@ async fn interrupt_stamps_streaming_entry_aborted() {
     // The command outcome write and the Idle stamp can lag the doc's
     // Aborted stamp (separate writes, host-side) — poll, don't assert blind.
     wait_for(
-        || {
-            command_status(&core, "cmd-int-1")
-                == Some((SessionCommandStatus::Applied, None))
-        },
+        || command_status(&core, "cmd-int-1") == Some((SessionCommandStatus::Applied, None)),
         "interrupt command resolution",
     )
     .await;
@@ -453,6 +450,383 @@ async fn interrupt_stamps_streaming_entry_aborted() {
     wait_for(
         || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
         "session back to idle",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn queued_prompts_deliver_sequentially_after_each_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    // A hanging harness: the turn stays live until interrupted, so queueing
+    // mid-turn is exercised for real (and interrupt counts as the turn end
+    // that drains the queue).
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: mock_script(),
+            step_delay: Duration::from_millis(5),
+            hang_until_interrupt: true,
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-1",
+        SessionCommandPayload::Run {
+            request: run_request("first"),
+            message_id: "m-1".into(),
+        },
+    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Working),
+        "first run working",
+    )
+    .await;
+
+    // Two queued prompts against the live run: both park (stack, not steer).
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-q-1",
+        SessionCommandPayload::Queue {
+            prompt: "after this".into(),
+            message_id: "q-1".into(),
+        },
+    );
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-q-2",
+        SessionCommandPayload::Queue {
+            prompt: "and then this".into(),
+            message_id: "q-2".into(),
+        },
+    );
+    wait_for(
+        || {
+            matches!(
+                command_status(&core, "cmd-q-2"),
+                Some((SessionCommandStatus::Applied, _))
+            )
+        },
+        "queue commands applied",
+    )
+    .await;
+    // While the turn is live both entries sit QUEUED — hidden from the
+    // transcript, owned by the tray.
+    let queued_status = |id: &str| entries(&core).iter().find(|e| e.id == id).map(|e| e.status);
+    assert_eq!(queued_status("q-1"), Some(Some(MessageStatus::Queued)));
+    assert_eq!(queued_status("q-2"), Some(Some(MessageStatus::Queued)));
+
+    // Turn 1 ends (interrupt): the FRONT queued prompt dispatches — one
+    // turn, not both.
+    core.sessions.interrupt(CHAT).await.unwrap();
+    wait_for(
+        || queued_status("q-1") == Some(Some(MessageStatus::Complete)),
+        "q-1 delivered",
+    )
+    .await;
+    assert_eq!(
+        queued_status("q-2"),
+        Some(Some(MessageStatus::Queued)),
+        "only the front prompt delivered"
+    );
+
+    // Turn 2 ends: the next queued prompt dispatches.
+    core.sessions.interrupt(CHAT).await.unwrap();
+    wait_for(
+        || queued_status("q-2") == Some(Some(MessageStatus::Complete)),
+        "q-2 delivered",
+    )
+    .await;
+    // Both delivered prompts ran as real turns (assistant entries exist).
+    wait_for(
+        || {
+            entries(&core)
+                .iter()
+                .filter(|e| {
+                    e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+                })
+                .count()
+                >= 3
+        },
+        "assistant replies for both queued turns",
+    )
+    .await;
+    // Nothing left: the queue drains to empty and the chat settles.
+    core.sessions.interrupt(CHAT).await.unwrap();
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "session idle after queue drains",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn queue_remove_deletes_a_queued_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: mock_script(),
+            step_delay: Duration::from_millis(5),
+            hang_until_interrupt: true,
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-1",
+        SessionCommandPayload::Run {
+            request: run_request("first"),
+            message_id: "m-1".into(),
+        },
+    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Working),
+        "run working",
+    )
+    .await;
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-q-1",
+        SessionCommandPayload::Queue {
+            prompt: "never mind".into(),
+            message_id: "q-1".into(),
+        },
+    );
+    wait_for(
+        || {
+            matches!(
+                command_status(&core, "cmd-q-1"),
+                Some((SessionCommandStatus::Applied, _))
+            )
+        },
+        "queue applied",
+    )
+    .await;
+    wait_for(
+        || {
+            entries(&core)
+                .iter()
+                .any(|e| e.id == "q-1" && e.status == Some(MessageStatus::Queued))
+        },
+        "queued entry present",
+    )
+    .await;
+
+    // Tray delete: the doc entry disappears and nothing is delivered later.
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-del-1",
+        SessionCommandPayload::QueueRemove {
+            message_id: "q-1".into(),
+        },
+    );
+    wait_for(
+        || !entries(&core).iter().any(|e| e.id == "q-1"),
+        "queued entry removed",
+    )
+    .await;
+
+    // The turn ends: with the queue empty nothing dispatches — the run
+    // settles to Idle with no extra user/assistant pair.
+    core.sessions.interrupt(CHAT).await.unwrap();
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "idle after turn end",
+    )
+    .await;
+    let user_count = entries(&core)
+        .iter()
+        .filter(|e| e.role == MessageRole::User)
+        .count();
+    assert_eq!(user_count, 1, "deleted prompt never delivered");
+}
+
+/// Gate-controlled harness: every run waits for the gate to open before its
+/// session events emit, then hangs until interrupted. Run N mints a distinct
+/// assistant id so turns never share an entry. This makes the mid-turn queue
+/// interleaving deterministic: the queued entry lands in the doc BEFORE the
+/// live turn's assistant entry exists.
+struct GateHarness {
+    open: tokio::sync::watch::Sender<bool>,
+    runs: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl Harness for GateHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Gate"
+    }
+    fn supports_steering(&self) -> bool {
+        true
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::StepBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
+        let mut open = self.open.subscribe();
+        let n = self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let token = controls.interrupt.clone();
+        tokio::spawn(async move {
+            while !*open.borrow_and_update() {
+                if open.changed().await.is_err() {
+                    return;
+                }
+            }
+            let _ = tx
+                .send(Ok(AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/tmp".into(),
+                    session_id: format!("hs-{n}"),
+                    assistant_message_id: format!("a-{n}"),
+                }))
+                .await;
+            let _ = tx
+                .send(Ok(AgentEvent::TextDelta { text: "hi".into() }))
+                .await;
+            token.cancelled().await;
+            let _ = tx.send(Ok(done(DoneStatus::Interrupted))).await;
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed())
+    }
+}
+
+#[tokio::test]
+async fn queued_prompt_delivers_after_the_live_turns_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let (open_tx, _) = tokio::sync::watch::channel(false);
+    let core = assemble(
+        dir.path(),
+        Arc::new(GateHarness {
+            open: open_tx.clone(),
+            runs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-1",
+        SessionCommandPayload::Run {
+            request: run_request("first"),
+            message_id: "m-1".into(),
+        },
+    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Working),
+        "first run working (gate still closed)",
+    )
+    .await;
+
+    // Queue mid-turn while the live run hasn't emitted ANYTHING yet: the
+    // parked entry lands ahead of the turn's assistant entry — the exact
+    // interleaving that must be undone at delivery.
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-q-1",
+        SessionCommandPayload::Queue {
+            prompt: "and then".into(),
+            message_id: "q-1".into(),
+        },
+    );
+    wait_for(
+        || {
+            matches!(
+                command_status(&core, "cmd-q-1"),
+                Some((SessionCommandStatus::Applied, _))
+            )
+        },
+        "queue command applied",
+    )
+    .await;
+
+    // Open the gate: turn 1's assistant entry appends AFTER the parked row.
+    // (The auto-titler's gated run shares this harness but never writes here,
+    // so the chat's first Assistant entry is turn 1's.)
+    open_tx.send(true).unwrap();
+    wait_for(
+        || {
+            entries(&core)
+                .iter()
+                .any(|e| e.role == MessageRole::Assistant)
+        },
+        "turn-1 assistant entry exists",
+    )
+    .await;
+    let parked = entries(&core);
+    let a1 = parked
+        .iter()
+        .find(|e| e.role == MessageRole::Assistant)
+        .map(|e| e.id.clone())
+        .unwrap();
+    let q_pos = parked.iter().position(|e| e.id == "q-1").unwrap();
+    let a_pos = parked.iter().position(|e| e.id == a1).unwrap();
+    assert!(
+        q_pos < a_pos,
+        "test setup: queued row parks ahead of the live turn's reply"
+    );
+
+    // Turn 1 ends: delivery must MOVE q-1 past the turn's entries, not flip
+    // it visible in its parked slot.
+    core.sessions.interrupt(CHAT).await.unwrap();
+    let a1_for_wait = a1.clone();
+    wait_for(
+        || {
+            let snapshot = entries(&core);
+            let order: Vec<&str> = snapshot.iter().map(|e| e.id.as_str()).collect();
+            let (Some(q), Some(a)) = (
+                order.iter().position(|id| *id == "q-1"),
+                order.iter().position(|id| *id == a1_for_wait),
+            ) else {
+                return false;
+            };
+            q > a
+                && snapshot
+                    .iter()
+                    .any(|e| e.id == "q-1" && e.status == Some(MessageStatus::Complete))
+        },
+        "delivered queued prompt lands after the finished turn",
+    )
+    .await;
+
+    // Turn 2 (the delivered prompt) runs; settle it so the test exits clean.
+    wait_for(
+        || {
+            entries(&core)
+                .iter()
+                .filter(|e| e.role == MessageRole::Assistant)
+                .count()
+                >= 2
+        },
+        "delivered turn streams its own reply",
+    )
+    .await;
+    core.sessions.interrupt(CHAT).await.unwrap();
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "session idle after the delivered turn",
     )
     .await;
 }

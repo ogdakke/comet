@@ -55,6 +55,26 @@ pub enum SteerOutcome {
     NotSteerable,
 }
 
+/// Outcome of a queue "steer now" promotion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueSteerOutcome {
+    /// Injected into the live run's steering mailbox.
+    Steered,
+    /// No live steerable run — dispatched as a fresh turn instead.
+    Dispatched,
+    /// The prompt is no longer queued (already delivered or removed).
+    NotQueued,
+}
+
+/// One prompt parked in the per-chat turn queue ("send after the current
+/// turn"). The doc's `queued` user entry is the durable representation;
+/// this is the live mirror used for delivery ordering and tray ops.
+#[derive(Debug, Clone)]
+pub struct QueuedTurn {
+    pub message_id: String,
+    pub prompt: String,
+}
+
 type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
 
 /// A harness-native session id plus the cwd it was created under. Harness
@@ -116,6 +136,13 @@ struct Inner {
     /// (zeron kept the same pair on `chats.harness_session_id`). An empty
     /// session id is the "do not resume" tombstone after a rejected resume.
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
+    /// chat_id → queued turns (composer tray). The doc's `queued` user
+    /// entries are the source of truth; this mirror drives delivery order.
+    queued_turns: Mutex<HashMap<String, std::collections::VecDeque<QueuedTurn>>>,
+    /// Set by [`SessionsEngine::shutdown`]: turn-end queue drains must not
+    /// fire while the engine is tearing down (they would spawn fresh runs
+    /// into a dying runtime).
+    shutting_down: std::sync::atomic::AtomicBool,
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
     /// Fired with `(chat_id, cwd)` when a user prompt starts a turn (fresh
@@ -155,6 +182,8 @@ impl SessionsEngine {
                 sessions_tx,
                 last_requests: Mutex::new(HashMap::new()),
                 harness_sessions: Mutex::new(HashMap::new()),
+                queued_turns: Mutex::new(HashMap::new()),
+                shutting_down: std::sync::atomic::AtomicBool::new(false),
                 titles: OnceLock::new(),
                 turn_listener: OnceLock::new(),
             }),
@@ -523,6 +552,275 @@ impl SessionsEngine {
 
     /// Interrupt the live run, if any. The run settles with a synthetic
     /// `Done{interrupted}` and its streaming entry stamped `aborted`; this waits
+    /// Queue a prompt for delivery as the NEXT turn ("send after the current
+    /// turn"). The doc entry is written with status `queued` — the transcript
+    /// hides it and the composer's queue tray owns its presentation — and the
+    /// engine parks it in the per-chat queue. Delivery is sequential: the
+    /// live run's turn end (Done park or run exit) dispatches the queue's
+    /// front; with nothing busy it dispatches immediately.
+    pub async fn queue_turn(
+        &self,
+        chat_id: &str,
+        prompt: &str,
+        message_id: &str,
+    ) -> Result<(), EngineError> {
+        let handle = self.doc_handle(chat_id)?;
+        handle.write_queued_user_message(message_id, prompt, now_ms())?;
+        lock(&self.inner.queued_turns)
+            .entry(chat_id.to_string())
+            .or_default()
+            .push_back(QueuedTurn {
+                message_id: message_id.to_string(),
+                prompt: prompt.to_string(),
+            });
+        if !self.chat_busy(chat_id) {
+            self.dispatch_next_queued(chat_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Working or blocked on a question — a state where queueing (not
+    /// dispatching) is correct.
+    fn chat_busy(&self, chat_id: &str) -> bool {
+        matches!(
+            self.session_status(chat_id).map(|s| s.status),
+            Some(SessionStatus::Working | SessionStatus::AwaitingInput)
+        )
+    }
+
+    /// Pop and dispatch the front of the chat's queue. Re-checks busyness at
+    /// delivery time — a replacement run may have started since the drain was
+    /// scheduled (a user send racing the turn end); its turn owns the next
+    /// queue slot. `Ok(false)` when the queue is empty or the chat is busy.
+    pub async fn dispatch_next_queued(&self, chat_id: &str) -> Result<bool, EngineError> {
+        if self.chat_busy(chat_id) {
+            return Ok(false);
+        }
+        let next = lock(&self.inner.queued_turns)
+            .get_mut(chat_id)
+            .and_then(|q| q.pop_front());
+        let Some(turn) = next else {
+            return Ok(false);
+        };
+        match self.deliver_queued(chat_id, turn.clone()).await {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                // Delivery failed (no run config, dispatch error): keep the
+                // prompt queued — the tray still shows it and the next
+                // turn end retries. Never drop a queued prompt.
+                lock(&self.inner.queued_turns)
+                    .entry(chat_id.to_string())
+                    .or_default()
+                    .push_front(turn);
+                Err(err)
+            }
+        }
+    }
+
+    /// Dispatch one queued turn as a fresh/routed run, reusing the chat's
+    /// run config (last request or the workspace chat row). The doc entry's
+    /// `queued` → delivered flip happens in [`Self::dispatch`]'s own
+    /// `write_user_message` (its dedupe path moves the parked entry to the
+    /// transcript's end), so a failed dispatch leaves the prompt queued —
+    /// the tray row survives and the next turn end retries.
+    async fn deliver_queued(&self, chat_id: &str, turn: QueuedTurn) -> Result<String, EngineError> {
+        // A tray Delete racing this drain removes the doc entry while the
+        // delivery is in flight — honor it (the dispatch below would
+        // otherwise re-create the entry and run a prompt the user just
+        // deleted). Reported as delivered: the turn stays popped.
+        let still_queued = self
+            .doc_handle(chat_id)
+            .ok()
+            .and_then(|h| h.doc().read_entries().ok())
+            .is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|e| e.id == turn.message_id && e.status == Some(MessageStatus::Queued))
+            });
+        if !still_queued {
+            return Ok(String::new());
+        }
+        self.dispatch_queued(chat_id, turn).await
+    }
+
+    /// Dispatch one queued turn as a fresh/routed run, reusing the chat's
+    /// run config (last request or the workspace chat row).
+    async fn dispatch_queued(
+        &self,
+        chat_id: &str,
+        turn: QueuedTurn,
+    ) -> Result<String, EngineError> {
+        let Some(host) = self.inner.doc_host() else {
+            return Err(EngineError::Other(
+                "doc host not wired into sessions engine".into(),
+            ));
+        };
+        let request = self
+            .last_request(chat_id)
+            .or_else(|| host.request_from_chat_row(chat_id, &turn.prompt));
+        let Some(mut request) = request else {
+            return Err(EngineError::Other(
+                "no run config to deliver queued prompt".into(),
+            ));
+        };
+        request.prompt = turn.prompt.clone();
+        request.resume = None; // dispatch re-injects the remembered session
+        // The queued prompt's own attachment refs ride its text; re-derive
+        // the inline-block paths from them (a reused config's previous-turn
+        // images must not leak in).
+        request.attachments = zeron_doc::attachment_refs(&turn.prompt);
+        let harness = host.harness_for_request(chat_id, &request);
+        self.dispatch(chat_id, harness, request, Some(turn.message_id))
+            .await
+    }
+
+    /// Remove a queued prompt (tray delete, or edit-to-composer): drops it
+    /// from the queue and deletes the doc entry. `Ok(false)` when it is no
+    /// longer queued (already delivered — its transcript row stays).
+    pub fn queue_remove(&self, chat_id: &str, message_id: &str) -> Result<bool, EngineError> {
+        let handle = self.doc_handle(chat_id)?;
+        // Only a still-queued entry may be removed — a delivered one is
+        // transcript history.
+        let still_queued = handle.doc().read_entries()?.iter().any(|e| {
+            e.id == message_id
+                && e.role == MessageRole::User
+                && e.status == Some(MessageStatus::Queued)
+        });
+        if !still_queued {
+            return Ok(false);
+        }
+        {
+            let mut map = lock(&self.inner.queued_turns);
+            if let Some(q) = map.get_mut(chat_id) {
+                q.retain(|t| t.message_id != message_id);
+                if q.is_empty() {
+                    map.remove(chat_id);
+                }
+            }
+        }
+        handle.doc().remove_message(message_id)?;
+        Ok(true)
+    }
+
+    /// Promote a queued prompt to a mid-turn steer right now (tray "Steer"
+    /// button). Falls back to a fresh dispatch when no live steerable run
+    /// exists.
+    pub async fn queue_steering_now(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+    ) -> Result<QueueSteerOutcome, EngineError> {
+        let turn = {
+            let mut map = lock(&self.inner.queued_turns);
+            let Some(q) = map.get_mut(chat_id) else {
+                return Ok(QueueSteerOutcome::NotQueued);
+            };
+            let taken = q
+                .iter()
+                .position(|t| t.message_id == message_id)
+                .map(|i| q.remove(i).expect("position just checked"));
+            if q.is_empty() {
+                map.remove(chat_id);
+            }
+            let Some(turn) = taken else {
+                return Ok(QueueSteerOutcome::NotQueued);
+            };
+            turn
+        };
+        // The doc entry's `queued` → delivered flip rides the steer/dispatch
+        // write (`write_user_message`'s dedupe path moves the parked entry to
+        // the transcript's end) — so until one of those lands, the prompt is
+        // still queued and a failure can re-park it instead of dropping it.
+        match self
+            .steer(chat_id, &turn.prompt, Some(turn.message_id.clone()), false)
+            .await?
+        {
+            SteerOutcome::Accepted => Ok(QueueSteerOutcome::Steered),
+            SteerOutcome::NotSteerable => {
+                if let Err(err) = self.dispatch_queued(chat_id, turn.clone()).await {
+                    lock(&self.inner.queued_turns)
+                        .entry(chat_id.to_string())
+                        .or_default()
+                        .push_back(turn);
+                    return Err(err);
+                }
+                Ok(QueueSteerOutcome::Dispatched)
+            }
+        }
+    }
+
+    /// Boot rehydration: rebuild the per-chat queues from the docs' `queued`
+    /// entries (the durable representation survived the restart; the
+    /// in-process mirror did not) and deliver each chat's front prompt. A
+    /// short delay lets `recover_stale`'s revival dispatches claim their
+    /// chats first (the busy-check then skips them here).
+    pub fn rehydrate_queued_turns(&self) {
+        let Some(host) = self.inner.doc_host() else {
+            return;
+        };
+        let Some(workspace) = host.workspace().cloned() else {
+            return;
+        };
+        let Ok(chats) = workspace.read_chats() else {
+            return;
+        };
+        let mut rehydrated: Vec<String> = Vec::new();
+        for chat in chats {
+            if lock(&self.inner.runs).contains_key(&chat.id) {
+                continue; // a live run owns this chat's drain cycle
+            }
+            let Ok(Some(bytes)) = host.peek_snapshot(&chat.id) else {
+                continue;
+            };
+            let raw = loro::LoroDoc::new();
+            if raw.import(&bytes).is_err() {
+                continue;
+            }
+            let queued: std::collections::VecDeque<QueuedTurn> =
+                zeron_doc::SessionDoc::from_doc(raw)
+                    .read_entries()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|e| {
+                        e.role == MessageRole::User && e.status == Some(MessageStatus::Queued)
+                    })
+                    .filter_map(|e| {
+                        let text = e
+                            .parts
+                            .iter()
+                            .filter_map(|p| match p {
+                                MessagePart::Text { text, .. } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                        (!text.is_empty()).then(|| QueuedTurn {
+                            message_id: e.id,
+                            prompt: text,
+                        })
+                    })
+                    .collect();
+            if queued.is_empty() {
+                continue;
+            }
+            lock(&self.inner.queued_turns).insert(chat.id.clone(), queued);
+            rehydrated.push(chat.id);
+        }
+        if rehydrated.is_empty() {
+            return;
+        }
+        tracing::info!(chats = rehydrated.len(), "rehydrated queued turns on boot");
+        let engine = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            for chat_id in rehydrated {
+                if let Err(err) = engine.dispatch_next_queued(&chat_id).await {
+                    tracing::warn!(chat = %chat_id, error = %err, "queued prompt delivery failed after rehydrate");
+                }
+            }
+        });
+    }
+
     /// (bounded) for that settlement so callers observe a consistent doc.
     pub async fn interrupt(&self, chat_id: &str) -> Result<bool, EngineError> {
         let target = lock(&self.inner.runs).get(chat_id).map(|h| {
@@ -710,6 +1008,12 @@ impl SessionsEngine {
 
     /// Graceful shutdown: interrupt every live run so streaming entries settle.
     pub async fn shutdown(&self) {
+        // Suppress turn-end queue drains: interrupting live runs below ends
+        // their turns, and a drain would spawn fresh runs into the dying
+        // runtime (queued prompts stay queued — the next boot rehydrates).
+        self.inner
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
         for chat_id in chats {
             if let Err(err) = self.interrupt(&chat_id).await {
@@ -1945,6 +2249,11 @@ async fn drive_run(
                 idle_since = Some(tokio::time::Instant::now());
                 self_continued_turn = false;
                 inner.set_status(&chat_id, SessionStatus::Idle, false);
+                // Turn ended with queued prompts waiting: deliver the next
+                // one. The dispatch routes into this parked session's
+                // mailbox (zero respawn latency), exactly like a
+                // user-sent follow-up; the turn after THAT drains the next.
+                spawn_queue_drain(&inner, &chat_id);
                 continue;
             }
             break match status {
@@ -1989,7 +2298,8 @@ async fn drive_run(
         .unwrap_or_default();
     inner.remove_run(&chat_id, &run_id);
     inner.set_status(&chat_id, final_status, false);
-    if !interrupted && !orphans.is_empty() {
+    let has_orphans = !interrupted && !orphans.is_empty();
+    if has_orphans {
         // The dying run accepted these into its mailbox but never confirmed a
         // Steered boundary (idle-reaper race, a mid-turn error discarding
         // queued boundary steers, a parked child death). Their user entries
@@ -2023,6 +2333,43 @@ async fn drive_run(
             }
         });
     }
+    // Queue drain — the turn ended (completed, errored, or interrupted;
+    // Stop counts as a turn end), so the next queued prompt dispatches as a
+    // fresh run. When orphaned steers are being re-dispatched they own the
+    // next turn; the queued prompt goes after THAT turn ends. Suppressed
+    // entirely while the engine shuts down (a drain here would spawn fresh
+    // runs into a dying runtime).
+    if !has_orphans {
+        spawn_queue_drain(&inner, &chat_id);
+    }
+}
+
+/// Fire-and-forget delivery of a chat's next queued turn, if any. Deferred
+/// through `tokio::spawn` so the run task's exit path never blocks on doc
+/// writes or harness dispatch; `dispatch_next_queued` re-checks busyness at
+/// delivery time to keep races with user sends harmless.
+fn spawn_queue_drain(inner: &Arc<Inner>, chat_id: &str) {
+    if inner
+        .shutting_down
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
+    if !lock(&inner.queued_turns)
+        .get(chat_id)
+        .is_some_and(|q| !q.is_empty())
+    {
+        return;
+    }
+    let engine = SessionsEngine {
+        inner: inner.clone(),
+    };
+    let chat = chat_id.to_string();
+    tokio::spawn(async move {
+        if let Err(err) = engine.dispatch_next_queued(&chat).await {
+            tracing::warn!(chat = %chat, error = %err, "queued prompt delivery failed");
+        }
+    });
 }
 
 #[cfg(test)]

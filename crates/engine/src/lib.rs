@@ -249,6 +249,10 @@ impl EngineCore {
             Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
             Err(err) => tracing::error!(error = %err, "stale-session recovery failed"),
         }
+        // Rebuild the turn queues from the docs' `queued` entries and
+        // deliver each chat's front prompt (queued prompts survive engine
+        // restarts — the doc is the durable queue).
+        sessions.rehydrate_queued_turns();
         doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
         let repos = Repos::new(data_dir, &device_id);
         let terminals = Terminals::new();

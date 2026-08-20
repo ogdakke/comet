@@ -169,6 +169,14 @@ fn input_scroll_offset_for_cursor(
     content_height: f32,
     viewport_height: f32,
 ) -> f32 {
+    // A cursor line as tall as (or taller than) the viewport can never fit
+    // inside it: chasing the bottom edge one frame and the top edge the next
+    // ping-pongs the offset forever (22.75px line in a device-snapped 22.5px
+    // compact input looped ViewportChanged → redraw indefinitely — the
+    // slash-popup window test hung on exactly this). Hold position instead.
+    if cursor_height >= viewport_height {
+        return current.clamp(0.0, input_max_scroll(content_height, viewport_height));
+    }
     let mut next = current;
     if cursor_top < next {
         next = cursor_top;
@@ -1906,7 +1914,13 @@ impl TextInput {
         let point = self.point_for_index(index)?;
         let height = self.last_bounds?.size.height;
         let y = point.y - px(self.scroll_top);
-        (y >= px(0.0) && y + self.line_height <= height).then_some(gpui::point(point.x, y))
+        // Partial visibility is enough: the anchor only needs to sit on a
+        // row the user can see. Requiring the FULL line inside the viewport
+        // broke the compact composer on 2x displays, where device-pixel
+        // snapping shrinks the one-line box 22.75 → 22.5px and the slash /
+        // mention popups never rendered (user report: commands gone after
+        // the first send — the layout flips expanded → compact there).
+        (y < height && y + self.line_height > px(0.0)).then_some(gpui::point(point.x, y))
     }
 
     /// Content-local point for a shaped projection byte index. The icon layer
@@ -3264,6 +3278,32 @@ mod tests {
         assert_eq!(input_element_height(50.0, None, 240.0), 50.0);
         assert_eq!(input_element_height(400.0, None, 240.0), 240.0);
         assert_eq!(input_element_height(0.0, None, 240.0), 0.0);
+    }
+
+    #[test]
+    fn cursor_scroll_holds_steady_when_the_line_exceeds_the_viewport() {
+        // The compact composer on a 2x display: device-pixel snapping shrinks
+        // the one-line box 22.75 → 22.5, so the cursor line can never fit
+        // whole. Chasing it alternated the offset 0 ↔ 0.25 every prepaint —
+        // ViewportChanged → notify → redraw, forever. The guard holds the
+        // offset steady instead.
+        let content = INPUT_LINE_HEIGHT; // 22.75
+        let viewport = 22.5;
+        let mut scroll = 0.0;
+        for _ in 0..8 {
+            scroll =
+                input_scroll_offset_for_cursor(scroll, 0.0, INPUT_LINE_HEIGHT, content, viewport);
+            assert_eq!(scroll, 0.0, "offset must not oscillate");
+        }
+        // Sanity: a line that CAN fit still follows the cursor normally.
+        assert_eq!(
+            input_scroll_offset_for_cursor(0.0, 0.0, INPUT_LINE_HEIGHT, 200.0, 100.0),
+            0.0
+        );
+        let deep = input_scroll_offset_for_cursor(0.0, 150.0, INPUT_LINE_HEIGHT, 200.0, 100.0);
+        assert!((deep - 72.75).abs() < f32::EPSILON); // 150 + 22.75 − 100
+        let back = input_scroll_offset_for_cursor(deep, 150.0, INPUT_LINE_HEIGHT, 200.0, 100.0);
+        assert_eq!(back, deep, "visible cursor stays put");
     }
 
     #[test]

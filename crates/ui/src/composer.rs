@@ -20,7 +20,9 @@ use gpui::{
     Subscription, Task, Window, div, img, point, prelude::*, px,
 };
 
-use zeron_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
+use zeron_doc::{
+    MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionMessageEntry,
+};
 use zeron_proto::{
     FileSearchMatch, HarnessId, RunRequest, SandboxLevel, SlashCommand, UserInputAnswer,
     UserInputQuestion,
@@ -520,6 +522,11 @@ pub fn prompt_history(
         if entry.role != MessageRole::User || !seen.insert(entry.id.clone()) {
             continue;
         }
+        // Queued prompts haven't run yet — they belong to the tray, not the
+        // up-arrow history (Edit puts them back in the composer instead).
+        if entry.status == Some(MessageStatus::Queued) {
+            continue;
+        }
         let text = visible_user_prompt(entry);
         if text.trim().is_empty() {
             continue;
@@ -898,6 +905,10 @@ pub struct Composer {
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
     /// navigating away and back restores them; memory-only, like the original.
     attachments: HashMap<String, Vec<StagedAttachment>>,
+    /// Staged attachments held for queued prompts (by queued message id), so
+    /// Edit can hand the exact files back into the stash without re-reading
+    /// disk — pruned whenever the tray rebuilds without the row.
+    queued_staged: HashMap<String, Vec<StagedAttachment>>,
     /// The staged attachment being viewed full-size (click a thumbnail).
     preview: Option<attachments::PreviewImage>,
     /// Focused while the lightbox is open so Escape reaches it; the input
@@ -915,6 +926,8 @@ pub struct Composer {
     /// Scroll position for the slash-command list. Keyboard navigation keeps
     /// the active row visible, just like the picker menus.
     slash_scroll: gpui::ScrollHandle,
+    /// Scroll position for the queued-prompt tray (more than three rows).
+    queue_scroll: gpui::ScrollHandle,
     /// Advertised commands per harness (one `ListCommands` per harness per
     /// composer lifetime; the engine caches discovery on its side too).
     slash_cache: HashMap<HarnessId, Vec<SlashCommand>>,
@@ -1048,6 +1061,7 @@ impl Composer {
             drafts: HashMap::new(),
             history: PromptHistory::default(),
             attachments: HashMap::new(),
+            queued_staged: HashMap::new(),
             preview: None,
             preview_focus: cx.focus_handle(),
             preview_focus_pending: false,
@@ -1057,6 +1071,7 @@ impl Composer {
             slash_task: None,
             slash: SlashState::default(),
             slash_scroll: gpui::ScrollHandle::new(),
+            queue_scroll: gpui::ScrollHandle::new(),
             slash_cache: HashMap::new(),
             current_key,
             sending: false,
@@ -2176,6 +2191,17 @@ impl Composer {
             Some(id) => (id, false),
             None => (uuid::Uuid::new_v4().to_string(), true),
         };
+        // QUEUED DELIVERY ("send after the current turn"): Ctrl+Enter against
+        // a live run, or Enter on a turn-boundary agent mid-run (its "steer"
+        // can't inject mid-turn — the queue IS its steering). The prompt goes
+        // to the tray (doc `queued` entry), NOT the transcript; the engine
+        // dispatches it as the next turn when this one settles.
+        let turn_boundary = self.pickers.read(cx).resolved_steering_mode(cx)
+            == Some(zeron_proto::SteeringMode::TurnBoundary);
+        if (follow_up || (steer && turn_boundary)) && !is_new && self.run_live(cx) {
+            self.queue_prompt(text, cx);
+            return;
+        }
         // Where the new session runs (Current checkout / reuse an existing
         // worktree / fresh worktree off the picked base) — resolved NOW so
         // the async block needs no picker access.
@@ -2552,6 +2578,229 @@ impl Composer {
             })
             .ok();
         }));
+    }
+
+    /// Queue a prompt for delivery after the current turn ("send after the
+    /// current turn"). Mirrors [`Self::send`]'s attachment/comment handling,
+    /// but the prompt becomes a doc `queued` entry — rendered in the queue
+    /// tray, not the transcript — and delivery is engine-owned: the next
+    /// turn end dispatches it (attachments upload now; their real paths ride
+    /// the queued text, so delivery needs nothing from this client).
+    fn queue_prompt(&mut self, text: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.failure = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+            return;
+        };
+        let staged = self
+            .attachments
+            .remove(&self.current_key)
+            .unwrap_or_default();
+        let key = self.current_key.clone();
+        let comments = self.state.update(cx, |state, cx| {
+            let taken = state.take_diff_comments(&key);
+            if !taken.is_empty() {
+                cx.notify();
+            }
+            taken
+        });
+        let typed = text.clone();
+        let text = crate::comments::with_comments(&text, &comments);
+        self.preview = None;
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let created_at = chrono::Utc::now().timestamp_millis();
+
+        // Optimistic tray row: synthetic pending paths (same shape as send's
+        // echo) until the upload lands the real ones. Staged bytes stay in
+        // `queued_staged` so Edit can hand them back without a re-read.
+        let echo_paths: Vec<String> = staged
+            .iter()
+            .map(|att| format!("pending/{}/{}", att.id, att.name))
+            .collect();
+        let echo_text = attachments::with_attachments(&text, &echo_paths);
+        let echo = SessionMessageEntry {
+            id: message_id.clone(),
+            role: zeron_doc::MessageRole::User,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: echo_text.clone(),
+            }],
+            created_at,
+            device_id: "local".into(),
+            status: Some(zeron_doc::MessageStatus::Queued),
+            continuation_of: None,
+        };
+        if !staged.is_empty() {
+            self.queued_staged
+                .insert(message_id.clone(), staged.clone());
+        }
+        self.state.update(cx, |s, cx| {
+            s.push_queued_echo(&chat_id, echo);
+            cx.notify();
+        });
+
+        self.input.update(cx, |input, cx| input.set_text("", cx));
+        self.drafts.remove(&self.current_key);
+        self.history.reset();
+        self.failure = None;
+        cx.notify();
+
+        // Uploads target the chat's HOST device (forwardable RPCs).
+        let host_device_id = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .map(|c| c.device_id.clone());
+        let local_device_id = self.state.read(cx).local_device_id.clone();
+        let err_chat_id = chat_id.clone();
+        let err_message_id = message_id.clone();
+        self.send_task = Some(cx.spawn(async move |this, cx| {
+            let result: Result<(), String> = async {
+                let mut content = text.clone();
+                let mut attachment_paths: Vec<String> = Vec::new();
+                if !staged.is_empty() {
+                    for att in &staged {
+                        match attachments::upload_attachment(
+                            &engine,
+                            cx.background_executor(),
+                            host_device_id.as_deref(),
+                            att,
+                        )
+                        .await
+                        {
+                            Ok(path) => attachment_paths.push(path),
+                            Err(err) => {
+                                tracing::warn!(name = %att.name, error = %err, "attachment upload failed");
+                                return Err(
+                                    "Couldn't upload the attachment — the device may be offline."
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                    let seed_device = host_device_id
+                        .clone()
+                        .unwrap_or_else(|| "local".to_string());
+                    for (path, att) in attachment_paths.iter().zip(&staged) {
+                        attachments::seed_attachment(
+                            &seed_device,
+                            path,
+                            &att.name,
+                            att.image.clone(),
+                        );
+                        if let Some(local) = local_device_id.as_deref()
+                            && local != seed_device
+                        {
+                            attachments::seed_attachment(
+                                local,
+                                path,
+                                &att.name,
+                                att.image.clone(),
+                            );
+                        }
+                    }
+                    content = attachments::with_attachments(&text, &attachment_paths);
+                    // Refresh the tray row with the real paths (same id).
+                    let refreshed = SessionMessageEntry {
+                        id: message_id.clone(),
+                        role: zeron_doc::MessageRole::User,
+                        parts: vec![MessagePart::Text {
+                            id: "t0".into(),
+                            text: content.clone(),
+                        }],
+                        created_at,
+                        device_id: "local".into(),
+                        status: Some(zeron_doc::MessageStatus::Queued),
+                        continuation_of: None,
+                    };
+                    let refresh_chat_id = chat_id.clone();
+                    this.update(cx, |composer, cx| {
+                        composer.state.update(cx, |s, cx| {
+                            s.remove_queued_echo(&refresh_chat_id, &message_id);
+                            s.push_queued_echo(&refresh_chat_id, refreshed);
+                            cx.notify();
+                        });
+                    })
+                    .ok();
+                }
+
+                let command = SessionCommandPayload::Queue {
+                    prompt: content.clone(),
+                    message_id: message_id.clone(),
+                };
+                let command =
+                    serde_json::to_value(&command).map_err(|e| format!("Queue failed: {e}"))?;
+                let params = serde_json::json!({ "chatId": chat_id, "command": command });
+                engine
+                    .client()
+                    .call(methods::QUEUE_COMMAND, params)
+                    .await
+                    .map_err(|e| format!("Queue failed: {e}"))?;
+                Ok(())
+            }
+            .await;
+            this.update(cx, |composer, cx| {
+                if let Err(message) = result {
+                    // Failure: red banner, tray row removed, prompt back in
+                    // the draft, staged files back in the stash.
+                    composer.failure = Some(message.into());
+                    composer.state.update(cx, |s, cx| {
+                        s.remove_queued_echo(&err_chat_id, &err_message_id);
+                        cx.notify();
+                    });
+                    composer.queued_staged.remove(&err_message_id);
+                    composer
+                        .input
+                        .update(cx, |input, cx| input.set_text(typed, cx));
+                    if !staged.is_empty() {
+                        let slot = composer
+                            .attachments
+                            .entry(err_chat_id.clone())
+                            .or_default();
+                        let mut merged = staged.clone();
+                        merged.extend(
+                            slot.drain(..)
+                                .filter(|e| !staged.iter().any(|f| f.id == e.id)),
+                        );
+                        *slot = merged;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Send a queue-tray op (QueueRemove / QueueSteerNow) to the host. The
+    /// doc sync is the source of truth; these are fire-and-forget with a
+    /// failure banner.
+    fn queue_command(
+        &mut self,
+        chat_id: String,
+        payload: SessionCommandPayload,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let Ok(command) = serde_json::to_value(&payload) else {
+            return;
+        };
+        let params = serde_json::json!({ "chatId": chat_id, "command": command });
+        cx.spawn(async move |this, cx| {
+            if let Err(err) = engine.client().call(methods::QUEUE_COMMAND, params).await {
+                this.update(cx, |composer, cx| {
+                    composer.failure =
+                        Some(SharedString::from(format!("Queue action failed: {err}")));
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     fn interrupt(&mut self, cx: &mut Context<Self>) {
@@ -3177,6 +3426,174 @@ impl Composer {
             .into_any_element()
     }
 
+    /// The queued-prompt tray (composer's queue rows): one line per prompt,
+    /// ghost Edit / Steer / Delete actions, three rows visible before the
+    /// edge-faded scrollbox. Shared chrome with the studio conflict tray
+    /// ([`crate::tray`]).
+    fn render_queue_tray(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let items = self.state.read(cx).queued_items();
+        if items.is_empty() {
+            self.queued_staged.clear();
+            return None;
+        }
+        // Prune staged holds for rows that left the tray (delivered or
+        // removed elsewhere).
+        let live_ids: std::collections::HashSet<&str> =
+            items.iter().map(|e| e.id.as_str()).collect();
+        self.queued_staged
+            .retain(|id, _| live_ids.contains(id.as_str()));
+
+        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+            return None;
+        };
+        // Steer-now only for real mid-turn steering (StepBoundary); a
+        // turn-boundary agent's "steer now" is just the queue.
+        let steerable = self.pickers.read(cx).resolved_steering_mode(cx)
+            == Some(zeron_proto::SteeringMode::StepBoundary);
+
+        let mut tray_items: Vec<crate::tray::TrayItem> = Vec::new();
+        for entry in items {
+            let raw: String = entry
+                .parts
+                .iter()
+                .filter_map(|p| match p {
+                    MessagePart::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let parsed = attachments::parse_user_message_images(&raw);
+            let label = if parsed.attachments.is_empty() {
+                parsed.text.clone()
+            } else {
+                format!("{} · {} attached", parsed.text, parsed.attachments.len())
+            };
+            let message_id = entry.id.clone();
+
+            let mut actions = Vec::new();
+            // Edit — remove from queue, prompt (and its files) back into the
+            // composer.
+            {
+                let chat_id = chat_id.clone();
+                let message_id = message_id.clone();
+                let text = parsed.text.clone();
+                let paths: Vec<String> =
+                    parsed.attachments.iter().map(|a| a.path.clone()).collect();
+                actions.push(crate::tray::TrayAction::label(
+                    SharedString::from(format!("queue-edit-{message_id}")),
+                    "Edit",
+                    cx.listener(move |this, _, _, cx| {
+                        this.state.update(cx, |s, cx| {
+                            s.remove_queued_echo(&chat_id, &message_id);
+                            cx.notify();
+                        });
+                        this.queue_command(
+                            chat_id.clone(),
+                            SessionCommandPayload::QueueRemove {
+                                message_id: message_id.clone(),
+                            },
+                            cx,
+                        );
+                        this.input
+                            .update(cx, |input, cx| input.set_text(text.clone(), cx));
+                        // Held staged files win (exact bytes, no disk read);
+                        // doc-path re-staging covers rows from another
+                        // device or a restart.
+                        if let Some(held) = this.queued_staged.remove(&message_id) {
+                            let slot = this
+                                .attachments
+                                .entry(this.current_key.clone())
+                                .or_default();
+                            for att in held {
+                                if !slot.iter().any(|e| e.id == att.id) {
+                                    slot.push(att);
+                                }
+                            }
+                        } else {
+                            for path in &paths {
+                                if let Ok(att) = attachments::stage_file(std::path::Path::new(path))
+                                {
+                                    let slot = this
+                                        .attachments
+                                        .entry(this.current_key.clone())
+                                        .or_default();
+                                    if !slot.iter().any(|e| e.id == att.id) {
+                                        slot.push(att);
+                                    }
+                                }
+                            }
+                        }
+                        cx.notify();
+                    }),
+                ));
+            }
+            // Steer — deliver now as a mid-turn steer (StepBoundary only).
+            if steerable {
+                let chat_id = chat_id.clone();
+                let message_id = message_id.clone();
+                actions.push(crate::tray::TrayAction::label(
+                    SharedString::from(format!("queue-steer-{message_id}")),
+                    "Steer",
+                    cx.listener(move |this, _, _, cx| {
+                        this.state.update(cx, |s, cx| {
+                            s.remove_queued_echo(&chat_id, &message_id);
+                            cx.notify();
+                        });
+                        this.queued_staged.remove(&message_id);
+                        this.queue_command(
+                            chat_id.clone(),
+                            SessionCommandPayload::QueueSteerNow {
+                                message_id: message_id.clone(),
+                            },
+                            cx,
+                        );
+                        cx.notify();
+                    }),
+                ));
+            }
+            // Delete — trash icon only.
+            {
+                let chat_id = chat_id.clone();
+                let message_id = message_id.clone();
+                actions.push(crate::tray::TrayAction::icon(
+                    SharedString::from(format!("queue-delete-{message_id}")),
+                    crate::icons::TRASH_BIN_MINIMALISTIC,
+                    cx.listener(move |this, _, _, cx| {
+                        this.state.update(cx, |s, cx| {
+                            s.remove_queued_echo(&chat_id, &message_id);
+                            cx.notify();
+                        });
+                        this.queued_staged.remove(&message_id);
+                        this.queue_command(
+                            chat_id.clone(),
+                            SessionCommandPayload::QueueRemove {
+                                message_id: message_id.clone(),
+                            },
+                            cx,
+                        );
+                        cx.notify();
+                    }),
+                ));
+            }
+
+            tray_items.push(crate::tray::TrayItem {
+                id: SharedString::from(format!("queue-row-{}", entry.id)),
+                label: SharedString::from(label),
+                actions,
+            });
+        }
+        crate::tray::render_tray(
+            "composer-queue-tray",
+            self.queue_scroll.clone(),
+            tray_items,
+            theme,
+        )
+    }
+
     fn render_send_button(
         &mut self,
         mode: SendButtonMode,
@@ -3424,43 +3841,6 @@ impl Render for Composer {
                 )
             });
 
-        // Turn-boundary steering notice: for agents without mid-turn
-        // injection (Grok over ACP today), a "steer" is queued and applies
-        // when the current turn finishes. Without this hint the queue read
-        // as a dropped steer (user report: "my steer didn't apply until
-        // grok already finished").
-        let steer_queues = mode == SendButtonMode::Steer
-            && self.pickers.read(cx).resolved_steering_mode(cx)
-                == Some(zeron_proto::SteeringMode::TurnBoundary);
-        let container = container.when(steer_queues, |el| {
-            el.child(
-                div()
-                    .mt(px(6.0))
-                    .px(px(12.0))
-                    .text_size(px(11.0))
-                    .line_height(px(15.0))
-                    .text_color(theme.text_muted.opacity(0.8))
-                    .child("This agent can't be steered mid-turn — your message will be queued and sent when the current turn finishes."),
-            )
-        });
-
-        // Queue affordance: mid-turn steerable agents also take Ctrl+Enter
-        // as "send after the current turn" — undiscoverable without a hint.
-        let steer_live = mode == SendButtonMode::Steer
-            && self.pickers.read(cx).resolved_steering_mode(cx)
-                == Some(zeron_proto::SteeringMode::StepBoundary);
-        let container = container.when(steer_live, |el| {
-            el.child(
-                div()
-                    .mt(px(6.0))
-                    .px(px(12.0))
-                    .text_size(px(11.0))
-                    .line_height(px(15.0))
-                    .text_color(theme.text_muted.opacity(0.8))
-                    .child("Enter steers the live turn · Ctrl+Enter queues for the next turn."),
-            )
-        });
-
         if wizard_active {
             let wizard = self.render_wizard(window, cx);
             // Full-width root so the expand tween can measure the
@@ -3692,13 +4072,25 @@ impl Render for Composer {
         // The file dropzone lives in the shell (the whole conversation column,
         // not just the pill — shell.rs `chat-dropzone`); drops land back here
         // via `add_paths`.
+        // The queued-prompt tray hugs the pill's top edge — no gap between
+        // them (shared chrome with the studio conflict tray, whose container
+        // drops its own gap while the tray shows). The container's SPACE_SM
+        // gap stays for the failure notice above and the footer below. The
+        // jump-to-bottom pill keeps its gap too: it anchors 14px into the
+        // reserved status strip above this whole stack (shell.rs), so the
+        // tray sliding in under it changes nothing.
+        let tray = self.render_queue_tray(&theme, cx);
+        let mut composer_stack = div().w_full().flex().flex_col();
+        if let Some(tray) = tray {
+            composer_stack = composer_stack.child(tray);
+        }
         // Frosted: the pill backdrop-blurs the transcript scrolling under it
         // (the popover glass treatment; radius matches the pill's rounding).
-        let container = container.child(crate::frost::frosted(
+        let container = container.child(composer_stack.child(crate::frost::frosted(
             26.0,
             16.0,
             motion::fade_quick("composer-input", body),
-        ));
+        )));
         // Branch/worktree toolbar under the pill (t3code BranchToolbar): the
         // checkout-kind selector + ref picker for new sessions, read-only
         // labels once the session exists. Git spaces only.
@@ -3784,6 +4176,351 @@ mod tests {
         // Bare "/" with cursor at 0 → closed; cursor after it → open-all.
         assert!(slash_token("/", 0).is_none());
         assert_eq!(slash_token("/", 1).map(|t| t.query), Some(String::new()));
+    }
+
+    // ---- slash popup lifecycle (drives the real Composer state machine) ---
+
+    /// A pi chat row, as the registry sync delivers it.
+    fn pi_chat_row(id: &str) -> zeron_proto::Chat {
+        zeron_proto::Chat {
+            id: id.into(),
+            device_id: "local".into(),
+            title: None,
+            archived: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            config: Some(zeron_proto::ChatConfig {
+                harness: HarnessId::Pi,
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                sandbox: SandboxLevel::WorkspaceWrite,
+            }),
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: chrono::Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+        }
+    }
+
+    fn pi_commands() -> Vec<SlashCommand> {
+        vec![
+            SlashCommand {
+                name: "compact".into(),
+                description: "shrink history".into(),
+                input_hint: None,
+            },
+            SlashCommand {
+                name: "venice-status".into(),
+                description: "provider status".into(),
+                input_hint: None,
+            },
+        ]
+    }
+
+    /// An engine whose ListCommands answers pi's command list. The client's
+    /// reader and a minimal serve loop run on a current-thread tokio runtime
+    /// that the test drives in lockstep with the gpui scheduler — every
+    /// wakeup lands on the test thread, so the test stays deterministic
+    /// (`serve_connection`'s worker spawns would break that).
+    struct ListCommandsEngine {
+        handle: crate::state::EngineHandle,
+        rt: tokio::runtime::Runtime,
+    }
+
+    impl ListCommandsEngine {
+        fn new() -> Self {
+            struct Service;
+            #[async_trait::async_trait]
+            impl zeron_rpc::RpcService for Service {
+                async fn handle(
+                    &self,
+                    method: &str,
+                    _params: serde_json::Value,
+                ) -> Result<zeron_rpc::RpcReply, zeron_rpc::RpcError> {
+                    match method {
+                        methods::LIST_COMMANDS => zeron_rpc::RpcReply::value(&pi_commands()),
+                        _ => Err(zeron_rpc::RpcError::UnknownMethod(method.into())),
+                    }
+                }
+            }
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let handle = {
+                let _guard = rt.enter();
+                let (client_out, mut server_in) = tokio::sync::mpsc::channel::<String>(64);
+                let (server_out, client_in) = tokio::sync::mpsc::channel::<String>(64);
+                let service: std::sync::Arc<dyn zeron_rpc::RpcService> =
+                    std::sync::Arc::new(Service);
+                rt.spawn(async move {
+                    while let Some(payload) = server_in.recv().await {
+                        for line in payload.lines() {
+                            let line = line.trim();
+                            if line.is_empty() {
+                                continue;
+                            }
+                            let Ok(frame) = serde_json::from_str::<zeron_rpc::ClientFrame>(line)
+                            else {
+                                continue;
+                            };
+                            let Some(method) = frame.method else {
+                                continue;
+                            };
+                            let reply = match service.handle(&method, frame.params).await {
+                                Ok(zeron_rpc::RpcReply::Value(value)) => zeron_rpc::ServerFrame {
+                                    id: frame.id,
+                                    ok: Some(value),
+                                    ..Default::default()
+                                },
+                                Ok(zeron_rpc::RpcReply::Stream(_)) => zeron_rpc::ServerFrame {
+                                    id: frame.id,
+                                    done: true,
+                                    ..Default::default()
+                                },
+                                Err(err) => zeron_rpc::ServerFrame {
+                                    id: frame.id,
+                                    err: Some(err.to_string()),
+                                    ..Default::default()
+                                },
+                            };
+                            let Ok(text) = serde_json::to_string(&reply) else {
+                                continue;
+                            };
+                            if server_out.send(text).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+                crate::state::EngineHandle::for_tests(zeron_rpc::RpcClient::new(
+                    client_out, client_in,
+                ))
+            };
+            Self { handle, rt }
+        }
+
+        /// One round of the tokio scheduler (the reader + serve tasks).
+        fn drive(&self) {
+            self.rt.block_on(async { tokio::task::yield_now().await });
+        }
+    }
+
+    /// Type `text` into the composer exactly like the editor would.
+    fn type_text(composer: &mut Composer, text: &str, cx: &mut Context<Composer>) {
+        composer
+            .input
+            .update(cx, |input, cx| input.set_text(text, cx));
+        composer.on_input_edited(cx);
+    }
+
+    /// Drive both schedulers in lockstep until the pi command cache is warm
+    /// (the fetch round-trips through the fake engine's tokio tasks).
+    fn warm_pi_cache(
+        cx: &gpui::TestAppContext,
+        composer: &Entity<Composer>,
+        engine: &ListCommandsEngine,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !cx.read(|app| composer.read(app).slash_cache.contains_key(&HarnessId::Pi)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ListCommands response never landed"
+            );
+            cx.run_until_parked();
+            engine.drive();
+        }
+        cx.run_until_parked();
+        engine.drive();
+    }
+
+    #[gpui::test]
+    fn slash_popup_opens_in_existing_chat_from_cache(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |s, _| {
+            s.chats.push(pi_chat_row("chat-1"));
+            s.selected_chat = Some("chat-1".into());
+        });
+        let composer = cx.new(|cx| Composer::new(state, cx));
+
+        // The canvas phase fetched pi's commands once — the cache is warm.
+        composer.update(cx, |c, _| {
+            c.slash_cache.insert(HarnessId::Pi, pi_commands());
+        });
+
+        composer.update(cx, |c, cx| type_text(c, "/", cx));
+        composer.update(cx, |c, _| {
+            assert!(
+                c.slash.token.is_some(),
+                "'/' must open the slash popup in an existing chat"
+            );
+            assert_eq!(c.slash.filtered.len(), 2, "cached commands filter in");
+            assert!(c.slash.active.is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn slash_popup_survives_the_first_send(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        // Sticky defaults: the canvas resolves harness pi (composer-defaults).
+        std::fs::write(
+            crate::settings::composer::ComposerDefaults::path(dir.path()),
+            serde_json::json!({ "harness": "pi" }).to_string(),
+        )
+        .unwrap();
+        let state = cx.new(|_| {
+            let mut s = AppState::new();
+            s.data_dir = Some(dir.path().to_path_buf());
+            s
+        });
+        let engine = ListCommandsEngine::new();
+        state.update(cx, |s, _| {
+            s.chats.push(pi_chat_row("chat-1"));
+            s.engine = Some(engine.handle.clone());
+            s.local_device_id = Some("local".into());
+        });
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+
+        // Canvas: '/' fetches pi's commands over the (fake) engine.
+        composer.update(cx, |c, cx| type_text(c, "/", cx));
+        warm_pi_cache(cx, &composer, &engine);
+        composer.update(cx, |c, _| {
+            assert!(c.slash.token.is_some());
+            assert!(!c.slash.filtered.is_empty());
+        });
+
+        // Send: the chat becomes selected and the input clears (the draft
+        // swap in on_state_changed — exactly what send() drives).
+        state.update(cx, |s, cx| {
+            s.selected_chat = Some("chat-1".into());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        composer.update(cx, |c, cx| {
+            c.input.update(cx, |input, cx| input.set_text("", cx));
+        });
+        cx.run_until_parked();
+
+        // The existing chat: '/' must reopen the popup from the warm cache.
+        composer.update(cx, |c, cx| type_text(c, "/", cx));
+        composer.update(cx, |c, _| {
+            assert!(
+                c.slash.token.is_some(),
+                "popup must reopen after the first send"
+            );
+            assert!(!c.slash.filtered.is_empty(), "commands still listed");
+        });
+    }
+
+    #[gpui::test]
+    fn slash_popup_fetches_into_existing_chat(cx: &mut gpui::TestAppContext) {
+        // Entering an existing chat with a cold cache (app restart): the
+        // first '/' must fetch and stay open for the response.
+        let engine = ListCommandsEngine::new();
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |s, _| {
+            s.chats.push(pi_chat_row("chat-2"));
+            s.selected_chat = Some("chat-2".into());
+            s.engine = Some(engine.handle.clone());
+            s.local_device_id = Some("local".into());
+        });
+        let composer = cx.new(|cx| Composer::new(state, cx));
+
+        composer.update(cx, |c, cx| type_text(c, "/", cx));
+        warm_pi_cache(cx, &composer, &engine);
+        composer.update(cx, |c, _| {
+            assert!(c.slash.token.is_some(), "popup stays open for the fetch");
+            assert!(!c.slash.filtered.is_empty());
+            assert!(!c.slash.loading);
+        });
+    }
+
+    /// The full stack in a real window: focus, keystroke dispatch, the
+    /// render-time focus reset, and the popup's anchor (`last_bounds`) all
+    /// run — this is the path a user exercises typing '/' in an agent chat.
+    #[gpui::test]
+    fn slash_popup_renders_in_existing_chat_window(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::theme::Theme::install(crate::theme::Appearance::Dark, cx);
+        });
+        let engine = ListCommandsEngine::new();
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |s, _| {
+            s.chats.push(pi_chat_row("chat-1"));
+            s.selected_chat = Some("chat-1".into());
+            s.engine = Some(engine.handle.clone());
+            s.local_device_id = Some("local".into());
+        });
+        let composer = cx.new(|cx| Composer::new(state, cx));
+
+        struct ComposerHost {
+            composer: Entity<Composer>,
+        }
+        impl gpui::Render for ComposerHost {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .justify_end()
+                    .child(self.composer.clone())
+            }
+        }
+        let window = gpui::AnyWindowHandle::from(cx.add_window({
+            let composer = composer.clone();
+            move |_, _| ComposerHost { composer }
+        }));
+
+        // Click-into-the-input equivalent FIRST: the render-time completion
+        // reset kills popups in an unfocused composer (by design), so
+        // warming the cache while unfocused would cancel the fetch task.
+        cx.update_window(window, |_, window, cx| {
+            window.focus(&composer.focus_handle(cx), cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+
+        // Warm the cache (the canvas-phase fetch), then clear the input —
+        // the chat is now an ordinary existing-chat composer.
+        composer.update(cx, |c, cx| type_text(c, "/", cx));
+        warm_pi_cache(cx, &composer, &engine);
+        composer.update(cx, |c, cx| {
+            c.input.update(cx, |input, cx| input.set_text("", cx));
+        });
+        cx.run_until_parked();
+
+        // Type '/' through the real keystroke path.
+        cx.simulate_input(window, "/");
+        engine.drive();
+        cx.run_until_parked();
+
+        // Draw: the render-time focus reset must not kill the popup.
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+
+        cx.update_window(window, |_, _, cx| {
+            composer.update(cx, |c, cx| {
+                assert!(
+                    c.slash.token.is_some(),
+                    "popup survives the render-time focus check"
+                );
+                assert!(!c.slash.filtered.is_empty());
+                let theme = Theme::of(cx).clone();
+                assert!(
+                    c.render_slash_popup(&theme, cx).is_some(),
+                    "popup element renders (anchor resolves)"
+                );
+            });
+        })
+        .unwrap();
     }
 
     #[test]

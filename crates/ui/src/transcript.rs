@@ -667,6 +667,12 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
 /// `parse` maps `(part_key, text)` to a block tree — the entity supplies
 /// incremental parsers for live parts and a cache for complete ones; tests pass
 /// a plain `parse_full`.
+/// A queued prompt ("send after the current turn") — owned by the
+/// composer's queue tray, hidden from the transcript until delivered.
+pub fn is_queued_entry(entry: &SessionMessageEntry) -> bool {
+    entry.role == MessageRole::User && entry.status == Some(MessageStatus::Queued)
+}
+
 pub fn rows_for_entry(
     entry: &SessionMessageEntry,
     pending: bool,
@@ -2464,10 +2470,12 @@ impl Transcript {
         }
 
         let mut new_rows: Vec<Row> = Vec::new();
-        for entry in &entries {
+        // Queued prompts render in the composer's queue tray, not the
+        // transcript — the bubble appears only once the prompt is delivered.
+        for entry in entries.iter().filter(|e| !is_queued_entry(e)) {
             new_rows.extend(self.rows_for(entry, false));
         }
-        for echo in &echoes {
+        for echo in echoes.iter().filter(|e| !is_queued_entry(e)) {
             new_rows.extend(self.rows_for(echo, true));
         }
 
@@ -4409,6 +4417,7 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
         Some(MessageStatus::Streaming) => 1,
         Some(MessageStatus::Complete) => 2,
         Some(MessageStatus::Aborted) => 3,
+        Some(MessageStatus::Queued) => 4,
     });
     acc.push(pending as u8);
     for part in &entry.parts {

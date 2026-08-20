@@ -461,6 +461,31 @@ impl EngineHandle {
     pub async fn shutdown(&self) {
         self.inner.shutdown().await;
     }
+
+    /// Test-only: an engine handle speaking to `client` — the composer's
+    /// completion fetches (ListCommands/SearchFiles) run against it.
+    #[cfg(test)]
+    pub(crate) fn for_tests(client: RpcClient) -> Self {
+        struct TestBackend(RpcClient);
+        #[async_trait]
+        impl EngineBackend for TestBackend {
+            fn client(&self) -> &RpcClient {
+                &self.0
+            }
+            fn mode(&self) -> EngineMode {
+                EngineMode::InProcess
+            }
+            async fn shutdown(&self) {}
+        }
+        Self {
+            inner: Arc::new(TestBackend(client)),
+            engine_info: EngineInfo {
+                device_id: "local".into(),
+                workspace_scope: WorkspaceScope::Local,
+            },
+            deferred_state: None,
+        }
+    }
 }
 
 /// Query the current protocol first, with a conservative fallback for daemons
@@ -604,6 +629,10 @@ pub struct AppState {
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
     echoes: HashMap<String, Vec<SessionMessageEntry>>,
+    /// Optimistic QUEUED echoes per chat id: a queued prompt whose doc entry
+    /// hasn't synced back yet (the queue tray's own optimistic row, same
+    /// dedup-by-id discipline as [`Self::echoes`]).
+    queued_echoes: HashMap<String, Vec<SessionMessageEntry>>,
     /// Send-in-flight overlay per chat id: a queued doc command the host
     /// hasn't executed yet (see [`Self::begin_pending_send`]).
     pending_sends: HashMap<String, PendingSend>,
@@ -618,7 +647,8 @@ pub struct AppState {
     /// `studio-defaults.json`); set at bootstrap so child views can persist
     /// small preference files.
     pub data_dir: Option<PathBuf>,
-    engine: Option<EngineHandle>,
+    /// `pub(crate)` for tests that drive the composer's engine RPCs directly.
+    pub(crate) engine: Option<EngineHandle>,
     watch_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
     /// SUBAGENT transcripts keyed by subagent doc id (the right pane's
@@ -654,6 +684,7 @@ impl AppState {
             selected_chat: None,
             transcript: Vec::new(),
             echoes: HashMap::new(),
+            queued_echoes: HashMap::new(),
             pending_sends: HashMap::new(),
             diff_comments: HashMap::new(),
             local_device_id: None,
@@ -820,6 +851,11 @@ impl AppState {
         {
             echoes.retain(|echo| !entries.iter().any(|e| e.id == echo.id));
         }
+        if let Some(chat_id) = self.selected_chat.as_deref()
+            && let Some(queued) = self.queued_echoes.get_mut(chat_id)
+        {
+            queued.retain(|echo| !entries.iter().any(|e| e.id == echo.id));
+        }
         self.transcript = entries;
         self.ack_pending_send_from_transcript();
     }
@@ -836,6 +872,12 @@ impl AppState {
         {
             let transcript = &self.transcript;
             echoes.retain(|echo| !transcript.iter().any(|e| e.id == echo.id));
+        }
+        if let Some(chat_id) = self.selected_chat.as_deref()
+            && let Some(queued) = self.queued_echoes.get_mut(chat_id)
+        {
+            let transcript = &self.transcript;
+            queued.retain(|echo| !transcript.iter().any(|e| e.id == echo.id));
         }
         self.ack_pending_send_from_transcript();
         Ok(())
@@ -954,6 +996,47 @@ impl AppState {
         {
             self.pending_sends.remove(chat_id);
         }
+    }
+
+    /// Add an optimistic queued echo (composer queue path).
+    pub fn push_queued_echo(&mut self, chat_id: &str, entry: SessionMessageEntry) {
+        let queued = self.queued_echoes.entry(chat_id.to_string()).or_default();
+        if !queued.iter().any(|e| e.id == entry.id) {
+            queued.push(entry);
+        }
+    }
+
+    /// Drop a queued echo (queue command failed — the prompt returns to the
+    /// draft).
+    pub fn remove_queued_echo(&mut self, chat_id: &str, message_id: &str) {
+        if let Some(queued) = self.queued_echoes.get_mut(chat_id) {
+            queued.retain(|e| e.id != message_id);
+        }
+    }
+
+    /// The selected chat's queued prompts (doc `queued` entries, then
+    /// unconfirmed echoes), in send order — the queue tray's rows.
+    pub fn queued_items(&self) -> Vec<SessionMessageEntry> {
+        let Some(chat_id) = self.selected_chat.as_deref() else {
+            return Vec::new();
+        };
+        let mut items: Vec<SessionMessageEntry> = self
+            .transcript
+            .iter()
+            .filter(|e| {
+                e.role == zeron_doc::MessageRole::User
+                    && e.status == Some(zeron_doc::MessageStatus::Queued)
+            })
+            .cloned()
+            .collect();
+        if let Some(echoes) = self.queued_echoes.get(chat_id) {
+            for echo in echoes {
+                if !items.iter().any(|e| e.id == echo.id) {
+                    items.push(echo.clone());
+                }
+            }
+        }
+        items
     }
 
     /// Unconfirmed echoes for the selected chat, in send order.
@@ -1156,6 +1239,7 @@ impl AppState {
         self.spaces_synced = false;
         self.transcript.clear();
         self.echoes.clear();
+        self.queued_echoes.clear();
         self.pending_sends.clear();
         self.local_device_id = None;
         self.update = None;

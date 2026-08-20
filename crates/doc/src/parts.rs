@@ -108,6 +108,12 @@ pub enum MessageStatus {
     Streaming,
     Complete,
     Aborted,
+    /// A queued prompt ("send after the current turn") that has NOT been
+    /// delivered yet. The doc entry is the queue's durable representation:
+    /// the transcript hides it (it renders in the composer's queue tray
+    /// instead), and delivery flips it to `Complete`. Recovery treats a
+    /// `queued` user entry as pending work to re-dispatch.
+    Queued,
 }
 
 /// Lifecycle of a spawned subagent, carried on its spawn chip.

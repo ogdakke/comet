@@ -42,6 +42,7 @@ pub mod terminal;
 pub mod text_input;
 pub mod theme;
 pub mod transcript;
+pub mod tray;
 pub mod video;
 
 use std::borrow::Cow;
