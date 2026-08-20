@@ -27,6 +27,9 @@ use super::page::StudioPage;
 const IMPORT_CHUNK_BYTES: usize = 256 * 1024;
 const MAX_IMPORT_BYTES: u64 = 64 * 1024 * 1024;
 const TRAY_THUMB: f32 = 44.0;
+/// Horizontal EdgeFade ramp for the attachment chips row (see the model-chips
+/// row's `MODEL_CHIPS_FADE`).
+const TRAY_CHIPS_FADE: f32 = 24.0;
 
 pub(super) struct StagedStudioFile {
     bytes: Vec<u8>,
@@ -357,13 +360,21 @@ impl StudioPage {
             .gap(px(8.0))
             .pt(px(6.0))
             .pr(px(6.0))
-            .overflow_x_scroll();
+            .overflow_x_scroll()
+            .track_scroll(&self.tray_chips_scroll);
         for attachment in items {
             chips = chips.child(self.render_tray_chip(attachment, theme, cx));
         }
         if add_enabled {
             chips = chips.child(self.render_tray_add(theme, cx));
         }
+        // Mirror the model-chips row: fade the scroll row's horizontal edges
+        // inside an EdgeFade scope so thumbnails dissolve per-pixel under the
+        // glass composer instead of colliding with its rounded border.
+        let chips = crate::edge_fade::edge_faded(TRAY_CHIPS_FADE, false, false, chips)
+            .fade_left(true)
+            .fade_right(true)
+            .fade_overflow_x(&self.tray_chips_scroll);
         row = row.child(chips);
         if let Some(budgets) = self.render_role_budgets(theme) {
             row = row.child(budgets);
