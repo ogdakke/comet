@@ -68,8 +68,9 @@ impl StudioPage {
         }
     }
 
-    /// The split action requested by the artifact inspector: a wide primary
-    /// action and a compact settings trigger that owns its anchored menu.
+    /// A subdued artifact action with a compact settings trigger that owns its
+    /// anchored menu. Upscale intentionally carries no leading icon: it reads
+    /// as a utility action alongside the icon-led media transforms.
     pub(super) fn render_artifact_upscale_actions(
         &self,
         artifact_id: StudioArtifactId,
@@ -87,20 +88,15 @@ impl StudioPage {
         let primary_label = if busy { "Upscaling…" } else { "Upscale" };
         let mut primary = div()
             .id("studio-upscale-artifact")
-            .h(px(34.0))
+            .h(px(36.0))
             .flex_1()
             .flex()
             .items_center()
             .justify_center()
-            .gap(px(7.0))
             .rounded(px(8.0))
-            .bg(if available {
-                theme.text
-            } else {
-                crate::theme::wash(0.06)
-            })
+            .bg(crate::theme::wash(0.06))
             .text_color(if available {
-                theme.on_solid
+                theme.text
             } else {
                 theme.text_faint
             })
@@ -119,7 +115,7 @@ impl StudioPage {
         } else if available {
             primary = primary
                 .cursor_pointer()
-                .hover(|style| style.opacity(0.88))
+                .hover(|style| style.bg(crate::theme::wash(0.10)))
                 .on_click(cx.listener(move |page, _, _, cx| {
                     page.start_upscale(artifact_id, cx);
                 }))
@@ -133,23 +129,22 @@ impl StudioPage {
         let mut settings = div()
             .id("studio-upscale-settings")
             .relative()
-            .size(px(34.0))
+            .size(px(36.0))
             .flex_none()
             .flex()
             .items_center()
             .justify_center()
             .rounded(px(8.0))
-            .border_1()
-            .border_color(if menu_open {
-                theme.border_strong
+            .bg(if menu_open {
+                crate::theme::wash(0.10)
             } else {
-                theme.border
+                crate::theme::wash(0.06)
             })
             .text_color(theme.text_muted)
             .when(available, |button| {
                 button
                     .cursor_pointer()
-                    .hover(|style| style.bg(crate::theme::wash(0.09)))
+                    .hover(|style| style.bg(crate::theme::wash(0.10)))
             })
             .on_mouse_down(
                 gpui::MouseButton::Left,

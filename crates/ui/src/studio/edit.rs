@@ -1046,46 +1046,51 @@ impl StudioPage {
         let active = self.edit_target == Some(artifact_id);
         let mut button = div()
             .id("studio-edit-artifact")
-            .h(px(34.0))
+            .h(px(36.0))
             .w_full()
             .flex()
             .items_center()
-            .justify_center()
-            .gap(px(7.0))
+            .px(px(12.0))
             .rounded(px(8.0))
+            .bg(crate::theme::wash(0.06))
+            .text_color(theme.text)
             .text_size(px(12.0))
             .font_weight(gpui::FontWeight::MEDIUM);
         if !available {
             return button
-                .bg(crate::theme::wash(0.06))
                 .text_color(theme.text_faint)
                 .opacity(0.58)
-                .child("Edit image")
+                .child(div().size(px(16.0)).flex_none())
+                .child(div().flex_1().flex().justify_center().child("Edit image"))
+                .child(div().size(px(16.0)).flex_none())
                 .into_any_element();
         }
         if active {
             button = button
-                .bg(theme.text)
-                .text_color(theme.on_solid)
                 .cursor_pointer()
-                .hover(|style| style.opacity(0.88))
+                .hover(|style| style.bg(crate::theme::wash(0.10)))
                 .on_click(cx.listener(move |page, _, _, cx| page.exit_edit_mode(cx)))
-                .child("Editing");
+                .child(
+                    crate::icons::icon(crate::icons::PEN)
+                        .size(px(16.0))
+                        .text_color(theme.text_muted),
+                )
+                .child(div().flex_1().flex().justify_center().child("Editing"))
+                .child(div().size(px(16.0)).flex_none());
         } else {
             button = button
-                .bg(theme.text)
-                .text_color(theme.on_solid)
                 .cursor_pointer()
-                .hover(|style| style.opacity(0.88))
+                .hover(|style| style.bg(crate::theme::wash(0.10)))
                 .on_click(cx.listener(move |page, _, window, cx| {
                     page.enter_edit_mode(artifact_id, window, cx);
                 }))
                 .child(
                     crate::icons::icon(crate::icons::PEN)
-                        .size(px(13.0))
-                        .text_color(theme.on_solid),
+                        .size(px(16.0))
+                        .text_color(theme.text_muted),
                 )
-                .child("Edit image");
+                .child(div().flex_1().flex().justify_center().child("Edit image"))
+                .child(div().size(px(16.0)).flex_none());
         }
         button.into_any_element()
     }

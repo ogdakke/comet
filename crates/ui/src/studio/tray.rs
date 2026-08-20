@@ -594,16 +594,14 @@ impl StudioPage {
     ) -> gpui::Stateful<gpui::Div> {
         div()
             .id("studio-make-video")
-            .h(px(34.0))
+            .h(px(36.0))
             .w_full()
             .flex()
             .items_center()
-            .justify_center()
-            .gap(px(7.0))
+            .px(px(12.0))
             .rounded(px(8.0))
-            .border_1()
-            .border_color(theme.border)
             .bg(crate::theme::wash(0.06))
+            .text_color(theme.text)
             .text_size(px(12.0))
             .font_weight(gpui::FontWeight::MEDIUM)
             .cursor_pointer()
@@ -611,7 +609,21 @@ impl StudioPage {
             .on_click(cx.listener(move |page, _, window, cx| {
                 page.make_video_from_artifact(artifact_id, window, cx);
             }))
-            .child(SharedString::from("Make video"))
+            .child(
+                crate::icons::icon(crate::icons::VIDEOCAMERA)
+                    .size(px(16.0))
+                    .text_color(theme.text_muted),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .justify_center()
+                    .child(SharedString::from("Make video")),
+            )
+            // Reserve the icon's width so the action label remains centered
+            // while its icon follows the sidebar's left edge.
+            .child(div().size(px(16.0)).flex_none())
     }
 }
 

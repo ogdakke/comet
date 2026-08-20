@@ -57,7 +57,8 @@ const ARTIFACT_ZOOM_SPRING_DAMPING: f32 = 30.0;
 /// Full-size frames kept around the current filmstrip index.
 const LIGHTBOX_PREFETCH: usize = 6;
 const INSPECTOR_WIDTH: f32 = 320.0;
-const INSPECTOR_PAD_X: f32 = 18.0;
+/// Matches the horizontal inset used by agent-chat rows in the left sidebar.
+const INSPECTOR_PAD_X: f32 = Theme::SPACE_SM;
 const INSPECTOR_COPY_SIZE: f32 = 24.0;
 const INSPECTOR_COPY_GAP: f32 = 8.0;
 /// Collapsed inspector prompt: ten rows of 12px sidebar type, then Show more.
