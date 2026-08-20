@@ -1736,6 +1736,24 @@ impl StudioPage {
             .children(self.render_attachment_tray(theme, cx))
             .child(body);
 
+        // The floating stack shares one composer-width column. In particular,
+        // the conflict tray must size against this 768px column, not the
+        // entire studio viewport.
+        let composer_stack = div()
+            .w_full()
+            .max_w(px(768.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .children(self.render_conflict_popup(theme, cx))
+            .children(
+                self.popup_conflict
+                    .is_none()
+                    .then(|| self.render_generate_more_pill(theme, cx))
+                    .flatten(),
+            )
+            .child(crate::frost::frosted(26.0, 16.0, composer));
+
         div()
             .absolute()
             .left(px(24.0))
@@ -1764,14 +1782,7 @@ impl StudioPage {
                 this.attach_artifact_reference(drag.artifact_id, cx);
                 cx.notify();
             }))
-            .children(self.render_conflict_popup(theme, cx))
-            .children(
-                self.popup_conflict
-                    .is_none()
-                    .then(|| self.render_generate_more_pill(theme, cx))
-                    .flatten(),
-            )
-            .child(crate::frost::frosted(26.0, 16.0, composer))
+            .child(composer_stack)
             .into_any_element()
     }
 

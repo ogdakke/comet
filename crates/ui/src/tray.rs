@@ -125,26 +125,34 @@ pub fn render_tray(
     for item in items {
         list = list.child(render_row(item, theme));
     }
+    // Keep the tray's *surface* 42px narrower than its composer column.
+    // Margins on a `w_full` surface only move it outward in GPUI's flex
+    // layout; this wrapper reserves the two 21px insets instead, so the
+    // surface is both centered and exactly 42px narrower.
     Some(
         div()
-            .id(tray_id)
             .w_full()
-            .mx(px(TRAY_INSET))
-            .px(px(10.0))
-            .py(px(4.0))
-            // Hugs the composer's top edge: rounded top corners, square
-            // bottom corners, no bottom border — the pill's own top border
-            // is the seam (the studio conflict popup's shape).
-            .rounded_t(px(18.0))
-            .border_1()
-            .border_b_0()
-            .border_color(theme.border)
-            .bg(theme.input_glass_bg())
-            .when(!theme.is_glass(), |el| el.shadow_md())
+            .px(px(TRAY_INSET))
             .child(
-                crate::edge_fade::edge_faded(PEEK_H, true, true, list)
-                    .band_top(TOP_BAND)
-                    .fade_overflow_y(&scroll),
+                div()
+                    .id(tray_id)
+                    .w_full()
+                    .px(px(10.0))
+                    .py(px(4.0))
+                    // Hugs the composer's top edge: rounded top corners, square
+                    // bottom corners, no bottom border — the pill's own top border
+                    // is the seam (the studio conflict popup's shape).
+                    .rounded_t(px(18.0))
+                    .border_1()
+                    .border_b_0()
+                    .border_color(theme.border)
+                    .bg(theme.input_glass_bg())
+                    .when(!theme.is_glass(), |el| el.shadow_md())
+                    .child(
+                        crate::edge_fade::edge_faded(PEEK_H, true, true, list)
+                            .band_top(TOP_BAND)
+                            .fade_overflow_y(&scroll),
+                    ),
             )
             .into_any_element(),
     )
