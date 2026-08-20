@@ -24,8 +24,8 @@ const ROW_H: f32 = 30.0;
 /// this sliver, so a fully-visible row is never dimmed (the old 16px band
 /// over exactly-fitted rows ate the last row's text — user report).
 const PEEK_H: f32 = 14.0;
-/// Keep part of the preview sliver readable instead of fading all 14px to
-/// transparent; it still signals more queued rows without hiding their copy.
+/// Bottom overlay height. Unlike a primitive edge fade, this is composited
+/// over the scroller, so a partially clipped text glyph dissolves smoothly.
 const BOTTOM_BAND: f32 = 8.0;
 /// Top-edge fade when scrolled down (only ever covers the half-scrolled
 /// row at the top, never a full one).
@@ -130,6 +130,45 @@ pub fn render_tray(
     for item in items {
         list = list.child(render_row(item, theme));
     }
+    // A bottom `EdgeFade` evaluates text glyph bounds conservatively. The
+    // preview row's glyphs cross the scroll clip, so they can disappear as a
+    // whole instead of fading. Keep EdgeFade for the top, where it works well,
+    // and blend the bottom into the opaque tray surface with a gradient.
+    let bottom_fade_scroll = scroll.clone();
+    let bottom_fade_color = theme.surface_raised;
+    let bottom_fade = gpui::canvas(
+        move |_, _, _| {
+            let scrolled = -f32::from(bottom_fade_scroll.offset().y);
+            let max_scroll = f32::from(bottom_fade_scroll.max_offset().y);
+            scrolled < max_scroll - 1.0
+        },
+        move |bounds, show, window, _| {
+            if show {
+                window.paint_quad(gpui::fill(
+                    bounds,
+                    gpui::linear_gradient(
+                        0.0,
+                        gpui::linear_color_stop(bottom_fade_color, 0.0),
+                        gpui::linear_color_stop(bottom_fade_color.opacity(0.0), 1.0),
+                    ),
+                ));
+            }
+        },
+    )
+    .absolute()
+    .bottom_0()
+    .left_0()
+    .right_0()
+    .h(px(BOTTOM_BAND));
+    let faded_list = div()
+        .relative()
+        .w_full()
+        .child(
+            crate::edge_fade::edge_faded(TOP_BAND, true, false, list)
+                .band_top(TOP_BAND)
+                .fade_overflow_y(&scroll),
+        )
+        .child(bottom_fade);
     // Keep the tray's *surface* 42px narrower than its composer column.
     // Margins on a `w_full` surface only move it outward in GPUI's flex
     // layout; this wrapper reserves the two 21px insets instead, so the
@@ -158,12 +197,7 @@ pub fn render_tray(
                     .border_color(theme.border)
                     .bg(theme.surface_raised)
                     .when(!theme.is_glass(), |el| el.shadow_md())
-                    .child(
-                        crate::edge_fade::edge_faded(PEEK_H, true, true, list)
-                            .band_top(TOP_BAND)
-                            .band_bottom(BOTTOM_BAND)
-                            .fade_overflow_y(&scroll),
-                    ),
+                    .child(faded_list),
             )
             .into_any_element(),
     )
