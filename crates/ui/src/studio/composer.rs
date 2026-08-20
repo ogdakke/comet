@@ -1738,13 +1738,18 @@ impl StudioPage {
 
         // The floating stack shares one composer-width column. In particular,
         // the conflict tray must size against this 768px column, not the
-        // entire studio viewport.
+        // entire studio viewport. The tray HUGS the composer (no gap); the
+        // generate-more pill keeps the 10px float the pre-tray layout had
+        // (it only shows when no conflict does).
         let composer_stack = div()
             .w_full()
             .max_w(px(768.0))
             .flex()
             .flex_col()
             .items_center()
+            .when(self.popup_conflict.is_none(), |this| {
+                this.gap(px(10.0))
+            })
             .children(self.render_conflict_popup(theme, cx))
             .children(
                 self.popup_conflict
@@ -1762,7 +1767,6 @@ impl StudioPage {
             .flex()
             .flex_col()
             .items_center()
-            .when(self.popup_conflict.is_none(), |this| this.gap(px(10.0)))
             .on_drag_move::<ExternalPaths>(cx.listener(
                 |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
                     let inside = e.bounds.contains(&e.event.position);

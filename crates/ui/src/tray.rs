@@ -10,7 +10,9 @@
 //! Rows are one line, truncated with an ellipsis; the scrollbox shows three
 //! rows before scrolling (edge-faded top/bottom when overflow exists).
 
-use gpui::{AnyElement, ClickEvent, ScrollHandle, SharedString, div, prelude::*, px};
+use gpui::{
+    AnyElement, ClickEvent, ScrollHandle, ScrollWheelEvent, SharedString, div, prelude::*, px,
+};
 
 use crate::theme::Theme;
 
@@ -137,6 +139,11 @@ pub fn render_tray(
                 div()
                     .id(tray_id)
                     .w_full()
+                    // This floats over the transcript. It must own the hitbox
+                    // and consume wheel events even when the row list has no
+                    // overflow, otherwise the transcript scrolls underneath.
+                    .occlude()
+                    .on_scroll_wheel(|_: &ScrollWheelEvent, _, cx| cx.stop_propagation())
                     .px(px(10.0))
                     .py(px(4.0))
                     // Hugs the composer's top edge: rounded top corners, square
