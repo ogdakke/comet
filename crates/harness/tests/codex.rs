@@ -33,6 +33,15 @@ fn harness() -> CodexHarness {
     CodexHarness::new().with_executable(fixture_path())
 }
 
+#[tokio::test]
+async fn rejects_undiscoverable_slash_commands() {
+    let err = harness()
+        .commands()
+        .await
+        .expect_err("commands must not be guessed");
+    assert!(matches!(err, HarnessError::Unsupported(message) if message.contains("app-server")));
+}
+
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
         prompt: prompt.into(),

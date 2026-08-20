@@ -27,6 +27,8 @@ pub enum HarnessError {
     NotInstalled(String),
     #[error("harness protocol error: {0}")]
     Protocol(String),
+    #[error("harness capability unavailable: {0}")]
+    Unsupported(String),
     /// A managed adapter install (npm) failed; carries npm's own output so
     /// the cause is diagnosable from the chat error alone.
     #[error("adapter install failed: {0}")]
@@ -82,11 +84,10 @@ pub trait Harness: Send + Sync {
         false
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
-    /// Slash commands the agent advertises (ACP `availableCommands`); empty
-    /// for harnesses without them. May spawn a short-lived discovery process.
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        Ok(Vec::new())
-    }
+    /// Slash commands the agent advertises. Every harness must implement this
+    /// explicitly: either discover the real command catalog or return a clear
+    /// unsupported-capability error. Never silently substitute a partial list.
+    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError>;
     /// Run one (persistent) session; the stream ends with `AgentEvent::Done`.
     async fn run(
         &self,

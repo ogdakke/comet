@@ -48,7 +48,7 @@ use tokio::sync::mpsc;
 
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, ReasoningLevel,
-    RunRequest, SteeringMode, TodoItem, ToolCall,
+    RunRequest, SlashCommand, SteeringMode, TodoItem, ToolCall,
 };
 
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
@@ -192,6 +192,14 @@ impl Harness for CursorHarness {
                 options: Vec::new(),
             },
         ])
+    }
+
+    /// Cursor's SDK exposes no slash-command registry and does not accept the
+    /// interactive CLI's command palette over this wire.
+    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+        Err(HarnessError::Unsupported(
+            "Cursor's SDK does not expose a slash-command registry".into(),
+        ))
     }
 
     async fn run(

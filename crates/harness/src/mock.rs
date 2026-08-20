@@ -5,8 +5,8 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
-    UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
+    SteeringMode, UserInputQuestion,
 };
 
 use crate::{Harness, HarnessError, RunControls};
@@ -85,6 +85,12 @@ impl Harness for MockHarness {
                 options: vec![],
             },
         ])
+    }
+    /// The mock has no command parser.
+    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+        Err(HarnessError::Unsupported(
+            "the mock harness has no slash-command parser".into(),
+        ))
     }
     async fn run(
         &self,
