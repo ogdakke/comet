@@ -20,10 +20,13 @@ use crate::theme::Theme;
 pub const TRAY_MAX_ROWS: usize = 3;
 const ROW_H: f32 = 30.0;
 /// The sliver of the next row that peeks above the fold when the tray
-/// overflows — the "there's more" affordance. The bottom fade covers exactly
+/// overflows — the "there's more" affordance. The bottom fade stays within
 /// this sliver, so a fully-visible row is never dimmed (the old 16px band
 /// over exactly-fitted rows ate the last row's text — user report).
 const PEEK_H: f32 = 14.0;
+/// Keep part of the preview sliver readable instead of fading all 14px to
+/// transparent; it still signals more queued rows without hiding their copy.
+const BOTTOM_BAND: f32 = 8.0;
 /// Top-edge fade when scrolled down (only ever covers the half-scrolled
 /// row at the top, never a full one).
 const TOP_BAND: f32 = 10.0;
@@ -153,11 +156,12 @@ pub fn render_tray(
                     .border_1()
                     .border_b_0()
                     .border_color(theme.border)
-                    .bg(theme.input_glass_bg())
+                    .bg(theme.surface_raised)
                     .when(!theme.is_glass(), |el| el.shadow_md())
                     .child(
                         crate::edge_fade::edge_faded(PEEK_H, true, true, list)
                             .band_top(TOP_BAND)
+                            .band_bottom(BOTTOM_BAND)
                             .fade_overflow_y(&scroll),
                     ),
             )
