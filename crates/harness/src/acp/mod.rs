@@ -2,12 +2,11 @@
 //! stdio, protocol v1) and maps its session updates onto [`AgentEvent`]s.
 //!
 //! KEPT ONLY for agents built ground-up on ACP: Grok ([`AcpHarness::grok`],
-//! `grok agent stdio`) and Hermes ([`AcpHarness::hermes`], `hermes acp`).
-//! Claude, Codex, Cursor, and pi moved to native drivers
-//! ([`crate::ClaudeHarness`], [`crate::CodexHarness`], [`crate::CursorHarness`],
-//! [`crate::PiHarness`]) after adapter-mediated ACP kept manufacturing
-//! done-status bugs the native wires don't have (turn-hold bookkeeping vs
-//! the CLI's own eager result).
+//! `grok agent stdio`), Hermes ([`AcpHarness::hermes`], `hermes acp`) and
+//! OpenCode ([`AcpHarness::opencode`], `opencode acp`). Claude, Codex, Cursor,
+//! and Pi use native drivers. In particular, Pi must never pass through the
+//! community `pi-acp` adapter because it loses Pi's native settlement and
+//! steering semantics.
 //!
 //! - `initialize` (protocolVersion 1, fs/terminal capabilities declined) →
 //!   `session/new`, or `session/load` with a fresh-session fallback when
@@ -18,11 +17,7 @@
 //! - `session/update` notifications normalize per [`normalize::map_update`].
 //! - Permission requests auto-accept with the agent's preferred allow option
 //!   (zeron sessions run unattended); question-shaped requests block on the
-//!   engine's input bridge. Grok's `x.ai/exit_plan_mode` and
-//!   `x.ai/ask_user_question` reverse-requests are answered the same way
-//!   (often `_`-prefixed on the wire): live runs present the question wizard;
-//!   unattended paths approve the plan / cancel the interview so the tools
-//!   do not fail as "client disconnected".
+//!   engine's input bridge.
 //! - Steering: agents advertising `_session/steering` get mid-turn injection;
 //!   others queue steers and deliver them as the next `session/prompt` at the
 //!   turn boundary. The session stays parked between turns while the
@@ -31,6 +26,8 @@
 //!   always ends with `Done { status: Interrupted }`.
 
 mod normalize;
+mod subagent;
+mod subagent_opencode;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -54,6 +51,25 @@ use zeron_proto::{
 use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
 use normalize::{map_update, parse_commands, preferred_allow_option};
+use subagent::SubagentTracker;
+use subagent_opencode::OpencodeTracker;
+
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// OpenCode loads its plugins and MCP configuration before it answers ACP.
+/// Plugin-heavy cold starts can take minutes, so model discovery and a real
+/// chat must share one generous startup budget instead of racing 10s vs 120s.
+const DEFAULT_OPENCODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
+const OPENCODE_STARTUP_TIMEOUT_ENV: &str = "ZERON_OPENCODE_STARTUP_TIMEOUT_SECS";
+
+fn opencode_startup_timeout() -> Duration {
+    std::env::var(OPENCODE_STARTUP_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_OPENCODE_STARTUP_TIMEOUT)
+}
 
 /// Per-agent configuration: which binary to spawn and what to tell the picker.
 struct AcpAgentSpec {
@@ -110,10 +126,26 @@ struct AcpAgentSpec {
     /// a dead update check) — surface a visible error chip instead of
     /// indefinite Working.
     prompt_stall: Option<Duration>,
+    /// Agent-specific advice appended to the stall error chip: what a wedge
+    /// usually means for THIS agent and what the user can check.
+    stall_hint: &'static str,
+    /// The agent's ACP process doubles as its own HTTP server (opencode):
+    /// runs pass `--port <free>` and tail the `/event` SSE bus for subagent
+    /// transcripts, which never ride the ACP wire. A failed port pick (or a
+    /// server that never binds) degrades to chip + final output.
+    http_sidecar: bool,
 }
 
 fn identity_transform(_reasoning: Option<ReasoningLevel>, text: &str) -> String {
     text.to_owned()
+}
+
+/// A kernel-assigned free localhost port, released for the child to claim.
+fn free_localhost_port() -> Option<u16> {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .ok()
 }
 
 /// PATH + login-shell + extra dirs + node-version-manager scan for a binary.
@@ -227,6 +259,10 @@ fn grok_spec() -> AcpAgentSpec {
         // `_meta.promptId`, just ahead of the RPC response.
         prompt_complete_extension: true,
         prompt_stall: Some(Duration::from_secs(30)),
+        stall_hint: "The agent process is likely wedged — a stale shared leader \
+             process or a hung startup check; zeron launches it with --no-leader \
+             and --no-auto-update to avoid both.",
+        http_sidecar: false,
     }
 }
 
@@ -291,6 +327,107 @@ fn hermes_spec() -> AcpAgentSpec {
         ladder_extras: &[],
         prompt_complete_extension: false,
         prompt_stall: None,
+        stall_hint: "The agent process is likely wedged.",
+        http_sidecar: false,
+    }
+}
+
+fn opencode_install_paths() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        dirs.push(home.join(".opencode").join("bin").join("opencode"));
+        dirs.push(home.join(".local").join("bin").join("opencode"));
+        dirs.push(home.join(".npm-global").join("bin").join("opencode"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin/opencode"));
+    dirs.push(PathBuf::from("/usr/local/bin/opencode"));
+    dirs
+}
+
+fn opencode_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::Opencode,
+        display_name: "OpenCode",
+        executable: "opencode",
+        env_override: "OPENCODE_EXECUTABLE",
+        args: &["acp"],
+        // The opencode-ai npm package ships a NATIVE platform binary (its
+        // `bin` entry is `opencode.exe` swapped in by postinstall), so the
+        // managed `node <entry>` adapter path can't launch it — the CLI
+        // itself is the ACP server, installed like grok/hermes.
+        npm_package: None,
+        extra_paths: opencode_install_paths,
+        cli_executable: "opencode",
+        cli_extra_paths: opencode_install_paths,
+        install_hint: "opencode (searched PATH, the login shell's PATH, ~/.opencode/bin, \
+             ~/.local/bin, ~/.npm-global/bin, /opt/homebrew/bin, /usr/local/bin, and \
+             fnm/nvm/volta/pnpm/bun install dirs; install with \
+             `curl -fsSL https://opencode.ai/install | bash` or \
+             `npm install -g opencode-ai`, then `opencode auth login`; set \
+             OPENCODE_EXECUTABLE to override)",
+        // opencode routes models through its provider config (`opencode auth
+        // login` + opencode.json); the always-advertised OpenCode Zen frees
+        // anchor the static fallback. Ids the agent doesn't advertise are
+        // skipped by the config-option set (verified: the `model` config
+        // option lists every configured provider, no auth needed to probe).
+        models: || {
+            vec![
+                Model {
+                    id: "opencode/big-pickle".into(),
+                    label: "Big Pickle".into(),
+                    description: Some("OpenCode Zen's flagship coding model".into()),
+                    reasoning_levels: Vec::new(),
+                    options: Vec::new(),
+                },
+                Model {
+                    id: "opencode/deepseek-v4-flash-free".into(),
+                    label: "DeepSeek V4 Flash (free)".into(),
+                    description: Some("Free tier on OpenCode Zen".into()),
+                    reasoning_levels: Vec::new(),
+                    options: Vec::new(),
+                },
+            ]
+        },
+        // No `_session/steering` extension (1.18.18): turn boundaries.
+        steering_mode: SteeringMode::TurnBoundary,
+        // Effort rides opencode's model VARIANTS: when the session's current
+        // model has variants (models.dev metadata, or `variants` in
+        // opencode.json), the session advertises an `effort` config option
+        // (category thought_level) whose values mirror them — verified live
+        // (1.18.18) end to end: set_config_option effort=high applies the
+        // variant's options to the provider request. Variant-less models
+        // (the Zen frees today) advertise no option and the run-start set
+        // skips, falling to the agent default — so the blanket ladder here
+        // is safe (pi precedent). The option is per-model and reactive;
+        // exact per-model ladders would need the sidecar's provider.list
+        // (model.variants) — follow-up.
+        reasoning_levels: &[
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Max,
+        ],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+        ladder_extras: &[],
+        prompt_complete_extension: false,
+        // A failing model provider is INVISIBLE on this wire: opencode
+        // retries the provider stream forever without failing the
+        // session/prompt RPC, and neither session/update nor the /event bus
+        // carries the error (verified live, 1.18.18, unreachable provider —
+        // only ~/.local/share/opencode/log records the AI_APICallError
+        // retry loop). Fast provider rejections (e.g. a Zen model without a
+        // subscription) DO fail the RPC and surface as an error chip; total
+        // silence past the bound means the retry loop, so the watchdog is
+        // the only way the user ever learns.
+        prompt_stall: Some(Duration::from_secs(60)),
+        stall_hint: "The model provider is likely unreachable or rejecting \
+             requests — opencode retries these silently and never reports the \
+             failure. Check the model/provider setup (`opencode auth list`, \
+             opencode.json) or the opencode log \
+             (~/.local/share/opencode/log).",
+        http_sidecar: true,
     }
 }
 
@@ -348,6 +485,9 @@ enum Launch {
 pub struct AcpHarness {
     spec: AcpAgentSpec,
     executable: Option<PathBuf>,
+    /// Override of the agent's on-disk sessions root (grok's
+    /// `~/.grok/sessions`), where subagent transcripts are tailed from.
+    sessions_root: Option<PathBuf>,
     /// Grace between `session/cancel` and SIGTERM.
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
@@ -355,11 +495,18 @@ pub struct AcpHarness {
     /// Bound on the initialize → session handshake; a hang past it errors the
     /// run instead of spinning "Working" forever.
     handshake_timeout: Duration,
+    /// Bound on the initialize → session/new probe used to populate the model
+    /// picker. OpenCode shares this with its real startup budget because both
+    /// paths wait for the same plugin-heavy boot.
+    model_discovery_timeout: Duration,
     /// Discovery result cache: the advertised commands survive across calls.
     commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
     /// Model discovery cache: only a successful, non-empty probe is cached,
     /// so a mis-authed agent retries on the next picker open.
     models_cache: tokio::sync::OnceCell<Vec<Model>>,
+    /// Coalesce concurrent picker/title probes. Starting several OpenCode
+    /// processes at once makes cold plugin loading slower and wastes memory.
+    models_probe: tokio::sync::Mutex<()>,
 }
 
 impl AcpHarness {
@@ -367,14 +514,17 @@ impl AcpHarness {
         Self {
             spec,
             executable: None,
+            sessions_root: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             // Generous: the handshake is local work for every agent
             // (session/load replays from disk), so a hang past this is a
             // wedged agent, not a slow one.
-            handshake_timeout: Duration::from_secs(120),
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            model_discovery_timeout: DEFAULT_MODEL_DISCOVERY_TIMEOUT,
             commands: tokio::sync::OnceCell::new(),
             models_cache: tokio::sync::OnceCell::new(),
+            models_probe: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -388,9 +538,26 @@ impl AcpHarness {
         Self::with_spec(hermes_spec())
     }
 
+    /// opencode (`opencode acp`) — SST's native ACP agent.
+    pub fn opencode() -> Self {
+        let startup_timeout = opencode_startup_timeout();
+        let mut harness = Self::with_spec(opencode_spec());
+        harness.handshake_timeout = startup_timeout;
+        harness.model_discovery_timeout = startup_timeout;
+        harness
+    }
+
     /// Use a fixed agent binary instead of PATH/known-location resolution.
     pub fn with_executable(mut self, path: impl Into<PathBuf>) -> Self {
         self.executable = Some(path.into());
+        self
+    }
+
+    /// Test seam: tail subagent transcripts from this sessions root instead
+    /// of the agent's real one (`~/.grok/sessions`).
+    #[doc(hidden)]
+    pub fn with_sessions_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.sessions_root = Some(root.into());
         self
     }
 
@@ -404,6 +571,14 @@ impl AcpHarness {
     /// Tune the handshake bound (tests shrink it; default 120s).
     pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = timeout;
+        self
+    }
+
+    /// Tune the model-probe bound (tests shrink it; OpenCode defaults to the
+    /// same five-minute, environment-overridable budget as its real startup).
+    #[doc(hidden)]
+    pub fn with_model_discovery_timeout(mut self, timeout: Duration) -> Self {
+        self.model_discovery_timeout = timeout;
         self
     }
 
@@ -514,10 +689,12 @@ impl AcpHarness {
         &self,
         cwd: Option<&str>,
         block_on_install: bool,
+        extra_args: &[String],
     ) -> Result<(Child, crate::StderrTail), HarnessError> {
         let (exe, args) = self.resolve_program(block_on_install).await?;
         let mut cmd = Command::new(&exe);
         cmd.args(args);
+        cmd.args(extra_args);
         crate::compose_child_path(&mut cmd, &exe);
         if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
             cmd.current_dir(cwd);
@@ -553,7 +730,7 @@ impl AcpHarness {
     /// refuses sessions before login still surfaces whatever the handshake
     /// advertised.
     async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        let (mut child, _stderr) = self.spawn_agent(None, false).await?;
+        let (mut child, _stderr) = self.spawn_agent(None, false, &[]).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -617,7 +794,7 @@ impl AcpHarness {
     /// wire is the source of truth — the spec's static catalog only enriches
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
-        let (mut child, _stderr) = self.spawn_agent(None, false).await?;
+        let (mut child, stderr_tail) = self.spawn_agent(None, false, &[]).await?;
         let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -647,11 +824,22 @@ impl AcpHarness {
             }
             Ok::<Vec<Model>, HarnessError>(models)
         };
-        let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
+        let result = tokio::time::timeout(self.model_discovery_timeout, discovery).await;
         shutdown_child(&mut child, self.kill_grace).await;
         match result {
             Ok(inner) => inner,
-            Err(_) => Err(HarnessError::Protocol("model discovery timed out".into())),
+            Err(_) => {
+                let mut error = format!(
+                    "{} model discovery did not complete within {}s",
+                    self.spec.display_name,
+                    self.model_discovery_timeout.as_secs()
+                );
+                if let Some(stderr) = stderr_tail.snapshot() {
+                    error.push_str("; stderr: ");
+                    error.push_str(&stderr);
+                }
+                Err(HarnessError::Protocol(error))
+            }
         }
     }
 }
@@ -911,15 +1099,6 @@ impl Harness for AcpHarness {
     fn supports_steering(&self) -> bool {
         true
     }
-    /// Grok's `_x.ai/session/prompt_complete` is the real turn end. The
-    /// engine's 120s / 20s self-continued quiesce would otherwise park a
-    /// long think / subagent wait (execute-plan: chime, timestamp, then
-    /// "parked session resumed") the same way the harness 30s quiet-settle
-    /// used to. Hermes keeps the watchdog (pi left for the native
-    /// PiHarness, which settles deterministically on `agent_settled`).
-    fn deterministic_turn_end(&self) -> bool {
-        self.spec.prompt_complete_extension
-    }
     fn steering_mode(&self) -> SteeringMode {
         self.spec.steering_mode
     }
@@ -943,10 +1122,16 @@ impl Harness for AcpHarness {
 
     /// ACP is the source of truth: a short-lived probe reads the agent's
     /// advertised model list (cached on success). The spec's static catalog
-    /// answers when the agent advertises nothing or the probe fails — and an
-    /// absent binary still surfaces as NotInstalled, like before.
+    /// answers when the agent advertises nothing. Most legacy ACP adapters also
+    /// use it when probing fails; OpenCode does not, because presenting two
+    /// static Zen models as a successful load permanently hides a slow or
+    /// failed plugin-backed catalog from the picker.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_launch()?;
+        if let Some(models) = self.models_cache.get() {
+            return Ok(models.clone());
+        }
+        let _probe = self.models_probe.lock().await;
         if let Some(models) = self.models_cache.get() {
             return Ok(models.clone());
         }
@@ -955,7 +1140,9 @@ impl Harness for AcpHarness {
                 let _ = self.models_cache.set(models.clone());
                 Ok(self.models_cache.get().cloned().unwrap_or(models))
             }
-            Ok(_) | Err(_) => Ok((self.spec.models)()),
+            Ok(_) => Ok((self.spec.models)()),
+            Err(error) if self.spec.id == HarnessId::Opencode => Err(error),
+            Err(_) => Ok((self.spec.models)()),
         }
     }
 
@@ -971,7 +1158,18 @@ impl Harness for AcpHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        let (mut child, stderr_tail) = self.spawn_agent(Some(&request.cwd), true).await?;
+        // An http_sidecar agent (opencode) gets a per-run port: the default
+        // (4096) is shared, and a losing concurrent bind silently drops the
+        // server the subagent viz tails. The pick-then-release race is
+        // acceptable — a lost port only degrades transcripts to final output.
+        let sidecar_port = self.spec.http_sidecar.then(free_localhost_port).flatten();
+        let extra_args = match sidecar_port {
+            Some(port) => vec!["--port".to_owned(), port.to_string()],
+            None => Vec::new(),
+        };
+        let (mut child, stderr_tail) = self
+            .spawn_agent(Some(&request.cwd), true, &extra_args)
+            .await?;
         let stdin = child
             .stdin
             .take()
@@ -995,6 +1193,9 @@ impl Harness for AcpHarness {
             effort_values: self.spec.effort_values,
             prompt_complete_extension: self.spec.prompt_complete_extension,
             prompt_stall: self.spec.prompt_stall,
+            stall_hint: self.spec.stall_hint,
+            sessions_root: self.sessions_root.clone(),
+            sidecar_port,
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             handshake_timeout: self.handshake_timeout,
@@ -1023,6 +1224,11 @@ struct Session {
     agent_name: &'static str,
     prompt_complete_extension: bool,
     prompt_stall: Option<Duration>,
+    stall_hint: &'static str,
+    /// Sessions-root override for the subagent transcript tail (tests).
+    sessions_root: Option<PathBuf>,
+    /// The http_sidecar port this run's agent was told to bind (opencode).
+    sidecar_port: Option<u16>,
     prompt_transform: fn(Option<ReasoningLevel>, &str) -> String,
     effort_values: fn(Option<ReasoningLevel>, Option<&str>) -> Vec<&'static str>,
     interrupt_grace: Duration,
@@ -1154,6 +1360,60 @@ fn pick_model_value(requested: &str, available: &[&str], context_1m: bool) -> Op
         .map(|v| (**v).to_owned())
 }
 
+/// Pick a first-class ACP model switch when the session uses the legacy
+/// `models` state instead of a category=model config option. Grok Build 1.0.5
+/// has exactly this shape and accepts the selected id through
+/// `session/set_model`; treating its advertised models as config options makes
+/// the picker look functional while every selection is silently ignored.
+///
+/// Config options remain preferred when present: org adapters can expose a
+/// legacy `models` matrix alongside the canonical base-model config option.
+fn first_class_model_change(
+    session_response: &Value,
+    requested: Option<&str>,
+) -> Result<Option<String>, HarnessError> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    let has_model_config = session_response
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .is_some_and(|options| {
+            options.iter().any(|option| {
+                option.get("type").and_then(Value::as_str) == Some("select")
+                    && option.get("category").and_then(Value::as_str) == Some("model")
+            })
+        });
+    if has_model_config {
+        return Ok(None);
+    }
+
+    let Some(models) = session_response.get("models") else {
+        return Ok(None);
+    };
+    let available: Vec<&str> = models
+        .get("availableModels")
+        .and_then(Value::as_array)
+        .map(|models| models.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|model| model.get("modelId").and_then(Value::as_str))
+        .collect();
+    if available.is_empty() {
+        return Ok(None);
+    }
+    if !available.contains(&requested) {
+        return Err(HarnessError::Protocol(format!(
+            "agent does not advertise requested model {requested}; available models: {}",
+            available.join(", ")
+        )));
+    }
+    if models.get("currentModelId").and_then(Value::as_str) == Some(requested) {
+        return Ok(None);
+    }
+    Ok(Some(requested.to_owned()))
+}
+
 /// The `session/set_config_option` calls a session response's `configOptions`
 /// warrant for this run:
 /// - the requested model (category `model`; a `contextWindow: "1m"` model
@@ -1267,12 +1527,51 @@ fn config_option_sets(
     sets
 }
 
-/// The events of one `session/update` notification, session-filtered.
-fn session_update_events(params: &Value, session_id: &str) -> Vec<AgentEvent> {
+/// The per-agent subagent correlator: grok's spawn-tool + disk-tail tracker
+/// (inert for agents that never emit `subagent_*` updates), or opencode's
+/// task-chip + sidecar-bus tracker. Both observe the raw updates ahead of
+/// [`map_update`]; their tagged events flow from their own tasks.
+enum SubagentObserver {
+    Grok(SubagentTracker),
+    Opencode(OpencodeTracker),
+}
+
+impl SubagentObserver {
+    fn observe(&mut self, update: &Value) {
+        match self {
+            SubagentObserver::Grok(tracker) => tracker.observe(update),
+            SubagentObserver::Opencode(tracker) => tracker.observe(update),
+        }
+    }
+}
+
+/// The events of one notification, session-filtered. `session/update` maps
+/// per [`map_update`]; `_x.ai/session_notification` is grok's extension
+/// channel — same `{sessionId, update}` envelope, but its updates (the
+/// `subagent_*` lifecycle) render nothing directly. The subagent tracker sees
+/// both first (spawn/finished correlation + transcript tails); its tagged
+/// events flow from its own tasks, not this return value.
+fn session_update_events(
+    method: &str,
+    params: &Value,
+    session_id: &str,
+    subagents: &mut SubagentObserver,
+) -> Vec<AgentEvent> {
     if params.get("sessionId").and_then(Value::as_str) != Some(session_id) {
         return Vec::new();
     }
-    map_update(params.get("update").unwrap_or(&Value::Null))
+    let update = params.get("update").unwrap_or(&Value::Null);
+    match method {
+        "session/update" => {
+            subagents.observe(update);
+            map_update(update)
+        }
+        "_x.ai/session_notification" => {
+            subagents.observe(update);
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Per-turn token usage from a settled `session/prompt` response, when the
@@ -1340,66 +1639,12 @@ fn prompt_turn(
     })
 }
 
-/// Hermes (and other agents without an authoritative turn-end
-/// notification) get a 30s quiet window; Grok does not — long silent
-/// reasoning / plan writes look finished and a false settle orphans the
-/// real `session/prompt` response. `ZERON_ACP_QUIET_SETTLE_MS` overrides
-/// (0 disables).
-fn quiet_settle_window(prompt_complete_extension: bool) -> Option<Duration> {
-    if prompt_complete_extension {
-        return None;
-    }
-    match std::env::var("ZERON_ACP_QUIET_SETTLE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        Some(0) => None,
-        Some(ms) => Some(Duration::from_millis(ms)),
-        None => Some(Duration::from_secs(30)),
-    }
-}
-
-/// Grok's plan-approval reverse-request. ACP reserves `_`-prefixed methods
-/// for extensions; Grok's `ExtRequest::new("x.ai/exit_plan_mode")` lands on
-/// the wire as `_x.ai/exit_plan_mode` (same underscore convention as
-/// `_x.ai/session/prompt_complete`). A method-not-found here is treated as a
-/// client disconnect: the tool fails red and plan mode stays active.
-const EXIT_PLAN_MODE_METHOD: &str = "x.ai/exit_plan_mode";
-const EXIT_PLAN_MODE_METHOD_META: &str = "_x.ai/exit_plan_mode";
-const EXIT_PLAN_APPROVE: &str = "Approve";
-const EXIT_PLAN_REVISE: &str = "Request changes";
-const EXIT_PLAN_ABANDON: &str = "Abandon";
-
-fn is_exit_plan_mode_method(method: &str) -> bool {
-    method == EXIT_PLAN_MODE_METHOD
-        || method == EXIT_PLAN_MODE_METHOD_META
-        || method.ends_with("/exit_plan_mode")
-}
-
-/// Unwrap Grok's plan-approval payload. The ACP SDK may send the method
-/// name at the JSON-RPC layer, or nest `{ method, params }` as ExtRequest.
-fn exit_plan_mode_params<'a>(method: &str, params: &'a Value) -> Option<&'a Value> {
-    if is_exit_plan_mode_method(method) {
-        return Some(params);
-    }
-    if let Some(inner) = params.get("method").and_then(Value::as_str)
-        && is_exit_plan_mode_method(inner)
-    {
-        return params.get("params").or(Some(params));
-    }
-    if params.get("planContent").is_some() && params.get("toolCallId").is_some() {
-        return Some(params);
-    }
-    None
-}
-
 /// Answer a server→client request. Permission requests are auto-accepted with
 /// the agent's preferred allow option — parity with the claude harness's
 /// bypassPermissions and the codex harness's approvalPolicy "never" (zeron
-/// sessions run unattended). Grok's `x.ai/exit_plan_mode` is auto-approved on
-/// this unattended path (setup / discovery). Everything else (fs, terminal,
-/// elicitation) was declined at initialize, so a stray request gets
-/// method-not-found rather than wedging the agent.
+/// sessions run unattended). Everything else (fs, terminal, elicitation) was
+/// declined at initialize, so a stray request gets method-not-found rather
+/// than wedging the agent.
 fn handle_server_request(
     client: &RpcClient,
     id: Value,
@@ -1422,20 +1667,8 @@ fn handle_server_request(
             }
             Vec::new()
         }
-        method if exit_plan_mode_params(method, params).is_some() => {
-            client.respond(&id, exit_plan_mode_response(Some(EXIT_PLAN_APPROVE)));
-            Vec::new()
-        }
-        method if ask_user_question_params(method, params).is_some() => {
-            client.respond(&id, json!({ "outcome": "cancelled" }));
-            Vec::new()
-        }
         _ => {
-            tracing::warn!(
-                target: "zeron_harness::acp",
-                %method,
-                "unhandled server request"
-            );
+            tracing::debug!(target: "zeron_harness::acp", "unhandled server request: {method}");
             client.respond_error(&id, -32601, &format!("unsupported method: {method}"));
             Vec::new()
         }
@@ -1464,250 +1697,11 @@ fn is_user_question(options: &[Value]) -> bool {
     })
 }
 
-/// Grok `ExitPlanModeExtResponse`: `{ outcome, feedback? }` where outcome is
-/// `approved` / `cancelled` (keep planning) / `abandoned`.
-fn exit_plan_mode_response(label: Option<&str>) -> Value {
-    match label.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(EXIT_PLAN_APPROVE) => json!({ "outcome": "approved" }),
-        Some(EXIT_PLAN_ABANDON) => json!({ "outcome": "abandoned" }),
-        Some(EXIT_PLAN_REVISE) => json!({ "outcome": "cancelled" }),
-        // Free-text from the question wizard is revision notes.
-        Some(feedback) => json!({ "outcome": "cancelled", "feedback": feedback }),
-        None => json!({ "outcome": "cancelled" }),
-    }
-}
-
-fn plan_approval_question(params: &Value) -> UserInputQuestion {
-    let raw = params
-        .get("planContent")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    // Full markdown — the wizard card scrolls and can expand over the
-    // conversation, so a 12-line preview left long plans unreadable.
-    let question = if raw.is_empty() {
-        "The agent finished planning without writing a plan. Approve and start implementing, request changes, or abandon plan mode?".to_owned()
-    } else {
-        raw.to_owned()
-    };
-    UserInputQuestion {
-        id: new_message_id(),
-        header: "Plan approval".into(),
-        question,
-        options: vec![
-            EXIT_PLAN_APPROVE.into(),
-            EXIT_PLAN_REVISE.into(),
-            EXIT_PLAN_ABANDON.into(),
-        ],
-        multi_select: false,
-    }
-}
-
-fn ask_exit_plan_mode(
-    client: &RpcClient,
-    id: Value,
-    params: &Value,
-    request_input: &std::sync::Arc<RequestInputFn>,
-    open_questions: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
-) -> Vec<AgentEvent> {
-    let question = plan_approval_question(params);
-    let client = client.clone();
-    let request_input = std::sync::Arc::clone(request_input);
-    let open_questions = std::sync::Arc::clone(open_questions);
-    open_questions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    tokio::spawn(async move {
-        let answers = (request_input)(vec![question.clone()])
-            .await
-            .unwrap_or_default();
-        let label = answers
-            .iter()
-            .find(|a| a.question_id == question.id)
-            .and_then(|a| a.labels.first())
-            .map(String::as_str);
-        client.respond(&id, exit_plan_mode_response(label));
-        open_questions.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    });
-    Vec::new()
-}
-
-const ASK_USER_QUESTION_METHOD: &str = "x.ai/ask_user_question";
-const ASK_USER_QUESTION_METHOD_META: &str = "_x.ai/ask_user_question";
-const ASK_CHAT_ABOUT: &str = "Chat about this";
-const ASK_SKIP_INTERVIEW: &str = "Skip interview";
-
-fn is_ask_user_question_method(method: &str) -> bool {
-    method == ASK_USER_QUESTION_METHOD
-        || method == ASK_USER_QUESTION_METHOD_META
-        || method.ends_with("/ask_user_question")
-}
-
-fn ask_user_question_params<'a>(method: &str, params: &'a Value) -> Option<&'a Value> {
-    if is_ask_user_question_method(method) {
-        return Some(params);
-    }
-    if let Some(inner) = params.get("method").and_then(Value::as_str)
-        && is_ask_user_question_method(inner)
-    {
-        return params.get("params").or(Some(params));
-    }
-    if params.get("questions").and_then(Value::as_array).is_some()
-        && params.get("toolCallId").is_some()
-    {
-        return Some(params);
-    }
-    None
-}
-
-fn grok_questions_from_params(params: &Value) -> Vec<UserInputQuestion> {
-    let plan_mode = params.get("mode").and_then(Value::as_str) == Some("plan");
-    let header = if plan_mode {
-        "Plan interview"
-    } else {
-        "Agent question"
-    };
-    let mut questions: Vec<UserInputQuestion> = params
-        .get("questions")
-        .and_then(Value::as_array)
-        .map(|a| a.as_slice())
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|q| {
-            let text = q
-                .get("question")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim();
-            if text.is_empty() {
-                return None;
-            }
-            let options = q
-                .get("options")
-                .and_then(Value::as_array)
-                .map(|a| a.as_slice())
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|o| {
-                    o.get("label")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_owned)
-                })
-                .collect::<Vec<_>>();
-            let multi_select = q
-                .get("multiSelect")
-                .or_else(|| q.get("multi_select"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            Some(UserInputQuestion {
-                id: text.to_owned(),
-                header: header.into(),
-                question: text.to_owned(),
-                options,
-                multi_select,
-            })
-        })
-        .collect();
-    if plan_mode && let Some(last) = questions.last_mut() {
-        if !last.options.iter().any(|o| o == ASK_CHAT_ABOUT) {
-            last.options.push(ASK_CHAT_ABOUT.into());
-        }
-        if !last.options.iter().any(|o| o == ASK_SKIP_INTERVIEW) {
-            last.options.push(ASK_SKIP_INTERVIEW.into());
-        }
-    }
-    questions
-}
-
-/// Grok `AskUserQuestionExtResponse`: internally tagged on `outcome`.
-fn ask_user_question_response(
-    questions: &[UserInputQuestion],
-    answers: &[UserInputAnswer],
-) -> Value {
-    let mut accepted = serde_json::Map::new();
-    let mut annotations = serde_json::Map::new();
-    let mut partial = serde_json::Map::new();
-    let mut special: Option<&'static str> = None;
-
-    for question in questions {
-        let labels = answers
-            .iter()
-            .find(|a| a.question_id == question.id)
-            .map(|a| a.labels.as_slice())
-            .unwrap_or(&[]);
-        if labels.iter().any(|l| l == ASK_CHAT_ABOUT) {
-            special = Some("chat_about_this");
-            continue;
-        }
-        if labels.iter().any(|l| l == ASK_SKIP_INTERVIEW) {
-            special = Some("skip_interview");
-            continue;
-        }
-        if labels.is_empty() {
-            continue;
-        }
-        let known: Vec<&str> = labels
-            .iter()
-            .filter(|l| question.options.iter().any(|o| o == *l))
-            .map(String::as_str)
-            .collect();
-        if known.is_empty() {
-            accepted.insert(question.question.clone(), json!(["Other"]));
-            annotations.insert(
-                question.question.clone(),
-                json!({ "notes": labels.join("\n") }),
-            );
-        } else {
-            accepted.insert(question.question.clone(), json!(known));
-            if let Some(first) = known.first() {
-                partial.insert(question.question.clone(), json!(first));
-            }
-        }
-    }
-
-    if let Some(outcome) = special {
-        return json!({ "outcome": outcome, "partial_answers": partial });
-    }
-    if accepted.is_empty() {
-        return json!({ "outcome": "cancelled" });
-    }
-    let mut resp = json!({ "outcome": "accepted", "answers": accepted });
-    if !annotations.is_empty() {
-        resp["annotations"] = Value::Object(annotations);
-    }
-    resp
-}
-
-fn ask_user_question(
-    client: &RpcClient,
-    id: Value,
-    params: &Value,
-    request_input: &std::sync::Arc<RequestInputFn>,
-    open_questions: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
-) -> Vec<AgentEvent> {
-    let questions = grok_questions_from_params(params);
-    if questions.is_empty() {
-        client.respond(&id, json!({ "outcome": "cancelled" }));
-        return Vec::new();
-    }
-    let client = client.clone();
-    let request_input = std::sync::Arc::clone(request_input);
-    let open_questions = std::sync::Arc::clone(open_questions);
-    open_questions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    tokio::spawn(async move {
-        let answers = (request_input)(questions.clone()).await.unwrap_or_default();
-        client.respond(&id, ask_user_question_response(&questions, &answers));
-        open_questions.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    });
-    Vec::new()
-}
-
 /// The live-run request handler: tool permissions auto-accept like
-/// [`handle_server_request`], but question-shaped requests (and Grok plan
-/// approval) block on the engine's input bridge (in a subtask so the
-/// message loop keeps flowing) and answer with the option whose name
-/// matches the chosen label. A dropped resolver degrades to `cancelled` —
-/// never a silent allow.
+/// [`handle_server_request`], but question-shaped requests block on the
+/// engine's input bridge (in a subtask so the message loop keeps flowing)
+/// and answer with the option whose name matches the chosen label. A dropped
+/// resolver degrades to `cancelled` — never a silent allow.
 fn handle_server_request_live(
     client: &RpcClient,
     id: Value,
@@ -1716,12 +1710,6 @@ fn handle_server_request_live(
     request_input: &std::sync::Arc<RequestInputFn>,
     open_questions: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> Vec<AgentEvent> {
-    if let Some(plan_params) = exit_plan_mode_params(method, params) {
-        return ask_exit_plan_mode(client, id, plan_params, request_input, open_questions);
-    }
-    if let Some(q_params) = ask_user_question_params(method, params) {
-        return ask_user_question(client, id, q_params, request_input, open_questions);
-    }
     if method != "session/request_permission" {
         return handle_server_request(client, id, method, params);
     }
@@ -1883,6 +1871,9 @@ async fn run_session(session: Session) {
         agent_name,
         prompt_complete_extension,
         prompt_stall,
+        stall_hint,
+        sessions_root,
+        sidecar_port,
         prompt_transform,
         effort_values,
         interrupt_grace,
@@ -1949,10 +1940,32 @@ async fn run_session(session: Session) {
                 "session/new returned no sessionId".into(),
             ));
         }
+        // ACP has had two model-selection surfaces. Newer config-option agents
+        // use category=model below; Grok Build currently advertises only the
+        // first-class `models` state and requires `session/set_model`. Paseo
+        // follows the same split. Unlike the best-effort auxiliary options,
+        // an explicit model switch is strict: prompting with a different
+        // model than the picker shows is worse than surfacing the RPC error.
+        if let Some(model) = first_class_model_change(&session_response, request.model.as_deref())?
+        {
+            request_draining(
+                &client,
+                &mut incoming,
+                "session/set_model",
+                json!({
+                    "sessionId": session_id,
+                    "modelId": model,
+                }),
+            )
+            .await
+            .map_err(|error| {
+                HarnessError::Protocol(format!("agent rejected model switch to {model}: {error}"))
+            })?;
+        }
         // Apply the run's model + effort + model options through the
-        // session's advertised config options (ACP has no per-prompt model
-        // field). Best-effort: a rejected set is logged, never fatal — the
-        // agent's default runs.
+        // session's advertised config options. Best-effort for effort and
+        // traits: a rejected auxiliary set is logged and the agent default
+        // runs.
         let efforts = effort_values(request.reasoning, request.model.as_deref());
         let requested_model = request.model.as_deref();
         let options_snapshot = session_response;
@@ -2086,12 +2099,31 @@ async fn run_session(session: Session) {
         return;
     }
 
+    // Subagent correlation + transcript tails: opencode rides its sidecar
+    // event bus; everything else gets the grok tracker (inert for agents
+    // that never emit the `subagent_*` extension updates).
+    let mut subagents = if harness == HarnessId::Opencode {
+        SubagentObserver::Opencode(OpencodeTracker::new(
+            session_id.clone(),
+            event_tx.clone(),
+            sidecar_port.map(|p| format!("http://127.0.0.1:{p}")),
+        ))
+    } else {
+        SubagentObserver::Grok(SubagentTracker::new(
+            session_id.clone(),
+            event_tx.clone(),
+            sessions_root,
+        ))
+    };
+
     // ---- main loop --------------------------------------------------------
     // Prompt-completion settlement state (the prompt-complete extension):
     // one prompt is outstanding at a time, identified by `current_prompt_id`;
     // settled ids are remembered so a STALE `prompt_complete` (a late replay
     // of an already-settled prompt) can never settle a newer turn.
     let mut prompt_seq: u64 = 0;
+    let mut current_prompt_id =
+        prompt_complete_extension.then(|| format!("zeron-p{}", prompt_seq + 1));
     let mut completed_prompts: VecDeque<String> = VecDeque::new();
     // `ZERON_ACP_PROMPT_STALL_MS` overrides the spec's bound; 0 disables.
     let prompt_stall: Option<Duration> = match std::env::var("ZERON_ACP_PROMPT_STALL_MS")
@@ -2104,15 +2136,15 @@ async fn run_session(session: Session) {
     };
     let mut prompt_stall_deadline: Option<tokio::time::Instant> =
         prompt_stall.map(|d| tokio::time::Instant::now() + d);
-    prompt_seq += 1;
-    let mut current_prompt_id: Option<String> =
-        prompt_complete_extension.then(|| format!("zeron-p{prompt_seq}"));
-    let mut turn: Option<BoxFuture<'static, Result<Value, HarnessError>>> = Some(prompt_turn(
-        client.clone(),
-        session_id.clone(),
-        prompt_transform(request.reasoning, &request.prompt),
-        current_prompt_id.clone(),
-    ));
+    let mut turn: Option<BoxFuture<'static, Result<Value, HarnessError>>> = Some({
+        prompt_seq += 1;
+        prompt_turn(
+            client.clone(),
+            session_id.clone(),
+            prompt_transform(request.reasoning, &request.prompt),
+            current_prompt_id.clone(),
+        )
+    });
     // Steers waiting for the turn boundary (agents without the extension, or
     // extension steers that lost the turn-end race).
     let mut queued_steers: VecDeque<String> = VecDeque::new();
@@ -2156,17 +2188,15 @@ async fn run_session(session: Session) {
     // Done ever comes, and the session strands Working until the engine's
     // quiesce watchdog parks it.
     //
-    // Grok is exempt: it advertises
-    // `_x.ai/session/prompt_complete` as the AUTHORITATIVE turn end, and a
-    // 30s think / long plan-file write looks identical to a dropped reply
-    // (Grok 2026-08-18: timestamp landed, then the session self-continued
-    // when more output arrived). Hermes uses this blanket window.
-    // (pi-acp was exempt too — long silent reasoning stretches — but the
-    // adapter is retired; the native PiHarness settles deterministically on
-    // pi's own agent_settled and never consults this window.)
-    // `ZERON_ACP_QUIET_SETTLE_MS`
-    // overrides; 0 disables.
-    let quiet_settle: Option<Duration> = quiet_settle_window(prompt_complete_extension);
+    // `ZERON_ACP_QUIET_SETTLE_MS` overrides; 0 disables.
+    let quiet_settle: Option<Duration> = match std::env::var("ZERON_ACP_QUIET_SETTLE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(ms) => Some(Duration::from_millis(ms)),
+        None => Some(Duration::from_secs(30)),
+    };
     let mut last_update_at = tokio::time::Instant::now();
     let mut turn_content_seen = false;
     // A steering injection makes the cost hint unsafe for the REST of the
@@ -2260,11 +2290,8 @@ async fn run_session(session: Session) {
                 while let Ok(inc) = incoming.try_recv() {
                     match inc {
                         Incoming::Notification { method, params } => {
-                            let events = if method == "session/update" {
-                                session_update_events(&params, &session_id)
-                            } else {
-                                Vec::new()
-                            };
+                            let events =
+                                session_update_events(&method, &params, &session_id, &mut subagents);
                             for ev in events {
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
@@ -2372,9 +2399,27 @@ async fn run_session(session: Session) {
             inc = incoming.recv() => match inc {
                 Some(Incoming::Notification { method, params }) => {
                     last_update_at = tokio::time::Instant::now();
-                    // Any wire traffic is a sign of life: the prompt-stall
-                    // watchdog only guards TOTAL silence after a prompt.
-                    prompt_stall_deadline = None;
+                    // Wire traffic is a sign of life for the prompt-stall
+                    // watchdog — EXCEPT session boilerplate: opencode emits
+                    // available_commands_update right after session/new on
+                    // every session, including ones whose provider is down
+                    // (where it then retries the provider stream forever
+                    // with nothing further on the wire — verified live,
+                    // 1.18.18). One such frame must not disarm the watchdog
+                    // for the whole turn; only turn progress counts.
+                    let boilerplate = method == "session/update"
+                        && matches!(
+                            params
+                                .get("update")
+                                .and_then(|u| u.get("sessionUpdate"))
+                                .and_then(Value::as_str),
+                            Some("available_commands_update")
+                                | Some("config_option_update")
+                                | Some("current_mode_update")
+                        );
+                    if !boilerplate {
+                        prompt_stall_deadline = None;
+                    }
                     // `_x.ai/session/prompt_complete` — the AUTHORITATIVE
                     // turn end for agents advertising it (grok): the
                     // `session/prompt` RPC can hang after the turn really
@@ -2418,11 +2463,8 @@ async fn run_session(session: Session) {
                     }
                     // Other notifications (other sessions, agent noise) are
                     // tolerated by design.
-                    let events = if method == "session/update" {
-                        session_update_events(&params, &session_id)
-                    } else {
-                        Vec::new()
-                    };
+                    let events =
+                        session_update_events(&method, &params, &session_id, &mut subagents);
                     for ev in events {
                         track_turn_signals(&ev, &mut turn_content_seen, &mut open_tools);
                         if !send(&event_tx, ev).await {
@@ -2432,7 +2474,6 @@ async fn run_session(session: Session) {
                 }
                 Some(Incoming::Request { id, method, params }) => {
                     prompt_stall_deadline = None;
-                    last_update_at = tokio::time::Instant::now();
                     for ev in handle_server_request_live(
                         &client,
                         id,
@@ -2533,11 +2574,8 @@ async fn run_session(session: Session) {
                         while let Ok(inc) = incoming.try_recv() {
                             match inc {
                                 Incoming::Notification { method, params } => {
-                                    let events = if method == "session/update" {
-                                        session_update_events(&params, &session_id)
-                                    } else {
-                                        Vec::new()
-                                    };
+                                    let events =
+                                        session_update_events(&method, &params, &session_id, &mut subagents);
                                     for ev in events {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
@@ -2921,8 +2959,10 @@ async fn run_session(session: Session) {
                     &event_tx,
                     AgentEvent::Error {
                         message: format!(
-                            "{agent_name} did not respond to the prompt at all                              (no wire activity for {}s). The agent process is                              likely wedged — a stale shared leader process or a                              hung startup check; zeron launches it with                              --no-leader and --no-auto-update to avoid both.",
-                            prompt_stall.map(|d| d.as_secs()).unwrap_or(0)
+                            "{agent_name} did not respond to the prompt at all \
+                             (no wire activity for {}s). {}",
+                            prompt_stall.map(|d| d.as_secs()).unwrap_or(0),
+                            stall_hint,
                         ),
                     },
                 )
@@ -2985,6 +3025,18 @@ async fn run_session(session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencode_model_probe_and_chat_share_one_startup_budget() {
+        let harness = AcpHarness::opencode();
+        assert_eq!(
+            harness.model_discovery_timeout, harness.handshake_timeout,
+            "model discovery must not fail before the same OpenCode process would be considered hung"
+        );
+        if std::env::var_os(OPENCODE_STARTUP_TIMEOUT_ENV).is_none() {
+            assert_eq!(harness.handshake_timeout, DEFAULT_OPENCODE_STARTUP_TIMEOUT);
+        }
+    }
 
     #[test]
     fn steering_capability_reads_initialize_meta() {
@@ -3080,6 +3132,54 @@ mod tests {
         assert_eq!(
             config_option_sets(&json!({"sessionId": "s"}), Some("x"), &["high"], &no_opts),
             Vec::new()
+        );
+    }
+
+    #[test]
+    fn first_class_models_use_session_set_model_without_config_option() {
+        let response = json!({
+            "models": {
+                "currentModelId": "grok-4.6",
+                "availableModels": [
+                    { "modelId": "grok-4.6", "name": "Grok 4.6" },
+                    { "modelId": "grok-4.5", "name": "Grok 4.5" },
+                ],
+            },
+        });
+        assert_eq!(
+            first_class_model_change(&response, Some("grok-4.5")).unwrap(),
+            Some("grok-4.5".into())
+        );
+        assert_eq!(
+            first_class_model_change(&response, Some("grok-4.6")).unwrap(),
+            None
+        );
+        assert!(first_class_model_change(&response, Some("unknown")).is_err());
+    }
+
+    #[test]
+    fn model_config_option_takes_precedence_over_legacy_models_state() {
+        let response = json!({
+            "models": {
+                "currentModelId": "gpt-5.6-sol low",
+                "availableModels": [
+                    { "modelId": "gpt-5.6-sol low", "name": "GPT-5.6-Sol (low)" },
+                ],
+            },
+            "configOptions": [{
+                "id": "model",
+                "category": "model",
+                "type": "select",
+                "currentValue": "gpt-5.6-sol",
+                "options": [
+                    { "value": "gpt-5.6-sol", "name": "GPT-5.6-Sol" },
+                    { "value": "gpt-5.6-terra", "name": "GPT-5.6-Terra" },
+                ],
+            }],
+        });
+        assert_eq!(
+            first_class_model_change(&response, Some("gpt-5.6-terra")).unwrap(),
+            None
         );
     }
 
@@ -3354,178 +3454,6 @@ mod tests {
             config_option_sets(&codex, None, &[], &no_opts),
             vec![("mode".to_owned(), json!({ "value": "agent-full-access" }))]
         );
-    }
-
-    #[test]
-    fn grok_skips_the_quiet_settle_window() {
-        assert!(quiet_settle_window(true).is_none());
-        assert_eq!(quiet_settle_window(false), Some(Duration::from_secs(30)));
-    }
-
-    #[test]
-    fn ask_user_question_response_maps_picks_and_freeform() {
-        let questions = grok_questions_from_params(&json!({
-            "sessionId": "s-1",
-            "toolCallId": "tc-1",
-            "mode": "plan",
-            "questions": [
-                {
-                    "question": "Which dummy flavor should this test plan use?",
-                    "options": [
-                        { "label": "Keep it tiny" },
-                        { "label": "Make it look real" },
-                    ],
-                },
-                {
-                    "question": "How many follow-up questions?",
-                    "options": [{ "label": "None" }, { "label": "One more" }],
-                },
-            ],
-        }));
-        assert_eq!(questions.len(), 2);
-        assert_eq!(questions[0].header, "Plan interview");
-        assert!(questions[1].options.iter().any(|o| o == "Chat about this"));
-        assert!(questions[1].options.iter().any(|o| o == "Skip interview"));
-
-        let accepted = ask_user_question_response(
-            &questions,
-            &[
-                UserInputAnswer {
-                    question_id: questions[0].id.clone(),
-                    labels: vec!["Keep it tiny".into()],
-                },
-                UserInputAnswer {
-                    question_id: questions[1].id.clone(),
-                    labels: vec!["None".into()],
-                },
-            ],
-        );
-        assert_eq!(accepted["outcome"], "accepted");
-        assert_eq!(
-            accepted["answers"]["Which dummy flavor should this test plan use?"],
-            json!(["Keep it tiny"])
-        );
-
-        let notes = ask_user_question_response(
-            &questions[..1],
-            &[UserInputAnswer {
-                question_id: questions[0].id.clone(),
-                labels: vec!["something custom".into()],
-            }],
-        );
-        assert_eq!(notes["outcome"], "accepted");
-        assert_eq!(
-            notes["answers"]["Which dummy flavor should this test plan use?"],
-            json!(["Other"])
-        );
-        assert_eq!(
-            notes["annotations"]["Which dummy flavor should this test plan use?"]["notes"],
-            "something custom"
-        );
-
-        let skip = ask_user_question_response(
-            &questions,
-            &[
-                UserInputAnswer {
-                    question_id: questions[0].id.clone(),
-                    labels: vec!["Keep it tiny".into()],
-                },
-                UserInputAnswer {
-                    question_id: questions[1].id.clone(),
-                    labels: vec!["Skip interview".into()],
-                },
-            ],
-        );
-        assert_eq!(skip["outcome"], "skip_interview");
-        assert_eq!(
-            skip["partial_answers"]["Which dummy flavor should this test plan use?"],
-            "Keep it tiny"
-        );
-        assert!(
-            ask_user_question_params(
-                "_x.ai/ask_user_question",
-                &json!({ "questions": [], "toolCallId": "t" })
-            )
-            .is_some()
-        );
-    }
-
-    #[test]
-    fn exit_plan_mode_method_accepts_underscore_prefix() {
-        assert!(is_exit_plan_mode_method("x.ai/exit_plan_mode"));
-        assert!(is_exit_plan_mode_method("_x.ai/exit_plan_mode"));
-        assert!(!is_exit_plan_mode_method("session/request_permission"));
-        let nested = json!({
-            "method": "_x.ai/exit_plan_mode",
-            "params": {
-                "sessionId": "s-1",
-                "toolCallId": "call-1",
-                "planContent": "# Plan",
-            }
-        });
-        assert_eq!(
-            exit_plan_mode_params("some/wrapper", &nested)
-                .and_then(|p| p.get("planContent"))
-                .and_then(Value::as_str),
-            Some("# Plan")
-        );
-        assert!(
-            exit_plan_mode_params(
-                "mystery",
-                &json!({ "toolCallId": "c", "planContent": "hi" })
-            )
-            .is_some()
-        );
-    }
-
-    #[test]
-    fn exit_plan_mode_response_maps_labels() {
-        assert_eq!(
-            exit_plan_mode_response(Some("Approve")),
-            json!({ "outcome": "approved" })
-        );
-        assert_eq!(
-            exit_plan_mode_response(Some("Abandon")),
-            json!({ "outcome": "abandoned" })
-        );
-        assert_eq!(
-            exit_plan_mode_response(Some("Request changes")),
-            json!({ "outcome": "cancelled" })
-        );
-        assert_eq!(
-            exit_plan_mode_response(Some("please add tests")),
-            json!({ "outcome": "cancelled", "feedback": "please add tests" })
-        );
-        assert_eq!(
-            exit_plan_mode_response(None),
-            json!({ "outcome": "cancelled" })
-        );
-    }
-
-    #[test]
-    fn plan_approval_question_keeps_full_plan_content() {
-        let long = format!(
-            "# Dummy\n\n{}\n\n## Table of Contents\n\n{}",
-            "Do nothing.\n".repeat(20),
-            (1..=40)
-                .map(|n| format!("- step {n}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-        let question = plan_approval_question(&json!({
-            "sessionId": "s-1",
-            "toolCallId": "call-1",
-            "planContent": long.clone(),
-        }));
-        assert_eq!(question.header, "Plan approval");
-        assert_eq!(question.question, long);
-        assert!(question.question.contains("- step 40"));
-        assert_eq!(
-            question.options,
-            vec!["Approve", "Request changes", "Abandon"]
-        );
-        let empty = plan_approval_question(&json!({ "planContent": "   " }));
-        assert!(empty.question.contains("without writing a plan"));
     }
 
     #[test]

@@ -41,6 +41,7 @@ fn request(prompt: &str) -> RunRequest {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
+        worktree: None,
         resume: None,
     }
 }
@@ -225,95 +226,16 @@ async fn config_options_apply_requested_model_and_effort() {
     );
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
-#[tokio::test]
-async fn grok_exit_plan_mode_ext_method_is_answered() {
-    // Grok intercepts exit_plan_mode and reverse-requests x.ai/exit_plan_mode.
-    // method-not-found used to fail the tool ("client disconnected").
-    let (steer_tx, steer_rx) = mpsc::channel(8);
-    let token = CancellationToken::new();
-    let controls = RunControls {
-        request_input: Box::new(move |questions| {
-            let (tx, rx) = oneshot::channel();
-            let answers: Vec<UserInputAnswer> = questions
-                .iter()
-                .map(|q| UserInputAnswer {
-                    question_id: q.id.clone(),
-                    labels: vec!["Approve".into()],
-                })
-                .collect();
-            let _ = tx.send(answers);
-            rx
-        }),
-        steering: steer_rx,
-        interrupt: token.clone(),
-    };
-    let _steer = steer_tx;
-    let events = run_to_end(&harness(), request("scenario:exit-plan"), controls).await;
-    assert!(
-        events.contains(&AgentEvent::TextDelta {
-            text: "plan approved".into()
-        }),
-        "{events:?}"
-    );
-    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
-}
 
 #[tokio::test]
-async fn grok_exit_plan_mode_accepts_underscore_ext_method() {
-    let (steer_tx, steer_rx) = mpsc::channel(8);
-    let token = CancellationToken::new();
-    let controls = RunControls {
-        request_input: Box::new(move |questions| {
-            let (tx, rx) = oneshot::channel();
-            let answers: Vec<UserInputAnswer> = questions
-                .iter()
-                .map(|q| UserInputAnswer {
-                    question_id: q.id.clone(),
-                    labels: vec!["Approve".into()],
-                })
-                .collect();
-            let _ = tx.send(answers);
-            rx
-        }),
-        steering: steer_rx,
-        interrupt: token.clone(),
-    };
-    let _steer = steer_tx;
-    let events = run_to_end(&harness(), request("scenario:exit-plan-meta"), controls).await;
+async fn resumed_first_class_model_is_switched_before_prompt() {
+    let (controls, _steer, _token) = controls();
+    let mut req = request("scenario:model-api");
+    req.resume = Some("existing-grok-session".into());
+    let events = run_to_end(&harness(), req, controls).await;
     assert!(
         events.contains(&AgentEvent::TextDelta {
-            text: "plan approved".into()
-        }),
-        "{events:?}"
-    );
-    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
-}
-
-#[tokio::test]
-async fn grok_ask_user_question_ext_method_is_answered() {
-    let (steer_tx, steer_rx) = mpsc::channel(8);
-    let token = CancellationToken::new();
-    let controls = RunControls {
-        request_input: Box::new(move |questions| {
-            let (tx, rx) = oneshot::channel();
-            let answers: Vec<UserInputAnswer> = questions
-                .iter()
-                .map(|q| UserInputAnswer {
-                    question_id: q.id.clone(),
-                    labels: q.options.first().cloned().into_iter().collect(),
-                })
-                .collect();
-            let _ = tx.send(answers);
-            rx
-        }),
-        steering: steer_rx,
-        interrupt: token.clone(),
-    };
-    let _steer = steer_tx;
-    let events = run_to_end(&harness(), request("scenario:ask-user"), controls).await;
-    assert!(
-        events.contains(&AgentEvent::TextDelta {
-            text: "questions answered".into()
+            text: "model switched".into()
         }),
         "{events:?}"
     );
@@ -573,11 +495,6 @@ fn descriptor_surface_matches_registry_expectations() {
     assert_eq!(harness.id(), HarnessId::Grok);
     assert_eq!(harness.display_name(), "Grok");
     assert!(harness.supports_steering());
-    assert!(harness.deterministic_turn_end());
-    assert!(
-        !AcpHarness::hermes().deterministic_turn_end(),
-        "Hermes has no prompt_complete; the engine quiesce stays armed"
-    );
     assert_eq!(harness.steering_mode(), SteeringMode::TurnBoundary);
     assert_eq!(
         harness.reasoning_levels(),
@@ -632,10 +549,36 @@ async fn models_enrich_from_the_static_catalog_on_id_match() {
 
 #[tokio::test]
 async fn models_fall_back_to_the_static_catalog_when_the_probe_fails() {
-    let harness = AcpHarness::hermes().with_executable("/nonexistent/never-a-hermes");
+    let harness = AcpHarness::pi().with_executable("/nonexistent/never-a-pi-acp");
     let models = harness.models().await.expect("static fallback");
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-    assert_eq!(ids, vec!["hermes-4-405b", "hermes-4-70b"], "{models:?}");
+    assert_eq!(ids, vec!["default"], "{models:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn opencode_model_timeout_is_not_hidden_by_the_static_catalog() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("slow-opencode.sh");
+    std::fs::write(&script, "#!/bin/sh\nexec sleep 1000\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let harness = AcpHarness::opencode()
+        .with_executable(&script)
+        .with_graces(Duration::from_millis(10), Duration::from_millis(10))
+        .with_model_discovery_timeout(Duration::from_millis(20));
+    let error = harness
+        .models()
+        .await
+        .expect_err("OpenCode must surface discovery failure so the picker can retry");
+    assert!(
+        error
+            .to_string()
+            .contains("OpenCode model discovery did not complete within"),
+        "{error}"
+    );
 }
 
 #[cfg(unix)]
@@ -668,13 +611,48 @@ async fn hung_handshake_errors_instead_of_spinning_forever() {
     );
 }
 #[test]
-fn hermes_descriptor_surfaces_match_registry_expectations() {
+fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
     let hermes = AcpHarness::hermes();
     assert_eq!(hermes.id(), HarnessId::Hermes);
     assert_eq!(hermes.display_name(), "Hermes");
     assert!(hermes.supports_steering());
     assert_eq!(hermes.steering_mode(), SteeringMode::TurnBoundary);
     assert!(hermes.reasoning_levels().is_empty());
+
+    let opencode = AcpHarness::opencode();
+    assert_eq!(opencode.id(), HarnessId::Opencode);
+    assert_eq!(opencode.display_name(), "OpenCode");
+    assert!(opencode.supports_steering());
+    assert_eq!(opencode.steering_mode(), SteeringMode::TurnBoundary);
+    // Effort rides opencode's model variants (the session's `effort` config
+    // option, category thought_level); variant-less models skip the set.
+    assert_eq!(
+        opencode.reasoning_levels(),
+        &[
+            zeron_proto::ReasoningLevel::Low,
+            zeron_proto::ReasoningLevel::Medium,
+            zeron_proto::ReasoningLevel::High,
+            zeron_proto::ReasoningLevel::XHigh,
+            zeron_proto::ReasoningLevel::Max,
+        ]
+    );
+
+    let pi = AcpHarness::pi();
+    assert_eq!(pi.id(), HarnessId::Pi);
+    assert_eq!(pi.display_name(), "Pi");
+    assert!(pi.supports_steering());
+    assert_eq!(pi.steering_mode(), SteeringMode::TurnBoundary);
+    assert_eq!(
+        pi.reasoning_levels(),
+        &[
+            zeron_proto::ReasoningLevel::Minimal,
+            zeron_proto::ReasoningLevel::Low,
+            zeron_proto::ReasoningLevel::Medium,
+            zeron_proto::ReasoningLevel::High,
+            zeron_proto::ReasoningLevel::XHigh,
+            zeron_proto::ReasoningLevel::Max,
+        ]
+    );
 }
 
 #[tokio::test]
@@ -757,4 +735,116 @@ async fn stale_prompt_complete_never_settles_a_newer_turn() {
         input_tokens: 9,
         output_tokens: 4
     }));
+}
+
+#[tokio::test]
+async fn grok_subagent_lifecycle_tails_the_disk_transcript_into_tagged_events() {
+    // The child session's chat_history.jsonl, one level under the sessions
+    // root exactly like grok's `<root>/<urlencoded-cwd>/<session-id>/` layout
+    // (entry shapes captured from a real 1.0.4 run).
+    let tmp = tempfile::tempdir().unwrap();
+    let child_dir = tmp.path().join("%2Ftmp").join("sub-1");
+    std::fs::create_dir_all(&child_dir).unwrap();
+    let history = child_dir.join("chat_history.jsonl");
+    std::fs::write(
+        &history,
+        concat!(
+            "{\"type\":\"system\",\"content\":\"You are a Grok Build subagent\"}\n",
+            "{\"type\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Count the files.\"}],\"prompt_index\":0}\n",
+            "{\"type\":\"reasoning\",\"id\":\"rs-1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Listing the directory.\"}],\"encrypted_content\":\"opaque\",\"status\":\"completed\"}\n",
+            "{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call-1-0\",\"name\":\"run_terminal_command\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}],\"model_id\":\"grok-4.6-build\"}\n",
+            "{\"type\":\"tool_result\",\"tool_call_id\":\"call-1-0\",\"content\":\"a.txt\\nb.txt\"}\n",
+        ),
+    )
+    .unwrap();
+    // A mid-run append: the tail must pick it up incrementally, before the
+    // wire's subagent_finished lands (the fake agent sleeps 1.4s).
+    let append_to = history.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(append_to)
+            .unwrap();
+        writeln!(
+            f,
+            "{}",
+            "{\"type\":\"assistant\",\"content\":\"two files\",\"model_id\":\"grok-4.6-build\"}"
+        )
+        .unwrap();
+    });
+
+    let (controls, _steer, _token) = controls();
+    let harness = harness().with_sessions_root(tmp.path());
+    let events = run_to_end(&harness, request("scenario:subagent"), controls).await;
+
+    // The spawn chip is named after the task, claude-driver parity.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCall { id, call: ToolCall::Unknown { name, .. } }
+                if id == "sp1" && name == "Agent: Count files"
+        )),
+        "{events:?}"
+    );
+
+    // Tagged transcript: every wrapped event attributes to the spawn chip,
+    // and the disk entries surfaced in order — reasoning, the typed tool
+    // call + result, the mid-run append — then the lifecycle Done.
+    let tagged: Vec<&AgentEvent> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Subagent {
+                parent_tool_use_id,
+                event,
+            } => {
+                assert_eq!(parent_tool_use_id, "sp1", "{events:?}");
+                Some(event.as_ref())
+            }
+            _ => None,
+        })
+        .collect();
+    let pos = |pred: &dyn Fn(&AgentEvent) -> bool| tagged.iter().position(|e| pred(e));
+    let reasoning = pos(&|e| {
+        matches!(e, AgentEvent::ReasoningDelta { text } if text.starts_with("Listing the directory."))
+    })
+    .expect("reasoning entry tailed");
+    let tool = pos(&|e| {
+        matches!(
+            e,
+            AgentEvent::ToolCall { id, call: zeron_proto::ToolCall::Exec { command } }
+                if id == "call-1-0" && command == "ls"
+        )
+    })
+    .expect("tool call typed from disk");
+    let result = pos(&|e| {
+        matches!(
+            e,
+            AgentEvent::ToolResult { id, is_error: false, output: Some(o), .. }
+                if id == "call-1-0" && o.contains("a.txt")
+        )
+    })
+    .expect("tool result tailed");
+    let text =
+        pos(&|e| matches!(e, AgentEvent::TextDelta { text } if text.starts_with("two files")))
+            .expect("mid-run append tailed");
+    let done = pos(&|e| {
+        matches!(
+            e,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )
+    })
+    .expect("tagged done from subagent_finished");
+    assert!(
+        reasoning < tool && tool < result && result < text && text < done,
+        "{tagged:?}"
+    );
+    // The nested spawned update (another parent session) bound nothing —
+    // every wrapped event attributed to sp1 (the assert in the filter) — and
+    // the parent's own turn settled cleanly with its single untagged Done.
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }

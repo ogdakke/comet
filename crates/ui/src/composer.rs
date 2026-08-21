@@ -2459,7 +2459,9 @@ impl Composer {
                             &engine,
                             cx.background_executor(),
                             host_device_id.as_deref(),
+                            &att.id,
                             att,
+                            None,
                         )
                         .await
                         {
@@ -2527,6 +2529,7 @@ impl Composer {
                             cwd,
                             sandbox: SandboxLevel::WorkspaceWrite,
                             auto_approve: false,
+                            worktree: None,
                             resume: None,
                             attachments: attachment_paths,
                         },
@@ -2667,7 +2670,9 @@ impl Composer {
                             &engine,
                             cx.background_executor(),
                             host_device_id.as_deref(),
+                            &att.id,
                             att,
+                            None,
                         )
                         .await
                         {

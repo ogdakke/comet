@@ -34,6 +34,7 @@ tokio-util = { workspace = true, features = ["rt"] }
 sha2.workspace = true
 reqwest.workspace = true
 ignore.workspace = true
+nucleo-matcher.workspace = true
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 thumbhash = "0.1"
 

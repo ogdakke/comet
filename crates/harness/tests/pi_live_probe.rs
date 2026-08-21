@@ -42,6 +42,7 @@ async fn live_turn_settles() {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
+        worktree: None,
         resume: None,
     };
     let stream = PiHarness::new()

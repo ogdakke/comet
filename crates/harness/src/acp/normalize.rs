@@ -24,7 +24,7 @@ fn str_field(v: &Value, key: &str) -> String {
 }
 
 /// Truncate on a char boundary, marking the cut so the UI can say "truncated".
-fn cap_text(text: &str, cap: usize) -> String {
+pub(crate) fn cap_text(text: &str, cap: usize) -> String {
     if text.len() <= cap {
         return text.to_owned();
     }
@@ -91,6 +91,12 @@ fn tool_diff(update: &Value) -> Option<ToolDiff> {
     })
 }
 
+/// The grok-native tool name stamped on a tool call's `_meta` (`x.ai/tool`,
+/// present on every grok tool_call — verified live, 1.0.4).
+pub(crate) fn xai_tool_name(update: &Value) -> Option<&str> {
+    update.get("_meta")?.get("x.ai/tool")?.get("name")?.as_str()
+}
+
 /// First location path (`locations: [{path, line?}]`), for read/edit calls.
 fn first_location(update: &Value) -> Option<String> {
     let path = update.get("locations")?.as_array()?.first()?.get("path")?;
@@ -154,101 +160,6 @@ fn arg_from_title(title: &str) -> Option<String> {
     }
 }
 
-fn raw_has(raw: Option<&Value>, key: &str) -> bool {
-    match raw.and_then(|r| r.get(key)) {
-        None | Some(Value::Null) => false,
-        Some(_) => true,
-    }
-}
-
-/// `path` / `file_path` / `filePath` on rawInput, else the first location.
-fn input_path(update: &Value, raw_str: impl Fn(&str) -> Option<String>) -> Option<String> {
-    raw_str("path")
-        .or_else(|| raw_str("file_path"))
-        .or_else(|| raw_str("filePath"))
-        .or_else(|| first_location(update))
-}
-
-/// Pi `edit` sends `{path, edits:[{oldText,newText}]}`; others use a single
-/// old/new pair. Either is enough to type the call as an edit.
-fn is_edit_input(raw: Option<&Value>) -> bool {
-    let Some(raw) = raw else {
-        return false;
-    };
-    if raw
-        .get("edits")
-        .and_then(Value::as_array)
-        .is_some_and(|a| !a.is_empty())
-    {
-        return true;
-    }
-    let has_old = raw
-        .get("oldText")
-        .or_else(|| raw.get("old_string"))
-        .and_then(Value::as_str)
-        .is_some_and(|s| !s.is_empty());
-    let has_new = raw
-        .get("newText")
-        .or_else(|| raw.get("new_string"))
-        .and_then(Value::as_str)
-        .is_some();
-    has_old && has_new
-}
-
-/// Recover a typed call from `rawInput` when ACP `kind` is missing or
-/// `"other"`. `pi-acp` repeats args on `tool_call_update` without `kind` /
-/// `title`; treating that as unknown names the chip "other" and clobbers the
-/// opening `Read`/`Edit`.
-fn infer_from_raw_input(
-    update: &Value,
-    raw: Option<&Value>,
-    raw_str: impl Fn(&str) -> Option<String>,
-) -> Option<ToolCall> {
-    if let Some(command) = raw_str("command").or_else(|| raw_str("cmd")) {
-        return Some(ToolCall::Exec { command });
-    }
-    let path = input_path(update, &raw_str);
-    if let Some(path) = path.clone().filter(|_| is_edit_input(raw)) {
-        return Some(ToolCall::EditFile {
-            path,
-            old_string: None,
-            new_string: None,
-        });
-    }
-    if let Some(path) = path.clone().filter(|_| {
-        raw.and_then(|r| r.get("content"))
-            .and_then(Value::as_str)
-            .is_some()
-            && !raw_has(raw, "offset")
-            && !raw_has(raw, "limit")
-            && !is_edit_input(raw)
-    }) {
-        return Some(ToolCall::WriteFile {
-            path,
-            content: None,
-        });
-    }
-    if let Some(url) = raw_str("url") {
-        return Some(ToolCall::WebFetch { url, prompt: None });
-    }
-    if let Some(query) = raw_str("searchTerm") {
-        return Some(ToolCall::WebSearch { query });
-    }
-    if let Some(pattern) = raw_str("pattern")
-        .or_else(|| raw_str("globPattern"))
-        .or_else(|| raw_str("query"))
-    {
-        return Some(ToolCall::Search {
-            pattern,
-            path: raw_str("path"),
-        });
-    }
-    if let Some(pattern) = raw_str("glob") {
-        return Some(ToolCall::Glob { pattern });
-    }
-    path.map(|path| ToolCall::ReadFile { path })
-}
-
 /// Reduce an ACP tool call (kind + title + rawInput + locations + diff
 /// content) to the typed [`ToolCall`] zeron renders. Best-effort: agents vary
 /// in how much structure they put in `rawInput`, so every arm has a fallback.
@@ -267,7 +178,6 @@ fn typed_call(update: &Value) -> ToolCall {
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
     };
-    let path = input_path(update, &raw_str);
     match kind {
         "execute" => ToolCall::Exec {
             command: raw_str("command")
@@ -276,7 +186,12 @@ fn typed_call(update: &Value) -> ToolCall {
                 .unwrap_or_default(),
         },
         "read" => ToolCall::ReadFile {
-            path: path.or_else(|| arg_from_title(&title)).unwrap_or_default(),
+            path: raw_str("path")
+                .or_else(|| raw_str("file_path"))
+                .or_else(|| raw_str("filePath"))
+                .or_else(|| first_location(update))
+                .or_else(|| arg_from_title(&title))
+                .unwrap_or_default(),
         },
         "edit" | "delete" | "move" => {
             // A diff pins down the file and shape; otherwise fall back to the
@@ -295,7 +210,11 @@ fn typed_call(update: &Value) -> ToolCall {
                     }
                 }
             } else {
-                match path {
+                match raw_str("path")
+                    .or_else(|| raw_str("file_path"))
+                    .or_else(|| raw_str("filePath"))
+                    .or_else(|| first_location(update))
+                {
                     Some(path) if kind == "edit" => ToolCall::EditFile {
                         path,
                         old_string: None,
@@ -348,6 +267,46 @@ fn typed_call(update: &Value) -> ToolCall {
                 }
             }
         }
+        // Grok's subagent spawn: name the chip — and the subagent tab it
+        // opens — after the task, matching the claude driver's "Agent: {d}"
+        // (the bare tool name says nothing in a tab strip).
+        _ if xai_tool_name(update) == Some("spawn_subagent") => ToolCall::Unknown {
+            name: raw_str("description")
+                .map(|d| format!("Agent: {d}"))
+                .unwrap_or_else(|| "Agent".into()),
+            input: raw.cloned(),
+        },
+        // opencode's subagent spawn (`task` tool — rawInput carries
+        // description/prompt/subagent_type): same naming as grok's, so the
+        // chip and its subagent tab say what the agent is doing.
+        _ if raw.is_some_and(|r| r.get("subagent_type").is_some() && r.get("prompt").is_some()) => {
+            ToolCall::Unknown {
+                name: raw_str("description")
+                    .map(|d| format!("Agent: {d}"))
+                    .unwrap_or_else(|| "Agent".into()),
+                input: raw.cloned(),
+            }
+        }
+        // Its completion drops rawInput but keeps a title (the description),
+        // which would re-type the chip to a bare Unknown and cost it the
+        // Agent icon/label. The rawOutput metadata (child + parent session
+        // ids) still marks the spawn — keep the naming.
+        _ if update
+            .get("rawOutput")
+            .and_then(|r| r.get("metadata"))
+            .is_some_and(|m| {
+                m.get("sessionId").is_some() && m.get("parentSessionId").is_some()
+            }) =>
+        {
+            ToolCall::Unknown {
+                name: if title.is_empty() {
+                    "Agent".into()
+                } else {
+                    format!("Agent: {title}")
+                },
+                input: raw.cloned(),
+            }
+        }
         _ if raw_str("_toolName").as_deref() == Some("task") => ToolCall::Unknown {
             name: raw_str("description")
                 .filter(|d| d != "Subagent task")
@@ -362,17 +321,10 @@ fn typed_call(update: &Value) -> ToolCall {
                 }),
             input: raw.cloned(),
         },
-        _ => infer_from_raw_input(update, raw, raw_str).unwrap_or_else(|| ToolCall::Unknown {
-            // Never surface ACP's catch-all kind as the chip name.
-            name: if title.is_empty() || title.eq_ignore_ascii_case("other") {
-                raw_str("_toolName")
-                    .filter(|n| !n.eq_ignore_ascii_case("other"))
-                    .unwrap_or_default()
-            } else {
-                title
-            },
+        _ => ToolCall::Unknown {
+            name: if title.is_empty() { kind.into() } else { title },
             input: raw.cloned(),
-        }),
+        },
     }
 }
 
@@ -910,99 +862,46 @@ mod tests {
         );
     }
 
-    /// pi-acp repeats `rawInput` on `tool_call_update` without `kind`/`title`.
-    /// Those updates used to type as `Unknown { name: "other" }` and clobber
-    /// the opening Read/Edit chip.
     #[test]
-    fn pi_kindless_read_raw_input_maps_to_read_file() {
+    fn opencode_task_keeps_agent_naming_across_frames() {
+        // The rawInput frame (in_progress) names the chip off the spawn args.
         let update = json!({
             "sessionUpdate": "tool_call_update",
             "toolCallId": "t1",
             "status": "in_progress",
+            "kind": "think",
+            "title": "Viz probe",
             "rawInput": {
-                "path": "crates/ui/src/popover.rs",
-                "offset": 1,
-                "limit": 460,
+                "description": "Viz probe",
+                "prompt": "run the probe",
+                "subagent_type": "general",
             },
         });
-        assert_eq!(
-            map_update(&update),
-            vec![AgentEvent::ToolCall {
-                id: "t1".into(),
-                call: ToolCall::ReadFile {
-                    path: "crates/ui/src/popover.rs".into(),
-                },
-            }]
-        );
-    }
-
-    #[test]
-    fn pi_kindless_edit_raw_input_maps_to_edit_file() {
+        assert!(matches!(
+            map_update(&update).as_slice(),
+            [AgentEvent::ToolCall { call: ToolCall::Unknown { name, .. }, .. }]
+                if name == "Agent: Viz probe"
+        ));
+        // The completion drops rawInput (title = the bare description); the
+        // rawOutput metadata still marks the spawn — naming survives.
         let update = json!({
             "sessionUpdate": "tool_call_update",
-            "toolCallId": "t2",
-            "rawInput": {
-                "path": "crates/ui/src/composer.rs",
-                "edits": [{
-                    "oldText": "slash_task: None,",
-                    "newText": "slash_task: None,\n            slash_scroll: gpui::ScrollHandle::new(),",
-                }],
+            "toolCallId": "t1",
+            "status": "completed",
+            "title": "Viz probe",
+            "content": [{"type": "content", "content": {"type": "text",
+                "text": "<task id=\"ses_c\" state=\"completed\">\n<task_result>\nfinished\n</task_result>\n</task>"}}],
+            "rawOutput": {
+                "output": "<task id=\"ses_c\" state=\"completed\">\n<task_result>\nfinished\n</task_result>\n</task>",
+                "metadata": {"parentSessionId": "ses_p", "sessionId": "ses_c"},
             },
         });
-        assert_eq!(
-            map_update(&update),
-            vec![AgentEvent::ToolCall {
-                id: "t2".into(),
-                call: ToolCall::EditFile {
-                    path: "crates/ui/src/composer.rs".into(),
-                    old_string: None,
-                    new_string: None,
-                },
-            }]
-        );
-    }
-
-    #[test]
-    fn kind_other_with_read_args_maps_to_read_file() {
-        let update = json!({
-            "sessionUpdate": "tool_call",
-            "toolCallId": "t3",
-            "title": "read",
-            "kind": "other",
-            "rawInput": {
-                "path": "crates/ui/src/pickers.rs",
-                "offset": 1680,
-                "limit": 190,
-            },
-        });
-        assert_eq!(
-            map_update(&update),
-            vec![AgentEvent::ToolCall {
-                id: "t3".into(),
-                call: ToolCall::ReadFile {
-                    path: "crates/ui/src/pickers.rs".into(),
-                },
-            }]
-        );
-    }
-
-    #[test]
-    fn kind_other_without_inferable_args_does_not_name_chip_other() {
-        let update = json!({
-            "sessionUpdate": "tool_call_update",
-            "toolCallId": "t4",
-            "kind": "other",
-            "rawInput": { "method": "notify" },
-        });
-        assert_eq!(
-            map_update(&update),
-            vec![AgentEvent::ToolCall {
-                id: "t4".into(),
-                call: ToolCall::Unknown {
-                    name: String::new(),
-                    input: Some(json!({ "method": "notify" })),
-                },
-            }]
-        );
+        assert!(matches!(
+            map_update(&update).as_slice(),
+            [
+                AgentEvent::ToolCall { call: ToolCall::Unknown { name, .. }, .. },
+                AgentEvent::ToolResult { is_error: false, .. },
+            ] if name == "Agent: Viz probe"
+        ));
     }
 }

@@ -153,6 +153,26 @@ fn tag(parent: &str, event: AgentEvent) -> AgentEvent {
     }
 }
 
+/// CLI-synthesized text that rides a user frame but is NOT conversation:
+/// `<system-reminder>` context injections and the interruption marker the CLI
+/// stamps into the transcript when a turn (or a subagent) is stopped.
+///
+/// On a TAGGED frame the distinction is load-bearing, not cosmetic. A tagged
+/// user message means "the parent steered its subagent", which announces more
+/// work and is therefore the one event allowed to resurrect a settled spawn
+/// chip. The CLI emits `[Request interrupted by user]` on the child feed
+/// immediately AFTER the subagent's `done{interrupted}` — read as a steer it
+/// un-settled a chip that nothing would ever settle again, and the spinner ran
+/// forever (2026-08-21: "orchestrator killed them but spinner doesn't stop").
+/// It announces the opposite of more work.
+///
+/// Prefix-matched: the CLI ships at least two spellings of the marker
+/// (`…by user]` and `…by user for tool use]`).
+fn is_synthetic_user_text(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("<system-reminder>") || text.starts_with("[Request interrupted")
+}
+
 /// Per-run normalization state.
 ///
 /// `saw_init` dedupes `system:init` — the CLI re-emits it every time the model
@@ -165,6 +185,19 @@ fn tag(parent: &str, event: AgentEvent) -> AgentEvent {
 /// resume turns them into the done→Working→done wake.
 pub(crate) struct Normalizer {
     saw_init: bool,
+    /// Background-agent ids (`task_started.task_id`) → the spawning Agent
+    /// tool_use id. `SendMessage` steers address the AGENT id; this map
+    /// re-keys them onto the spawn chip's feed (the wire never echoes the
+    /// steer on the child feed — live-verified 2.1.228).
+    agent_tasks: std::collections::HashMap<String, String>,
+    /// tool_use ids of Agent/Task spawn calls, recorded from their own
+    /// assistant frames (plus `task_started`'s agent-task pairing). Gates
+    /// `task_notification`: background SHELL tasks settle through the same
+    /// subtype carrying their Bash call's id, and tagging that Done as
+    /// subagent traffic stamped a spawn ref onto an ordinary Run chip —
+    /// which then opened as an empty, never-created subagent doc (user
+    /// report 2026-08-20).
+    agent_spawn_tools: std::collections::HashSet<String>,
     /// Rotates at each assistant-frame close and at each steer; SessionStarted
     /// carries the first value so folds can attribute deltas from the start.
     assistant_message_id: String,
@@ -176,6 +209,8 @@ impl Normalizer {
     pub fn new() -> Self {
         Self {
             saw_init: false,
+            agent_tasks: std::collections::HashMap::new(),
+            agent_spawn_tools: std::collections::HashSet::new(),
             assistant_message_id: new_message_id(),
             session_id: None,
         }
@@ -203,6 +238,16 @@ impl Normalizer {
                     let Some(parent) = f.tool_use_id.as_deref().filter(|t| !t.is_empty()) else {
                         return Vec::new();
                     };
+                    // Only a KNOWN spawn settles as a subagent. Background
+                    // SHELL tasks (`Bash` with `run_in_background`) settle
+                    // through this same subtype carrying the Bash call's id —
+                    // tagging that Done would bind a subagent ref onto an
+                    // ordinary Run chip. A real spawn's tool_use frame always
+                    // precedes its notification on the wire, so the set is
+                    // populated by the time a genuine one arrives.
+                    if !self.agent_spawn_tools.contains(parent) {
+                        return Vec::new();
+                    }
                     let status = match f.status.as_deref().unwrap_or("") {
                         "completed" | "complete" | "succeeded" | "success" => DoneStatus::Completed,
                         "failed" | "errored" | "error" => DoneStatus::Errored,
@@ -221,6 +266,20 @@ impl Normalizer {
                             session_id: None,
                         },
                     )];
+                }
+                // An AGENT task starting (subagent_type present — subagent-
+                // owned shell tasks carry the same subtype without it):
+                // record agentId → spawn id for SendMessage steer re-keying.
+                if f.subtype == "task_started"
+                    && f.subagent_type.is_some()
+                    && let (Some(task), Some(tool)) = (
+                        f.task_id.as_deref().filter(|t| !t.is_empty()),
+                        f.tool_use_id.as_deref().filter(|t| !t.is_empty()),
+                    )
+                {
+                    self.agent_tasks.insert(task.to_owned(), tool.to_owned());
+                    self.agent_spawn_tools.insert(tool.to_owned());
+                    return Vec::new();
                 }
                 if f.subtype != "init" || self.saw_init {
                     return Vec::new();
@@ -324,13 +383,64 @@ impl Normalizer {
                     }
                     return out;
                 }
+                // Record spawn tool ids up front: `task_notification` keys on
+                // them, and only foreground spawns ever get a `task_started`.
+                for b in f.message.blocks() {
+                    if b.kind == "tool_use" && matches!(b.name.as_str(), "Agent" | "Task") {
+                        self.agent_spawn_tools.insert(b.id.clone());
+                    }
+                }
                 let mut out: Vec<AgentEvent> = f
                     .message
                     .blocks()
                     .filter(|b: &ContentBlock| b.kind == "tool_use")
-                    .map(|b| AgentEvent::ToolCall {
-                        id: b.id.clone(),
-                        call: decode_tool_use(&b.name, &b.input),
+                    .flat_map(|b| {
+                        let call = AgentEvent::ToolCall {
+                            id: b.id.clone(),
+                            call: decode_tool_use(&b.name, &b.input),
+                        };
+                        // A spawn's `prompt` is the subagent's opening user
+                        // message — the wire never echoes it on the child
+                        // feed (child user frames carry tool results and
+                        // steers only), so seed it here and the subagent
+                        // transcript starts the way every chat does.
+                        let opening = matches!(b.name.as_str(), "Agent" | "Task")
+                            .then(|| b.input.get("prompt"))
+                            .flatten()
+                            .and_then(Value::as_str)
+                            .filter(|p| !p.trim().is_empty())
+                            .map(|prompt| {
+                                tag(
+                                    &b.id,
+                                    AgentEvent::UserMessage {
+                                        text: prompt.to_owned(),
+                                    },
+                                )
+                            });
+                        // A SendMessage steer never echoes on the child feed
+                        // (live-verified) — surface it from the parent's own
+                        // call, re-keyed onto the spawn it addresses.
+                        let steer = (b.name == "SendMessage")
+                            .then(|| {
+                                let to = ["to", "recipient"]
+                                    .iter()
+                                    .find_map(|k| b.input.get(*k))
+                                    .and_then(Value::as_str)?;
+                                let spawn = self.agent_tasks.get(to)?;
+                                let text = ["message", "content"]
+                                    .iter()
+                                    .find_map(|k| b.input.get(*k))
+                                    .and_then(Value::as_str)
+                                    .filter(|m| !m.trim().is_empty())?;
+                                Some(tag(
+                                    spawn,
+                                    AgentEvent::UserMessage {
+                                        text: text.to_owned(),
+                                    },
+                                ))
+                            })
+                            .flatten();
+                        std::iter::once(call).chain(opening).chain(steer)
                     })
                     .collect();
                 // A failed turn (usage limit, billing, auth, overloaded, …)
@@ -354,7 +464,7 @@ impl Normalizer {
                 if let Some(parent) = &f.parent_tool_use_id {
                     // A subagent's tool results echo on the main channel too;
                     // they belong to its transcript, attributed like its calls.
-                    return f
+                    let mut out: Vec<AgentEvent> = f
                         .message
                         .blocks()
                         .filter(|b: &ContentBlock| b.kind == "tool_result")
@@ -370,6 +480,22 @@ impl Normalizer {
                             )
                         })
                         .collect();
+                    // A tagged user frame's TEXT blocks are the parent
+                    // steering its subagent (SendMessage-style follow-ups —
+                    // tool results ride their own blocks, filtered above).
+                    // Synthetic harness injections are not conversation, and
+                    // must not read as a steer — see [`is_synthetic_user_text`].
+                    out.extend(
+                        f.message
+                            .blocks()
+                            .filter(|b: &ContentBlock| {
+                                b.kind == "text"
+                                    && !b.text.trim().is_empty()
+                                    && !is_synthetic_user_text(&b.text)
+                            })
+                            .map(|b| tag(parent, AgentEvent::UserMessage { text: b.text })),
+                    );
+                    return out;
                 }
                 f.message
                     .blocks()
@@ -641,26 +767,190 @@ mod tests {
     }
 
     #[test]
-    fn task_notification_settles_the_subagent_with_a_tagged_done() {
-        // The wire's ONLY terminal signal for a background subagent
-        // (live-verified 2.1.228): an untagged system frame carrying the
-        // spawning tool's id. Shape from the captured fixture.
+    fn spawn_prompt_seeds_the_subagent_opening_user_message() {
+        // The wire never echoes a Task's prompt on the child feed, so the
+        // spawn itself seeds the subagent's opening user entry.
         let ev = normalize_one(
-            r#"{"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"toolu_agent","status":"completed","summary":"DONE."}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_sub","name":"Task","input":{"description":"probe","prompt":"scan the fold path"}}]}}"#,
+        );
+        assert!(matches!(
+            &ev[..],
+            [
+                AgentEvent::ToolCall { id, .. },
+                AgentEvent::Subagent { parent_tool_use_id, event },
+                AgentEvent::AssistantMessageCompleted { .. },
+            ] if id == "toolu_sub"
+                && parent_tool_use_id == "toolu_sub"
+                && matches!(event.as_ref(), AgentEvent::UserMessage { text } if text == "scan the fold path")
+        ));
+        // No prompt → no synthetic opening; ordinary tools never spawn one.
+        for frame in [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Task","input":{"description":"probe"}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"ls","prompt":"red herring"}}]}}"#,
+        ] {
+            let ev = normalize_one(frame);
+            assert!(
+                !ev.iter().any(|e| matches!(e, AgentEvent::Subagent { .. })),
+                "{frame}: {ev:?}"
+            );
+        }
+    }
+
+    /// Killing a subagent puts `done{interrupted}` on the child feed and then
+    /// an interruption MARKER as a tagged user frame. Read as a steer, that
+    /// marker resurrects the spawn chip the `done` just settled — and nothing
+    /// ever settles it again, so the chip spins forever. It is CLI
+    /// bookkeeping, filtered like a `<system-reminder>`; a real steer on the
+    /// same frame shape still gets through.
+    #[test]
+    fn the_interruption_marker_is_not_a_steer() {
+        for marker in [
+            "[Request interrupted by user]",
+            "[Request interrupted by user for tool use]",
+        ] {
+            let frame = format!(
+                r#"{{"type":"user","parent_tool_use_id":"toolu_spawn","message":{{"content":[{{"type":"text","text":"{marker}"}}]}}}}"#
+            );
+            assert!(
+                !normalize_one(&frame)
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Subagent { .. })),
+                "{marker} leaked as a steer"
+            );
+        }
+        // A genuine steer on the very same frame shape still arrives.
+        let real = r#"{"type":"user","parent_tool_use_id":"toolu_spawn","message":{"content":[{"type":"text","text":"Keep going."}]}}"#;
+        assert!(
+            normalize_one(real).iter().any(|e| matches!(
+                e,
+                AgentEvent::Subagent { parent_tool_use_id, event }
+                    if parent_tool_use_id == "toolu_spawn"
+                        && matches!(event.as_ref(), AgentEvent::UserMessage { text } if text == "Keep going.")
+            )),
+            "a real steer must still reach the subagent"
+        );
+    }
+
+    #[test]
+    fn send_message_steers_rekey_onto_the_spawn_feed() {
+        // Live 2.1.228: the steer NEVER echoes on the child feed; the only
+        // wire evidence is the parent's SendMessage call addressed to the
+        // agent id that task_started paired with the spawn tool id.
+        let mut norm = Normalizer::new();
+        let started = crate::claude::wire::parse_frame(
+            r#"{"type":"system","subtype":"task_started","task_id":"a20b2336","tool_use_id":"toolu_spawn","subagent_type":"general-purpose","prompt":"p","description":"d"}"#,
+        )
+        .expect("parses");
+        assert!(norm.normalize(started, false).is_empty());
+        let send = crate::claude::wire::parse_frame(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_send","name":"SendMessage","input":{"to":"a20b2336","message":"Also read the rebuild.","summary":"s"}}]}}"#,
+        )
+        .expect("parses");
+        let ev = norm.normalize(send, false);
+        assert!(
+            ev.iter().any(|e| matches!(
+                e,
+                AgentEvent::Subagent { parent_tool_use_id, event }
+                    if parent_tool_use_id == "toolu_spawn"
+                        && matches!(event.as_ref(), AgentEvent::UserMessage { text } if text == "Also read the rebuild.")
+            )),
+            "{ev:?}"
+        );
+        // Unknown recipient (no task_started seen) or a subagent-owned shell
+        // task's task_started: no steer synthesized.
+        let mut norm = Normalizer::new();
+        let shell_task = crate::claude::wire::parse_frame(
+            r#"{"type":"system","subtype":"task_started","task_id":"bg1","tool_use_id":"toolu_bash","task_type":"local_bash"}"#,
+        )
+        .expect("parses");
+        assert!(norm.normalize(shell_task, false).is_empty());
+        let send = crate::claude::wire::parse_frame(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"SendMessage","input":{"to":"bg1","message":"x"}}]}}"#,
+        )
+        .expect("parses");
+        assert!(
+            !norm
+                .normalize(send, false)
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Subagent { .. }))
+        );
+    }
+
+    #[test]
+    fn tagged_user_text_becomes_a_subagent_steer() {
+        // A tagged user frame's TEXT block is the parent steering its
+        // subagent — forwarded as a tagged UserMessage so the subagent doc
+        // grows a user entry.
+        let ev = normalize_one(
+            r#"{"type":"user","parent_tool_use_id":"toolu_sub","message":{"content":[{"type":"text","text":"Also check the rebuild path."}]}}"#,
         );
         assert_eq!(
             ev,
             vec![AgentEvent::Subagent {
-                parent_tool_use_id: "toolu_agent".into(),
-                event: Box::new(AgentEvent::Done {
-                    status: DoneStatus::Completed,
-                    result: None,
-                    error: None,
-                    session_id: None,
+                parent_tool_use_id: "toolu_sub".into(),
+                event: Box::new(AgentEvent::UserMessage {
+                    text: "Also check the rebuild path.".into(),
                 }),
             }]
         );
+        // Synthetic harness injections are not conversation, and blank text
+        // is noise; an UNTAGGED user text frame is not a steer at all (the
+        // parent chat's user messages come from doc commands).
+        for frame in [
+            r#"{"type":"user","parent_tool_use_id":"toolu_sub","message":{"content":[{"type":"text","text":"<system-reminder>tick</system-reminder>"}]}}"#,
+            r#"{"type":"user","parent_tool_use_id":"toolu_sub","message":{"content":[{"type":"text","text":"   "}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"typed into the parent"}]}}"#,
+        ] {
+            assert_eq!(normalize_one(frame), Vec::new(), "frame: {frame}");
+        }
+        // Mixed frames keep both: the tool result AND the steer text.
         let ev = normalize_one(
+            r#"{"type":"user","parent_tool_use_id":"toolu_sub","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false},{"type":"text","text":"Keep going."}]}}"#,
+        );
+        assert!(matches!(
+            &ev[..],
+            [
+                AgentEvent::Subagent { event: first, .. },
+                AgentEvent::Subagent { event: second, .. },
+            ] if matches!(first.as_ref(), AgentEvent::ToolResult { .. })
+                && matches!(second.as_ref(), AgentEvent::UserMessage { text } if text == "Keep going.")
+        ));
+    }
+
+    #[test]
+    fn task_notification_settles_the_subagent_with_a_tagged_done() {
+        // The wire's ONLY terminal signal for a background subagent
+        // (live-verified 2.1.228): an untagged system frame carrying the
+        // spawning tool's id. Shape from the captured fixture. The spawn's
+        // own tool_use frame always precedes it — that's what marks the id
+        // as an AGENT task (shell tasks share the subtype).
+        let spawn = |norm: &mut Normalizer| {
+            let frame = crate::claude::wire::parse_frame(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_agent","name":"Agent","input":{"description":"probe"}}]}}"#,
+            )
+            .expect("parses");
+            norm.normalize(frame, false);
+        };
+        let notify = |norm: &mut Normalizer, raw: &str| {
+            let frame = crate::claude::wire::parse_frame(raw).expect("parses");
+            norm.normalize(frame, false)
+        };
+        let mut norm = Normalizer::new();
+        spawn(&mut norm);
+        let ev = notify(
+            &mut norm,
+            r#"{"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"toolu_agent","status":"completed","summary":"DONE."}"#,
+        );
+        assert!(matches!(
+            &ev[..],
+            [AgentEvent::Subagent { parent_tool_use_id, event }]
+                if parent_tool_use_id == "toolu_agent"
+                    && matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Completed, .. })
+        ));
+        let mut norm = Normalizer::new();
+        spawn(&mut norm);
+        let ev = notify(
+            &mut norm,
             r#"{"type":"system","subtype":"task_notification","tool_use_id":"toolu_agent","status":"failed"}"#,
         );
         assert!(matches!(
@@ -669,7 +959,10 @@ mod tests {
                 if matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Errored, .. })
         ));
         // Non-terminal or id-less notifications close nothing.
-        assert!(normalize_one(
+        let mut norm = Normalizer::new();
+        spawn(&mut norm);
+        assert!(notify(
+            &mut norm,
             r#"{"type":"system","subtype":"task_notification","tool_use_id":"toolu_agent","status":"running"}"#,
         )
         .is_empty());
@@ -679,6 +972,30 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn shell_task_notification_never_settles_a_subagent() {
+        // `Bash` with `run_in_background` settles through the SAME
+        // `task_notification` subtype, carrying the Bash call's own id.
+        // Tagging that Done bound a subagent ref onto an ordinary Run chip,
+        // which then rendered as a spawn chip opening an empty, never-created
+        // subagent doc (user report 2026-08-20).
+        let mut norm = Normalizer::new();
+        for raw in [
+            // The shell task's start is already unmapped (no subagent_type)…
+            r#"{"type":"system","subtype":"task_started","task_id":"bg1","tool_use_id":"toolu_bash","task_type":"local_bash"}"#,
+            // …and the Bash call itself must not mark the id as a spawn.
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"git clone …","run_in_background":true}}]}}"#,
+        ] {
+            let frame = crate::claude::wire::parse_frame(raw).expect("parses");
+            norm.normalize(frame, false);
+        }
+        let done = crate::claude::wire::parse_frame(
+            r#"{"type":"system","subtype":"task_notification","task_id":"bg1","tool_use_id":"toolu_bash","status":"completed"}"#,
+        )
+        .expect("parses");
+        assert!(norm.normalize(done, false).is_empty());
     }
 
     #[test]

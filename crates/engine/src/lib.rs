@@ -17,6 +17,7 @@ use zeron_sync::DocsStore;
 
 pub mod agent_accounts;
 pub mod auth;
+pub mod change_requests;
 pub mod chat2_host;
 pub mod diff_sync;
 pub mod doc_host;
@@ -28,6 +29,7 @@ pub mod repos;
 pub mod rpc;
 pub mod run_journal;
 pub mod sessions;
+pub mod source_control;
 pub mod spaces;
 pub mod studio;
 pub mod studio_credentials;
@@ -40,6 +42,7 @@ pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
+pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
 pub use diff_sync::{
     CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
     capture_commit_diff, capture_diff, capture_diff_against, capture_turn_diff, merge_base,
@@ -53,6 +56,11 @@ pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
 pub use rpc::EngineRpc;
 pub use run_journal::{JournalError, RunJournal};
 pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
+pub use source_control::{
+    BranchHeadContext, ChangeRequestError, ChangeRequestProvider, ChangeRequestResolution,
+    ChangeRequestResolver, CheckoutChangeRequestLookup, CheckoutSourceContext, GitHubCli,
+    GitRemote, parse_git_remote,
+};
 pub use spaces::SpacesSync;
 pub use studio::{
     ArtifactStore, CompleteRun, StudioAttemptCheck, StudioProviderDescriptor,
@@ -132,6 +140,7 @@ pub struct EngineCore {
     pub registry: Arc<HarnessRegistry>,
     pub repos: Repos,
     pub terminals: Terminals,
+    pub change_requests: CheckoutChangeRequests,
     pub diff_sync: CheckoutDiffSync,
     pub spaces_sync: SpacesSync,
     pub uploads: Uploads,
@@ -255,6 +264,8 @@ impl EngineCore {
         sessions.rehydrate_queued_turns();
         doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
         let repos = Repos::new(data_dir, &device_id);
+        doc_host.set_repos(repos.clone());
+        let change_requests = CheckoutChangeRequests::start(repos.clone(), &device_id);
         let terminals = Terminals::new();
         let uploads = Uploads::from_root_with_fallback(
             profile.uploads_root(),
@@ -269,6 +280,9 @@ impl EngineCore {
         {
             uploads.add_read_only_root(&root);
         }
+        // Queued-attachment support: the doc host resolves `pending://` refs
+        // against this store and pushes staged bytes to remote hosts.
+        doc_host.set_uploads(uploads.clone());
         let local_import = (profile.scope() == WorkspaceScope::Synced).then(|| {
             local_import::LocalImporter::new(
                 data_dir,
@@ -321,6 +335,7 @@ impl EngineCore {
             registry,
             repos,
             terminals,
+            change_requests,
             diff_sync,
             spaces_sync,
             uploads,
@@ -410,8 +425,10 @@ impl EngineCore {
         .clone()
     }
 
-    /// Attach the peer link cache — enables `targetDeviceId` routing and [`Self::dial_device`].
+    /// Attach the peer link cache — enables `targetDeviceId` routing,
+    /// [`Self::dial_device`], and the doc host's queued-attachment transfers.
     pub fn set_links(&self, links: Arc<zeron_rpc::LinkCache>) {
+        self.doc_host.set_links(links.clone());
         *self
             .links
             .lock()
@@ -491,6 +508,7 @@ impl EngineCore {
             self.registry.clone(),
             self.repos.clone(),
             self.terminals.clone(),
+            self.change_requests.clone(),
             self.diff_sync.clone(),
             self.uploads.clone(),
             self.agent_accounts.clone(),
@@ -530,6 +548,7 @@ impl EngineCore {
         self.sessions.shutdown().await;
         self.terminals.shutdown();
         self.agent_accounts.shutdown();
+        self.change_requests.shutdown();
         // Cancel + await every worker that can reach Edge before flushing: a
         // replaced synced runtime must not keep polling releases or draining
         // the attachment outbox under the old identity after Local boots.
@@ -846,6 +865,13 @@ impl Engine {
                 .as_deref()
                 .is_some_and(|token| !token.trim().is_empty()),
         };
+        if edge_enabled {
+            // OS network-path events (macOS NWPathMonitor): the instant the
+            // path returns every parked reconnect backoff redials, and while
+            // the OS says there is no path the dial loops park instead of
+            // burning attempts. No-op on platforms without a monitor.
+            zeron_sync::net_path::spawn_path_monitor();
+        }
         let device_id = load_or_create_device_id(profile.device_root())?;
         let edge = edge_enabled.then(|| {
             EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())).with_device(device_id)
@@ -899,10 +925,16 @@ impl Engine {
         core.prefetch_studio_catalogs();
 
         let host_relay = edge.as_ref().map(|edge| {
-            let links = zeron_rpc::LinkCache::new(zeron_rpc::LinkCacheConfig::new(
-                edge.url.clone(),
-                Arc::new(auth.clone()),
-            ));
+            let mut link_config =
+                zeron_rpc::LinkCacheConfig::new(edge.url.clone(), Arc::new(auth.clone()));
+            // Registry-dark dial gate: devices with no recent presence fail
+            // fast with zero dials; presence returning un-parks them (the
+            // peer-alive hook below clears any cooldown at the same moment).
+            let workspace_for_liveness = core.workspace.clone();
+            link_config.liveness = Some(Arc::new(move |device_id: &str| {
+                workspace_for_liveness.peer_liveness(device_id)
+            }));
+            let links = zeron_rpc::LinkCache::new(link_config);
             let links_for_presence = links.clone();
             core.workspace
                 .set_peer_alive_hook(Arc::new(move |device_id: &str| {

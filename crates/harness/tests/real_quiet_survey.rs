@@ -5,9 +5,8 @@
 //!   SURVEY_RUNS=3 cargo test -p zeron-harness --test real_quiet_survey -- --ignored --nocapture
 //!
 //! No env knob is set here — this binary runs the DEFAULTS the app ships:
-//! Claude, Codex, Grok, and Pi exempt from the blanket settle, every other
-//! adapter on the 30s window. For each installed+authenticated agent CLI it
-//! reports, per run:
+//! Claude exempt from the blanket settle, every other adapter on the 30s
+//! window. For each installed+authenticated agent CLI it reports, per run:
 //! the Done count, content events after the first Done (orphan signature),
 //! and the maximum inter-event silent gap — the safety margin against the
 //! window. Uninstalled/unauthenticated agents are skipped by name.
@@ -15,10 +14,9 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
-use zeron_harness::{AcpHarness, CancellationToken, Harness, PiHarness, RunControls, SteerMessage};
+use zeron_harness::{AcpHarness, CancellationToken, Harness, RunControls, SteerMessage};
 use zeron_proto::{
     AgentEvent, DoneStatus, RunRequest, SandboxLevel, UserInputAnswer, UserInputQuestion,
 };
@@ -55,7 +53,7 @@ struct ProbeOutcome {
     started_err: Option<String>,
 }
 
-async fn probe_once(harness: Arc<dyn Harness>) -> ProbeOutcome {
+async fn probe_once(harness: AcpHarness) -> ProbeOutcome {
     let (controls, steer_tx, _token) = controls();
     let req = RunRequest {
         prompt: "Use your shell tool to run `echo probe-one`. After you see its output, \
@@ -70,6 +68,7 @@ async fn probe_once(harness: Arc<dyn Harness>) -> ProbeOutcome {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
+        worktree: None,
         resume: None,
     };
     let mut stream = match harness.run(req, controls).await {
@@ -200,10 +199,11 @@ async fn real_all_harnesses_quiet_survey() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
-    let agents: Vec<(&str, fn() -> Arc<dyn Harness>)> = vec![
-        ("grok", || Arc::new(AcpHarness::grok())),
-        ("hermes", || Arc::new(AcpHarness::hermes())),
-        ("pi", || Arc::new(PiHarness::new())),
+    let agents: Vec<(&str, fn() -> AcpHarness)> = vec![
+        ("grok", AcpHarness::grok),
+        ("hermes", AcpHarness::hermes),
+        ("pi", AcpHarness::pi),
+        ("opencode", AcpHarness::opencode),
     ];
     let mut failures: Vec<String> = Vec::new();
     for (name, ctor) in agents {

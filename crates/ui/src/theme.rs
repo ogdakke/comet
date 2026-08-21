@@ -508,6 +508,11 @@ impl Theme {
         self.glass().a < 1.0
     }
 
+    /// Whether this platform can render frosted surfaces for the active theme.
+    pub fn is_frost(&self) -> bool {
+        cfg!(any(target_os = "macos", target_os = "linux")) && self.is_glass()
+    }
+
     /// Hover wash for chrome that sits ON GLASS (sidebar rows, tabs, titlebar
     /// buttons). One recipe, both appearances: the 11% [`wash`], tone-flipped
     /// by the palette convention (soft-white on dark, soft-black on light).

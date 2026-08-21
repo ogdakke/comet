@@ -349,6 +349,7 @@ mod tests {
             sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
             auto_approve: false,
             attachments: Vec::new(),
+            worktree: None,
             resume: None,
         }
     }
