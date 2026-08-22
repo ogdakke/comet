@@ -13,6 +13,8 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_os = "macos"))]
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use uuid::Uuid;
 use zeron_proto::{ProviderValidationState, StudioProviderConnection};
