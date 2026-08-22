@@ -40,7 +40,7 @@ const ASSET_INPUT_REJECTED: &str =
     "studio asset inputs are only accepted for video roles and ImageEdit masks";
 const MAX_CREATE_TURN_RUNS: usize = 16;
 const MAX_TURN_RUNS: usize = 64;
-pub(crate) const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+pub const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const STUDIO_CATALOG_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const ARTIFACT_READ_CHUNK_BYTES: u64 = 192_000;
 const CONVERSATION_SELECT: &str = "\
@@ -484,7 +484,7 @@ impl StudioStore {
     /// The caller decides when this is safe. StudioSync calls it only when the
     /// remote is absent or proven empty, so an old local catalog can never
     /// mask a snapshot another device already pushed.
-    pub(crate) fn import_legacy_local_snapshot(
+    pub fn import_legacy_local_snapshot(
         &self,
         source_studio_root: &Path,
     ) -> Result<bool, StudioStoreError> {
@@ -528,7 +528,7 @@ impl StudioStore {
     /// Whether a verified snapshot database contains any durable Studio rows.
     /// This lets the one-off local migration distinguish an old empty remote
     /// seed from a real catalog without guessing from database byte size.
-    pub(crate) fn snapshot_has_sync_content(database: &Path) -> Result<bool, StudioStoreError> {
+    pub fn snapshot_has_sync_content(database: &Path) -> Result<bool, StudioStoreError> {
         let connection = Connection::open(database)?;
         let has_rows: i64 = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM studio_conversations) \

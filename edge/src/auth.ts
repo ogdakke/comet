@@ -52,7 +52,10 @@ export const verifyToken = async (env: Env, token: string): Promise<Verified | u
   } catch {
     return undefined;
   }
-  const issuer = env.WORKOS_ISSUER ?? `https://api.workos.com/user_management/${clientId}`;
+  // AuthKit access tokens use the WorkOS API origin as their standard issuer.
+  // A private deployment may still provide WORKOS_ISSUER for a custom AuthKit
+  // domain, but deriving an issuer from the client ID rejects normal tokens.
+  const issuer = env.WORKOS_ISSUER ?? "https://api.workos.com";
   const jwksUrl = env.WORKOS_JWKS_URL ?? `https://api.workos.com/sso/jwks/${clientId}`;
   try {
     const { payload } = await jwtVerify(token, getJwks(jwksUrl), { issuer });

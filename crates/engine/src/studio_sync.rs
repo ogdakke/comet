@@ -101,9 +101,6 @@ pub struct StudioSync {
     org_id: String,
     device_id: String,
     http: reqwest::Client,
-    /// Old local-profile Studio root. Used exactly once, and only when this
-    /// account has no remote Studio manifest yet.
-    legacy_local_studio: Option<PathBuf>,
 }
 
 impl StudioSync {
@@ -119,13 +116,7 @@ impl StudioSync {
             org_id: org_id.into(),
             device_id: device_id.into(),
             http: reqwest::Client::new(),
-            legacy_local_studio: None,
         }
-    }
-
-    pub fn with_legacy_local_studio(mut self, source: impl Into<PathBuf>) -> Self {
-        self.legacy_local_studio = Some(source.into());
-        self
     }
 
     /// Download a newer remote snapshot into a private same-volume staging
@@ -133,28 +124,10 @@ impl StudioSync {
     pub async fn pull(&self) -> Result<StudioSyncOutcome, StudioSyncError> {
         let envelope = self.fetch_manifest().await?;
         let Some(manifest) = envelope.manifest else {
-            self.import_legacy_local_if_needed().await?;
             return Ok(StudioSyncOutcome::NoRemoteSnapshot);
         };
         validate_manifest(&manifest)?;
         let state = self.read_state().await?;
-        // A short-lived pre-migration build may have seeded R2 with an empty
-        // Studio database before it knew how to carry `profiles/local/studio`.
-        // Detect that exact case by reading the verified remote database, then
-        // import the old catalog. Any real remote row or media file wins and is
-        // pulled normally instead.
-        if self
-            .should_replace_empty_remote_with_legacy(&manifest, state.as_ref())
-            .await?
-            && self.import_legacy_local_if_needed().await?
-        {
-            self.write_state(&LocalState {
-                generation: envelope.generation,
-                manifest,
-            })
-            .await?;
-            return Ok(StudioSyncOutcome::NoRemoteSnapshot);
-        }
         if state
             .as_ref()
             .is_some_and(|state| state.generation == envelope.generation)
@@ -221,6 +194,58 @@ impl StudioSync {
         // failed partial download) is always disposable.
         let _ = tokio::fs::remove_dir_all(&stage).await;
         result
+    }
+
+    /// Explicitly copy an old local-profile Studio catalog into the current
+    /// signed-in profile, then publish it. This never runs during boot: the
+    /// operator must name the source (or accept the CLI default), and the
+    /// remote profile must be absent or provably empty.
+    pub async fn import_local_catalog(
+        &self,
+        source: &Path,
+    ) -> Result<StudioSyncOutcome, StudioSyncError> {
+        if self.store.has_sync_content()? {
+            return Err(StudioSyncError::Protocol(
+                "the signed-in Studio profile already has local content".into(),
+            ));
+        }
+        let current = self.fetch_manifest().await?;
+        if let Some(manifest) = current.manifest {
+            validate_manifest(&manifest)?;
+            if !self.remote_manifest_is_empty(&manifest).await? {
+                return Err(StudioSyncError::Conflict {
+                    generation: current.generation,
+                });
+            }
+            // `publish` uses the saved generation as its CAS precondition.
+            // Record the known-empty remote first so it cannot overwrite an
+            // intervening real publication.
+            self.write_state(&LocalState {
+                generation: current.generation,
+                manifest,
+            })
+            .await?;
+        } else if current.generation != 0 {
+            return Err(StudioSyncError::Protocol(
+                "Studio manifest is missing at a nonzero generation".into(),
+            ));
+        }
+
+        let store = self.store.clone();
+        let source = source.to_path_buf();
+        let imported = tokio::task::spawn_blocking(move || {
+            store.import_legacy_local_snapshot(&source)
+        })
+        .await
+        .map_err(|error| {
+            StudioSyncError::Protocol(format!("local Studio importer panicked: {error}"))
+        })??;
+        if !imported {
+            return Err(StudioSyncError::Protocol(
+                "source Studio catalog is missing or the signed-in profile changed".into(),
+            ));
+        }
+        self.publish().await
     }
 
     /// Snapshot local Studio state, upload only missing immutable objects, then
@@ -351,38 +376,8 @@ impl StudioSync {
         Ok(same_content(&actual, expected))
     }
 
-    async fn import_legacy_local_if_needed(&self) -> Result<bool, StudioSyncError> {
-        let Some(source) = self.legacy_local_studio.clone() else {
-            return Ok(false);
-        };
-        if self.store.has_sync_content()? {
-            return Ok(false);
-        }
-        let store = self.store.clone();
-        let source_for_import = source.clone();
-        let imported = tokio::task::spawn_blocking(move || {
-            store.import_legacy_local_snapshot(&source_for_import)
-        })
-        .await
-        .map_err(|error| {
-            StudioSyncError::Protocol(format!("legacy Studio importer panicked: {error}"))
-        })??;
-        if imported {
-            tracing::info!(source = %source.display(), "imported local Studio catalog before first sync publish");
-        }
-        Ok(imported)
-    }
-
-    async fn should_replace_empty_remote_with_legacy(
-        &self,
-        manifest: &Manifest,
-        state: Option<&LocalState>,
-    ) -> Result<bool, StudioSyncError> {
-        if state.is_some()
-            || self.legacy_local_studio.is_none()
-            || self.store.has_sync_content()?
-            || !manifest.files.is_empty()
-        {
+    async fn remote_manifest_is_empty(&self, manifest: &Manifest) -> Result<bool, StudioSyncError> {
+        if !manifest.files.is_empty() {
             return Ok(false);
         }
         let stage = self.stage_path("legacy-check");

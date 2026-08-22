@@ -127,3 +127,18 @@ older manifest might still be installed on another device.
 - UI/iOS: consumes the existing Studio watch data. A later status surface can
   show pending upload or conflict, but no generic deployment setup UI is
   introduced.
+
+## One-time local import
+
+Zeron does not automatically promote `profiles/local/studio` when a device
+signs in. Import explicitly after signing in to the intended personal account:
+
+```sh
+zeron studio import-local
+```
+
+The command uses the active runtime's `profiles/local/studio` by default. Use
+`--source /path/to/studio` only when intentionally moving another catalog. It
+refuses to run while the engine is active, and refuses if either the signed-in
+profile or remote Studio manifest has real content. A successful import copies
+the source without changing it, then publishes the snapshot.

@@ -59,7 +59,7 @@ pub fn install(data_dir: &Path) -> anyhow::Result<()> {
     } else if cfg!(target_os = "linux") {
         let unit = systemd_unit_path()?;
         std::fs::create_dir_all(unit.parent().expect("systemd user dir"))?;
-        std::fs::write(&unit, render_systemd_unit(&exe, &env))?;
+        std::fs::write(&unit, render_systemd_unit(&exe, &env, data_dir))?;
         run("systemctl", &["--user", "daemon-reload"])?;
         run("systemctl", &["--user", "enable", "--now", SYSTEMD_UNIT])?;
         println!("Installed and started {SYSTEMD_UNIT} ({}).", unit.display());
@@ -232,7 +232,7 @@ fn captured_env() -> Vec<(String, String)> {
         .collect()
 }
 
-fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
+fn render_systemd_unit(exe: &Path, env: &[(String, String)], data_dir: &Path) -> String {
     let mut unit = String::from(
         "[Unit]\nDescription=Zeron headless engine\nAfter=network-online.target\nStartLimitIntervalSec=60\nStartLimitBurst=5\n\n[Service]\n",
     );
@@ -242,8 +242,9 @@ fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
         unit.push_str(&format!("Environment=\"{key}={value}\"\n"));
     }
     unit.push_str(&format!(
-        "ExecStart={} headless\nRestart=on-failure\nRestartSec=5\nEnvironmentFile=-%h/.zeron/env\n\n[Install]\nWantedBy=default.target\n",
-        systemd_exec_path(exe)
+        "ExecStart={} headless\nRestart=on-failure\nRestartSec=5\nEnvironmentFile=-{}\n\n[Install]\nWantedBy=default.target\n",
+        systemd_exec_path(exe),
+        data_dir.join("env").display()
     ));
     unit
 }
@@ -394,6 +395,7 @@ mod tests {
                 ("ZERON_EDGE_URL".into(), "https://edge.example".into()),
                 ("RUST_LOG".into(), "info,zeron=\"debug\"".into()),
             ],
+            Path::new("/home/u/.zeron-dev"),
         );
         assert!(unit.contains("ExecStart=/usr/local/bin/zeron headless\n"));
         assert!(unit.contains("Environment=\"PATH=/usr/bin:/bin\"\n"));
@@ -405,7 +407,7 @@ mod tests {
         assert!(unit.contains("Restart=on-failure"));
         assert!(!unit.contains("session.json"));
         assert!(!unit.contains("ConditionPathExists"));
-        assert!(unit.contains("EnvironmentFile=-%h/.zeron/env"));
+        assert!(unit.contains("EnvironmentFile=-/home/u/.zeron-dev/env"));
         assert!(unit.contains("WantedBy=default.target"));
     }
 
