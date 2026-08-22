@@ -311,12 +311,10 @@ impl EngineCore {
         let studio_sync = (profile.scope() == WorkspaceScope::Synced)
             .then(|| {
                 edge.clone().map(|edge| {
-                    StudioSync::new(
-                        studio.clone(),
-                        edge,
-                        profile.org_id(),
-                        device_id.clone(),
-                    )
+                    StudioSync::new(studio.clone(), edge, profile.org_id(), device_id.clone())
+                        .with_legacy_local_studio(
+                            data_dir.join("profiles").join("local").join("studio"),
+                        )
                 })
             })
             .flatten();

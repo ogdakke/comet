@@ -6,7 +6,11 @@
 //! replacing the local catalog. The caller gets a conflict when another device
 //! won, never an automatic overwrite.
 
-use std::{collections::HashMap, path::{Path, PathBuf}, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -15,7 +19,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
-use crate::{doc_host::EdgeConfig, studio::StudioStore, StudioStoreError};
+use crate::{StudioStoreError, doc_host::EdgeConfig, studio::StudioStore};
 
 const MANIFEST_VERSION: u8 = 1;
 const MAX_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
@@ -97,6 +101,9 @@ pub struct StudioSync {
     org_id: String,
     device_id: String,
     http: reqwest::Client,
+    /// Old local-profile Studio root. Used exactly once, and only when this
+    /// account has no remote Studio manifest yet.
+    legacy_local_studio: Option<PathBuf>,
 }
 
 impl StudioSync {
@@ -106,7 +113,19 @@ impl StudioSync {
         org_id: impl Into<String>,
         device_id: impl Into<String>,
     ) -> Self {
-        Self { store, edge, org_id: org_id.into(), device_id: device_id.into(), http: reqwest::Client::new() }
+        Self {
+            store,
+            edge,
+            org_id: org_id.into(),
+            device_id: device_id.into(),
+            http: reqwest::Client::new(),
+            legacy_local_studio: None,
+        }
+    }
+
+    pub fn with_legacy_local_studio(mut self, source: impl Into<PathBuf>) -> Self {
+        self.legacy_local_studio = Some(source.into());
+        self
     }
 
     /// Download a newer remote snapshot into a private same-volume staging
@@ -114,47 +133,88 @@ impl StudioSync {
     pub async fn pull(&self) -> Result<StudioSyncOutcome, StudioSyncError> {
         let envelope = self.fetch_manifest().await?;
         let Some(manifest) = envelope.manifest else {
+            self.import_legacy_local_if_needed().await?;
             return Ok(StudioSyncOutcome::NoRemoteSnapshot);
         };
         validate_manifest(&manifest)?;
         let state = self.read_state().await?;
-        if state.as_ref().is_some_and(|state| state.generation == envelope.generation) {
-            return Ok(StudioSyncOutcome::UpToDate { generation: envelope.generation });
+        // A short-lived pre-migration build may have seeded R2 with an empty
+        // Studio database before it knew how to carry `profiles/local/studio`.
+        // Detect that exact case by reading the verified remote database, then
+        // import the old catalog. Any real remote row or media file wins and is
+        // pulled normally instead.
+        if self
+            .should_replace_empty_remote_with_legacy(&manifest, state.as_ref())
+            .await?
+            && self.import_legacy_local_if_needed().await?
+        {
+            self.write_state(&LocalState {
+                generation: envelope.generation,
+                manifest,
+            })
+            .await?;
+            return Ok(StudioSyncOutcome::NoRemoteSnapshot);
+        }
+        if state
+            .as_ref()
+            .is_some_and(|state| state.generation == envelope.generation)
+        {
+            return Ok(StudioSyncOutcome::UpToDate {
+                generation: envelope.generation,
+            });
         }
         // A remote generation changed. A device with local state needs a hash
         // comparison against the last installed manifest before it can pull;
         // this is the guard that turns a stale two-device race into a conflict.
         if let Some(state) = &state {
             if !self.local_matches(&state.manifest).await? {
-                return Err(StudioSyncError::Conflict { generation: envelope.generation });
+                return Err(StudioSyncError::Conflict {
+                    generation: envelope.generation,
+                });
             }
         } else if self.store.has_sync_content()? {
-            return Err(StudioSyncError::Conflict { generation: envelope.generation });
+            return Err(StudioSyncError::Conflict {
+                generation: envelope.generation,
+            });
         }
         let stage = self.stage_path("download");
         tokio::fs::create_dir_all(&stage).await?;
         let result = async {
             let database = stage.join("studio.sqlite3");
             let mut cached = HashMap::<String, PathBuf>::new();
-            self.download_once(&manifest.database, &database, &mut cached).await?;
+            self.download_once(&manifest.database, &database, &mut cached)
+                .await?;
             for file in &manifest.files {
                 let destination = stage.join(&file.path);
                 if let Some(parent) = destination.parent() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
                 self.download_once(
-                    &ObjectRef { sha256: file.sha256.clone(), size_bytes: file.size_bytes },
+                    &ObjectRef {
+                        sha256: file.sha256.clone(),
+                        size_bytes: file.size_bytes,
+                    },
                     &destination,
                     &mut cached,
-                ).await?;
+                )
+                .await?;
             }
             let store = self.store.clone();
             let install = stage.clone();
             tokio::task::spawn_blocking(move || store.install_sync_snapshot(&install))
                 .await
-                .map_err(|error| StudioSyncError::Protocol(format!("sync installer panicked: {error}")))??;
-            self.write_state(&LocalState { generation: envelope.generation, manifest: manifest.clone() }).await?;
-            Ok(StudioSyncOutcome::Pulled { generation: envelope.generation, files: manifest.files.len() })
+                .map_err(|error| {
+                    StudioSyncError::Protocol(format!("sync installer panicked: {error}"))
+                })??;
+            self.write_state(&LocalState {
+                generation: envelope.generation,
+                manifest: manifest.clone(),
+            })
+            .await?;
+            Ok(StudioSyncOutcome::Pulled {
+                generation: envelope.generation,
+                files: manifest.files.len(),
+            })
         }
         .await;
         // install moves the media children out, but the now-empty stage (or a
@@ -173,30 +233,49 @@ impl StudioSync {
             None => current.manifest.is_none() && current.generation == 0,
         };
         if !may_publish {
-            return Err(StudioSyncError::Conflict { generation: current.generation });
+            return Err(StudioSyncError::Conflict {
+                generation: current.generation,
+            });
         }
         let stage = self.stage_path("publish");
         let store = self.store.clone();
         let export = stage.clone();
         tokio::task::spawn_blocking(move || store.export_sync_snapshot(&export))
             .await
-            .map_err(|error| StudioSyncError::Protocol(format!("sync exporter panicked: {error}")))??;
+            .map_err(|error| {
+                StudioSyncError::Protocol(format!("sync exporter panicked: {error}"))
+            })??;
         let result = async {
             let device_id = self.device_id.clone();
             let manifest_stage = stage.clone();
-            let manifest = tokio::task::spawn_blocking(move || build_manifest(&manifest_stage, &device_id))
-                .await
-                .map_err(|error| StudioSyncError::Protocol(format!("manifest builder panicked: {error}")))??;
-            self.upload_if_missing(&manifest.database, &stage.join("studio.sqlite3")).await?;
+            let manifest =
+                tokio::task::spawn_blocking(move || build_manifest(&manifest_stage, &device_id))
+                    .await
+                    .map_err(|error| {
+                        StudioSyncError::Protocol(format!("manifest builder panicked: {error}"))
+                    })??;
+            self.upload_if_missing(&manifest.database, &stage.join("studio.sqlite3"))
+                .await?;
             for file in &manifest.files {
                 self.upload_if_missing(
-                    &ObjectRef { sha256: file.sha256.clone(), size_bytes: file.size_bytes },
+                    &ObjectRef {
+                        sha256: file.sha256.clone(),
+                        size_bytes: file.size_bytes,
+                    },
                     &stage.join(&file.path),
-                ).await?;
+                )
+                .await?;
             }
             let generation = self.commit_manifest(current.generation, &manifest).await?;
-            self.write_state(&LocalState { generation, manifest: manifest.clone() }).await?;
-            Ok(StudioSyncOutcome::Published { generation, files: manifest.files.len() })
+            self.write_state(&LocalState {
+                generation,
+                manifest: manifest.clone(),
+            })
+            .await?;
+            Ok(StudioSyncOutcome::Published {
+                generation,
+                files: manifest.files.len(),
+            })
         }
         .await;
         let _ = tokio::fs::remove_dir_all(&stage).await;
@@ -204,15 +283,25 @@ impl StudioSync {
     }
 
     fn manifest_url(&self) -> String {
-        format!("{}/studio/{}/manifest", self.edge.url.trim_end_matches('/'), self.org_id)
+        format!(
+            "{}/studio/{}/manifest",
+            self.edge.url.trim_end_matches('/'),
+            self.org_id
+        )
     }
 
     fn object_url(&self, sha256: &str) -> String {
-        format!("{}/studio/{}/objects/{sha256}", self.edge.url.trim_end_matches('/'), self.org_id)
+        format!(
+            "{}/studio/{}/objects/{sha256}",
+            self.edge.url.trim_end_matches('/'),
+            self.org_id
+        )
     }
 
     fn stage_path(&self, purpose: &str) -> PathBuf {
-        self.store.sync_root().join(format!(".sync-{purpose}-{}", Uuid::new_v4()))
+        self.store
+            .sync_root()
+            .join(format!(".sync-{purpose}-{}", Uuid::new_v4()))
     }
 
     fn state_path(&self) -> PathBuf {
@@ -245,14 +334,75 @@ impl StudioSync {
         let export = stage.clone();
         tokio::task::spawn_blocking(move || store.export_sync_snapshot(&export))
             .await
-            .map_err(|error| StudioSyncError::Protocol(format!("sync comparison exporter panicked: {error}")))??;
+            .map_err(|error| {
+                StudioSyncError::Protocol(format!("sync comparison exporter panicked: {error}"))
+            })??;
         let stage_for_manifest = stage.clone();
         let device_id = self.device_id.clone();
-        let actual = tokio::task::spawn_blocking(move || build_manifest(&stage_for_manifest, &device_id))
-            .await
-            .map_err(|error| StudioSyncError::Protocol(format!("sync comparison manifest builder panicked: {error}")))??;
+        let actual =
+            tokio::task::spawn_blocking(move || build_manifest(&stage_for_manifest, &device_id))
+                .await
+                .map_err(|error| {
+                    StudioSyncError::Protocol(format!(
+                        "sync comparison manifest builder panicked: {error}"
+                    ))
+                })??;
         let _ = tokio::fs::remove_dir_all(stage).await;
         Ok(same_content(&actual, expected))
+    }
+
+    async fn import_legacy_local_if_needed(&self) -> Result<bool, StudioSyncError> {
+        let Some(source) = self.legacy_local_studio.clone() else {
+            return Ok(false);
+        };
+        if self.store.has_sync_content()? {
+            return Ok(false);
+        }
+        let store = self.store.clone();
+        let source_for_import = source.clone();
+        let imported = tokio::task::spawn_blocking(move || {
+            store.import_legacy_local_snapshot(&source_for_import)
+        })
+        .await
+        .map_err(|error| {
+            StudioSyncError::Protocol(format!("legacy Studio importer panicked: {error}"))
+        })??;
+        if imported {
+            tracing::info!(source = %source.display(), "imported local Studio catalog before first sync publish");
+        }
+        Ok(imported)
+    }
+
+    async fn should_replace_empty_remote_with_legacy(
+        &self,
+        manifest: &Manifest,
+        state: Option<&LocalState>,
+    ) -> Result<bool, StudioSyncError> {
+        if state.is_some()
+            || self.legacy_local_studio.is_none()
+            || self.store.has_sync_content()?
+            || !manifest.files.is_empty()
+        {
+            return Ok(false);
+        }
+        let stage = self.stage_path("legacy-check");
+        tokio::fs::create_dir_all(&stage).await?;
+        let result = async {
+            let database = stage.join("studio.sqlite3");
+            let mut cached = HashMap::new();
+            self.download_once(&manifest.database, &database, &mut cached)
+                .await?;
+            tokio::task::spawn_blocking(move || StudioStore::snapshot_has_sync_content(&database))
+                .await
+                .map_err(|error| {
+                    StudioSyncError::Protocol(format!("remote Studio probe panicked: {error}"))
+                })?
+                .map(|has_content| !has_content)
+                .map_err(Into::into)
+        }
+        .await;
+        let _ = tokio::fs::remove_dir_all(stage).await;
+        result
     }
 
     async fn bearer(&self) -> Result<String, StudioSyncError> {
@@ -260,9 +410,17 @@ impl StudioSync {
     }
 
     async fn fetch_manifest(&self) -> Result<ManifestEnvelope, StudioSyncError> {
-        let response = self.http.get(self.manifest_url()).bearer_auth(self.bearer().await?).send().await?;
+        let response = self
+            .http
+            .get(self.manifest_url())
+            .bearer_auth(self.bearer().await?)
+            .send()
+            .await?;
         if !response.status().is_success() {
-            return Err(StudioSyncError::Protocol(format!("manifest GET returned HTTP {}", response.status())));
+            return Err(StudioSyncError::Protocol(format!(
+                "manifest GET returned HTTP {}",
+                response.status()
+            )));
         }
         Ok(response.json().await?)
     }
@@ -284,44 +442,81 @@ impl StudioSync {
             .send()
             .await?;
         if response.status() != StatusCode::OK {
-            return Err(StudioSyncError::Protocol(format!("object GET returned HTTP {}", response.status())));
+            return Err(StudioSyncError::Protocol(format!(
+                "object GET returned HTTP {}",
+                response.status()
+            )));
         }
-        if response.headers().get("x-studio-sha256").and_then(|value| value.to_str().ok()) != Some(object.sha256.as_str()) {
-            return Err(StudioSyncError::Protocol("object response omitted or changed its SHA-256".into()));
+        if response
+            .headers()
+            .get("x-studio-sha256")
+            .and_then(|value| value.to_str().ok())
+            != Some(object.sha256.as_str())
+        {
+            return Err(StudioSyncError::Protocol(
+                "object response omitted or changed its SHA-256".into(),
+            ));
         }
         let mut output = tokio::fs::File::create(destination).await?;
         let mut digest = Sha256::new();
         let mut bytes = 0_u64;
         let mut response = response;
         while let Some(chunk) = response.chunk().await? {
-            bytes = bytes.checked_add(chunk.len() as u64).ok_or_else(|| StudioSyncError::Protocol("object size overflow".into()))?;
+            bytes = bytes
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| StudioSyncError::Protocol("object size overflow".into()))?;
             if bytes > object.size_bytes || bytes > MAX_OBJECT_BYTES {
-                return Err(StudioSyncError::Protocol("object body exceeds its manifest size".into()));
+                return Err(StudioSyncError::Protocol(
+                    "object body exceeds its manifest size".into(),
+                ));
             }
             digest.update(&chunk);
             output.write_all(&chunk).await?;
         }
         output.sync_all().await?;
         if bytes != object.size_bytes || hex_digest(digest.finalize()) != object.sha256 {
-            return Err(StudioSyncError::Protocol("downloaded object SHA-256 mismatch".into()));
+            return Err(StudioSyncError::Protocol(
+                "downloaded object SHA-256 mismatch".into(),
+            ));
         }
         cached.insert(object.sha256.clone(), destination.to_path_buf());
         Ok(())
     }
 
-    async fn upload_if_missing(&self, object: &ObjectRef, path: &Path) -> Result<(), StudioSyncError> {
+    async fn upload_if_missing(
+        &self,
+        object: &ObjectRef,
+        path: &Path,
+    ) -> Result<(), StudioSyncError> {
         let url = self.object_url(&object.sha256);
-        let head = self.http.head(&url).bearer_auth(self.bearer().await?).send().await?;
+        let head = self
+            .http
+            .head(&url)
+            .bearer_auth(self.bearer().await?)
+            .send()
+            .await?;
         if head.status() == StatusCode::OK {
-            let bytes = head.headers().get(reqwest::header::CONTENT_LENGTH).and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<u64>().ok());
-            let hash = head.headers().get("x-studio-sha256").and_then(|value| value.to_str().ok());
+            let bytes = head
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok());
+            let hash = head
+                .headers()
+                .get("x-studio-sha256")
+                .and_then(|value| value.to_str().ok());
             if bytes == Some(object.size_bytes) && hash == Some(object.sha256.as_str()) {
                 return Ok(());
             }
-            return Err(StudioSyncError::Protocol("existing remote object does not match its content address".into()));
+            return Err(StudioSyncError::Protocol(
+                "existing remote object does not match its content address".into(),
+            ));
         }
         if head.status() != StatusCode::NOT_FOUND {
-            return Err(StudioSyncError::Protocol(format!("object HEAD returned HTTP {}", head.status())));
+            return Err(StudioSyncError::Protocol(format!(
+                "object HEAD returned HTTP {}",
+                head.status()
+            )));
         }
         let file = tokio::fs::File::open(path).await?;
         let response = self
@@ -335,12 +530,19 @@ impl StudioSync {
             .send()
             .await?;
         if response.status() != StatusCode::CREATED && response.status() != StatusCode::OK {
-            return Err(StudioSyncError::Protocol(format!("object PUT returned HTTP {}", response.status())));
+            return Err(StudioSyncError::Protocol(format!(
+                "object PUT returned HTTP {}",
+                response.status()
+            )));
         }
         Ok(())
     }
 
-    async fn commit_manifest(&self, generation: u64, manifest: &Manifest) -> Result<u64, StudioSyncError> {
+    async fn commit_manifest(
+        &self,
+        generation: u64,
+        manifest: &Manifest,
+    ) -> Result<u64, StudioSyncError> {
         let response = self
             .http
             .put(self.manifest_url())
@@ -359,7 +561,10 @@ impl StudioSync {
             return Err(StudioSyncError::Conflict { generation });
         }
         if !response.status().is_success() {
-            return Err(StudioSyncError::Protocol(format!("manifest PUT returned HTTP {}", response.status())));
+            return Err(StudioSyncError::Protocol(format!(
+                "manifest PUT returned HTTP {}",
+                response.status()
+            )));
         }
         response
             .json::<ManifestEnvelope>()
@@ -377,13 +582,19 @@ fn build_manifest(stage: &Path, device_id: &str) -> Result<Manifest, StudioSyncE
         for entry in std::fs::read_dir(&root)? {
             let entry = entry?;
             let name = entry.file_name();
-            let name = name.to_str().ok_or_else(|| StudioSyncError::Protocol("non-UTF-8 Studio media name".into()))?;
+            let name = name
+                .to_str()
+                .ok_or_else(|| StudioSyncError::Protocol("non-UTF-8 Studio media name".into()))?;
             if !valid_media_name(name) {
-                return Err(StudioSyncError::Protocol("invalid Studio media filename".into()));
+                return Err(StudioSyncError::Protocol(
+                    "invalid Studio media filename".into(),
+                ));
             }
             let metadata = std::fs::symlink_metadata(entry.path())?;
             if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(StudioSyncError::Protocol("Studio media entry is not a regular file".into()));
+                return Err(StudioSyncError::Protocol(
+                    "Studio media entry is not a regular file".into(),
+                ));
             }
             let object = object_ref(&entry.path())?;
             files.push(FileRef {
@@ -406,23 +617,40 @@ fn build_manifest(stage: &Path, device_id: &str) -> Result<Manifest, StudioSyncE
 
 fn object_ref(path: &Path) -> Result<ObjectRef, StudioSyncError> {
     let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > MAX_OBJECT_BYTES {
-        return Err(StudioSyncError::Protocol("Studio object is not a permitted regular file".into()));
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > MAX_OBJECT_BYTES
+    {
+        return Err(StudioSyncError::Protocol(
+            "Studio object is not a permitted regular file".into(),
+        ));
     }
     let mut file = std::fs::File::open(path)?;
     let mut digest = Sha256::new();
     std::io::copy(&mut file, &mut digest)?;
-    Ok(ObjectRef { sha256: hex_digest(digest.finalize()), size_bytes: metadata.len() })
+    Ok(ObjectRef {
+        sha256: hex_digest(digest.finalize()),
+        size_bytes: metadata.len(),
+    })
 }
 
 fn validate_manifest(manifest: &Manifest) -> Result<(), StudioSyncError> {
-    if manifest.version != MANIFEST_VERSION || !valid_object(&manifest.database) || manifest.publisher_device_id.is_empty() || manifest.publisher_device_id.len() > 128 {
+    if manifest.version != MANIFEST_VERSION
+        || !valid_object(&manifest.database)
+        || manifest.publisher_device_id.is_empty()
+        || manifest.publisher_device_id.len() > 128
+    {
         return Err(StudioSyncError::Protocol("invalid Studio manifest".into()));
     }
     let mut paths = std::collections::HashSet::new();
     for file in &manifest.files {
-        if !valid_object(&ObjectRef { sha256: file.sha256.clone(), size_bytes: file.size_bytes }) || !valid_remote_path(&file.path) || !paths.insert(&file.path) {
-            return Err(StudioSyncError::Protocol("invalid Studio manifest file entry".into()));
+        if !valid_object(&ObjectRef {
+            sha256: file.sha256.clone(),
+            size_bytes: file.size_bytes,
+        }) || !valid_remote_path(&file.path)
+            || !paths.insert(&file.path)
+        {
+            return Err(StudioSyncError::Protocol(
+                "invalid Studio manifest file entry".into(),
+            ));
         }
     }
     Ok(())
@@ -431,7 +659,10 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), StudioSyncError> {
 fn valid_object(object: &ObjectRef) -> bool {
     object.size_bytes <= MAX_OBJECT_BYTES
         && object.sha256.len() == 64
-        && object.sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && object
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn same_content(left: &Manifest, right: &Manifest) -> bool {
@@ -447,19 +678,31 @@ fn same_content(left: &Manifest, right: &Manifest) -> bool {
 }
 
 fn valid_remote_path(path: &str) -> bool {
-    let Some((directory, name)) = path.split_once('/') else { return false; };
-    matches!(directory, "artifacts" | "previews" | "inputs") && !name.contains('/') && valid_media_name(name)
+    let Some((directory, name)) = path.split_once('/') else {
+        return false;
+    };
+    matches!(directory, "artifacts" | "previews" | "inputs")
+        && !name.contains('/')
+        && valid_media_name(name)
 }
 
 fn valid_media_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(first) if first.is_ascii_alphanumeric())
         && name.len() <= 255
-        && chars.all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-'))
+        && chars.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        })
 }
 
 fn mime_for_path(path: &Path) -> &'static str {
-    match path.extension().and_then(|extension| extension.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "webp" => "image/webp",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
