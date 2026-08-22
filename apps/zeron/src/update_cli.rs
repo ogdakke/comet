@@ -57,6 +57,12 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
             println!("updated {} — relaunch Zeron to finish.", bundle.display());
             Ok(())
         }
+        InstallKind::UserInstalled => {
+            bail!(
+                "this user-installed CLI is not update-managed.\n\
+                 Replace ~/.local/bin/zeron yourself, or install the managed Linux release."
+            )
+        }
         InstallKind::Unmanaged => {
             bail!(
                 "this binary is not update-managed (source build or hand-copied).\n\

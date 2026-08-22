@@ -221,6 +221,7 @@ fn install_kind_label() -> &'static str {
     match crate::defaults::install_kind() {
         zeron_update::InstallKind::MacApp { .. } => "Zeron.app",
         zeron_update::InstallKind::Managed { .. } => "managed (~/.zeron/app)",
+        zeron_update::InstallKind::UserInstalled => "user CLI (~/.local/bin/zeron)",
         zeron_update::InstallKind::Unmanaged => "source build (isolated from the installed app)",
     }
 }
