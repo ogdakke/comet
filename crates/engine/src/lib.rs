@@ -34,6 +34,7 @@ pub mod spaces;
 pub mod studio;
 pub mod studio_credentials;
 pub mod studio_preview;
+pub mod studio_sync;
 pub mod terminals;
 pub mod titles;
 pub mod uploads;
@@ -69,6 +70,7 @@ pub use studio::{
 pub use studio_credentials::{
     StudioCredentialError, StudioCredentials, StudioSecretBackend, SystemStudioSecretBackend,
 };
+pub use studio_sync::{StudioSync, StudioSyncError, StudioSyncOutcome};
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
 pub use uploads::{AttachmentChunk, Uploads};
@@ -146,6 +148,9 @@ pub struct EngineCore {
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
     pub studio: Arc<StudioStore>,
+    /// Personal Studio snapshot/media transport. Absent for local and explicit
+    /// dev profiles; WorkOS profiles start it after the core is assembled.
+    studio_sync: Option<StudioSync>,
     pub studio_providers: Arc<StudioProviderRegistry>,
     pub studio_credentials: Arc<StudioCredentials>,
     pub device_id: String,
@@ -161,6 +166,9 @@ pub struct EngineCore {
     updater: std::sync::Mutex<Option<zeron_update::Updater>>,
     /// The updater's token-change wake forwarder — owned so shutdown can end it.
     updater_wake: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Background manifest poll + debounced publisher. Kept so runtime
+    /// replacement and sign-out cannot leave an old account uploading media.
+    studio_sync_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Exclusive data-dir lock — held for the engine's lifetime (single-instance).
     _instance_lock: InstanceLock,
 }
@@ -300,6 +308,18 @@ impl EngineCore {
             profile.store_root(),
             studio::DEFAULT_MAX_ARTIFACT_BYTES,
         )?);
+        let studio_sync = (profile.scope() == WorkspaceScope::Synced)
+            .then(|| {
+                edge.clone().map(|edge| {
+                    StudioSync::new(
+                        studio.clone(),
+                        edge,
+                        profile.org_id(),
+                        device_id.clone(),
+                    )
+                })
+            })
+            .flatten();
         StudioStore::spawn_preview_backfill(studio.clone());
         let recovered_studio_runs = studio.recover_interrupted_image_runs()?;
         if recovered_studio_runs > 0 {
@@ -341,6 +361,7 @@ impl EngineCore {
             uploads,
             agent_accounts,
             studio,
+            studio_sync,
             studio_providers,
             studio_credentials,
             device_id,
@@ -350,6 +371,7 @@ impl EngineCore {
             links: std::sync::Mutex::new(None),
             updater: std::sync::Mutex::new(None),
             updater_wake: std::sync::Mutex::new(None),
+            studio_sync_task: std::sync::Mutex::new(None),
             _instance_lock: lock,
         };
         // Recover already left queued video with a remote id in place. Resume
@@ -361,6 +383,82 @@ impl EngineCore {
 
     pub fn workspace_scope(&self) -> WorkspaceScope {
         self.workspace_scope
+    }
+
+    pub fn studio_sync(&self) -> Option<StudioSync> {
+        self.studio_sync.clone()
+    }
+
+    /// Pull at boot, publish a first empty-or-local snapshot when necessary,
+    /// then check the tiny manifest every 30 seconds. The gallery always reads
+    /// local files; transfer work runs outside UI calls and only an actual new
+    /// generation causes media downloads.
+    pub fn start_studio_sync(&self) {
+        let Some(sync) = self.studio_sync() else {
+            return;
+        };
+        let mut task = self
+            .studio_sync_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if task.is_some() || tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let store = self.studio.clone();
+        *task = Some(tokio::spawn(async move {
+            // Subscribe before the initial pass so a preview backfill or a
+            // just-finished run cannot slip into the gap and wait forever for
+            // an unrelated edit. We consume the initial install notification
+            // below, since pulling does not need an immediate re-publish.
+            let mut changes = store.subscribe_changes();
+            match sync.pull().await {
+                Ok(StudioSyncOutcome::NoRemoteSnapshot) => {
+                    if let Err(error) = sync.publish().await {
+                        tracing::warn!(%error, "initial Studio publish failed");
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "initial Studio pull failed"),
+            }
+            changes.borrow_and_update();
+            let mut poll = tokio::time::interval(std::time::Duration::from_secs(30));
+            poll.tick().await; // consume interval's immediate first tick
+            loop {
+                tokio::select! {
+                    changed = changes.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        // One run can stamp several rows and files. A short
+                        // quiet period collapses that churn into one snapshot.
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        if let Err(error) = sync.publish().await {
+                            tracing::warn!(%error, "Studio publish failed");
+                        }
+                    }
+                    _ = poll.tick() => match sync.pull().await {
+                        Ok(StudioSyncOutcome::NoRemoteSnapshot) => {
+                            if let Err(error) = sync.publish().await {
+                                tracing::warn!(%error, "Studio publish after empty remote failed");
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => tracing::warn!(%error, "Studio pull failed"),
+                    }
+                }
+            }
+        }));
+    }
+
+    fn stop_studio_sync(&self) {
+        let task = self
+            .studio_sync_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            task.abort();
+        }
     }
 
     /// Fetch each configured Studio provider's catalog in the background.
@@ -535,6 +633,7 @@ impl EngineCore {
     /// draining. Connected sockets remain authorized by their handshake, so
     /// clearing credentials alone is not a security boundary.
     pub fn disconnect_edge(&self) {
+        self.stop_studio_sync();
         if let Some(links) = self.links() {
             links.disconnect_all();
         }
@@ -546,6 +645,7 @@ impl EngineCore {
     /// kill live PTYs, stamp our workspace `lastSeenAt`, and flush every open doc
     /// snapshot.
     pub async fn shutdown(&self) {
+        self.stop_studio_sync();
         self.sessions.shutdown().await;
         self.terminals.shutdown();
         self.agent_accounts.shutdown();
@@ -895,6 +995,7 @@ impl Engine {
             )?,
         };
         core.set_auth(auth.clone());
+        core.start_studio_sync();
         if edge_enabled {
             // Release checker: polls {edge}/releases on a 6h cadence; headless
             // installs with ZERON_AUTO_UPDATE=1 apply + restart themselves — gated

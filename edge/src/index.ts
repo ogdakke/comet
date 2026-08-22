@@ -35,6 +35,8 @@
  *   GET|PUT  /chat2/:chatId/diff
  *   GET  /chat2/:chatId/stats
  *   POST /chat2/:chatId/reset
+ *   GET|PUT /studio/:orgId/manifest — personal Studio snapshot generation
+ *   GET|HEAD|PUT /studio/:orgId/objects/:sha256 — immutable Studio media
  */
 import { authenticate } from "./auth";
 import { handleAuthRoute } from "./auth-routes";
@@ -43,9 +45,11 @@ import { SessionRoom } from "./session-room";
 import { DeviceRoom } from "./device-room";
 import { RegistryRoom } from "./registry-room";
 import { ChatRoom } from "./chat-room";
+import { StudioRoom } from "./studio-room";
+import { SHA256_RE } from "./studio-manifest";
 import installSh from "./install.sh";
 
-export { SessionRoom, DeviceRoom, RegistryRoom, ChatRoom };
+export { SessionRoom, DeviceRoom, RegistryRoom, ChatRoom, StudioRoom };
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
@@ -61,6 +65,9 @@ const safeDecode = (segment: string): string | undefined => {
  * wider than ID_RE but still no slashes, so a part id can't traverse keys. */
 const PART_RE = /^[A-Za-z0-9._:#~-]{1,200}$/;
 const MAX_TOOL_BLOB_BYTES = 1024 * 1024;
+/** Same upper bound as the local Studio artifact jail. R2 receives the body
+ * as a stream, so this is a protocol guard rather than a Worker memory cap. */
+const MAX_STUDIO_OBJECT_BYTES = 512 * 1024 * 1024;
 
 const json = (value: unknown, status = 200): Response =>
   new Response(JSON.stringify(value), {
@@ -339,6 +346,93 @@ export default {
       }
     }
 
+    // ── Studio snapshot + media sync ───────────────────────────────────────
+    // Studio is a profile-local relational SQLite catalog plus artifact files.
+    // A per-user DO serializes manifest generations; immutable bytes go straight
+    // to R2 so opening the gallery never waits for a giant sync document.
+    if (parts[0] === "studio" && parts[1] && ID_RE.test(parts[1])) {
+      const orgId = parts[1];
+      if (auth.orgId !== orgId) return json({ error: "forbidden" }, 403);
+      const prefix = `studio/${orgId}/${auth.userId}`;
+      if (parts.length === 3 && parts[2] === "manifest") {
+        if (request.method !== "GET" && request.method !== "PUT") {
+          return json({ error: "method_not_allowed" }, 405);
+        }
+        return forward(
+          env.STUDIO_ROOMS,
+          `studio1/${orgId}/${auth.userId}`,
+          request,
+          auth.userId,
+          "/manifest",
+          ""
+        );
+      }
+      const objectHash = parts.length === 4 && parts[2] === "objects" ? safeDecode(parts[3]) : undefined;
+      if (objectHash === undefined || !SHA256_RE.test(objectHash)) {
+        return json({ error: "not_found" }, 404);
+      }
+      const key = `${prefix}/objects/${objectHash}`;
+      if (request.method === "PUT") {
+        if (request.headers.get("x-studio-sha256") !== objectHash) {
+          return json({ error: "hash_required" }, 400);
+        }
+        const declaredLength = Number(request.headers.get("content-length") ?? "");
+        if (!Number.isSafeInteger(declaredLength) || declaredLength < 0) {
+          return json({ error: "length_required" }, 411);
+        }
+        if (declaredLength > MAX_STUDIO_OBJECT_BYTES) return json({ error: "too_large" }, 413);
+        if (!request.body) return json({ error: "body_required" }, 400);
+        const existing = await env.BLOBS.head(key);
+        if (existing) {
+          if (existing.customMetadata?.sha256 !== objectHash) {
+            return json({ error: "integrity_error", message: "existing object hash metadata is invalid" }, 409);
+          }
+          if (existing.size !== declaredLength) {
+            return json({ error: "integrity_error", message: "existing object size differs" }, 409);
+          }
+          return json({ ok: true, existed: true, bytes: existing.size });
+        }
+        const object = await env.BLOBS.put(key, request.body, {
+          // The R2 checksum verification is streaming. The Engine performs the
+          // same SHA-256 check again when it downloads an object to disk.
+          sha256: hexToBytes(objectHash),
+          onlyIf: { etagDoesNotMatch: "*" },
+          httpMetadata: {
+            contentType: request.headers.get("content-type") ?? "application/octet-stream"
+          },
+          customMetadata: { sha256: objectHash }
+        });
+        if (!object) {
+          // Another device won the immutable put race. Make the result
+          // explicit rather than replacing bytes under the same hash key.
+          const raced = await env.BLOBS.head(key);
+          if (raced?.customMetadata?.sha256 === objectHash && raced.size === declaredLength) {
+            return json({ ok: true, existed: true, bytes: raced.size });
+          }
+          return json({ error: "integrity_error", message: "object changed during upload" }, 409);
+        }
+        return json({ ok: true, existed: false, bytes: object.size }, 201);
+      }
+      if (request.method === "GET" || request.method === "HEAD") {
+        const object =
+          request.method === "GET" ? await env.BLOBS.get(key) : await env.BLOBS.head(key);
+        if (!object) return json({ error: "not_found" }, 404);
+        if (object.customMetadata?.sha256 !== objectHash) {
+          return json({ error: "integrity_error", message: "object hash metadata is invalid" }, 409);
+        }
+        const headers = new Headers({
+          "content-length": String(object.size),
+          "cache-control": "private, max-age=31536000, immutable",
+          "x-studio-sha256": objectHash,
+          etag: object.httpEtag
+        });
+        object.writeHttpMetadata(headers);
+        const body = request.method === "GET" ? (object as R2ObjectBody).body : null;
+        return new Response(body, { headers });
+      }
+      return json({ error: "method_not_allowed" }, 405);
+    }
+
     // ── device rooms ────────────────────────────────────────────────────────
     if (parts[0] === "device" && parts[1] && ID_RE.test(parts[1])) {
       const deviceId = parts[1];
@@ -423,3 +517,12 @@ export default {
     return json({ error: "not_found" }, 404);
   }
 } satisfies ExportedHandler<Env>;
+
+/** R2's streaming checksum API takes raw bytes, not hexadecimal text. */
+const hexToBytes = (hex: string): Uint8Array => {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let index = 0; index < bytes.length; index++) {
+    bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+  }
+  return bytes;
+};
