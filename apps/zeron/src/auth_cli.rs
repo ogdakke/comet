@@ -83,8 +83,13 @@ pub async fn login(config: EngineConfig) -> anyhow::Result<()> {
     let _lock = engine_lock(&config, "sign in")?;
     let auth = Engine::build_auth(&config).await;
     if !auth.workos_enabled() {
-        println!("Auth is in dev mode (no WorkOS client id) — there is nothing to sign in to.");
-        return Ok(());
+        if auth.development_enabled() {
+            println!("Auth is in development mode — there is nothing to sign in to.");
+            return Ok(());
+        }
+        anyhow::bail!(
+            "WorkOS login is not configured. Set ZERON_EDGE_URL and ZERON_WORKOS_CLIENT_ID."
+        );
     }
     if let AuthState::SignedIn { user, org_id } = auth.state() {
         println!(
@@ -127,11 +132,16 @@ pub async fn logout(config: EngineConfig) -> anyhow::Result<()> {
     let _lock = engine_lock(&config, "sign out")?;
     let auth = Engine::build_auth(&config).await;
     if !auth.workos_enabled() {
-        // Dev mode has no live session, but clear any stale session.json from a
-        // previous WorkOS-mode run so the next real run starts signed out.
+        // Neither disabled auth nor development mode has a live session, but
+        // clear any stale WorkOS session before the next start.
         auth.sign_out();
-        println!("Auth is in dev mode — cleared any stale saved session.");
-        println!("The next engine start will remain in development mode.");
+        if auth.development_enabled() {
+            println!("Auth is in development mode — cleared any stale saved session.");
+            println!("The next engine start will remain in development mode.");
+        } else {
+            println!("WorkOS is not configured — cleared any stale saved session.");
+            println!("The next engine start will use the local-only workspace.");
+        }
         return Ok(());
     }
     match auth.state() {
@@ -211,6 +221,7 @@ fn install_kind_label() -> &'static str {
     match crate::defaults::install_kind() {
         zeron_update::InstallKind::MacApp { .. } => "Zeron.app",
         zeron_update::InstallKind::Managed { .. } => "managed (~/.zeron/app)",
+        zeron_update::InstallKind::UserInstalled => "user CLI (~/.local/bin/zeron)",
         zeron_update::InstallKind::Unmanaged => "source build (isolated from the installed app)",
     }
 }

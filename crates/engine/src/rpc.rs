@@ -1297,7 +1297,10 @@ impl RpcService for AuthRpc {
                 RpcReply::value(&serde_json::json!({ "url": url }))
             }
             methods::SIGN_IN_HEADLESS => {
-                let url = self.auth.start_headless_sign_in();
+                let url = self
+                    .auth
+                    .start_headless_sign_in()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "url": url }))
             }
             methods::COMPLETE_SIGN_IN => {

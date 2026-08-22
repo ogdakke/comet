@@ -5,9 +5,12 @@
 mod auth_cli;
 mod daemon;
 mod defaults;
+mod studio_cli;
 mod update_cli;
 
 use clap::{Parser, Subcommand};
+
+const PRIVATE_ENV_KEYS: [&str; 2] = ["ZERON_EDGE_URL", "ZERON_WORKOS_CLIENT_ID"];
 
 #[derive(Parser)]
 #[command(name = "zeron", about = "Multi-device controller for coding agents")]
@@ -29,6 +32,11 @@ enum Command {
     /// Live sync introspection from the running engine: per-room connection
     /// state, last pushed-frame/ack ages, rejoin/probe/resync counters.
     Sync,
+    /// Import an old local Studio catalog into the signed-in personal workspace.
+    Studio {
+        #[command(subcommand)]
+        command: StudioCommand,
+    },
     /// Manage `zeron headless` as a background service (launchd / systemd --user).
     Daemon {
         #[command(subcommand)]
@@ -39,6 +47,16 @@ enum Command {
     Update {
         #[arg(long)]
         check: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum StudioCommand {
+    /// Copy a local Studio catalog once, then publish it to the personal edge.
+    ImportLocal {
+        /// Studio directory to import. Defaults to this runtime's profiles/local/studio.
+        #[arg(long)]
+        source: Option<std::path::PathBuf>,
     },
 }
 
@@ -58,33 +76,21 @@ enum DaemonCommand {
     Status,
 }
 
-/// Production edge (Cloudflare Worker + Durable Objects on the zeron.sh zone).
-/// `ZERON_EDGE_URL` overrides (local dev / self-hosting).
-const DEFAULT_EDGE_URL: &str = "https://edge.zeron.sh";
-
-/// Production WorkOS AuthKit client id — public knowledge (it appears in every
-/// authorize URL), so baking it in is safe. Overridden by `ZERON_WORKOS_CLIENT_ID`;
-/// set it to the empty string — or set a dev bearer via `ZERON_EDGE_TOKEN` — to
-/// force dev-mode auth instead.
-const DEFAULT_WORKOS_CLIENT_ID: &str = "client_01KWD0EAKZKD50YCQJNYSRE4BY";
-
 fn edge_url_from_env() -> String {
     std::env::var("ZERON_EDGE_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_EDGE_URL.into())
+        .unwrap_or_default()
 }
 
-/// WorkOS client id resolution: explicit env wins (empty string = dev mode);
-/// otherwise a `ZERON_EDGE_TOKEN` dev bearer keeps dev mode (smoke tests,
-/// local wrangler); otherwise the baked production client id makes optional
-/// sync available while a bare start remains local-only.
+/// WorkOS requires an explicit client id. An explicit development bearer still
+/// enables the local development edge flow; no configuration remains local-only.
 fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
     match std::env::var("ZERON_WORKOS_CLIENT_ID") {
         Ok(v) if v.trim().is_empty() => None,
         Ok(v) => Some(v),
         Err(_) if edge_token.is_some() => None,
-        Err(_) => Some(DEFAULT_WORKOS_CLIENT_ID.into()),
+        Err(_) => None,
     }
 }
 
@@ -94,7 +100,61 @@ fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+fn load_private_deployment_env() {
+    let path = private_deployment_env_path();
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
+
+    for (key, value) in parse_private_env(&contents) {
+        if std::env::var_os(key).is_none() {
+            // This is before CLI parsing, logging, or runtime creation, so no
+            // other thread can observe a partially loaded process environment.
+            unsafe { std::env::set_var(key, value) };
+        }
+    }
+}
+
+/// The deployment file lives beside the active runtime's state. This keeps a
+/// source build (`~/.zeron-dev`) from inheriting the installed app's edge and
+/// WorkOS application (`~/.zeron`). An explicit `ZERON_DATA_DIR` gets the same
+/// behavior, which makes private test deployments self-contained.
+fn private_deployment_env_path() -> std::path::PathBuf {
+    private_deployment_env_path_for(
+        std::env::var_os("ZERON_DATA_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(defaults::data_dir),
+    )
+}
+
+fn private_deployment_env_path_for(data_dir: std::path::PathBuf) -> std::path::PathBuf {
+    data_dir.join("env")
+}
+
+fn parse_private_env(contents: &str) -> Vec<(&'static str, String)> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (key, value) = line.split_once('=')?;
+            let key = key.trim();
+            let key = PRIVATE_ENV_KEYS.iter().copied().find(|known| *known == key)?;
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+                .unwrap_or(value);
+            (!value.is_empty()).then(|| (key, value.to_owned()))
+        })
+        .collect()
+}
+
 fn main() -> anyhow::Result<()> {
+    load_private_deployment_env();
     let cli = Cli::parse();
     // Long-running modes log at info, one-shot CLI commands at warn (RUST_LOG
     // overrides either).
@@ -175,6 +235,14 @@ fn main() -> anyhow::Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(sync_cli(engine_config_from_env().ipc_port))
         }
+        Some(Command::Studio { command }) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            match command {
+                StudioCommand::ImportLocal { source } => {
+                    runtime.block_on(studio_cli::import_local(engine_config_from_env(), source))
+                }
+            }
+        }
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(update_cli::update(&edge_url_from_env(), check))
@@ -247,6 +315,33 @@ fn harness_from_env() -> zeron_engine::HarnessId {
         Ok("hermes") => zeron_engine::HarnessId::Hermes,
         Ok("pi") => zeron_engine::HarnessId::Pi,
         _ => zeron_engine::HarnessId::ClaudeCode,
+    }
+}
+
+#[cfg(test)]
+mod private_env_tests {
+    use super::{parse_private_env, private_deployment_env_path_for};
+
+    #[test]
+    fn parses_only_private_deployment_values() {
+        let values = parse_private_env(
+            "# personal deployment\nZERON_EDGE_URL=https://edge.example\nZERON_WORKOS_CLIENT_ID=\"client_test\"\nZERON_EDGE_TOKEN=must-not-load\n",
+        );
+        assert_eq!(
+            values,
+            vec![
+                ("ZERON_EDGE_URL", "https://edge.example".into()),
+                ("ZERON_WORKOS_CLIENT_ID", "client_test".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn private_env_follows_the_active_data_directory() {
+        assert_eq!(
+            private_deployment_env_path_for(std::path::PathBuf::from("/tmp/zeron-isolated")),
+            std::path::PathBuf::from("/tmp/zeron-isolated/env")
+        );
     }
 }
 

@@ -1,7 +1,8 @@
 #!/bin/sh
 # Zeron (native) headless installer.
 #
-#   curl -fsSL https://zeron.sh/install.sh | sh
+#   ZERON_BASE_URL=https://your-worker.example
+#   curl -fsSL "$ZERON_BASE_URL/install.sh" | sh
 #
 # Installs the self-contained native binary (no runtime deps) to
 # ~/.zeron/app, puts `zeron` on PATH, and runs it as a local-only
@@ -9,11 +10,12 @@
 # enables sync after a restart. Re-running
 # upgrades in place; ~/.zeron state is preserved.
 #
-# The binary ships with production endpoints baked in: no ZERON_EDGE_URL or
-# client-id configuration needed. Overrides (if any) go in ~/.zeron/env.
+# Before starting the installed daemon, put the private edge URL and WorkOS
+# client ID in ~/.zeron/env.
 set -eu
 
-BASE="${ZERON_BASE_URL:-https://zeron.sh}"
+: "${ZERON_BASE_URL:?set ZERON_BASE_URL to your private Worker URL before running this installer}"
+BASE="$ZERON_BASE_URL"
 
 # --- platform ---------------------------------------------------------------
 os="$(uname -s)"

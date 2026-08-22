@@ -39,7 +39,7 @@ loro = "1.13"
 # frames, cross-checked by its js_snapshots tests).
 loro-protocol = "0.3"
 
-# gpui — use the adjacent comet fork while iterating on GPU effects.
+# gpui — comet's patched Zed fork, pinned for reproducible builds.
 # upstream f14fea9 + edge-fade / backdrop-blur / GPU-budget commits through
 # 5d1f83d (horizontal per-pixel EdgeFade for quads/images), then f6789b8
 # EffectQuad and 761f12d (denser flowing dot lattice;
@@ -53,14 +53,14 @@ loro-protocol = "0.3"
 # transparent windows (Porter-Duff OVER); 53518c0 merges the edge-fade line;
 # 8a8954c switches the macOS blurred view to UnderWindowBackground;
 # 041a391 adds EdgeFadeEase (Quadratic default, optional Exponential).
-gpui = { path = "../../zed/crates/gpui" }
-gpui_platform = { path = "../../zed/crates/gpui_platform", features = [
+gpui = { git = "https://github.com/ogdakke/zed", rev = "041a391d9149c37990e2a60f6481b3f780b688e5" }
+gpui_platform = { git = "https://github.com/ogdakke/zed", rev = "041a391d9149c37990e2a60f6481b3f780b688e5", features = [
     "wayland",
     "x11",
     "font-kit",
     "runtime_shaders",
 ] }
-gpui_tokio = { path = "../../zed/crates/gpui_tokio" }
+gpui_tokio = { git = "https://github.com/ogdakke/zed", rev = "041a391d9149c37990e2a60f6481b3f780b688e5" }
 
 # diffs
 similar = "2"
@@ -80,7 +80,7 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # storage
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 
 # misc
 # Global allocator for the binaries: returns freed pages to the OS. System

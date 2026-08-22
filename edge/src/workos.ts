@@ -9,8 +9,6 @@
  * Without WORKOS_API_KEY configured the routes answer 501; in dev mode
  * backends use their userId as the bearer and never call these.
  */
-import type { Env } from "./env";
-
 const API = "https://api.workos.com";
 
 /** Thrown for rejected WorkOS calls; routes map it to 401 (same as the old
@@ -80,12 +78,16 @@ const post = async (apiKey: string, path: string, body: unknown): Promise<Respon
   });
 
 /** `authenticateWithCode`: WorkOS code → tokens + user. */
-export const exchange = async (env: Env, apiKey: string, code: string): Promise<ExchangeResult> => {
+export const exchange = async (
+  clientId: string,
+  apiKey: string,
+  code: string
+): Promise<ExchangeResult> => {
   const res = await fetch(`${API}/user_management/authenticate`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      client_id: env.WORKOS_CLIENT_ID,
+      client_id: clientId,
       client_secret: apiKey,
       grant_type: "authorization_code",
       code
@@ -108,7 +110,7 @@ export const exchange = async (env: Env, apiKey: string, code: string): Promise<
 /** `authenticateWithRefreshToken`; passing `organizationId` scopes the session
  * to that org (the next access token carries `org_id`). */
 export const refresh = async (
-  env: Env,
+  clientId: string,
   apiKey: string,
   refreshToken: string,
   organizationId?: string
@@ -117,7 +119,7 @@ export const refresh = async (
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      client_id: env.WORKOS_CLIENT_ID,
+      client_id: clientId,
       client_secret: apiKey,
       grant_type: "refresh_token",
       refresh_token: refreshToken,

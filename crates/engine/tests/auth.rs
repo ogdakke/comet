@@ -272,6 +272,7 @@ async fn dev_mode_is_signed_in_with_configured_bearer() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut config = AuthConfig::new("http://127.0.0.1:1", dir.path());
     config.dev_user_id = "wing-dev".into();
+    config.dev_mode = true;
     let auth = Auth::new(config);
     assert!(!auth.workos_enabled());
     assert!(!auth.loaded_workos_session());
@@ -285,6 +286,19 @@ async fn dev_mode_is_signed_in_with_configured_bearer() {
 }
 
 #[tokio::test]
+async fn missing_workos_config_does_not_fall_back_to_development_mode() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let auth = Auth::new(AuthConfig::new("http://127.0.0.1:1", dir.path()));
+
+    assert!(!auth.workos_enabled());
+    assert_eq!(auth.state(), AuthState::SignedOut);
+    assert_eq!(auth.access_token().await, None);
+    assert!(auth.start_sign_in().await.is_err());
+    assert!(auth.start_headless_sign_in().is_err());
+    assert!(auth.complete_sign_in("anything").await.is_err());
+}
+
+#[tokio::test]
 async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
     let edge = StubEdge::start().await;
     let dir = tempfile::tempdir().expect("tempdir");
@@ -294,7 +308,7 @@ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
     assert_eq!(auth.state(), AuthState::SignedOut);
     assert_eq!(auth.access_token().await, None, "signed out: no token");
 
-    let url = auth.start_headless_sign_in();
+    let url = auth.start_headless_sign_in().expect("authorize url");
     assert!(url.starts_with("https://authkit.example/user_management/authorize?"));
     assert_eq!(
         query_param(&url, "client_id").as_deref(),
@@ -385,7 +399,7 @@ async fn short_lived_tokens_refresh_on_demand() {
     let dir = tempfile::tempdir().expect("tempdir");
     let auth = Auth::new(workos_config(&edge.url(), dir.path()));
 
-    let url = auth.start_headless_sign_in();
+    let url = auth.start_headless_sign_in().expect("authorize url");
     let state = query_param(&url, "state").expect("state");
     auth.complete_sign_in(&format!("{state}.codeX"))
         .await

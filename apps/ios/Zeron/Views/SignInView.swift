@@ -2,20 +2,23 @@
 // the secret-bearing exchange delegated to the edge (`POST /auth/exchange`).
 // The zeron mark on black, one white button — the old mobile app's Gate.
 //
-// Endpoints are fixed to production (the old app's rule: mobile always talks
-// to prod; a stale override once broke sign-in in the worst ghost way).
-
 import AuthenticationServices
 import SwiftUI
 
-/// Production cloud endpoints — mirrors edge/wrangler.jsonc.
+/// Deployment values are compiled from the ignored `Private.xcconfig` file.
 enum Endpoints {
-    static let edgeURL = URL(string: "https://edge.zeron.sh")!
-    static let workosClientId = "client_01KWD0EAKZKD50YCQJNYSRE4BY"
+    static let edgeURL = Bundle.main.object(forInfoDictionaryKey: "ZeronEdgeURL")
+        .flatMap { $0 as? String }
+        .filter { !$0.isEmpty && !$0.contains("$") }
+        .flatMap(URL.init(string:))
+    static let workosClientId = Bundle.main.object(forInfoDictionaryKey: "ZeronWorkOSClientID")
+        .flatMap { $0 as? String }
+        .filter { !$0.isEmpty && !$0.contains("$") }
     static let workosAPIBase = "https://api.workos.com"
     static let callbackScheme = "zeron"
 
-    static func authorizeURL(state: String) -> URL {
+    static func authorizeURL(state: String) -> URL? {
+        guard let workosClientId else { return nil }
         var components = URLComponents(string: "\(workosAPIBase)/user_management/authorize")!
         components.queryItems = [
             URLQueryItem(name: "response_type", value: "code"),
@@ -24,7 +27,7 @@ enum Endpoints {
             URLQueryItem(name: "provider", value: "authkit"),
             URLQueryItem(name: "state", value: state),
         ]
-        return components.url!
+        return components.url
     }
 }
 
@@ -95,10 +98,15 @@ struct SignInView: View {
     /// The AuthKit code flow: system browser session → zeron://callback with
     /// code + state → exchange on the edge.
     private func signIn() {
+        let state = UUID().uuidString
+        guard let edgeURL = Endpoints.edgeURL,
+              let authorizeURL = Endpoints.authorizeURL(state: state) else {
+            error = "This build has no private deployment configuration."
+            return
+        }
         busy = true
         error = nil
-        let state = UUID().uuidString
-        authSession.start(url: Endpoints.authorizeURL(state: state),
+        authSession.start(url: authorizeURL,
                           callbackScheme: Endpoints.callbackScheme) { result in
             Task { @MainActor in
                 switch result {
@@ -118,7 +126,7 @@ struct SignInView: View {
                         return
                     }
                     do {
-                        try await model.signIn(edgeURL: Endpoints.edgeURL, code: code)
+                        try await model.signIn(edgeURL: edgeURL, code: code)
                     } catch {
                         self.error = error.localizedDescription
                     }

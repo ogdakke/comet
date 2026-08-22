@@ -8,5 +8,8 @@
 .env.local
 node_modules
 .wrangler
+edge/wrangler.personal.jsonc
+edge/wrangler.*.personal.jsonc
+apps/ios/Zeron/Private.xcconfig
 build/
 edge/dist/

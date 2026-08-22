@@ -4,9 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev --port 27640 --var AUTH_MODE:dev",
-    "deploy": "wrangler deploy",
-    "build": "wrangler deploy --dry-run --outdir dist",
+    "dev": "wrangler dev --config wrangler.personal.jsonc --port 27640 --var AUTH_MODE:dev",
+    "deploy": "wrangler deploy --config wrangler.personal.jsonc",
+    "build": "wrangler deploy --config wrangler.personal.jsonc --dry-run --outdir dist",
     "typecheck": "tsc --noEmit",
     "test": "npm run test:unit && npm run test:workerd",
     "test:unit": "vitest run",

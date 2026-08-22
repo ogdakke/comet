@@ -11,7 +11,7 @@ use std::{
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use rusqlite::Connection;
+use rusqlite::{Connection, DatabaseName};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeron_proto::{
@@ -40,7 +40,7 @@ const ASSET_INPUT_REJECTED: &str =
     "studio asset inputs are only accepted for video roles and ImageEdit masks";
 const MAX_CREATE_TURN_RUNS: usize = 16;
 const MAX_TURN_RUNS: usize = 64;
-pub(crate) const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+pub const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const STUDIO_CATALOG_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const ARTIFACT_READ_CHUNK_BYTES: u64 = 192_000;
 const CONVERSATION_SELECT: &str = "\
@@ -387,6 +387,7 @@ pub struct StudioAttemptCheck {
 
 /// SQLite catalog rooted under one active profile.
 pub struct StudioStore {
+    studio_root: PathBuf,
     database_path: PathBuf,
     connection: Mutex<Connection>,
     artifacts: ArtifactStore,
@@ -427,6 +428,7 @@ impl StudioStore {
 
         let (changes, _) = tokio::sync::watch::channel(0);
         Ok(Self {
+            studio_root: studio_root.clone(),
             database_path,
             connection: Mutex::new(connection),
             artifacts: ArtifactStore::open(&studio_root, maximum_artifact_bytes)?,
@@ -437,6 +439,210 @@ impl StudioStore {
 
     pub fn database_path(&self) -> &Path {
         &self.database_path
+    }
+
+    /// The profile-local Studio root. Sync uses this only to make a same-volume
+    /// staging directory. It never accepts a caller-controlled destination.
+    pub(crate) fn sync_root(&self) -> &Path {
+        &self.studio_root
+    }
+
+    /// True when this profile has durable Studio state that a first pull must
+    /// not blindly replace. Used only by the sync conflict guard.
+    pub(crate) fn has_sync_content(&self) -> Result<bool, StudioStoreError> {
+        let has_rows: i64 = self.connection()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM studio_conversations) \
+             OR EXISTS(SELECT 1 FROM studio_assets) \
+             OR EXISTS(SELECT 1 FROM studio_artifacts) \
+             OR EXISTS(SELECT 1 FROM studio_runs)",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_rows != 0 {
+            return Ok(true);
+        }
+        for directory in ["artifacts", "previews", "inputs"] {
+            for entry in fs::read_dir(self.studio_root.join(directory))? {
+                let entry = entry?;
+                let name = entry.file_name();
+                if name
+                    .to_str()
+                    .is_some_and(|name| !name.starts_with('.') && name != "tmp")
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Import the old `profiles/local/studio` catalog into an otherwise empty
+    /// signed-in profile. This is intentionally a one-way copy: the source is
+    /// retained untouched, while the target is populated through the same
+    /// staged restore path that a remote pull uses.
+    ///
+    /// The caller decides when this is safe. StudioSync calls it only when the
+    /// remote is absent or proven empty, so an old local catalog can never
+    /// mask a snapshot another device already pushed.
+    pub fn import_legacy_local_snapshot(
+        &self,
+        source_studio_root: &Path,
+    ) -> Result<bool, StudioStoreError> {
+        if self.has_sync_content()? {
+            return Ok(false);
+        }
+        let source_database = source_studio_root.join(DATABASE_FILE);
+        let source_metadata = match fs::symlink_metadata(&source_database) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+            return Err(StudioStoreError::InvalidArtifact);
+        }
+
+        let stage = self
+            .studio_root
+            .join(format!(".sync-local-import-{}", Uuid::new_v4()));
+        fs::create_dir(&stage)?;
+        let result = (|| -> Result<(), StudioStoreError> {
+            // Open the source independently and use SQLite's online backup
+            // API. This stays consistent even if an old local engine happens
+            // to still have the database open.
+            let source = Connection::open(&source_database)?;
+            source.backup(DatabaseName::Main, stage.join(DATABASE_FILE), None)?;
+            for directory in ["artifacts", "previews", "inputs"] {
+                let source_directory = source_studio_root.join(directory);
+                if source_directory.exists() {
+                    copy_sync_media_directory(&source_directory, &stage.join(directory))?;
+                } else {
+                    fs::create_dir(stage.join(directory))?;
+                }
+            }
+            self.install_sync_snapshot(&stage)
+        })();
+        let _ = fs::remove_dir_all(&stage);
+        result.map(|()| true)
+    }
+
+    /// Whether a verified snapshot database contains any durable Studio rows.
+    /// This lets the one-off local migration distinguish an old empty remote
+    /// seed from a real catalog without guessing from database byte size.
+    pub fn snapshot_has_sync_content(database: &Path) -> Result<bool, StudioStoreError> {
+        let connection = Connection::open(database)?;
+        let has_rows: i64 = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM studio_conversations) \
+             OR EXISTS(SELECT 1 FROM studio_assets) \
+             OR EXISTS(SELECT 1 FROM studio_artifacts) \
+             OR EXISTS(SELECT 1 FROM studio_runs)",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(has_rows != 0)
+    }
+
+    /// Write a transactionally consistent database copy plus regular Studio
+    /// media files into an empty, same-volume staging directory. SQLite's
+    /// online backup API matters here: copying `studio.sqlite3` itself can
+    /// lose WAL changes while a generation is being recorded.
+    pub(crate) fn export_sync_snapshot(&self, destination: &Path) -> Result<(), StudioStoreError> {
+        if destination.exists() {
+            return Err(StudioStoreError::InvalidValue(format!(
+                "sync snapshot destination already exists: {}",
+                destination.display()
+            )));
+        }
+        fs::create_dir_all(destination)?;
+        let result = (|| -> Result<(), StudioStoreError> {
+            let database = destination.join(DATABASE_FILE);
+            self.connection()?
+                .backup(DatabaseName::Main, &database, None)?;
+            for directory in ["artifacts", "previews", "inputs"] {
+                copy_sync_media_directory(
+                    &self.studio_root.join(directory),
+                    &destination.join(directory),
+                )?;
+            }
+            sync_directory(destination)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(destination);
+        }
+        result
+    }
+
+    /// Atomically replace the live Studio catalog and media directories from a
+    /// verified same-volume staging snapshot. The caller must hash-verify every
+    /// downloaded object before reaching this method.
+    pub(crate) fn install_sync_snapshot(&self, source: &Path) -> Result<(), StudioStoreError> {
+        validate_sync_snapshot(source)?;
+        let snapshot_database = source.join(DATABASE_FILE);
+        let snapshot = Connection::open(&snapshot_database)?;
+        let version: i64 = snapshot.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version > SCHEMA_VERSION {
+            return Err(StudioStoreError::NewerSchema(version));
+        }
+        if version != SCHEMA_VERSION {
+            return Err(StudioStoreError::InvalidValue(format!(
+                "downloaded Studio database schema {version} differs from local schema {SCHEMA_VERSION}; update this device before pulling"
+            )));
+        }
+        let integrity: String =
+            snapshot.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            return Err(StudioStoreError::InvalidValue(
+                "downloaded Studio database failed integrity check".into(),
+            ));
+        }
+        drop(snapshot);
+
+        let backup = self
+            .studio_root
+            .join(format!(".sync-previous-{}", Uuid::new_v4()));
+        fs::create_dir(&backup)?;
+        let backup_database = backup.join(DATABASE_FILE);
+        let names = ["artifacts", "previews", "inputs"];
+        let mut connection = self.connection()?;
+        connection.backup(DatabaseName::Main, &backup_database, None)?;
+
+        let mut moved_old = Vec::new();
+        for name in names {
+            let live = self.studio_root.join(name);
+            let previous = backup.join(name);
+            if let Err(error) = fs::rename(&live, &previous) {
+                restore_media_directories(&self.studio_root, &backup, &moved_old, &[]);
+                let _ = fs::remove_dir_all(&backup);
+                return Err(error.into());
+            }
+            moved_old.push(name);
+        }
+
+        let mut installed = Vec::new();
+        for name in names {
+            let staged = source.join(name);
+            let live = self.studio_root.join(name);
+            if let Err(error) = fs::rename(&staged, &live) {
+                restore_media_directories(&self.studio_root, &backup, &moved_old, &installed);
+                let _ = connection.restore(DatabaseName::Main, &backup_database, None::<fn(_)>);
+                let _ = fs::remove_dir_all(&backup);
+                return Err(error.into());
+            }
+            installed.push(name);
+        }
+
+        if let Err(error) =
+            connection.restore(DatabaseName::Main, &snapshot_database, None::<fn(_)>)
+        {
+            restore_media_directories(&self.studio_root, &backup, &moved_old, &installed);
+            let _ = connection.restore(DatabaseName::Main, &backup_database, None::<fn(_)>);
+            let _ = fs::remove_dir_all(&backup);
+            return Err(error.into());
+        }
+        drop(connection);
+        fs::remove_dir_all(&backup)?;
+        self.notify_change();
+        Ok(())
     }
 
     pub fn artifacts(&self) -> &ArtifactStore {
@@ -1520,6 +1726,10 @@ impl StudioStore {
             "UPDATE studio_artifacts SET preview_relative_path = ?2, thumbhash = ?3 WHERE id = ?1",
             rusqlite::params![artifact_id.0.to_string(), relative_path, thumbhash],
         )?;
+        // A preview is durable gallery state too. Wake the debounced snapshot
+        // publisher so a completed background thumbnail is not left local
+        // until some unrelated Studio edit happens.
+        self.notify_change();
         Ok(())
     }
 
@@ -3601,4 +3811,178 @@ impl ArtifactStore {
 
 fn sync_directory(path: &Path) -> Result<(), std::io::Error> {
     File::open(path)?.sync_all()
+}
+
+/// Copy only stable, single-file media entries. The Studio jail never gives
+/// callers a nested filename; rejecting anything else keeps a malformed local
+/// cache from becoming a remotely installed path on another device.
+fn copy_sync_media_directory(source: &Path, destination: &Path) -> Result<(), StudioStoreError> {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(StudioStoreError::InvalidArtifact);
+    }
+    fs::create_dir(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .ok_or_else(|| StudioStoreError::InvalidValue("non-UTF-8 Studio media name".into()))?;
+        // Import staging and an interrupted atomic publish are local details,
+        // not durable Studio state. They must never enter a snapshot.
+        if name.starts_with('.') || name == "tmp" {
+            continue;
+        }
+        if !valid_sync_media_name(name) {
+            return Err(StudioStoreError::InvalidArtifact);
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(StudioStoreError::InvalidArtifact);
+        }
+        fs::copy(entry.path(), destination.join(name))?;
+    }
+    sync_directory(destination)?;
+    Ok(())
+}
+
+fn valid_sync_media_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_alphanumeric())
+        && name.len() <= 255
+        && chars.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        })
+}
+
+fn validate_sync_snapshot(source: &Path) -> Result<(), StudioStoreError> {
+    let root = fs::symlink_metadata(source)?;
+    if root.file_type().is_symlink() || !root.is_dir() {
+        return Err(StudioStoreError::InvalidArtifact);
+    }
+    let database = source.join(DATABASE_FILE);
+    let database_meta = fs::symlink_metadata(database)?;
+    if database_meta.file_type().is_symlink() || !database_meta.is_file() {
+        return Err(StudioStoreError::InvalidArtifact);
+    }
+    for name in ["artifacts", "previews", "inputs"] {
+        let directory = source.join(name);
+        let metadata = fs::symlink_metadata(&directory)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(StudioStoreError::InvalidArtifact);
+        }
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_str().ok_or_else(|| {
+                StudioStoreError::InvalidValue("non-UTF-8 Studio media name".into())
+            })?;
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if !valid_sync_media_name(name)
+                || metadata.file_type().is_symlink()
+                || !metadata.is_file()
+            {
+                return Err(StudioStoreError::InvalidArtifact);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Undo a partially completed directory swap. The database has its own online
+/// backup beside these directories and is restored by the caller if needed.
+fn restore_media_directories(
+    studio_root: &Path,
+    backup: &Path,
+    moved_old: &[&str],
+    installed: &[&str],
+) {
+    for name in installed {
+        let live = studio_root.join(name);
+        if live.exists() {
+            let _ = fs::remove_dir_all(live);
+        }
+    }
+    for name in moved_old.iter().rev() {
+        let previous = backup.join(name);
+        let live = studio_root.join(name);
+        if previous.exists() {
+            let _ = fs::rename(previous, live);
+        }
+    }
+}
+
+#[cfg(test)]
+mod sync_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn online_database_snapshot_restores_without_copying_the_live_sqlite_file() {
+        let temporary = tempfile::tempdir().expect("temporary profile");
+        let store = StudioStore::open(temporary.path(), DEFAULT_MAX_ARTIFACT_BYTES)
+            .expect("open Studio store");
+        store
+            .create_conversation("before sync", None)
+            .expect("write first conversation");
+        let stage = store.sync_root().join(".snapshot-test");
+        store.export_sync_snapshot(&stage).expect("export snapshot");
+        store
+            .create_conversation("after sync", None)
+            .expect("write second conversation");
+
+        store
+            .install_sync_snapshot(&stage)
+            .expect("install snapshot");
+        let count: i64 = store
+            .connection()
+            .expect("lock database")
+            .query_row("SELECT COUNT(*) FROM studio_conversations", [], |row| {
+                row.get(0)
+            })
+            .expect("count conversations");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn imports_a_local_profile_once_without_touching_the_source() {
+        let temporary = tempfile::tempdir().expect("temporary profile");
+        let local_profile = temporary.path().join("profiles/local");
+        let local = StudioStore::open(&local_profile, DEFAULT_MAX_ARTIFACT_BYTES)
+            .expect("open local Studio store");
+        local
+            .create_conversation("old local generation", None)
+            .expect("write local conversation");
+        let target = StudioStore::open(
+            &temporary.path().join("orgs/org/user"),
+            DEFAULT_MAX_ARTIFACT_BYTES,
+        )
+        .expect("open target Studio store");
+
+        assert!(
+            target
+                .import_legacy_local_snapshot(&local_profile.join("studio"))
+                .expect("import local Studio")
+        );
+        assert!(
+            !target
+                .import_legacy_local_snapshot(&local_profile.join("studio"))
+                .expect("second import is skipped")
+        );
+        let count: i64 = target
+            .connection()
+            .expect("lock target database")
+            .query_row("SELECT COUNT(*) FROM studio_conversations", [], |row| {
+                row.get(0)
+            })
+            .expect("count target conversations");
+        assert_eq!(count, 1);
+        let source_count: i64 = local
+            .connection()
+            .expect("lock source database")
+            .query_row("SELECT COUNT(*) FROM studio_conversations", [], |row| {
+                row.get(0)
+            })
+            .expect("count source conversations");
+        assert_eq!(source_count, 1);
+    }
 }

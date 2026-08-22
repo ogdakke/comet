@@ -3,7 +3,7 @@
 //! (the sidebar update strip + macOS bundle swap).
 //!
 //! Release layout (see `.github/workflows/release.yml` and `edge/src/install.sh`):
-//! artifacts live in the `comet-native-releases` R2 bucket, served pre-auth at
+//! artifacts live in the deployment's private R2 release bucket, served pre-auth at
 //! `{edge}/releases/*`. `manifest.json` carries the latest version plus a
 //! sha256 per artifact; `latest.txt` (version only) remains as the fallback for
 //! releases published before the manifest existed.
@@ -169,6 +169,9 @@ pub enum InstallKind {
     Managed { app_root: PathBuf },
     /// Running out of a macOS `.app` bundle.
     MacApp { bundle: PathBuf },
+    /// A user-facing CLI installed at `~/.local/bin/zeron`. It deliberately
+    /// shares the production runtime, but the updater does not own it.
+    UserInstalled,
     /// Source build or hand-copied binary — updates are report-only.
     Unmanaged,
 }
@@ -196,6 +199,11 @@ fn detect_install_from(exe: &Path, home: Option<&Path>) -> InstallKind {
         let app_root = home.join(".zeron").join("app");
         if exe.starts_with(&app_root) {
             return InstallKind::Managed { app_root };
+        }
+        // A binary placed on the user's normal command PATH is the production
+        // CLI. Keep `target/debug/zeron` isolated for development.
+        if exe == home.join(".local").join("bin").join("zeron") {
+            return InstallKind::UserInstalled;
         }
     }
     for ancestor in exe.ancestors() {
@@ -747,6 +755,13 @@ mod tests {
                 bundle: PathBuf::from("/Applications/Zeron.app")
             }
         );
+        assert_eq!(
+            detect_install_from(
+                Path::new("/home/u/.local/bin/zeron"),
+                Some(Path::new("/home/u")),
+            ),
+            InstallKind::UserInstalled
+        );
         // A path merely containing `.app` without the bundle layout is not a bundle.
         assert_eq!(
             detect_install_from(Path::new("/tmp/foo.app/zeron"), None),
@@ -769,6 +784,13 @@ mod tests {
         assert!(
             detect_install_from(
                 Path::new("/home/u/.zeron/app/0.1.1/zeron"),
+                Some(Path::new("/home/u")),
+            )
+            .uses_production_runtime()
+        );
+        assert!(
+            detect_install_from(
+                Path::new("/home/u/.local/bin/zeron"),
                 Some(Path::new("/home/u")),
             )
             .uses_production_runtime()

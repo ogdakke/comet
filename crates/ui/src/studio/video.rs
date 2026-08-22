@@ -460,10 +460,15 @@ impl StudioVideoPlayback {
     }
 
     pub(super) fn needs_frame(&self) -> bool {
-        if !self.can_play_in_app() {
-            return false;
+        #[cfg(target_os = "macos")]
+        {
+            self.can_play_in_app()
+                && (self.playing || self.frame().is_none() || self.seek_settle > 0)
         }
-        self.playing || self.frame().is_none() || self.seek_settle > 0
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
     }
 
     pub(super) fn step(&mut self) -> bool {

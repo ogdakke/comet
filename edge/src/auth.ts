@@ -46,9 +46,17 @@ export const verifyToken = async (env: Env, token: string): Promise<Verified | u
     if (at > 0) return { userId: token.slice(0, at), orgId: token.slice(at + 1) };
     return { userId: token };
   }
-  const issuer =
-    env.WORKOS_ISSUER ?? `https://api.workos.com/user_management/${env.WORKOS_CLIENT_ID}`;
-  const jwksUrl = env.WORKOS_JWKS_URL ?? `https://api.workos.com/sso/jwks/${env.WORKOS_CLIENT_ID}`;
+  let clientId: string;
+  try {
+    clientId = await env.WORKOS_CLIENT_ID.get();
+  } catch {
+    return undefined;
+  }
+  // AuthKit access tokens use the WorkOS API origin as their standard issuer.
+  // A private deployment may still provide WORKOS_ISSUER for a custom AuthKit
+  // domain, but deriving an issuer from the client ID rejects normal tokens.
+  const issuer = env.WORKOS_ISSUER ?? "https://api.workos.com";
+  const jwksUrl = env.WORKOS_JWKS_URL ?? `https://api.workos.com/sso/jwks/${clientId}`;
   try {
     const { payload } = await jwtVerify(token, getJwks(jwksUrl), { issuer });
     if (typeof payload.sub !== "string" || payload.sub.length === 0) return undefined;

@@ -6,8 +6,10 @@
 //! (`/auth/exchange`, `/auth/refresh` — the WorkOS API key lives only there).
 //!
 //! Two modes:
-//! - **Dev** (no WorkOS client id configured, or the edge reports `auth: "dev"`): always
-//!   signed in; the bearer IS the configured user id (current M2/M3 behavior).
+//! - **Dev** (explicitly enabled, or the edge reports `auth: "dev"`): always signed in;
+//!   the bearer IS the configured user id (current M2/M3 behavior).
+//! - **Unconfigured** (no WorkOS client id and Dev is not explicitly enabled): signed out;
+//!   authentication and cloud sync are unavailable.
 //! - **WorkOS**: authorization-code flow. Headed devices use a loopback callback server
 //!   on an ephemeral port; headless devices use the paste-code flow (the redirect is the
 //!   edge's hosted `/auth/cli/callback` page, which shows `state.code` to paste back via
@@ -128,8 +130,11 @@ pub struct AuthConfig {
     pub edge_url: String,
     /// Data dir for the persisted session (`session.json`, 0600).
     pub data_dir: PathBuf,
-    /// WorkOS client id; `None` = dev mode.
+    /// WorkOS client id. `None` disables authentication unless `dev_mode` is set.
     pub workos_client_id: Option<String>,
+    /// Permit the explicit development bearer flow. A missing WorkOS client id
+    /// without this flag means auth is unavailable, never development mode.
+    pub dev_mode: bool,
     /// WorkOS API base (authorize URL host).
     pub workos_api_base: String,
     /// Dev-mode bearer/user id (mirrors the old `ZERON_EDGE_TOKEN` behavior).
@@ -144,6 +149,7 @@ impl AuthConfig {
             edge_url: edge_url.into(),
             data_dir: data_dir.into(),
             workos_client_id: None,
+            dev_mode: false,
             workos_api_base: "https://api.workos.com".into(),
             dev_user_id: "dev-user".into(),
             callback_port: None,
@@ -206,8 +212,9 @@ impl AccessEntry {
 
 struct AuthInner {
     config: AuthConfig,
-    /// `Some(client_id)` = WorkOS mode; `None` = dev mode.
+    /// `Some(client_id)` = WorkOS mode; `None` = disabled unless `dev_mode` is set.
     workos: Option<String>,
+    dev_mode: bool,
     /// Whether construction loaded a parseable WorkOS session. This is an
     /// immutable startup fact: refresh or sign-out must not rewrite it.
     loaded_workos_session: bool,
@@ -239,12 +246,13 @@ pub struct Auth {
 }
 
 impl Auth {
-    /// Build from config: dev mode unless a WorkOS client id is configured.
+    /// Build from config. Development mode requires an explicit opt-in.
     pub fn new(config: AuthConfig) -> Self {
         let workos = config
             .workos_client_id
             .clone()
             .filter(|s| !s.trim().is_empty());
+        let dev_mode = config.dev_mode;
         let session_file = config.data_dir.join("session.json");
         let stored: Option<StoredSession> = if workos.is_some() {
             std::fs::read_to_string(&session_file)
@@ -254,7 +262,7 @@ impl Auth {
             None
         };
         let initial = match (&workos, &stored) {
-            (None, _) => AuthState::SignedIn {
+            (None, _) if dev_mode => AuthState::SignedIn {
                 user: AuthUser {
                     id: config.dev_user_id.clone(),
                     email: config.dev_user_id.clone(),
@@ -262,6 +270,7 @@ impl Auth {
                 },
                 org_id: None,
             },
+            (None, _) => AuthState::SignedOut,
             (Some(_), Some(session)) => state_for(session.user.clone(), session.org_id.clone()),
             (Some(_), None) => AuthState::SignedOut,
         };
@@ -276,6 +285,7 @@ impl Auth {
             inner: Arc::new(AuthInner {
                 config,
                 workos,
+                dev_mode,
                 loaded_workos_session,
                 http,
                 state_tx,
@@ -315,6 +325,7 @@ impl Auth {
             {
                 tracing::info!("auth: edge is in dev mode — using dev bearer");
                 config.workos_client_id = None;
+                config.dev_mode = true;
             }
         }
         Self::new(config)
@@ -322,6 +333,11 @@ impl Auth {
 
     pub fn workos_enabled(&self) -> bool {
         self.inner.workos.is_some()
+    }
+
+    /// Whether an explicit development bearer enables the development profile.
+    pub fn development_enabled(&self) -> bool {
+        self.inner.dev_mode
     }
 
     /// True when construction loaded a parseable persisted WorkOS session.
@@ -342,9 +358,9 @@ impl Auth {
     /// The signed-in user id — the identity that scopes workspace rooms
     /// (`ws3/{orgId}/{userId}`) and local storage (`orgs/{org}/{user}/`).
     /// Dev mode mirrors the edge's dev-bearer parsing (`user@org` → `user`,
-    /// a bare token IS the user id). `None` = signed out (WorkOS only).
+    /// a bare token IS the user id). `None` = signed out or unconfigured.
     pub fn user_id(&self) -> Option<String> {
-        if self.inner.workos.is_none() {
+        if self.inner.dev_mode {
             let dev = &self.inner.config.dev_user_id;
             return Some(dev.split('@').next().unwrap_or(dev).to_string());
         }
@@ -355,7 +371,7 @@ impl Auth {
     /// Dev mode: the configured user id. WorkOS: cached access token, refreshed when
     /// it has under 30s left.
     pub async fn access_token(&self) -> Option<String> {
-        if self.inner.workos.is_none() {
+        if self.inner.dev_mode {
             return Some(self.inner.config.dev_user_id.clone());
         }
         if let Some(entry) = &*lock(&self.inner.access)
@@ -373,7 +389,7 @@ impl Auth {
     }
 
     /// Sleep-until-near-expiry refresh loop so long-lived dials (relay, rooms) always
-    /// have a live token to present on reconnect. No-op task in dev mode.
+    /// have a live token to present on reconnect. No-op outside WorkOS mode.
     pub fn spawn_refresh_loop(&self) -> tokio::task::JoinHandle<()> {
         let auth = self.clone();
         tokio::spawn(async move {
@@ -437,7 +453,13 @@ impl Auth {
     /// loopback callback server (bound lazily on an ephemeral port).
     pub async fn start_sign_in(&self) -> Result<String, EngineError> {
         if self.inner.workos.is_none() {
-            return Ok(String::new()); // dev mode: nothing to do (TS parity)
+            if self.inner.dev_mode {
+                return Ok(String::new());
+            }
+            return Err(EngineError::Other(
+                "WorkOS login is not configured. Set ZERON_EDGE_URL and ZERON_WORKOS_CLIENT_ID."
+                    .into(),
+            ));
         }
         let port = self.ensure_loopback().await?;
         Ok(self.begin_sign_in(&format!("http://127.0.0.1:{port}/callback")))
@@ -445,19 +467,31 @@ impl Auth {
 
     /// Begin a headless sign-in: the redirect is the edge's hosted paste-code page —
     /// nothing ever redirects to this machine, so the browser can be anywhere.
-    pub fn start_headless_sign_in(&self) -> String {
+    pub fn start_headless_sign_in(&self) -> Result<String, EngineError> {
         if self.inner.workos.is_none() {
-            return String::new();
+            if self.inner.dev_mode {
+                return Ok(String::new());
+            }
+            return Err(EngineError::Other(
+                "WorkOS login is not configured. Set ZERON_EDGE_URL and ZERON_WORKOS_CLIENT_ID."
+                    .into(),
+            ));
         }
         let edge = self.inner.config.edge_url.trim_end_matches('/');
-        self.begin_sign_in(&format!("{edge}/auth/cli/callback"))
+        Ok(self.begin_sign_in(&format!("{edge}/auth/cli/callback")))
     }
 
     /// Finish a headless sign-in with the pasted `state.code` string. The state half
     /// must match a sign-in started HERE (same CSRF discipline as the loopback flow).
     pub async fn complete_sign_in(&self, pasted: &str) -> Result<(), EngineError> {
         if self.inner.workos.is_none() {
-            return Ok(());
+            if self.inner.dev_mode {
+                return Ok(());
+            }
+            return Err(EngineError::Other(
+                "WorkOS login is not configured. Set ZERON_EDGE_URL and ZERON_WORKOS_CLIENT_ID."
+                    .into(),
+            ));
         }
         let trimmed = pasted.trim();
         let (state, code) = trimmed.split_once('.').unwrap_or(("", ""));

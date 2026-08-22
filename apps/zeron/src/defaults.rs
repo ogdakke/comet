@@ -108,5 +108,10 @@ mod tests {
         );
         assert_eq!(ipc_port_for(&mac), PACKAGED_IPC_PORT);
         assert_eq!(ipc_port_for(&managed), PACKAGED_IPC_PORT);
+        assert_eq!(
+            data_dir_for(&InstallKind::UserInstalled, home),
+            PathBuf::from("/Users/dev/.zeron")
+        );
+        assert_eq!(ipc_port_for(&InstallKind::UserInstalled), PACKAGED_IPC_PORT);
     }
 }

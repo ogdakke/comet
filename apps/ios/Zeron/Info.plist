@@ -22,6 +22,10 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
+	<key>ZeronEdgeURL</key>
+	<string>$(ZERON_EDGE_URL)</string>
+	<key>ZeronWorkOSClientID</key>
+	<string>$(ZERON_WORKOS_CLIENT_ID)</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
