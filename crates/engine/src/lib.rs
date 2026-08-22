@@ -420,6 +420,7 @@ impl EngineCore {
                 .unwrap_or_else(|| "dev-user".into());
             let mut config = AuthConfig::new("http://localhost:27640", std::env::temp_dir());
             config.dev_user_id = dev_user;
+            config.dev_mode = true;
             Auth::new(config)
         })
         .clone()
@@ -737,13 +738,14 @@ impl Engine {
         );
         if let Some(token) = &config.edge_token {
             auth_config.dev_user_id = token.clone();
+            auth_config.dev_mode = !token.trim().is_empty();
         }
         Auth::new(auth_config)
     }
 
     /// Capture the workspace boundary once, before refresh or sign-in can mutate auth.
     pub fn initial_workspace_scope(auth: &Auth) -> WorkspaceScope {
-        if !auth.workos_enabled() {
+        if auth.development_enabled() {
             WorkspaceScope::Development
         } else if auth.loaded_workos_session() {
             WorkspaceScope::Synced
@@ -1103,7 +1105,7 @@ pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
                     ));
                 }
                 if stdin_reader.is_none() {
-                    let url = auth.start_headless_sign_in();
+                    let url = auth.start_headless_sign_in()?;
                     println!("Sign in to Zeron:\n\n  {url}\n");
                     println!("Then paste the code shown in the browser here and press enter.");
                     let auth = auth.clone();

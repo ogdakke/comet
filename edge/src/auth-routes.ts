@@ -44,28 +44,43 @@ export const handleAuthRoute = async (
 ): Promise<Response | undefined> => {
   const parts = url.pathname.split("/").filter(Boolean);
   if (parts[0] !== "auth") return undefined;
-  const apiKey = env.WORKOS_API_KEY;
+  const readSecret = async (secret: SecretsStoreSecret | undefined): Promise<string | undefined> => {
+    if (!secret) return undefined;
+    try {
+      return await secret.get();
+    } catch {
+      return undefined;
+    }
+  };
 
   if (parts[1] === "exchange" && parts.length === 2 && request.method === "POST") {
-    if (!apiKey) return notConfigured();
+    const [apiKey, clientId] = await Promise.all([
+      readSecret(env.WORKOS_API_KEY),
+      readSecret(env.WORKOS_CLIENT_ID)
+    ]);
+    if (!apiKey || !clientId) return notConfigured();
     const body = await bodyJson<{ code?: string }>(request);
     if (typeof body?.code !== "string") return json({ error: "missing code" }, 400);
     try {
-      return json(await exchange(env, apiKey, body.code));
+      return json(await exchange(clientId, apiKey, body.code));
     } catch (e) {
       return authFailed(e);
     }
   }
 
   if (parts[1] === "refresh" && parts.length === 2 && request.method === "POST") {
-    if (!apiKey) return notConfigured();
+    const [apiKey, clientId] = await Promise.all([
+      readSecret(env.WORKOS_API_KEY),
+      readSecret(env.WORKOS_CLIENT_ID)
+    ]);
+    if (!apiKey || !clientId) return notConfigured();
     const body = await bodyJson<{ refreshToken?: string; organizationId?: string }>(request);
     if (typeof body?.refreshToken !== "string") return json({ error: "missing refreshToken" }, 400);
     if (body.organizationId !== undefined && typeof body.organizationId !== "string") {
       return json({ error: "missing refreshToken" }, 400);
     }
     try {
-      return json(await refresh(env, apiKey, body.refreshToken, body.organizationId));
+      return json(await refresh(clientId, apiKey, body.refreshToken, body.organizationId));
     } catch (e) {
       // Identify repeat offenders: a client with a rotated-out session
       // retries every 30s forever and is otherwise anonymous in the tail
@@ -82,6 +97,7 @@ export const handleAuthRoute = async (
   }
 
   if (parts[1] === "orgs" && parts.length === 2) {
+    const apiKey = await readSecret(env.WORKOS_API_KEY);
     if (!apiKey) return notConfigured();
     const token = bearerFromRequest(request);
     const caller = token ? await verifyToken(env, token) : undefined;

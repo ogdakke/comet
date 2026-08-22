@@ -6,7 +6,7 @@
   "name": "comet-native-edge-chat2test2",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-01",
-  "account_id": "b57dde68ee5964dccc025437b5478a5b",
+  "account_id": "REPLACE_WITH_PRIVATE_CLOUDFLARE_ACCOUNT_ID",
   "workers_dev": true,
   "rules": [{ "type": "Text", "globs": ["**/*.sh"], "fallthrough": true }],
   "alias": {
@@ -26,11 +26,11 @@
     { "tag": "v3", "new_sqlite_classes": ["ChatRoom"] }
   ],
   "r2_buckets": [
-    { "binding": "BLOBS", "bucket_name": "comet-native-blobs-chat2test" },
-    { "binding": "RELEASES", "bucket_name": "comet-native-blobs-chat2test" }
+    { "binding": "BLOBS", "bucket_name": "REPLACE_WITH_PRIVATE_BLOBS_BUCKET" },
+    { "binding": "RELEASES", "bucket_name": "REPLACE_WITH_PRIVATE_RELEASES_BUCKET" }
   ],
   "vars": {
-    "WORKOS_CLIENT_ID": "client_01KWD0EAKZKD50YCQJNYSRE4BY",
+    "WORKOS_CLIENT_ID": "client_test",
     "AUTH_MODE": "dev"
   },
   "observability": {

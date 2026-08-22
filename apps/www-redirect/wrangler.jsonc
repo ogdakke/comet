@@ -1,14 +1,11 @@
 {
-  // www.zeron.sh → zeron.sh canonicalization. The zone has a proxied DNS
-  // record for www but no origin behind it, so without this route Cloudflare
-  // answers 525. A zone route (not a custom domain) rides that existing
-  // record. Redirect rules would be cleaner but need zone rulesets write,
-  // which the deploy token doesn't have.
+  // Optional personal redirect worker template. Copy to an ignored private
+  // config before adding any domain or account values.
   "$schema": "https://unpkg.com/wrangler/config-schema.json",
-  "name": "zeron-www-redirect",
+  "name": "REPLACE_WITH_PRIVATE_REDIRECT_WORKER_NAME",
   "main": "src/index.js",
   "compatibility_date": "2026-07-01",
-  "account_id": "b57dde68ee5964dccc025437b5478a5b",
+  "account_id": "REPLACE_WITH_PRIVATE_CLOUDFLARE_ACCOUNT_ID",
   "workers_dev": false,
-  "routes": [{ "pattern": "www.zeron.sh/*", "zone_name": "zeron.sh" }]
+  "routes": []
 }
