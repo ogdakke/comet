@@ -495,6 +495,11 @@ fn descriptor_surface_matches_registry_expectations() {
     assert_eq!(harness.id(), HarnessId::Grok);
     assert_eq!(harness.display_name(), "Grok");
     assert!(harness.supports_steering());
+    assert!(harness.deterministic_turn_end());
+    assert!(
+        !AcpHarness::hermes().deterministic_turn_end(),
+        "Hermes has no prompt_complete; the engine quiesce stays armed"
+    );
     assert_eq!(harness.steering_mode(), SteeringMode::TurnBoundary);
     assert_eq!(
         harness.reasoning_levels(),

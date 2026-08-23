@@ -959,6 +959,15 @@ impl Harness for AcpHarness {
     fn supports_steering(&self) -> bool {
         true
     }
+    /// Grok's `_x.ai/session/prompt_complete` is the real turn end. The
+    /// engine's 120s / 20s self-continued quiesce would otherwise park a
+    /// long think / subagent wait (execute-plan: chime, timestamp, then
+    /// "parked session resumed") the same way the harness 30s quiet-settle
+    /// used to. Hermes keeps the watchdog (pi left for the native
+    /// PiHarness, which settles deterministically on `agent_settled`).
+    fn deterministic_turn_end(&self) -> bool {
+        self.spec.prompt_complete_extension
+    }
     fn steering_mode(&self) -> SteeringMode {
         self.spec.steering_mode
     }
@@ -1476,6 +1485,25 @@ fn prompt_turn(
         }
         client.request("session/prompt", params).await
     })
+}
+
+/// Hermes (and other agents without an authoritative turn-end
+/// notification) get a 30s quiet window; Grok does not — long silent
+/// reasoning / plan writes look finished and a false settle orphans the
+/// real `session/prompt` response. `ZERON_ACP_QUIET_SETTLE_MS` overrides
+/// (0 disables).
+fn quiet_settle_window(prompt_complete_extension: bool) -> Option<Duration> {
+    if prompt_complete_extension {
+        return None;
+    }
+    match std::env::var("ZERON_ACP_QUIET_SETTLE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(ms) => Some(Duration::from_millis(ms)),
+        None => Some(Duration::from_secs(30)),
+    }
 }
 
 /// Answer a server→client request. Permission requests are auto-accepted with
@@ -2017,15 +2045,16 @@ async fn run_session(session: Session) {
     // Done ever comes, and the session strands Working until the engine's
     // quiesce watchdog parks it.
     //
+    // Grok is exempt: it advertises
+    // `_x.ai/session/prompt_complete` as the AUTHORITATIVE turn end, and a
+    // 30s think / long plan-file write looks identical to a dropped reply
+    // (Grok 2026-08-18: timestamp landed, then the session self-continued
+    // when more output arrived). Hermes uses this blanket window.
+    // (pi-acp was exempt too — long silent reasoning stretches — but the
+    // adapter is retired; the native PiHarness settles deterministically on
+    // pi's own agent_settled and never consults this window.)
     // `ZERON_ACP_QUIET_SETTLE_MS` overrides; 0 disables.
-    let quiet_settle: Option<Duration> = match std::env::var("ZERON_ACP_QUIET_SETTLE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        Some(0) => None,
-        Some(ms) => Some(Duration::from_millis(ms)),
-        None => Some(Duration::from_secs(30)),
-    };
+    let quiet_settle: Option<Duration> = quiet_settle_window(prompt_complete_extension);
     let mut last_update_at = tokio::time::Instant::now();
     let mut turn_content_seen = false;
     // A steering injection makes the cost hint unsafe for the REST of the
@@ -3289,5 +3318,11 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].name, "compact");
         assert!(scan_available_commands(&json!({ "protocolVersion": 1 })).is_empty());
+    }
+
+    #[test]
+    fn grok_skips_the_quiet_settle_window() {
+        assert!(quiet_settle_window(true).is_none());
+        assert_eq!(quiet_settle_window(false), Some(Duration::from_secs(30)));
     }
 }
