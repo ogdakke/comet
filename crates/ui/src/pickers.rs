@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable as _, KeyDownEvent, SharedString,
@@ -958,7 +959,10 @@ impl Pickers {
                 // possibly from another viewer) — every open revalidates,
                 // keeping current rows visible until the fresh catalog lands.
                 self.ensure_harnesses(true, cx);
-                self.prefetch_models(cx);
+                // Model discovery can recover after a slow/plugin-heavy
+                // cold start. Revalidate on every open instead of pinning a
+                // timeout/fallback result until the application restarts.
+                self.prefetch_models(true, cx);
             }
             // Projects and devices are already synced state — nothing to load.
             PickerKind::Space | PickerKind::Device => {}
@@ -1014,7 +1018,7 @@ impl Pickers {
                     },
                     Err(err) => Loadable::Error(err.to_string()),
                 };
-                pickers.prefetch_models(cx);
+                pickers.prefetch_models(false, cx);
                 cx.notify();
             })
             .ok();
@@ -1026,7 +1030,7 @@ impl Pickers {
     /// tabs) the lists are already there, instead of a per-selection
     /// "Loading models…" round-trip. Each `ensure_models` call is guarded by
     /// its slot state, so re-running this every catalog load/render is free.
-    fn prefetch_models(&mut self, cx: &mut Context<Self>) {
+    fn prefetch_models(&mut self, force: bool, cx: &mut Context<Self>) {
         let mut targets: Vec<HarnessId> = match self.harnesses.ready() {
             Some(list) => offered_harnesses(list).iter().map(|d| d.id).collect(),
             None => Vec::new(),
@@ -1039,18 +1043,20 @@ impl Pickers {
             targets.push(effective);
         }
         for harness in targets {
-            self.ensure_models(harness, cx);
+            self.ensure_models(harness, force, cx);
         }
     }
 
-    fn ensure_models(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
-        // Absent or Idle only — same render-loop hazard as `ensure_harnesses`;
-        // the retry row clears the map to re-arm.
-        if self
-            .models
-            .get(&harness)
-            .is_some_and(|slot| !matches!(slot, Loadable::Idle))
-        {
+    fn ensure_models(&mut self, harness: HarnessId, force: bool, cx: &mut Context<Self>) {
+        // Normal prefetches load absent/Idle slots once. Picker-open refreshes
+        // also retry Ready/Error slots, while an in-flight load is always
+        // reused. Ready rows stay visible until the replacement lands.
+        let reload = match self.models.get(&harness) {
+            None | Some(Loadable::Idle) => true,
+            Some(Loadable::Loading) => false,
+            Some(Loadable::Ready(_)) | Some(Loadable::Error(_)) => force,
+        };
+        if !reload {
             return;
         }
         let Some(engine) = self.engine(cx) else {
@@ -1069,7 +1075,34 @@ impl Pickers {
                     serde_json::Value::String(target.clone()),
                 );
             }
-            let result = engine.client().call(methods::LIST_MODELS, params).await;
+            // A plugin-heavy OpenCode cold start can fail once while caches,
+            // MCP servers, or plugin runtimes are still warming. Keep this
+            // single Loading slot alive for two retries so recovery requires
+            // no picker close/reopen and cannot launch duplicate probes.
+            let mut attempt = 1_u64;
+            let result = loop {
+                let result = engine
+                    .client()
+                    .call(methods::LIST_MODELS, params.clone())
+                    .await;
+                if result.is_ok() || harness != HarnessId::Opencode || attempt >= 3 {
+                    break result;
+                }
+                if let Err(error) = &result {
+                    tracing::warn!(
+                        %error,
+                        attempt,
+                        "OpenCode model discovery failed; retrying automatically"
+                    );
+                }
+                if this.update(cx, |_, _| {}).is_err() {
+                    return;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_secs(attempt * 2))
+                    .await;
+                attempt += 1;
+            };
             this.update(cx, |pickers, cx| {
                 let loaded = match result {
                     Ok(value) => match serde_json::from_value::<Vec<Model>>(value) {
@@ -1291,7 +1324,7 @@ impl Pickers {
         self.defaults.harness = Some(harness);
         self.save_defaults();
         self.model_scroll_base().set_offset(gpui::Point::default());
-        self.ensure_models(harness, cx);
+        self.ensure_models(harness, false, cx);
         // Re-anchor the keyboard highlight onto the new harness's selected row.
         self.active = self.selected_model_index(cx);
         cx.notify();
@@ -3899,7 +3932,7 @@ impl Render for Pickers {
         // the chip reads "Fable 5" (a concrete pick) before any popover
         // opens, and rail switches inside the picker are instant.
         self.ensure_harnesses(false, cx);
-        self.prefetch_models(cx);
+        self.prefetch_models(false, cx);
         // A popover opened data-side (ZERON_OPEN_PICKER) never went through
         // `toggle`, so kick its loads here (all ensure_* are idempotent).
         if matches!(

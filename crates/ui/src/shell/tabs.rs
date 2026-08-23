@@ -319,7 +319,7 @@ impl Shell {
             .pt(px(Theme::TITLEBAR_TOP_PAD))
             .gap(px(8.0))
             .pl(px(content_left))
-            .pr(px(self.titlebar_right_pad(Theme::SPACE_LG)))
+            .pr(px(self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET)))
             .when_some(title, |el, title| {
                 el.child(
                     div()

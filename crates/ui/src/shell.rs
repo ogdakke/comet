@@ -41,8 +41,8 @@ use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
-    KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
-    SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
+    KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS, SIDEBAR_DEFAULT,
+    SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
@@ -88,12 +88,10 @@ fn conversation_width(viewport: f32, sidebar: f32, right: f32) -> f32 {
     (viewport - sidebar - right).max(0.0)
 }
 
-#[cfg(test)]
 fn right_pane_max_width(viewport: f32, sidebar: f32) -> f32 {
     (viewport - sidebar - crate::settings::CHAT_PANEL_MIN).max(0.0)
 }
 
-#[cfg(test)]
 fn right_pane_takeover_width(viewport: f32, sidebar: f32) -> f32 {
     (viewport - sidebar).max(0.0)
 }
@@ -1583,14 +1581,18 @@ impl Shell {
     fn right_target(&self, cx: &App) -> f32 {
         if !self.right_pane_open(cx) {
             0.0
-        } else if self.right_pane_expanded {
-            // Takeover: everything right of the sidebar; the conversation
-            // column (flex_1) collapses to zero behind it. Rides the sidebar's
-            // width tween so a sidebar toggle mid-takeover stays seamless.
-            let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
-            (self.viewport_width - sidebar_now).max(RIGHT_PANE_MIN)
         } else {
-            self.settings.right_pane_width
+            // Manual sizing preserves a usable conversation column. Takeover
+            // intentionally consumes it completely. Both ride the sidebar
+            // tween so toggling it remains seamless.
+            let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+            if self.right_pane_expanded {
+                right_pane_takeover_width(self.viewport_width, sidebar_now)
+            } else {
+                self.settings
+                    .right_pane_width
+                    .min(right_pane_max_width(self.viewport_width, sidebar_now))
+            }
         }
     }
 
@@ -2069,9 +2071,14 @@ impl Shell {
     ) {
         let viewport = f32::from(window.viewport_size().width);
         let width = viewport - f32::from(event.event.position.x);
-        // zeron caps the pane at 52% of the window on top of the absolute range.
-        let max = RIGHT_PANE_MAX.min(viewport * 0.52);
-        self.settings.right_pane_width = width.clamp(RIGHT_PANE_MIN, max.max(RIGHT_PANE_MIN));
+        // No arbitrary percentage ceiling, but retain the chat's usable 300px
+        // floor instead of allowing the conversation to collapse to zero.
+        let max = right_pane_max_width(viewport, self.sidebar_target());
+        self.settings.right_pane_width = if max >= RIGHT_PANE_MIN {
+            width.clamp(RIGHT_PANE_MIN, max)
+        } else {
+            max
+        };
         self.right_tween = None;
         self.right_takeover_content_tween = None;
         self.main_takeover_tween = None;
