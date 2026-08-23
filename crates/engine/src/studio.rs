@@ -386,12 +386,23 @@ pub struct StudioAttemptCheck {
 }
 
 /// SQLite catalog rooted under one active profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StudioChange {
+    /// A local edit, generation transition, or provider update that should be
+    /// published to the personal Studio replica.
+    Local,
+    /// A verified snapshot installed from the replica. UI subscribers still
+    /// need to redraw, but the sync worker must never publish it back as a
+    /// new manifest generation.
+    RemoteInstall,
+}
+
 pub struct StudioStore {
     studio_root: PathBuf,
     database_path: PathBuf,
     connection: Mutex<Connection>,
     artifacts: ArtifactStore,
-    changes: tokio::sync::watch::Sender<u64>,
+    changes: tokio::sync::watch::Sender<StudioChange>,
     /// In-process pollers for a given attempt. Process death clears this, which
     /// is the only case startup resume should start a new 45-minute timer.
     video_polls: Mutex<HashSet<StudioAttemptId>>,
@@ -426,7 +437,7 @@ impl StudioStore {
             }
         }
 
-        let (changes, _) = tokio::sync::watch::channel(0);
+        let (changes, _) = tokio::sync::watch::channel(StudioChange::Local);
         Ok(Self {
             studio_root: studio_root.clone(),
             database_path,
@@ -641,7 +652,7 @@ impl StudioStore {
         }
         drop(connection);
         fs::remove_dir_all(&backup)?;
-        self.notify_change();
+        self.notify_remote_install();
         Ok(())
     }
 
@@ -904,13 +915,16 @@ impl StudioStore {
             .remove(&attempt_id);
     }
 
-    pub fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+    pub fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<StudioChange> {
         self.changes.subscribe()
     }
 
     fn notify_change(&self) {
-        self.changes
-            .send_modify(|revision| *revision = revision.wrapping_add(1));
+        self.changes.send_replace(StudioChange::Local);
+    }
+
+    fn notify_remote_install(&self) {
+        self.changes.send_replace(StudioChange::RemoteInstall);
     }
 
     pub fn create_conversation(

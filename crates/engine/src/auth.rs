@@ -36,6 +36,13 @@ const SIGN_IN_TTL: Duration = Duration::from_secs(15 * 60);
 const TOKEN_SLACK: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The edge deliberately maps a WorkOS-rejected refresh token to this one
+/// status. Do not infer revocation from broader 4xx responses: quota and
+/// intermediary failures must leave the persisted session recoverable.
+fn refresh_token_is_rejected(status: u16) -> bool {
+    status == 401
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -752,11 +759,14 @@ impl Auth {
             }
         };
         let status = res.status().as_u16();
-        if (400..500).contains(&status) && organization_id.is_none() {
-            // A definitive 4xx means the refresh token itself is dead (revoked session,
-            // deleted user) — it can NEVER succeed again. Degrade to SignedOut so every
-            // downstream retry loop quiets down. (Org-switch refreshes are exempt: a 4xx
-            // there means "not a member", not a dead session.)
+        if refresh_token_is_rejected(status) && organization_id.is_none() {
+            // The edge maps a rejected WorkOS refresh token to 401. Other 4xx
+            // responses are not proof that the stored token is dead: notably,
+            // Cloudflare returns 429 after the account's daily Workers quota
+            // is spent. Keep the persisted session on those transient failures
+            // so the next successful refresh can recover without a fresh login.
+            // Org-switch refreshes are exempt: a 401 there means the requested
+            // membership may be unavailable, not that the session is dead.
             tracing::warn!(
                 status,
                 "auth: refresh rejected — session revoked; signing out"
@@ -1213,5 +1223,16 @@ mod tests {
                 "user": {"id": "u1", "email": "u@x", "name": null},
             })
         );
+    }
+
+    #[test]
+    fn only_edge_unauthorized_revokes_a_routine_refresh_session() {
+        // `/auth/refresh` maps a WorkOS-rejected refresh token to 401. A
+        // Cloudflare quota 429 must remain retryable and must not erase the
+        // user's persisted session.
+        assert!(refresh_token_is_rejected(401));
+        assert!(!refresh_token_is_rejected(429));
+        assert!(!refresh_token_is_rejected(400));
+        assert!(!refresh_token_is_rejected(403));
     }
 }

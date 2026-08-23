@@ -14,7 +14,7 @@
  * - `rows` — the state. Written synchronously inside the message event (write
  *   rate is index-scale: renames, status flips — never transcript traffic).
  * - `meta` — seq counter, gcFloor, per-device push attribution, backup marks.
- * - presence — memory-only by construction (15s client beats, rebroadcast).
+ * - presence — memory-only by construction (30s client beats, rebroadcast).
  *
  * Hibernation discipline: ZERO wall-clock timers; ping/pong rides the
  * auto-response pair; the daily alarm does tombstone GC + the R2 backup.

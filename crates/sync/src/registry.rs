@@ -29,8 +29,8 @@ use zeron_doc::{PendingBatch, RegistryDoc, RegistryRow, StateOutcome};
 
 use crate::types::{RoomStatsSnapshot, StaticUrl, SyncError, UrlProvider};
 
-/// Text `"ping"` keepalive interval (answered by the DO auto-response pair
-/// without waking it — transport liveness only).
+/// Native WebSocket ping interval. Cloudflare answers protocol pings without
+/// delivering an application message to the hibernating Durable Object.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 /// Transport silence lease: pongs count, so a healthy socket never trips this.
 const SILENCE_LEASE: Duration = Duration::from_secs(45);
@@ -41,9 +41,9 @@ const HELLO_DEADLINE: Duration = Duration::from_secs(15);
 /// A probe's `probe-ok` (or any other protocol frame) must arrive within this
 /// deadline, or the session is torn down for a fresh socket.
 const PROBE_DEADLINE: Duration = Duration::from_secs(10);
-/// Presence entries older than this are treated as expired (mirrors the
-/// EphemeralStore's 30s TTL the old workspace room used).
-const PRESENCE_TTL: Duration = Duration::from_secs(30);
+/// Presence entries older than this are treated as expired. It matches the
+/// engine's three 30-second beat live window.
+const PRESENCE_TTL: Duration = Duration::from_secs(90);
 const BACKOFF_BASE: Duration = Duration::from_millis(250);
 /// Worst-case dark window after the network returns (event wakes usually
 /// beat this; the cap only matters when every event path missed).
@@ -226,7 +226,7 @@ async fn pump(
                 Some(Err(_)) | None => break,
             },
             _ = ping.tick() => {
-                if sink.send(WsMessage::Text("ping".into())).await.is_err() {
+                if sink.send(WsMessage::Ping(Vec::new().into())).await.is_err() {
                     break;
                 }
             }

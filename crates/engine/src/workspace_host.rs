@@ -41,8 +41,10 @@ const LEGACY_WORKSPACE_DOC_ID: &str = "workspace";
 pub const DEFAULT_ORG_ID: &str = "dev-org";
 /// User used when none is configured (dev mode without a bearer).
 pub const DEFAULT_USER_ID: &str = "dev-user";
-/// Presence beat cadence.
-const PRESENCE_INTERVAL_MS: u64 = 15_000;
+/// Presence beat cadence. This is device reachability metadata, not chat
+/// realtime, so a 30-second cadence cuts its steady application traffic in
+/// half while preserving a generous three-beat live window.
+const PRESENCE_INTERVAL_MS: u64 = 30_000;
 /// Dial-gate thresholds (`peer_liveness`): a device is judged `Dark` — dials
 /// parked with zero network traffic — only on POSITIVE evidence: our registry
 /// room joined and warm past the warm-up window, and the device's freshest
@@ -55,7 +57,7 @@ const DIAL_GATE_DARK_MS: i64 = 5 * 60_000;
 /// A presence heartbeat younger than this marks the device alive (3 missed
 /// beats = offline). Also the "peer is reachable" signal that clears the
 /// peer-dial cooldown.
-const PRESENCE_FRESH_MS: i64 = 45_000;
+const PRESENCE_FRESH_MS: i64 = 90_000;
 /// Relay-status probe cadence. Presence heartbeats ride the registry room, so
 /// any registry pathology (or our own room connection being down) silently
 /// starves them — and every device looks offline while its relay works fine.
@@ -637,6 +639,13 @@ impl WorkspaceHost {
         self.inner.spaces_tx.subscribe()
     }
 
+    /// Every local or remote registry mutation. Consumers that need a
+    /// singleton control row not represented by the sidebar tables can use
+    /// this to inspect the latest registry value.
+    pub fn watch_registry_changes(&self) -> watch::Receiver<u64> {
+        self.inner.changed_tx.subscribe()
+    }
+
     /// WatchSessions source: remote devices' rows from the registry merged with
     /// this engine's live status watch (the local view is fresher for our own runs).
     pub fn merged_sessions_watch(
@@ -1012,6 +1021,17 @@ impl WorkspaceHost {
     /// host calls this in the same breath as seeding the chat2 checkpoint.
     pub fn set_chat_room_gen(&self, chat_id: &str, room_gen: u32) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.set_chat_room_gen(chat_id, room_gen))?)
+    }
+
+    /// Broadcast a successfully committed Studio manifest revision to the
+    /// already-connected registry peers.
+    pub fn set_studio_generation(&self, generation: u64) {
+        self.mutate(|doc| doc.set_studio_generation(generation));
+    }
+
+    /// Latest Studio manifest revision announced through the registry.
+    pub fn studio_generation(&self) -> Option<u64> {
+        self.read(RegistryDoc::studio_generation)
     }
 
     pub fn set_chat_archived(&self, chat_id: &str, archived: bool) -> Result<bool, EngineError> {
