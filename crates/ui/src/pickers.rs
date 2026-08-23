@@ -4061,6 +4061,9 @@ impl Render for Pickers {
             .items_center()
             .justify_between()
             .gap(px(Theme::SPACE_SM))
+            // GPUI dispatches this captured stream while the thumb is dragged,
+            // including when the pointer has left the model popover.
+            .on_drag_move(cx.listener(Self::on_model_scrollbar_drag_move))
             .child(left)
             .child(right)
     }

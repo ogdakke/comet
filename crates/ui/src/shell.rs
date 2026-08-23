@@ -41,9 +41,8 @@ use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
-    CHAT_PANEL_MIN, KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN,
-    SAVE_DEBOUNCE_MS, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT,
-    UiSettings, platform_combo,
+    KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
+    SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
@@ -91,7 +90,7 @@ fn conversation_width(viewport: f32, sidebar: f32, right: f32) -> f32 {
 
 #[cfg(test)]
 fn right_pane_max_width(viewport: f32, sidebar: f32) -> f32 {
-    (viewport - sidebar - CHAT_PANEL_MIN).max(0.0)
+    (viewport - sidebar - crate::settings::CHAT_PANEL_MIN).max(0.0)
 }
 
 #[cfg(test)]
@@ -8090,11 +8089,11 @@ mod tests {
     #[test]
     fn right_pane_ceiling_preserves_the_chat_floor() {
         assert_eq!(right_pane_max_width(1200.0, 256.0), 644.0);
-        assert_eq!(1200.0 - 256.0 - 644.0, CHAT_PANEL_MIN);
+        assert_eq!(1200.0 - 256.0 - 644.0, crate::settings::CHAT_PANEL_MIN);
         // The chat floor wins over the right pane's preferred 360px minimum
         // when the whole window is unusually narrow.
         assert_eq!(right_pane_max_width(800.0, 256.0), 244.0);
-        assert_eq!(800.0 - 256.0 - 244.0, CHAT_PANEL_MIN);
+        assert_eq!(800.0 - 256.0 - 244.0, crate::settings::CHAT_PANEL_MIN);
     }
 
     #[test]
