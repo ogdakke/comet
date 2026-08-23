@@ -508,7 +508,7 @@ impl GitHistory {
             loading: false,
             error: None,
             graph: GraphLayout::default(),
-            list: ListState::new(0, ListAlignment::Top, px(HISTORY_ROW_HEIGHT * 5.0)),
+            list: ListState::new(0, ListAlignment::Top, px(HISTORY_ROW_HEIGHT * 5.0)).measure_all(),
             copied_sha: None,
             request_task: None,
             copy_task: None,
@@ -726,6 +726,7 @@ impl GitHistory {
                                 old_commit_count..old_item_count,
                                 new_item_count - old_commit_count,
                             );
+                            history.list.clone().measure_all();
                         }
                     }
                     Err(error) => history.error = Some(error.to_string().into()),
@@ -1254,6 +1255,7 @@ impl Render for GitHistory {
                         .size_full()
                         .with_sizing_behavior(gpui::ListSizingBehavior::Auto),
                 )
+                .child(crate::scrollbar::overlay("git-history", &self.list))
                 .into_any_element()
         };
 

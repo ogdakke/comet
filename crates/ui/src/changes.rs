@@ -1150,7 +1150,7 @@ impl Changes {
             fold_settle: None,
             // Rows are single lines now — a deep overdraw is cheap and keeps
             // fast wheel flicks from outrunning measurement.
-            list: ListState::new(0, ListAlignment::Top, px(1024.0)),
+            list: ListState::new(0, ListAlignment::Top, px(1024.0)).measure_all(),
             scope: DiffScope::default(),
             base_ref: None,
             branches: Vec::new(),
@@ -1674,6 +1674,7 @@ impl Changes {
                 changes
                     .list
                     .reset_with_uniform_height(rows.len(), px(DIFF_LINE_HEIGHT));
+                changes.list.clone().measure_all();
                 changes.rows = rows;
                 changes.row_ranges = ranges;
                 changes.parsed = Some(ParsedDiff {
@@ -1724,6 +1725,7 @@ impl Changes {
         let changed = body.start + prefix..body.end - suffix;
         let mid: Vec<DiffRow> = new_body[prefix..new_body.len() - suffix].to_vec();
         self.list.splice(changed.clone(), mid.len());
+        self.list.clone().measure_all();
         self.rows.splice(changed, mid);
         self.row_ranges[file_ix] = range.start..(range.end as isize + delta) as usize;
         for r in &mut self.row_ranges[file_ix + 1..] {
@@ -1886,6 +1888,7 @@ impl Changes {
             };
             if body.len() != new_len {
                 self.list.splice(body, new_len);
+                self.list.clone().measure_all();
             }
         }
         let (rows, ranges) = flatten_rows(
@@ -3681,9 +3684,16 @@ impl Render for Changes {
                             .flex_col()
                             .children(self.render_header_strip(&theme))
                             .child(
-                                list(self.list.clone(), cx.processor(Self::render_row))
+                                div()
+                                    .relative()
                                     .flex_1()
-                                    .with_sizing_behavior(gpui::ListSizingBehavior::Auto),
+                                    .min_h_0()
+                                    .child(
+                                        list(self.list.clone(), cx.processor(Self::render_row))
+                                            .size_full()
+                                            .with_sizing_behavior(gpui::ListSizingBehavior::Auto),
+                                    )
+                                    .child(crate::scrollbar::overlay("changes", &self.list)),
                             )
                             .into_any_element()
                     } else {
