@@ -444,7 +444,10 @@ impl StudioPage {
                 .await;
             let conversations = engine
                 .client()
-                .call(methods::LIST_STUDIO_CONVERSATIONS, serde_json::json!({}))
+                .call(
+                    methods::LIST_STUDIO_CONVERSATIONS,
+                    serde_json::json!({ "includeArchived": true }),
+                )
                 .await;
             let mut models = Ok(ListStudioModelsResponse {
                 models: Vec::new(),
@@ -543,16 +546,19 @@ impl StudioPage {
         }
     }
 
+    fn first_active_conversation_id(&self) -> Option<StudioConversationId> {
+        self.conversations
+            .iter()
+            .find(|item| !item.archived)
+            .map(|item| item.id)
+    }
+
     fn apply_conversation_summary(
         &mut self,
         summary: StudioConversationSummary,
         cx: &mut Context<Self>,
     ) {
-        let changed = if summary.archived {
-            let before = self.conversations.len();
-            self.conversations.retain(|item| item.id != summary.id);
-            before != self.conversations.len()
-        } else if let Some(existing) = self
+        let changed = if let Some(existing) = self
             .conversations
             .iter_mut()
             .find(|item| item.id == summary.id)
@@ -667,7 +673,10 @@ impl StudioPage {
         self.conversations_watch_task = Some(cx.spawn(async move |this, cx| {
             let stream = engine
                 .client()
-                .subscribe(methods::WATCH_STUDIO_CONVERSATIONS, serde_json::json!({}))
+                .subscribe(
+                    methods::WATCH_STUDIO_CONVERSATIONS,
+                    serde_json::json!({ "includeArchived": true }),
+                )
                 .await;
             let mut stream = match stream {
                 Ok(stream) => stream,
@@ -1504,8 +1513,8 @@ impl StudioPage {
                             page.selected_conversation = None;
                             page.conversation = None;
                             page.prompt_history.reset();
-                            if let Some(next) = page.conversations.first() {
-                                page.open_conversation(next.id, cx);
+                            if let Some(next) = page.first_active_conversation_id() {
+                                page.open_conversation(next, cx);
                             }
                         }
                         cx.emit(StudioEvent::SidebarChanged);
@@ -1521,6 +1530,7 @@ impl StudioPage {
     pub fn archive_conversation(
         &mut self,
         conversation_id: StudioConversationId,
+        archived: bool,
         cx: &mut Context<Self>,
     ) {
         let Some(engine) = self.engine(cx) else {
@@ -1531,22 +1541,27 @@ impl StudioPage {
                 .client()
                 .call(
                     methods::ARCHIVE_STUDIO_CONVERSATION,
-                    serde_json::json!({ "conversationId": conversation_id, "archived": true }),
+                    serde_json::json!({
+                        "conversationId": conversation_id,
+                        "archived": archived
+                    }),
                 )
                 .await;
             this.update(cx, |page, cx| {
-                match result {
-                    Ok(_) => {
-                        page.conversations.retain(|item| item.id != conversation_id);
-                        if page.selected_conversation == Some(conversation_id) {
+                match result.and_then(|value| {
+                    serde_json::from_value::<StudioConversationSummary>(value)
+                        .map_err(|error| zeron_rpc::RpcError::Failed(error.to_string()))
+                }) {
+                    Ok(summary) => {
+                        page.apply_conversation_summary(summary, cx);
+                        if archived && page.selected_conversation == Some(conversation_id) {
                             page.selected_conversation = None;
                             page.conversation = None;
                             page.prompt_history.reset();
-                            if let Some(next) = page.conversations.first() {
-                                page.open_conversation(next.id, cx);
+                            if let Some(next) = page.first_active_conversation_id() {
+                                page.open_conversation(next, cx);
                             }
                         }
-                        cx.emit(StudioEvent::SidebarChanged);
                     }
                     Err(error) => page.error = Some(error.to_string().into()),
                 }

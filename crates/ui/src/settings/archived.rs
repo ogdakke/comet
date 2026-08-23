@@ -1,59 +1,145 @@
-//! Settings → Archived (feature-inventory §1.5): archived chats across
-//! devices, with Unarchive (Mutate setChatArchived false).
+//! Settings → Archived (feature-inventory §1.5): archived chats and studio
+//! threads, with Unarchive.
 
 use gpui::{
     AnyElement, Context, Entity, SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 
-use zeron_proto::Chat;
+use zeron_proto::{Chat, StudioConversationSummary};
 use zeron_rpc::methods;
+use zeron_studio::StudioConversationId;
 
 use crate::state::AppState;
+use crate::studio::StudioPage;
 use crate::theme::Theme;
 
-/// Archived rows in sidebar (recency) order. Pure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ArchivedId {
+    Chat(String),
+    Studio(StudioConversationId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchivedEntry {
+    pub id: ArchivedId,
+    pub title: String,
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub device: Option<String>,
+    pub location: Option<String>,
+}
+
+/// Archived chats in sidebar (recency) order. Pure.
 pub fn archived_chats(chats: &[Chat]) -> Vec<&Chat> {
     chats.iter().filter(|c| c.archived).collect()
 }
 
+pub fn archived_studio(
+    conversations: &[StudioConversationSummary],
+) -> Vec<&StudioConversationSummary> {
+    conversations.iter().filter(|c| c.archived).collect()
+}
+
+/// Combined archived list: agent sessions and studio threads, newest first.
+pub fn archived_entries(
+    chats: &[Chat],
+    studio: &[StudioConversationSummary],
+    device_names: &std::collections::HashMap<String, String>,
+) -> Vec<ArchivedEntry> {
+    let mut rows: Vec<ArchivedEntry> = archived_chats(chats)
+        .into_iter()
+        .map(|chat| ArchivedEntry {
+            id: ArchivedId::Chat(chat.id.clone()),
+            title: chat
+                .title
+                .clone()
+                .unwrap_or_else(|| "Untitled session".into()),
+            at: chat.last_message_at.unwrap_or(chat.created_at),
+            device: device_names.get(&chat.device_id).cloned(),
+            location: crate::state::chat_location(chat),
+        })
+        .collect();
+    rows.extend(
+        archived_studio(studio)
+            .into_iter()
+            .map(|conversation| ArchivedEntry {
+                id: ArchivedId::Studio(conversation.id),
+                title: conversation.title.clone(),
+                at: conversation.updated_at,
+                device: None,
+                location: Some("Studio".into()),
+            }),
+    );
+    rows.sort_by(|left, right| {
+        right
+            .at
+            .cmp(&left.at)
+            .then_with(|| match (&left.id, &right.id) {
+                (ArchivedId::Chat(a), ArchivedId::Chat(b)) => a.cmp(b),
+                (ArchivedId::Studio(a), ArchivedId::Studio(b)) => a.0.cmp(&b.0),
+                (ArchivedId::Chat(_), ArchivedId::Studio(_)) => std::cmp::Ordering::Less,
+                (ArchivedId::Studio(_), ArchivedId::Chat(_)) => std::cmp::Ordering::Greater,
+            })
+    });
+    rows
+}
+
 pub struct ArchivedPage {
     state: Entity<AppState>,
+    studio: Entity<StudioPage>,
     error: Option<SharedString>,
-    /// Chat with an in-flight unarchive (button shows working state).
-    busy: Option<String>,
+    /// Item with an in-flight unarchive (button shows working state).
+    busy: Option<ArchivedId>,
     /// Row index under the pointer — drives the original's `group-hover`
     /// Unarchive reveal (`opacity-0 group-hover:opacity-100`).
     hovered: Option<usize>,
     task: Option<Task<()>>,
     _observe: Subscription,
+    _studio_observe: Subscription,
 }
 
 impl ArchivedPage {
-    pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        state: Entity<AppState>,
+        studio: Entity<StudioPage>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
+        let studio_observe = cx.observe(&studio, |_, _, cx| cx.notify());
         Self {
             state,
+            studio,
             error: None,
             busy: None,
             hovered: None,
             task: None,
             _observe: observe,
+            _studio_observe: studio_observe,
         }
     }
 
-    fn unarchive(&mut self, chat_id: String, cx: &mut Context<Self>) {
+    fn unarchive(&mut self, id: ArchivedId, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        self.busy = Some(chat_id.clone());
+        self.busy = Some(id.clone());
         self.error = None;
-        let params = serde_json::json!({
-            "op": "setChatArchived",
-            "chatId": chat_id,
-            "archived": false,
-        });
+        let params = match &id {
+            ArchivedId::Chat(chat_id) => serde_json::json!({
+                "op": "setChatArchived",
+                "chatId": chat_id,
+                "archived": false,
+            }),
+            ArchivedId::Studio(conversation_id) => serde_json::json!({
+                "conversationId": conversation_id,
+                "archived": false,
+            }),
+        };
+        let method = match &id {
+            ArchivedId::Chat(_) => methods::MUTATE,
+            ArchivedId::Studio(_) => methods::ARCHIVE_STUDIO_CONVERSATION,
+        };
         self.task = Some(cx.spawn(async move |this, cx| {
-            let result = engine.client().call(methods::MUTATE, params).await;
+            let result = engine.client().call(method, params).await;
             this.update(cx, |page, cx| {
                 page.busy = None;
                 if let Err(err) = result {
@@ -72,15 +158,14 @@ impl Render for ArchivedPage {
         use crate::settings::widgets;
         let theme = Theme::of(cx).clone();
         let now = chrono::Utc::now();
-        let (rows, device_names): (Vec<Chat>, std::collections::HashMap<String, String>) = {
+        let rows = {
             let state = self.state.read(cx);
-            let rows = archived_chats(&state.chats).into_iter().cloned().collect();
             let names = state
                 .devices
                 .iter()
                 .map(|d| (d.id.clone(), d.name.clone()))
                 .collect();
-            (rows, names)
+            archived_entries(&state.chats, self.studio.read(cx).conversations(), &names)
         };
         let busy = self.busy.clone();
         let count = rows.len();
@@ -88,26 +173,14 @@ impl Render for ArchivedPage {
         let items: Vec<AnyElement> = rows
             .into_iter()
             .enumerate()
-            .map(|(ix, chat)| {
-                let title: SharedString = chat
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| "Untitled session".into())
-                    .into();
-                // Unknown device → no fragment at all (zeron renders the
-                // device span only when the name resolves).
-                let device: Option<SharedString> =
-                    device_names.get(&chat.device_id).cloned().map(Into::into);
-                let time_ago: SharedString = crate::state::format_time_ago(
-                    chat.last_message_at.unwrap_or(chat.created_at),
-                    now,
-                )
-                .into();
-                let location: Option<SharedString> =
-                    crate::state::chat_location(&chat).map(Into::into);
-                let is_busy = busy.as_deref() == Some(chat.id.as_str());
+            .map(|(ix, row)| {
+                let title: SharedString = row.title.into();
+                let device: Option<SharedString> = row.device.map(Into::into);
+                let time_ago: SharedString = crate::state::format_time_ago(row.at, now).into();
+                let location: Option<SharedString> = row.location.map(Into::into);
+                let is_busy = busy.as_ref() == Some(&row.id);
                 let row_hovered = self.hovered == Some(ix);
-                let chat_id = chat.id.clone();
+                let item_id = row.id.clone();
                 // zeron settings.archived.tsx row: archive tile, medium title
                 // + tabular time, quiet device · location meta, Unarchive.
                 div()
@@ -221,7 +294,7 @@ impl Render for ArchivedPage {
                             .cursor_pointer()
                             .hover(|s| s.bg(theme.surface_raised).text_color(theme.text))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.unarchive(chat_id.clone(), cx);
+                                this.unarchive(item_id.clone(), cx);
                             }))
                             .child(
                                 crate::icons::icon(crate::icons::ARCHIVE_UP_MINIMALISTIC)
@@ -293,7 +366,7 @@ impl Render for ArchivedPage {
                     ))
                     .child(widgets::page_subtitle(
                         &theme,
-                        "Hidden from the sidebar, never deleted. Unarchiving puts a session back on its device.",
+                        "Hidden from the sidebar, never deleted. Unarchive to put a session back.",
                     ))
                     .when_some(self.error.clone(), |el, message| {
                         el.child(
@@ -314,20 +387,20 @@ impl Render for ArchivedPage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use chrono::{Duration, Utc};
 
-    fn chat(id: &str, archived: bool) -> Chat {
+    fn chat(id: &str, archived: bool, minutes_ago: i64) -> Chat {
         Chat {
             id: id.into(),
             device_id: "d".into(),
-            title: None,
+            title: Some(id.into()),
             archived,
             cwd: None,
             branch: None,
             checkout_id: None,
             config: None,
             last_message_preview: None,
-            last_message_at: None,
+            last_message_at: Some(Utc::now() - Duration::minutes(minutes_ago)),
             created_at: Utc::now(),
             harness_session_id: None,
             harness_session_cwd: None,
@@ -337,11 +410,38 @@ mod tests {
         }
     }
 
+    fn studio(title: &str, archived: bool, minutes_ago: i64) -> StudioConversationSummary {
+        StudioConversationSummary {
+            id: StudioConversationId::new(),
+            title: title.into(),
+            turn_count: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now() - Duration::minutes(minutes_ago),
+            archived,
+            forked_from_turn_id: None,
+            creating: false,
+            done: false,
+        }
+    }
+
     #[test]
     fn only_archived_rows_show() {
-        let chats = vec![chat("a", false), chat("b", true), chat("c", true)];
+        let chats = vec![chat("a", false, 0), chat("b", true, 0), chat("c", true, 0)];
         let rows = archived_chats(&chats);
         let ids: Vec<&str> = rows.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["b", "c"]);
+    }
+
+    #[test]
+    fn studio_archived_rows_mix_with_chats_by_recency() {
+        let chats = vec![chat("agent", true, 10)];
+        let studio_rows = vec![studio("live", false, 0), studio("thread", true, 1)];
+        let names = std::collections::HashMap::new();
+        let rows = archived_entries(&chats, &studio_rows, &names);
+        let titles: Vec<&str> = rows.iter().map(|row| row.title.as_str()).collect();
+        assert_eq!(titles, ["thread", "agent"]);
+        assert!(matches!(rows[0].id, ArchivedId::Studio(_)));
+        assert_eq!(rows[0].location.as_deref(), Some("Studio"));
+        assert!(matches!(rows[1].id, ArchivedId::Chat(_)));
     }
 }

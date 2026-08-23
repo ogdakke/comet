@@ -898,6 +898,11 @@ pub struct Shell {
     /// Unarchive affordance and restores the dimmed harness mark (t3code's
     /// settled-row hover).
     pub(super) archived_hover: Option<String>,
+    /// Studio sidebar's archived accordion — same shelf as agent sessions,
+    /// session-transient and independent of the chat sidebar's open state.
+    studio_archived_open: bool,
+    studio_archived_shown: usize,
+    studio_archived_hover: Option<String>,
     /// Lazy panes: no entity (and no RPC) until first opened.
     terminal: Option<Entity<TerminalPanel>>,
     /// Embedded terminal host for right-pane Terminal surfaces — a SEPARATE
@@ -1191,6 +1196,9 @@ impl Shell {
             archived_open: true,
             archived_shown: 0,
             archived_hover: None,
+            studio_archived_open: true,
+            studio_archived_shown: 0,
+            studio_archived_hover: None,
             terminal: None,
             right_terminal: None,
             right_plus: popover::Popup::default(),
@@ -2471,7 +2479,8 @@ impl Shell {
             SettingsSection::Archived => {
                 if self.archived_page.is_none() {
                     let state = self.state.clone();
-                    self.archived_page = Some(cx.new(|cx| ArchivedPage::new(state, cx)));
+                    let studio = self.ensure_studio_page(cx);
+                    self.archived_page = Some(cx.new(|cx| ArchivedPage::new(state, studio, cx)));
                 }
                 match &self.archived_page {
                     Some(page) => page.clone().into_any_element(),
@@ -2626,10 +2635,19 @@ impl Shell {
         conversation_id: zeron_studio::StudioConversationId,
         cx: &mut Context<Self>,
     ) {
+        self.set_studio_archived(conversation_id, true, cx);
+    }
+
+    fn set_studio_archived(
+        &mut self,
+        conversation_id: zeron_studio::StudioConversationId,
+        archived: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.close_studio_menu(cx);
         if let Some(page) = self.studio_page.clone() {
             page.update(cx, |page, cx| {
-                page.archive_conversation(conversation_id, cx)
+                page.archive_conversation(conversation_id, archived, cx)
             });
         }
         cx.notify();
@@ -4105,6 +4123,208 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Studio sidebar archived shelf — same accordion as the chat sidebar:
+    /// label + hairline + chevron, slim 36px rows, Unarchive on hover, and
+    /// "Show N more" paging.
+    fn render_studio_archived_section(
+        &mut self,
+        rows: &[zeron_proto::StudioConversationSummary],
+        selected: Option<zeron_studio::StudioConversationId>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        const INITIAL: usize = 10;
+        const PAGE: usize = 25;
+        if rows.is_empty() {
+            return None;
+        }
+        let now = Utc::now();
+        let total = rows.len();
+        let open = self.studio_archived_open;
+        let shown = self.studio_archived_shown.max(INITIAL);
+        let label: SharedString = if open {
+            "Archived".into()
+        } else {
+            format!("Archived ({total})").into()
+        };
+        let header = div()
+            .id("studio-archived-toggle")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .mt(px(12.0))
+            .mb(px(4.0))
+            .px(px(10.0))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.studio_archived_open = !this.studio_archived_open;
+                this.studio_archived_shown = INITIAL;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(12.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted.opacity(0.5))
+                    .child(label),
+            )
+            .child(div().h(px(1.0)).flex_1().bg(theme.border.opacity(0.6)))
+            .child(
+                icon(if open {
+                    icons::ALT_ARROW_DOWN
+                } else {
+                    icons::ALT_ARROW_RIGHT
+                })
+                .size(px(12.0))
+                .flex_none()
+                .text_color(theme.text_muted.opacity(0.5)),
+            );
+        let mut section = div().flex().flex_col().child(header);
+        if open {
+            let selected_wash = crate::theme::glass_selected_bg();
+            let mut list = div().flex().flex_col().gap(px(2.0));
+            for conversation in rows.iter().take(shown) {
+                let id = conversation.id;
+                let key = id.0.to_string();
+                let hovered = self.studio_archived_hover.as_deref() == Some(key.as_str());
+                let is_selected = selected == Some(id);
+                let title: SharedString = conversation.title.clone().into();
+                let time_ago: SharedString = format_time_ago(conversation.updated_at, now).into();
+                let right: AnyElement = if hovered {
+                    div()
+                        .id(SharedString::from(format!("studio-archived-restore-{key}")))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.0))
+                        .h(px(18.0))
+                        .px(px(4.0))
+                        .mr(px(-4.0))
+                        .rounded(px(5.0))
+                        .bg(crate::theme::wash(0.10))
+                        .hover(|s| s.bg(crate::theme::wash(0.18)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.set_studio_archived(id, false, cx);
+                        }))
+                        .child(
+                            icon(icons::ARCHIVE_UP_MINIMALISTIC)
+                                .size(px(11.0))
+                                .flex_none()
+                                .text_color(theme.text_muted),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from("Unarchive")),
+                        )
+                        .into_any_element()
+                } else {
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted.opacity(0.55))
+                        .child(time_ago)
+                        .into_any_element()
+                };
+                let hover_key = key.clone();
+                list = list.child(
+                    div()
+                        .id(SharedString::from(format!("studio-archived-{key}")))
+                        .h(px(36.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.0))
+                        .px(px(10.0))
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .when(is_selected, |el| el.bg(selected_wash))
+                        .when(!is_selected, |el| el.hover(|s| s.bg(theme.glass_hover())))
+                        .on_hover(cx.listener(move |this, entered: &bool, _, cx| {
+                            if *entered {
+                                if this.studio_archived_hover.as_deref() != Some(hover_key.as_str())
+                                {
+                                    this.studio_archived_hover = Some(hover_key.clone());
+                                    cx.notify();
+                                }
+                            } else if this.studio_archived_hover.as_deref()
+                                == Some(hover_key.as_str())
+                            {
+                                this.studio_archived_hover = None;
+                                cx.notify();
+                            }
+                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.show_studio_thread(id, None, cx);
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.close_chat_menu(cx);
+                                this.studio_menu.open((id, event.position));
+                                cx.notify();
+                            }),
+                        )
+                        .child(
+                            icon(icons::GALLERY_WIDE)
+                                .size(px(14.0))
+                                .flex_none()
+                                .text_color(if hovered || is_selected {
+                                    theme.text_muted
+                                } else {
+                                    theme.text_muted.opacity(0.4)
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(13.0))
+                                .text_color(if hovered || is_selected {
+                                    theme.text
+                                } else {
+                                    theme.text.opacity(0.55)
+                                })
+                                .child(title),
+                        )
+                        .child(right),
+                );
+            }
+            section = section.child(motion::fade_quick("studio-archived-list", list));
+            if total > shown {
+                let remaining = (total - shown).min(PAGE);
+                section = section.child(
+                    div()
+                        .id("studio-archived-more")
+                        .mt(px(2.0))
+                        .h(px(36.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.0))
+                        .px(px(10.0))
+                        .rounded(px(6.0))
+                        .text_size(px(13.0))
+                        .text_color(theme.text_muted.opacity(0.55))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.studio_archived_shown =
+                                this.studio_archived_shown.max(INITIAL) + PAGE;
+                            cx.notify();
+                        }))
+                        .child(icon(icons::PLUS).size(px(14.0)).flex_none())
+                        .child(SharedString::from(format!("Show {remaining} more"))),
+                );
+            }
+        }
+        Some(section.pb(px(Theme::SPACE_SM)).into_any_element())
+    }
+
     fn render_studio_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let page = self.ensure_studio_page(cx);
         let (conversations, selected, gallery_selected) = {
@@ -4115,8 +4335,11 @@ impl Shell {
                 page.is_gallery(),
             )
         };
+        let (active, archived): (Vec<_>, Vec<_>) = conversations
+            .into_iter()
+            .partition(|conversation| !conversation.archived);
         let now = Utc::now();
-        let rows = conversations
+        let rows = active
             .into_iter()
             .map(|conversation| {
                 let is_selected = selected == Some(conversation.id);
@@ -4328,6 +4551,7 @@ impl Shell {
                     .into_any_element()
             })
             .collect::<Vec<_>>();
+        let archived_section = self.render_studio_archived_section(&archived, selected, theme, cx);
 
         let new_page = page.clone();
         let header = div()
@@ -4459,9 +4683,15 @@ impl Shell {
                             .pt(px(4.0))
                             .flex()
                             .flex_col()
-                            .gap(px(2.0))
-                            .pb(px(Theme::SPACE_SM))
-                            .children(rows),
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.0))
+                                    .pb(px(Theme::SPACE_SM))
+                                    .children(rows),
+                            )
+                            .children(archived_section),
                     ),
                 )
                 .fade_overflow_y(&self.studio_sidebar_scroll),
@@ -5601,6 +5831,17 @@ impl Shell {
             let rename_id = conversation_id;
             let archive_id = conversation_id;
             let delete_id = conversation_id;
+            let archived = self
+                .studio_page
+                .as_ref()
+                .and_then(|page| {
+                    page.read(cx)
+                        .conversations()
+                        .iter()
+                        .find(|item| item.id == conversation_id)
+                        .map(|item| item.archived)
+                })
+                .unwrap_or(false);
             let menu = popover::popover_card(&theme)
                 .w(px(170.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -5628,15 +5869,23 @@ impl Shell {
                         format!("studio-menu-archive-{}", conversation_id.0),
                     )
                     .id("studio-menu-archive")
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.archive_studio(archive_id, cx)),
-                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_studio_archived(archive_id, !archived, cx)
+                    }))
                     .child(
-                        icon(icons::ARCHIVE_MINIMALISTIC)
-                            .size(px(16.0))
-                            .text_color(theme.text_muted),
+                        icon(if archived {
+                            icons::ARCHIVE_UP_MINIMALISTIC
+                        } else {
+                            icons::ARCHIVE_MINIMALISTIC
+                        })
+                        .size(px(16.0))
+                        .text_color(theme.text_muted),
                     )
-                    .child(SharedString::from("Archive")),
+                    .child(SharedString::from(if archived {
+                        "Unarchive"
+                    } else {
+                        "Archive"
+                    })),
                 )
                 .child(popover::menu_separator())
                 .child(

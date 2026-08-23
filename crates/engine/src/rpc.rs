@@ -1559,24 +1559,24 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&ListStudioConversationsResponse { conversations })
             }
             methods::WATCH_STUDIO_CONVERSATIONS => {
+                let request: ListStudioConversationsRequest = parse_params(params)?;
+                let include_archived = request.include_archived;
                 let changes = self.studio.subscribe_changes();
                 let store = self.studio.clone();
                 let stream = futures::stream::unfold(
                     (changes, store, true),
-                    |(mut changes, store, first)| async move {
+                    move |(mut changes, store, first)| async move {
                         if !first && changes.changed().await.is_err() {
                             return None;
                         }
-                        let value =
-                            store
-                                .list_conversations(false)
+                        let value = store.list_conversations(include_archived).ok().and_then(
+                            |conversations| {
+                                serde_json::to_value(ListStudioConversationsResponse {
+                                    conversations,
+                                })
                                 .ok()
-                                .and_then(|conversations| {
-                                    serde_json::to_value(ListStudioConversationsResponse {
-                                        conversations,
-                                    })
-                                    .ok()
-                                })?;
+                            },
+                        )?;
                         Some((value, (changes, store, false)))
                     },
                 );

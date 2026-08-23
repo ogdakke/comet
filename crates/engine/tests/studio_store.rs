@@ -1653,6 +1653,35 @@ async fn conversation_rpc_round_trips_and_archives_profile_history() {
     assert_eq!(all.conversations.len(), 1);
     assert!(all.conversations[0].archived);
 
+    let restored: StudioConversationSummary = serde_json::from_value(
+        client
+            .call(
+                methods::ARCHIVE_STUDIO_CONVERSATION,
+                serde_json::json!({ "conversationId": created.id, "archived": false }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!restored.archived);
+    let active_again: ListStudioConversationsResponse = serde_json::from_value(
+        client
+            .call(methods::LIST_STUDIO_CONVERSATIONS, serde_json::json!({}))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(active_again.conversations.len(), 1);
+    assert!(!active_again.conversations[0].archived);
+
+    client
+        .call(
+            methods::ARCHIVE_STUDIO_CONVERSATION,
+            serde_json::json!({ "conversationId": created.id, "archived": true }),
+        )
+        .await
+        .unwrap();
+
     client
         .call(
             methods::DELETE_STUDIO_CONVERSATION,
