@@ -776,8 +776,11 @@ impl AppState {
 
     // ---- reducers (pure) ----
 
-    pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
+    pub fn apply_chats(&mut self, mut chats: Vec<Chat>) -> bool {
         sort_chats(&mut chats);
+        if self.chats == chats {
+            return false;
+        }
         self.chats = chats;
         self.chats_synced = true;
         if let Some(selected) = &self.selected_chat
@@ -789,14 +792,22 @@ impl AppState {
             self.transcript_replayed = false;
             self.transcript_task = None;
         }
+        true
     }
 
-    pub fn apply_sessions(&mut self, sessions: Vec<Session>) {
+    pub fn apply_sessions(&mut self, sessions: Vec<Session>) -> bool {
+        if self.sessions == sessions {
+            return false;
+        }
         self.sessions = sessions;
+        true
     }
 
-    pub fn apply_spaces(&mut self, mut spaces: Vec<Space>) {
+    pub fn apply_spaces(&mut self, mut spaces: Vec<Space>) -> bool {
         sort_spaces(&mut spaces);
+        if self.spaces == spaces {
+            return false;
+        }
         self.spaces = spaces;
         self.spaces_synced = true;
         // Heal a vanished selection (project deleted elsewhere): fall back to
@@ -816,6 +827,7 @@ impl AppState {
         if self.selected_space.is_none() && !self.no_project {
             self.selected_space = self.first_space_on_picked_device();
         }
+        true
     }
 
     /// Optimistic local echo of a `setChatConfig` mutate: stamp the row now so
@@ -827,8 +839,12 @@ impl AppState {
         }
     }
 
-    pub fn apply_connectivity(&mut self, connectivity: zeron_proto::Connectivity) {
+    pub fn apply_connectivity(&mut self, connectivity: zeron_proto::Connectivity) -> bool {
+        if self.connectivity == connectivity {
+            return false;
+        }
         self.connectivity = connectivity;
+        true
     }
 
     /// Is this chat's delivery path degraded — will a send QUEUE rather than
@@ -870,7 +886,7 @@ impl AppState {
         self.send_pending(chat_id, now) && self.chat_delivery_degraded(chat_id)
     }
 
-    pub fn apply_devices(&mut self, mut devices: Vec<Device>) {
+    pub fn apply_devices(&mut self, mut devices: Vec<Device>) -> bool {
         // A local-only workspace has no remote device identity to distinguish.
         // Keep the engine's legacy sentinel out of the UI while preserving real
         // hostnames and user-assigned device names.
@@ -881,11 +897,15 @@ impl AppState {
         {
             device.name = "Local".to_string();
         }
+        if self.devices == devices {
+            return false;
+        }
         for device in &devices {
             self.change_requests
                 .clear_unsupported_on_version_change(&device.id, device.version.as_deref());
         }
         self.devices = devices;
+        true
     }
 
     /// True when `device_id`'s engine (per its registry device row) is at
@@ -916,19 +936,30 @@ impl AppState {
             .map(|s| s.id.clone())
     }
 
-    pub fn apply_update(&mut self, status: zeron_update::UpdateStatus) {
+    pub fn apply_update(&mut self, status: zeron_update::UpdateStatus) -> bool {
+        if self.update.as_ref() == Some(&status) {
+            return false;
+        }
         self.update = Some(status);
+        true
     }
 
-    pub fn apply_auth(&mut self, auth: AuthState) {
+    pub fn apply_auth(&mut self, auth: AuthState) -> bool {
+        if self.auth.as_ref() == Some(&auth) {
+            return false;
+        }
         self.auth = Some(auth);
+        true
     }
 
     /// Tolerant AuthStatus frame reducer (see [`parse_auth_state`]).
-    pub fn apply_auth_value(&mut self, value: serde_json::Value) {
+    pub fn apply_auth_value(&mut self, value: serde_json::Value) -> bool {
         match parse_auth_state(&value) {
             Some(auth) => self.apply_auth(auth),
-            None => tracing::warn!("dropping unrecognized AuthStatus frame"),
+            None => {
+                tracing::warn!("dropping unrecognized AuthStatus frame");
+                false
+            }
         }
     }
 
@@ -1098,11 +1129,16 @@ impl AppState {
 
     /// A `WatchTransfers` snapshot: the engine-side relay leg's in-flight
     /// queued-attachment transfers, replacing the whole set each frame.
-    pub fn apply_transfers(&mut self, transfers: Vec<zeron_proto::TransferProgress>) {
-        self.transfers = transfers
+    pub fn apply_transfers(&mut self, transfers: Vec<zeron_proto::TransferProgress>) -> bool {
+        let next: HashMap<String, (u64, u64)> = transfers
             .into_iter()
             .map(|t| (t.upload_id, (t.done, t.total)))
             .collect();
+        if self.transfers == next {
+            return false;
+        }
+        self.transfers = next;
+        true
     }
 
     /// Percent of one queued attachment's relay transfer, by the uploadId
@@ -1734,9 +1770,10 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
                     }
                 };
                 let alive = this.update(cx, |state, cx| {
-                    state.apply_chats(parsed);
-                    state.reconcile_change_request_watches(cx);
-                    cx.notify();
+                    if state.apply_chats(parsed) {
+                        state.reconcile_change_request_watches(cx);
+                        cx.notify();
+                    }
                 });
                 if alive.is_err() {
                     return;
@@ -1846,7 +1883,7 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
     cx: &mut Context<AppState>,
     handle: EngineHandle,
     method: &'static str,
-    apply: fn(&mut AppState, T),
+    apply: fn(&mut AppState, T) -> bool,
 ) -> Task<()> {
     cx.spawn(async move |this, cx| {
         // Resubscribe loop: these are the standing Sessions/Devices/Spaces
@@ -1880,11 +1917,12 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
                     }
                 };
                 let alive = this.update(cx, |state, cx| {
-                    apply(state, parsed);
-                    if matches!(method, methods::WATCH_SPACES | methods::WATCH_DEVICES) {
-                        state.reconcile_change_request_watches(cx);
+                    if apply(state, parsed) {
+                        if matches!(method, methods::WATCH_SPACES | methods::WATCH_DEVICES) {
+                            state.reconcile_change_request_watches(cx);
+                        }
+                        cx.notify();
                     }
-                    cx.notify();
                 });
                 if alive.is_err() {
                     return;
@@ -2661,6 +2699,21 @@ mod tests {
             created_at: None,
             version: None,
         }
+    }
+
+    #[test]
+    fn identical_watch_snapshots_are_not_changes() {
+        let mut state = AppState::new();
+        let now = Utc::now();
+        let row = session("c", SessionStatus::Working, 5, now);
+        assert!(state.apply_sessions(vec![row.clone()]));
+        assert!(!state.apply_sessions(vec![row]));
+        let chats = vec![chat("a", 0, None)];
+        assert!(state.apply_chats(chats.clone()));
+        assert!(!state.apply_chats(chats));
+        let spaces = vec![space("s1", "dev", "/a", 1)];
+        assert!(state.apply_spaces(spaces.clone()));
+        assert!(!state.apply_spaces(spaces));
     }
 
     #[test]

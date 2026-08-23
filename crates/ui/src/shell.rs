@@ -17,8 +17,8 @@ use std::time::Duration;
 use chrono::Utc;
 use gpui::{
     AnyElement, App, Context, Empty, Entity, Focusable as _, IntoElement, KeyBinding, Keystroke,
-    MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, SharedString, Subscription,
-    Task, Window, WindowControlArea, actions, div, prelude::*, px,
+    MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, SharedString,
+    StyleRefinement, Subscription, Task, Window, WindowControlArea, actions, div, prelude::*, px,
 };
 
 use gpui_tokio::Tokio;
@@ -2297,7 +2297,11 @@ impl Shell {
                 shell.show_studio_thread(*conversation_id, *focus_artifact, cx);
             }
         }));
-        self.studio_observe = Some(cx.observe(&page, |_, _, cx| cx.notify()));
+        self.studio_observe = Some(cx.observe(&page, |shell, _, cx| {
+            if matches!(shell.route, Route::Studio | Route::StudioArtifact { .. }) {
+                cx.notify();
+            }
+        }));
         self.studio_page = Some(page.clone());
         page
     }
@@ -6128,7 +6132,10 @@ impl Shell {
         // → the onboarding card. The composer sits below the first two
         // (new-chat mode mints the chat id on first send).
         let outlet: AnyElement = if has_selection {
-            self.transcript.clone().into_any_element()
+            self.transcript
+                .clone()
+                .cached(StyleRefinement::default().size_full())
+                .into_any_element()
         } else if !has_spaces && !no_project {
             // Onboarding (first boot / after the destructive wipe): no folders
             // to work in yet — one clear affordance.
@@ -6662,7 +6669,11 @@ impl Shell {
                         .relative()
                         .flex()
                         .flex_col()
-                        .child(div().flex_1().min_h_0().child(transcript))
+                        .child(
+                            div().flex_1().min_h_0().child(
+                                transcript.cached(StyleRefinement::default().size_full()),
+                            ),
+                        )
                         .children(pill)
                         .into_any_element()
                 }

@@ -33,10 +33,10 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, BorderStyle, Bounds, ClipboardItem, Context, Entity, ListAlignment, ListOffset,
-    ListScrollEvent, ListState, MouseButton, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels,
-    Point, SharedString, StyledImage as _, StyledText, Subscription, Task, TextRun, Window, canvas,
-    div, img, list, prelude::*, px, quad,
+    AnyElement, App, BorderStyle, Bounds, ClipboardItem, Context, Entity, EntityId,
+    ListAlignment, ListOffset, ListScrollEvent, ListState, MouseButton, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, Pixels, Point, SharedString, StyledImage as _, StyledText,
+    Subscription, Task, TextRun, Window, canvas, div, img, list, prelude::*, px, quad,
 };
 
 use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
@@ -1487,6 +1487,74 @@ pub fn format_elapsed(secs: i64) -> String {
     } else {
         format!("{}m {}s", secs / 60, secs % 60)
     }
+}
+
+/// Working-trailer state shared with the shell overlay.
+#[derive(Clone, Copy, Debug)]
+pub struct WorkingChrome {
+    pub sending: bool,
+    pub queued: bool,
+    pub elapsed_secs: i64,
+    pub seed: u64,
+}
+
+/// Paint the working trailer. `drive` leases the pulse clock on that view
+/// (shell overlay). `None` follows a clock already leased elsewhere.
+pub fn paint_working_trailer(
+    chrome: &WorkingChrome,
+    theme: &Theme,
+    drive: Option<EntityId>,
+    cx: &mut App,
+) -> AnyElement {
+    let word = if chrome.queued {
+        "Queued — will send automatically"
+    } else if chrome.sending {
+        "Sending"
+    } else {
+        flavour_word(chrome.seed, chrome.elapsed_secs)
+    };
+    let spinner: AnyElement = match drive {
+        Some(view) => crate::loaders::gradient_spinner(
+            "working-indicator",
+            theme,
+            2.5,
+            view,
+            cx,
+        )
+        .into_any_element(),
+        None => crate::loaders::gradient_spinner_passive("working-indicator", theme, 2.5, cx)
+            .into_any_element(),
+    };
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(Theme::SPACE_SM))
+        .pt(px(Theme::SPACE_LG))
+        .text_size(px(11.0))
+        .child(spinner)
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(if chrome.queued {
+                    theme.warning
+                } else {
+                    theme.text_muted
+                })
+                .child(SharedString::from(if chrome.queued {
+                    word.to_string()
+                } else {
+                    format!("{word}…")
+                })),
+        )
+        .when(!chrome.sending, |el| {
+            el.child(
+                div()
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(format_elapsed(chrome.elapsed_secs))),
+            )
+        })
+        .into_any_element()
 }
 
 // ---------------------------------------------------------------------------
@@ -3702,20 +3770,17 @@ impl Transcript {
                                 .object_fit(ObjectFit::Cover),
                         )
                         .when(sending, |el| {
-                            // The pulse read registers this entity for frames,
-                            // so the overlay stays live even once the trailer's
-                            // 30s pending-send bridge has lapsed.
-                            let pulse = motion::pulse_wave(motion::pulse_delta(
+                            // Follow the shared clock (sidebar sending spinner
+                            // holds the lease). Do not lease this transcript.
+                            let pulse = motion::pulse_wave(motion::pulse_phase(
                                 &motion::ZERON_PULSE,
-                                cx.entity_id(),
                                 cx,
                             ));
                             let indicator: AnyElement = match uploading {
                                 Some(pct) => crate::loaders::upload_progress_ring(pct, 34.0),
-                                None => crate::loaders::mini_gradient_spinner(
+                                None => crate::loaders::mini_gradient_spinner_passive(
                                     format!("att-sending-{row_id}-{aix}"),
                                     3.0,
-                                    cx.entity_id(),
                                     cx,
                                 )
                                 .into_any_element(),
@@ -3748,9 +3813,8 @@ impl Transcript {
                     .bg(crate::theme::ink(0.055))
                     .opacity(
                         0.35 + 0.4
-                            * motion::pulse_wave(motion::pulse_delta(
+                            * motion::pulse_wave(motion::pulse_phase(
                                 &motion::ZERON_PULSE,
-                                cx.entity_id(),
                                 cx,
                             )),
                     )
@@ -3796,9 +3860,11 @@ impl Transcript {
         }
     }
 
-    fn render_working_trailer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// Live working-trailer chrome for the shell overlay. `None` when this
+    /// transcript is not in a Working/Sending/Queued run.
+    pub fn working_chrome(&self, cx: &App) -> Option<WorkingChrome> {
         let now = chrono::Utc::now();
-        let (sending, queued, elapsed_secs, seed) = if let Some(doc_id) = &self.doc_override {
+        if let Some(doc_id) = &self.doc_override {
             // A subagent doc has no Session row — `indicator_for` would read
             // the PARENT chat's live state into this tab. Liveness rides the
             // doc itself instead: the sink's assistant entry streams until
@@ -3816,101 +3882,68 @@ impl Transcript {
                 return None;
             }
             let elapsed = ((now.timestamp_millis() - last.created_at).max(0) / 1000) as i64;
-            (false, false, elapsed, flavour_seed(doc_id))
-        } else {
-            let chat_id = self.chat_id.clone()?;
-            // Failed-send state first: past the grace window the trailer IS
-            // the retry affordance, whatever the indicator fell back to.
-            if self.state.read(cx).send_undelivered(&chat_id, now) {
-                let theme = Theme::of(cx).clone();
-                return Some(
-                    div()
-                        .id("undelivered-retry")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(Theme::SPACE_SM))
-                        .pt(px(Theme::SPACE_LG))
-                        .text_size(px(12.0))
-                        .text_color(theme.danger)
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| this.retry_send(cx)))
-                        .child(SharedString::from("Not delivered — click to retry"))
-                        .into_any_element(),
-                );
-            }
-            let (sending, queued, elapsed) = {
-                let state = self.state.read(cx);
-                if state.indicator_for(&chat_id, now) != crate::state::Indicator::Working {
-                    return None;
-                }
-                // During the send→turn window the session row's `started_at`
-                // still belongs to the PREVIOUS turn — a timer based on the
-                // send counted the round-trip and then restarted when the
-                // turn actually began (user report). Bridge it as "Sending…"
-                // with no timer instead; the word + timer start with the
-                // turn.
-                let turn_started = state.session_for(&chat_id).and_then(|s| s.started_at);
-                let sending =
-                    sending_bridge(state.pending_send_started(&chat_id, now), turn_started);
-                // Degraded delivery path: the send is a durable local write
-                // waiting on connectivity — say so instead of faking
-                // progress. (The overlay holds while degraded, so this line
-                // owns the surface until the ack or the failed state.)
-                let queued = sending && state.chat_delivery_degraded(&chat_id);
-                let elapsed = turn_started
-                    .map(|t| now.signed_duration_since(t).num_seconds().max(0))
-                    .unwrap_or(0);
-                (sending, queued, elapsed)
-            };
-            (sending, queued, elapsed, flavour_seed(&chat_id))
-        };
-        let word = if queued {
-            "Queued — will send automatically"
-        } else if sending {
-            "Sending"
-        } else {
-            flavour_word(seed, elapsed_secs)
-        };
+            return Some(WorkingChrome {
+                sending: false,
+                queued: false,
+                elapsed_secs: elapsed,
+                seed: flavour_seed(doc_id),
+            });
+        }
+        let chat_id = self.chat_id.as_deref()?;
+        if self.state.read(cx).send_undelivered(chat_id, now) {
+            return None;
+        }
+        let state = self.state.read(cx);
+        if state.indicator_for(chat_id, now) != crate::state::Indicator::Working {
+            return None;
+        }
+        let turn_started = state.session_for(chat_id).and_then(|s| s.started_at);
+        let sending = sending_bridge(state.pending_send_started(chat_id, now), turn_started);
+        let queued = sending && state.chat_delivery_degraded(chat_id);
+        let elapsed = turn_started
+            .map(|t| now.signed_duration_since(t).num_seconds().max(0))
+            .unwrap_or(0);
+        Some(WorkingChrome {
+            sending,
+            queued,
+            elapsed_secs: elapsed,
+            seed: flavour_seed(chat_id),
+        })
+    }
+
+    /// In-flow working loader under the last row. Leases this view so the
+    /// spinner and elapsed timer keep moving through quiet tool runs.
+    fn render_working_trailer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let now = chrono::Utc::now();
+        if self.doc_override.is_none()
+            && let Some(chat_id) = self.chat_id.as_deref()
+            && self.state.read(cx).send_undelivered(chat_id, now)
+        {
+            let theme = Theme::of(cx).clone();
+            return Some(
+                div()
+                    .id("undelivered-retry")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(Theme::SPACE_SM))
+                    .pt(px(Theme::SPACE_LG))
+                    .text_size(px(12.0))
+                    .text_color(theme.danger)
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| this.retry_send(cx)))
+                    .child(SharedString::from("Not delivered — click to retry"))
+                    .into_any_element(),
+            );
+        }
+        let chrome = self.working_chrome(cx)?;
         let theme = Theme::of(cx).clone();
-        Some(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(Theme::SPACE_SM))
-                .pt(px(Theme::SPACE_LG))
-                .text_size(px(11.0))
-                .child(crate::loaders::gradient_spinner(
-                    "working-indicator",
-                    &theme,
-                    2.5,
-                    cx.entity_id(),
-                    cx,
-                ))
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(if queued {
-                            theme.warning
-                        } else {
-                            theme.text_muted
-                        })
-                        .child(SharedString::from(if queued {
-                            word.to_string()
-                        } else {
-                            format!("{word}…")
-                        })),
-                )
-                .when(!sending, |el| {
-                    el.child(
-                        div()
-                            .text_color(theme.text_faint)
-                            .child(SharedString::from(format_elapsed(elapsed_secs))),
-                    )
-                })
-                .into_any_element(),
-        )
+        Some(paint_working_trailer(
+            &chrome,
+            &theme,
+            Some(cx.entity_id()),
+            cx,
+        ))
     }
 
     fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -5155,7 +5188,7 @@ fn chip_header_row(
     tool: &ToolItem,
     trail: Option<ChipTrail>,
     theme: &Theme,
-    view: gpui::EntityId,
+    _view: gpui::EntityId,
     cx: &mut gpui::App,
 ) -> gpui::Div {
     let (label, detail) = if tool.is_thought {
@@ -5260,13 +5293,12 @@ fn chip_header_row(
             row.child(
                 div()
                     .flex_none()
-                    .child(crate::loaders::mini_gradient_spinner(
+                    .child(crate::loaders::mini_gradient_spinner_passive(
                         format!(
                             "subagent-chip-{}",
                             tool.subagent_ref.as_deref().unwrap_or_default()
                         ),
                         2.0,
-                        view,
                         cx,
                     )),
             )

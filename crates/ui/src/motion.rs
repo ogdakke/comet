@@ -75,21 +75,50 @@ impl Default for PulseClock {
     }
 }
 
+/// Current phase `[0,1)` of a repeating spec. Does not keep any view
+/// rendering — pair with [`pulse_delta`] on the view that actually paints
+/// the spinner. Reduced motion and a parked clock both return 0.
+pub fn pulse_phase(spec: &MotionSpec, cx: &App) -> f32 {
+    if cx.reduce_motion() {
+        return 0.0;
+    }
+    let Some(clock) = cx.try_global::<PulseClock>() else {
+        return 0.0;
+    };
+    pulse_phase_at(spec, clock.epoch.elapsed())
+}
+
+fn pulse_phase_at(spec: &MotionSpec, elapsed: Duration) -> f32 {
+    let period = spec.total().as_secs_f32();
+    if period <= 0.0 {
+        return 0.0;
+    }
+    (elapsed.as_secs_f32() / period).fract()
+}
+
 /// Current phase `[0,1)` of a repeating spec, plus a lease that keeps the
 /// calling view re-rendering at [`PULSE_TICK`] while its spinner stays
 /// mounted. All cells across all views share one epoch, so multi-instance
 /// loaders stay phase-locked. Reduced motion returns a static 0 and schedules
 /// nothing.
+///
+/// Lease the *spinner's* view, never a transcript or other heavy parent:
+/// `cx.notify` dirties every ancestor, and an uncached child is rebuilt on
+/// every parent frame.
 pub fn pulse_delta(spec: &MotionSpec, view: EntityId, cx: &mut App) -> f32 {
     if cx.reduce_motion() {
         return 0.0;
     }
-    let clock = cx.default_global::<PulseClock>();
-    clock.leases.insert(view, Instant::now() + PULSE_LEASE);
-    let period = spec.total().as_secs_f32();
-    let phase = (clock.epoch.elapsed().as_secs_f32() / period).fract();
-    if !clock.running {
-        clock.running = true;
+    let start_clock;
+    {
+        let clock = cx.default_global::<PulseClock>();
+        clock.leases.insert(view, Instant::now() + PULSE_LEASE);
+        start_clock = !clock.running;
+        if start_clock {
+            clock.running = true;
+        }
+    }
+    if start_clock {
         cx.spawn(async move |cx| {
             loop {
                 cx.background_executor().timer(PULSE_TICK).await;
@@ -114,7 +143,7 @@ pub fn pulse_delta(spec: &MotionSpec, view: EntityId, cx: &mut App) -> f32 {
         })
         .detach();
     }
-    phase
+    pulse_phase(spec, cx)
 }
 
 // ---------------------------------------------------------------------------
@@ -652,6 +681,8 @@ pub fn reduced_motion(cx: &App) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn eval_never_escapes_unit_interval_dense_sweep() {
         // Regression: f32 rounding produced 1.000000119 near the tail of
@@ -670,8 +701,6 @@ mod tests {
             }
         }
     }
-
-    use super::*;
 
     fn assert_close(actual: f32, expected: f32, tol: f32, ctx: &str) {
         assert!(
@@ -784,6 +813,16 @@ mod tests {
         assert_close(pulse_opacity(0.5), 1.0, 1e-6, "opacity peak");
         assert_close(pulse_scale(0.0), 0.9, 1e-6, "scale floor");
         assert_close(pulse_scale(0.5), 1.0, 1e-6, "scale peak");
+    }
+
+    #[test]
+    fn pulse_phase_wraps_the_period() {
+        let spec = GRADIENT_SPIN;
+        let period = spec.total();
+        assert_eq!(pulse_phase_at(&spec, Duration::ZERO), 0.0);
+        assert!((pulse_phase_at(&spec, period) - 0.0).abs() < 1e-5);
+        let half = pulse_phase_at(&spec, period / 2);
+        assert!((half - 0.5).abs() < 1e-5, "half period {half}");
     }
 
     #[test]

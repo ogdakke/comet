@@ -120,9 +120,24 @@ pub fn gradient_spinner(
     view: EntityId,
     cx: &mut App,
 ) -> impl IntoElement {
+    gradient_spinner_delta(cell_px, motion::pulse_delta(&GRADIENT_SPIN, view, cx))
+}
+
+/// [`gradient_spinner`] driven by the shared clock without leasing this
+/// view. Use inside a cached transcript: a live sidebar spinner already
+/// keeps the clock ticking.
+pub fn gradient_spinner_passive(
+    _id: &'static str,
+    _theme: &Theme,
+    cell_px: f32,
+    cx: &App,
+) -> impl IntoElement {
+    gradient_spinner_delta(cell_px, motion::pulse_phase(&GRADIENT_SPIN, cx))
+}
+
+fn gradient_spinner_delta(cell_px: f32, delta: f32) -> impl IntoElement {
     let center = (MATRIX_SIDE as f32 - 1.0) / 2.0;
     let max = MATRIX_SIDE as f32 - 1.0 + center;
-    let delta = motion::pulse_delta(&GRADIENT_SPIN, view, cx);
     div()
         .flex()
         .flex_col()
@@ -159,7 +174,18 @@ pub fn mini_gradient_spinner(
     cx: &mut App,
 ) -> impl IntoElement {
     let tints = GSPIN_ROW_TINTS.map(|t| gpui::rgb(t).into());
-    mini_spinner_tinted(key, cell_px, tints, view, cx)
+    mini_spinner_tinted(key, cell_px, tints, Some(view), cx)
+}
+
+/// [`mini_gradient_spinner`] without a view lease. Phase-locks to whatever
+/// is already driving [`motion::pulse_delta`].
+pub fn mini_gradient_spinner_passive(
+    key: impl Into<SharedString>,
+    cell_px: f32,
+    cx: &mut App,
+) -> impl IntoElement {
+    let tints = GSPIN_ROW_TINTS.map(|t| gpui::rgb(t).into());
+    mini_spinner_tinted(key, cell_px, tints, None, cx)
 }
 
 /// [`mini_gradient_spinner`] in a single flat tint — the grayscale take for
@@ -172,14 +198,14 @@ pub fn mini_mono_spinner(
     view: EntityId,
     cx: &mut App,
 ) -> impl IntoElement {
-    mini_spinner_tinted(key, cell_px, [tint; 3], view, cx)
+    mini_spinner_tinted(key, cell_px, [tint; 3], Some(view), cx)
 }
 
 fn mini_spinner_tinted(
     key: impl Into<SharedString>,
     cell_px: f32,
     row_tints: [gpui::Hsla; 3],
-    view: EntityId,
+    drive: Option<EntityId>,
     cx: &mut App,
 ) -> impl IntoElement {
     const COLS: usize = 2;
@@ -189,7 +215,10 @@ fn mini_spinner_tinted(
     const RING: [[usize; COLS]; ROWS] = [[0, 1], [5, 2], [4, 3]];
     const RING_LEN: f32 = (COLS * ROWS) as f32;
     let _key = key.into();
-    let delta = motion::pulse_delta(&GRADIENT_SPIN, view, cx);
+    let delta = match drive {
+        Some(view) => motion::pulse_delta(&GRADIENT_SPIN, view, cx),
+        None => motion::pulse_phase(&GRADIENT_SPIN, cx),
+    };
     div()
         .flex()
         .flex_col()
