@@ -861,11 +861,18 @@ fn assistant_copy_text(entry: &SessionMessageEntry) -> Option<SharedString> {
 /// `parse` maps `(part_key, text)` to a block tree — the entity supplies
 /// incremental parsers for live parts and a cache for complete ones; tests pass
 /// a plain `parse_full`.
+///
+/// Queued user entries return no rows: they belong to the composer tray until
+/// delivery stamps them `Complete` and moves them to the transcript end.
 pub fn rows_for_entry(
     entry: &SessionMessageEntry,
     pending: bool,
     parse: &mut dyn FnMut(&str, &str) -> Arc<BlockTree>,
 ) -> Vec<Row> {
+    if entry.status == Some(MessageStatus::Queued) {
+        return Vec::new();
+    }
+
     let mut rows: Vec<Row> = Vec::new();
     let streaming = entry.status == Some(MessageStatus::Streaming);
     let entry_id: SharedString = entry.id.clone().into();
@@ -2488,14 +2495,14 @@ impl Transcript {
         &mut self,
         _event: &MouseUpEvent,
         _window: &mut Window,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) {
         self.stop_selection_scroll();
         if let Some(_text) = crate::markdown::selection::end_any_drag() {
             // X11 middle-click paste parity, including the case where the
             // anchor row has virtualized away and cannot receive mouse-up.
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-            cx.write_to_primary(ClipboardItem::new_string(_text));
+            _cx.write_to_primary(ClipboardItem::new_string(_text));
         }
     }
 
@@ -7235,5 +7242,34 @@ mod tests {
             vec![text_part("t0", ""), text_part("t1", "   ")],
         );
         assert!(rows_for_entry(&entry, false, &mut parse).is_empty());
+    }
+
+    #[test]
+    fn queued_user_entries_produce_no_transcript_rows() {
+        let queued = SessionMessageEntry {
+            id: "q1".into(),
+            role: MessageRole::User,
+            parts: vec![text_part("t0", "how did you like that?")],
+            created_at: 1,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Queued),
+            continuation_of: None,
+        };
+        assert!(
+            rows_for_entry(&queued, false, &mut parse).is_empty(),
+            "queued prompts stay in the tray, not the transcript"
+        );
+        assert!(rows_for_entry(&queued, true, &mut parse).is_empty());
+
+        let committed = SessionMessageEntry {
+            status: Some(MessageStatus::Complete),
+            ..queued
+        };
+        let rows = rows_for_entry(&committed, false, &mut parse);
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            &rows[0].kind,
+            RowKind::User { text, .. } if text.as_ref() == "how did you like that?"
+        ));
     }
 }

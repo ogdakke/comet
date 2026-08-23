@@ -102,6 +102,9 @@ struct ScriptedHarness {
     script: Vec<AgentEvent>,
     step_delay: Duration,
     hang_until_interrupt: bool,
+    /// Prompts handed to [`Harness::run`], in dispatch order. Empty unless a
+    /// test clones the mutex to assert a queued prompt was not sent yet.
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 #[async_trait]
@@ -126,9 +129,10 @@ impl Harness for ScriptedHarness {
     }
     async fn run(
         &self,
-        _request: RunRequest,
+        request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.seen.lock().unwrap().push(request.prompt.clone());
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
         let script = self.script.clone();
         let delay = self.step_delay;
@@ -214,6 +218,28 @@ fn entries(core: &EngineCore) -> Vec<SessionMessageEntry> {
         .doc()
         .read_entries()
         .expect("read entries")
+}
+
+fn user_prompt(entry: &SessionMessageEntry) -> String {
+    entry
+        .parts
+        .iter()
+        .filter_map(|p| match p {
+            MessagePart::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// User rows the transcript should show: everything except still-queued
+/// prompts, which belong to the tray until delivery commits them.
+fn committed_user_prompts(entries: &[SessionMessageEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| e.role == MessageRole::User && e.status != Some(MessageStatus::Queued))
+        .map(user_prompt)
+        .collect()
 }
 
 /// Tolerant read for hot-polling predicates: a snapshot taken between a
@@ -359,6 +385,7 @@ async fn session_status_transitions_idle_working_idle() {
             script: mock_script(),
             step_delay: Duration::from_millis(40),
             hang_until_interrupt: false,
+            seen: Default::default(),
         }),
     );
     let mut watch = core.sessions.watch_sessions();
@@ -406,6 +433,7 @@ async fn interrupt_stamps_streaming_entry_aborted() {
             }],
             step_delay: Duration::from_millis(5),
             hang_until_interrupt: true,
+            seen: Default::default(),
         }),
     );
     let handle = core.doc_host.open(CHAT).unwrap();
@@ -484,6 +512,7 @@ async fn queued_prompts_deliver_sequentially_after_each_turn() {
             script: hanging_turn_script(),
             step_delay: Duration::from_millis(5),
             hang_until_interrupt: true,
+            seen: Default::default(),
         }),
     );
     let handle = core.doc_host.open(CHAT).unwrap();
@@ -588,6 +617,7 @@ async fn queue_remove_deletes_a_queued_prompt() {
             script: hanging_turn_script(),
             step_delay: Duration::from_millis(5),
             hang_until_interrupt: true,
+            seen: Default::default(),
         }),
     );
     let handle = core.doc_host.open(CHAT).unwrap();
@@ -841,6 +871,132 @@ async fn queued_prompt_delivers_after_the_live_turns_entries() {
         "delivered turn streams its own reply",
     )
     .await;
+    core.sessions.interrupt(CHAT).await.unwrap();
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "session idle after the delivered turn",
+    )
+    .await;
+}
+
+/// A queued prompt stays in the tray (`Queued`) and is not sent to the model
+/// until the live turn ends. Only then is it committed (`Complete`, after the
+/// live turn's entries) and dispatched as the next run.
+#[tokio::test]
+async fn queued_prompt_is_not_committed_until_the_live_turn_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: hanging_turn_script(),
+            step_delay: Duration::from_millis(5),
+            hang_until_interrupt: true,
+            seen: seen.clone(),
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-1",
+        SessionCommandPayload::Run {
+            request: run_request("first"),
+            message_id: "m-1".into(),
+        },
+    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Working),
+        "live turn working",
+    )
+    .await;
+    wait_for(
+        || seen.lock().unwrap().iter().any(|p| p == "first"),
+        "live prompt sent to the model",
+    )
+    .await;
+
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-q-1",
+        SessionCommandPayload::Queue {
+            prompt: "how did you like that?".into(),
+            message_id: "q-1".into(),
+        },
+    );
+    wait_for(
+        || {
+            matches!(
+                command_status(&core, "cmd-q-1"),
+                Some((SessionCommandStatus::Applied, _))
+            )
+        },
+        "queue command applied",
+    )
+    .await;
+    wait_for(
+        || {
+            entries(&core)
+                .iter()
+                .any(|e| e.id == "q-1" && e.status == Some(MessageStatus::Queued))
+        },
+        "queued entry parked",
+    )
+    .await;
+
+    let parked = entries(&core);
+    assert_eq!(
+        committed_user_prompts(&parked),
+        vec!["first".to_string()],
+        "queued prompt must not appear as a committed transcript user row while the live turn is running"
+    );
+    assert!(
+        !seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p == "how did you like that?"),
+        "queued prompt must not be sent to the model until the live turn ends"
+    );
+
+    // Live turn ends: the parked prompt is committed (Complete, after the
+    // live turn) and dispatched as the next run.
+    core.sessions.interrupt(CHAT).await.unwrap();
+    wait_for(
+        || {
+            entries(&core)
+                .iter()
+                .any(|e| e.id == "q-1" && e.status == Some(MessageStatus::Complete))
+        },
+        "queued prompt committed after the live turn",
+    )
+    .await;
+
+    let delivered = entries(&core);
+    let q_pos = delivered.iter().position(|e| e.id == "q-1").unwrap();
+    let a_pos = delivered
+        .iter()
+        .position(|e| e.role == MessageRole::Assistant)
+        .unwrap();
+    assert!(
+        q_pos > a_pos,
+        "committed queued prompt lands after the live turn, not in its parked slot"
+    );
+    assert_eq!(
+        committed_user_prompts(&delivered),
+        vec!["first".to_string(), "how did you like that?".to_string()]
+    );
+    wait_for(
+        || {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|p| p == "how did you like that?")
+        },
+        "committed prompt sent to the model",
+    )
+    .await;
+
     core.sessions.interrupt(CHAT).await.unwrap();
     wait_for(
         || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
