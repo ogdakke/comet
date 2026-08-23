@@ -1229,6 +1229,13 @@ fn pointer_hits_any_occluder(
 /// `(element index, byte offset)` for a window position: the registered
 /// element whose vertical band contains it, else the nearest by vertical
 /// distance (a drag past the gutter or between blocks clamps sensibly).
+pub(crate) fn update_drag_at(position: gpui::Point<gpui::Pixels>) -> bool {
+    let Some(head) = registry_point(position) else {
+        return false;
+    };
+    resolve_current_drag(head)
+}
+
 fn registry_point(position: gpui::Point<gpui::Pixels>) -> Option<(usize, usize)> {
     REGISTRY.with(|r| {
         let reg = r.borrow();

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
-use zeron_harness::{CancellationToken, Harness, PiHarness, RunControls, SteerMessage};
+use zeron_harness::{CancellationToken, Harness, PiHarness, RunControls};
 use zeron_proto::{AgentEvent, RunRequest, SandboxLevel, UserInputAnswer};
 
 #[tokio::test]

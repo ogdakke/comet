@@ -23,6 +23,9 @@ static TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
 pub(super) const HOVER_AUTOPLAY_DELAY: Duration = Duration::from_millis(200);
 /// Matches gallery and thread tile rounding. GPUI surfaces ignore `rounded`
 /// (they paint a square), so hover playback covers these corners itself.
+/// Linux hover playback does not paint a surface, so the constant is unused
+/// outside macOS except in tests.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) const TILE_CORNER_RADIUS: f32 = 10.0;
 
 /// Overlay plate for a duration chip sitting on media. Always a dark fill

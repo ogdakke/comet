@@ -559,6 +559,40 @@ impl SessionsEngine {
 
     /// Interrupt the live run, if any. The run settles with a synthetic
     /// `Done{interrupted}` and its streaming entry stamped `aborted`; this waits
+    /// for that settle so a follow-up send does not race a dying child.
+    pub async fn interrupt(&self, chat_id: &str) -> Result<bool, EngineError> {
+        let target = lock(&self.inner.runs).get(chat_id).map(|h| {
+            (
+                h.run_id.clone(),
+                h.interrupt_token.clone(),
+                h.cancel.clone(),
+                h.pending_inputs.clone(),
+            )
+        });
+        let Some((run_id, token, cancel, pending)) = target else {
+            return Ok(false);
+        };
+        // Unpark any blocked question FIRST (mirrors zeron: harness teardown can await a
+        // parked question callback — a run stuck on a question would deadlock the stop).
+        let parked: Vec<_> = lock(&pending).drain().map(|(_, tx)| tx).collect();
+        for tx in parked {
+            let _ = tx.send(Vec::new());
+        }
+        // Harness-level interrupt (protocol + child teardown) …
+        token.cancel();
+        // … plus the engine-side grace deadline in the run task, so a harness that
+        // ignores its token still settles with a synthesized Done{interrupted}.
+        let _ = cancel.send(true);
+        // Bounded settle wait (the run task appends Done + stamps `aborted`).
+        for _ in 0..500 {
+            if !self.is_live(chat_id, &run_id) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        Ok(true)
+    }
+
     /// Queue a prompt for delivery as the NEXT turn ("send after the current
     /// turn"). The doc entry is written with status `queued` — the transcript
     /// hides it and the composer's queue tray owns its presentation — and the
@@ -853,40 +887,6 @@ impl SessionsEngine {
                 }
             }
         });
-    }
-
-    /// (bounded) for that settlement so callers observe a consistent doc.
-    pub async fn interrupt(&self, chat_id: &str) -> Result<bool, EngineError> {
-        let target = lock(&self.inner.runs).get(chat_id).map(|h| {
-            (
-                h.run_id.clone(),
-                h.interrupt_token.clone(),
-                h.cancel.clone(),
-                h.pending_inputs.clone(),
-            )
-        });
-        let Some((run_id, token, cancel, pending)) = target else {
-            return Ok(false);
-        };
-        // Unpark any blocked question FIRST (mirrors zeron: harness teardown can await a
-        // parked question callback — a run stuck on a question would deadlock the stop).
-        let parked: Vec<_> = lock(&pending).drain().map(|(_, tx)| tx).collect();
-        for tx in parked {
-            let _ = tx.send(Vec::new());
-        }
-        // Harness-level interrupt (protocol + child teardown) …
-        token.cancel();
-        // … plus the engine-side grace deadline in the run task, so a harness that
-        // ignores its token still settles with a synthesized Done{interrupted}.
-        let _ = cancel.send(true);
-        // Bounded settle wait (the run task appends Done + stamps `aborted`).
-        for _ in 0..500 {
-            if !self.is_live(chat_id, &run_id) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        Ok(true)
     }
 
     /// Resolve a pending `request_input` question set. Returns `false` when no such

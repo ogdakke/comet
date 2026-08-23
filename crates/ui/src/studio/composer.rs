@@ -1747,9 +1747,7 @@ impl StudioPage {
             .flex()
             .flex_col()
             .items_center()
-            .when(self.popup_conflict.is_none(), |this| {
-                this.gap(px(10.0))
-            })
+            .when(self.popup_conflict.is_none(), |this| this.gap(px(10.0)))
             .children(self.render_conflict_popup(theme, cx))
             .children(
                 self.popup_conflict

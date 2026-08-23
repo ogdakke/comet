@@ -869,6 +869,15 @@ impl Engine {
         if let Some(token) = &config.edge_token {
             auth_config.dev_user_id = token.clone();
             auth_config.dev_mode = !token.trim().is_empty();
+        } else if config
+            .workos_client_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+        {
+            // WorkOS unset is development: a synthetic identity, no Edge
+            // until an explicit bearer is configured.
+            auth_config.dev_mode = true;
+            auth_config.dev_user_id = "dev-user".into();
         }
         Auth::new(auth_config)
     }

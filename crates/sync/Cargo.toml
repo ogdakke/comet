@@ -29,6 +29,7 @@ block2 = "0.6"
 mock-server = []
 
 [dev-dependencies]
+zeron-sync = { path = ".", features = ["mock-server"] }
 chrono.workspace = true
 # chat2_live example only (live checkpoint fetch against a deployed worker).
 reqwest.workspace = true

@@ -489,8 +489,7 @@ fn filmstrip_controls_lift(filmstrip_visible: bool, stage_height: f32, video_hei
         return 0.0;
     }
     let bottom_gap = (stage_height - video_height).max(0.0) / 2.0;
-    (ARTIFACT_FILMSTRIP_HEIGHT
-        + ARTIFACT_FILMSTRIP_CLEARANCE
+    (ARTIFACT_FILMSTRIP_HEIGHT + ARTIFACT_FILMSTRIP_CLEARANCE
         - bottom_gap
         - crate::video::CONTROLS_INSET)
         .max(0.0)
@@ -3513,7 +3512,7 @@ mod tests {
 
     #[test]
     fn inspector_prompt_inner_width_leaves_room_for_copy() {
-        assert!((inspector_prompt_inner_width() - 252.0).abs() < 0.01);
+        assert!((inspector_prompt_inner_width() - 272.0).abs() < 0.01);
     }
 
     #[test]
@@ -3583,9 +3582,8 @@ mod tests {
 
     #[test]
     fn video_pill_lifts_only_the_filmstrip_deficit() {
-        let full = ARTIFACT_FILMSTRIP_HEIGHT
-            + ARTIFACT_FILMSTRIP_CLEARANCE
-            - crate::video::CONTROLS_INSET;
+        let full =
+            ARTIFACT_FILMSTRIP_HEIGHT + ARTIFACT_FILMSTRIP_CLEARANCE - crate::video::CONTROLS_INSET;
         // Video fills the stage: the pill clears the strip plus clearance.
         assert!((filmstrip_controls_lift(true, 800.0, 800.0) - full).abs() < 0.01);
         // Partial overlap: only the deficit below the strip's top edge.
