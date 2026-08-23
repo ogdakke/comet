@@ -464,6 +464,12 @@ impl ChatDocHandle {
         text: &str,
         created_at: i64,
     ) -> Result<(), DocError> {
+        // A queued prompt already occupies this id. Delivery must promote it
+        // (`queued` → `Complete`, moved to the transcript end) rather than
+        // treating the existing row as a no-op.
+        if self.doc.redeliver_queued_message(message_id)? {
+            return Ok(());
+        }
         if self.doc.read_entries()?.iter().any(|e| e.id == message_id) {
             return Ok(());
         }

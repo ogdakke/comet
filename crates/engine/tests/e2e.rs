@@ -50,6 +50,23 @@ fn done(status: DoneStatus) -> AgentEvent {
     }
 }
 
+/// A live turn that does not emit Done. Use with `hang_until_interrupt` so the
+/// run stays Working until the test interrupts — `mock_script()` ends
+/// Completed, which parks a steerable harness and drains the queue early.
+fn hanging_turn_script() -> Vec<AgentEvent> {
+    vec![
+        AgentEvent::SessionStarted {
+            harness: HarnessId::Mock,
+            model: "mock-1".into(),
+            tools: vec![],
+            cwd: "/tmp".into(),
+            session_id: "hs-1".into(),
+            assistant_message_id: "a-1".into(),
+        },
+        AgentEvent::TextDelta { text: "Hel".into() },
+    ]
+}
+
 fn mock_script() -> Vec<AgentEvent> {
     vec![
         AgentEvent::SessionStarted {
@@ -464,7 +481,7 @@ async fn queued_prompts_deliver_sequentially_after_each_turn() {
     let core = assemble(
         dir.path(),
         Arc::new(ScriptedHarness {
-            script: mock_script(),
+            script: hanging_turn_script(),
             step_delay: Duration::from_millis(5),
             hang_until_interrupt: true,
         }),
@@ -540,13 +557,13 @@ async fn queued_prompts_deliver_sequentially_after_each_turn() {
     )
     .await;
     // Both delivered prompts ran as real turns (assistant entries exist).
+    // The hanging harness settles Interrupted, so those replies are Aborted
+    // rather than Complete.
     wait_for(
         || {
             entries(&core)
                 .iter()
-                .filter(|e| {
-                    e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
-                })
+                .filter(|e| e.role == MessageRole::Assistant)
                 .count()
                 >= 3
         },
@@ -568,7 +585,7 @@ async fn queue_remove_deletes_a_queued_prompt() {
     let core = assemble(
         dir.path(),
         Arc::new(ScriptedHarness {
-            script: mock_script(),
+            script: hanging_turn_script(),
             step_delay: Duration::from_millis(5),
             hang_until_interrupt: true,
         }),
