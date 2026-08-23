@@ -49,15 +49,15 @@ interface SocketState {
   userId: string;
   role: "host" | "client";
   connId: string;
-  /** Accept time — the liveness floor until the socket's first auto-pong. */
+  /** Accept time — recency among host sockets. Protocol pings never reach
+   * this isolate, so join time is the only stamp a native-ping host has. */
   joinedAt?: number;
 }
 
 const HOST_TAG = "host";
 const clientTag = (connId: string) => `client:${connId}`;
 
-/** How long a host socket may go without proving liveness before the relay
- * stops routing to it.
+/** Host selection among sockets the runtime still lists.
  *
  * A host whose network dies silently (laptop lid, NAT/proxy reaping an idle
  * flow) leaves a socket the runtime still reports as connected: no close
@@ -68,11 +68,14 @@ const clientTag = (connId: string) => `client:${connId}`;
  * clients hung to their own timeouts because a non-empty host list also
  * suppressed the `host_offline` bounce.
  *
- * Hosts ping every 15s (crates/rpc/src/device_room.rs PING_INTERVAL) and the
- * DO's auto-response stamps a timestamp without waking us, so liveness is free
- * to read. The window is sized for the 30s of older builds still in the fleet
- * — 2.5 of their intervals — so upgrading engines is never a prerequisite. */
-const HOST_LIVENESS_MS = 75_000;
+ * Recency is join time (and auto-response timestamp if one exists). RFC 6455
+ * Ping is answered at the Cloudflare edge and never reaches this isolate, so
+ * it cannot stamp liveness here. A wall-clock silence window on that stamp
+ * therefore killed idle headless hosts after 75s — they were still connected,
+ * still pinging, and every client dial bounced `host_offline`. Do not bring
+ * that window back, and do not send application-level `"ping"` strings to
+ * feed it: incoming WebSocket messages are billed, protocol pings are not.
+ * A dead host is replaced when it reconnects and supersedes the predecessor. */
 
 /** Control frames the relay itself emits (kind " relay"). */
 // MUST byte-match packages/rpc device-frames.ts RELAY_KIND — clients compare
@@ -117,9 +120,9 @@ export class DeviceRoom implements DurableObject {
     );
   }
 
-  /** The host socket to route to: the freshest one that has proven itself
-   * alive within [`HOST_LIVENESS_MS`]. `undefined` = no live host, which is
-   * what makes clients see `host_offline` instead of hanging on a corpse.
+  /** The host socket to route to: the freshest attached one. `undefined` =
+   * no host (or only legacy sockets from before `joinedAt`), which is what
+   * makes clients see `host_offline`.
    *
    * `exclude` drops the socket a close is being handled for — the runtime
    * still lists it during `webSocketClose`, and counting it as live would
@@ -128,15 +131,15 @@ export class DeviceRoom implements DurableObject {
     return pickLiveHost(
       this.ctx.getWebSockets(HOST_TAG).map((ws) => ({
         ws,
-        // Auto-pongs are stamped even while hibernating; `joinedAt` covers the
-        // window before a fresh socket's first ping. Sockets attached by an
-        // older deploy have neither and read as ancient — correct: they are.
+        // Join time is the recency signal. Auto-response timestamps are
+        // included if present, but protocol pings never produce them.
+        // Sockets attached by an older deploy have neither and read as 0 —
+        // skipped, not routed to.
         lastSeenAt: Math.max(
           this.ctx.getWebSocketAutoResponseTimestamp(ws)?.getTime() ?? 0,
           (ws.deserializeAttachment() as SocketState | null)?.joinedAt ?? 0
         )
       })),
-      Date.now(),
       exclude
     );
   }
@@ -319,23 +322,25 @@ export class DeviceRoom implements DurableObject {
   }
 }
 
-/** Freshest host socket that has proven itself alive inside the liveness
- * window, or `undefined` when every candidate is stale (or there are none).
- * `exclude` skips a socket whose close is being handled — the runtime still
- * lists it there, and counting it as live would suppress the `host_closed`
- * that close exists to announce. Pure so the routing rule is testable without
- * a DO. */
+/** Freshest attached host socket, or `undefined` when there are none (or
+ * only legacy sockets with no timestamp). `exclude` skips a socket whose
+ * close is being handled — the runtime still lists it there, and counting
+ * it as live would suppress the `host_closed` that close exists to announce.
+ * Pure so the routing rule is testable without a DO.
+ *
+ * Recency is not a liveness lease. Protocol pings never update `lastSeenAt`
+ * here, so a silence window on it would mark every idle host dead. */
 export const pickLiveHost = <T>(
   hosts: ReadonlyArray<{ ws: T; lastSeenAt: number }>,
-  now: number,
   exclude?: T
 ): T | undefined => {
   let best: { ws: T; lastSeenAt: number } | undefined;
   for (const host of hosts) {
     if (host.ws === exclude) continue;
+    if (host.lastSeenAt === 0) continue;
     if (!best || host.lastSeenAt > best.lastSeenAt) best = host;
   }
-  return best && now - best.lastSeenAt <= HOST_LIVENESS_MS ? best.ws : undefined;
+  return best?.ws;
 };
 
 const encodeRelayError = (code: string): Uint8Array =>

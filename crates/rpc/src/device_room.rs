@@ -47,7 +47,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Native WebSocket ping keepalive. Cloudflare answers it without waking the
-/// hibernating Durable Object.
+/// hibernating Durable Object, and incoming protocol pings are not billed.
 ///
 /// 10s, not 30: a laptop's uplink (corporate proxy, VPN split-tunnel extension,
 /// consumer NAT) can reap an idle flow well inside a minute, and a keepalive
@@ -61,9 +61,9 @@ const PING_INTERVAL: Duration = Duration::from_secs(10);
 /// timeout or sleep/wake) — drop it and reconnect instead of waiting on a TCP
 /// write error. 25s tolerates one lost pong (pings at +10/+20) before ruling
 /// the socket dead; the old 40s left sends wedged for most of a minute after
-/// an unnoticed drop. Must stay well under the relay's own host-liveness
-/// window (`HOST_LIVENESS_MS`, edge/src/device-room.ts) so a host replaces
-/// its dead socket before the relay gives up on the device.
+/// an unnoticed drop. Reconnect supersedes the old socket in the room, which
+/// is how a dead host is replaced — the relay does not evict on wall-clock
+/// silence (protocol pings never reach the isolate).
 const SILENCE_LEASE: Duration = Duration::from_secs(25);
 /// App-level end-to-end liveness for the CLIENT link. The transport lease
 /// above proves only the client↔edge leg — the DO's auto-pong answers from
