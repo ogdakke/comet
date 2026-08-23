@@ -233,13 +233,12 @@ impl StudioSync {
 
         let store = self.store.clone();
         let source = source.to_path_buf();
-        let imported = tokio::task::spawn_blocking(move || {
-            store.import_legacy_local_snapshot(&source)
-        })
-        .await
-        .map_err(|error| {
-            StudioSyncError::Protocol(format!("local Studio importer panicked: {error}"))
-        })??;
+        let imported =
+            tokio::task::spawn_blocking(move || store.import_legacy_local_snapshot(&source))
+                .await
+                .map_err(|error| {
+                    StudioSyncError::Protocol(format!("local Studio importer panicked: {error}"))
+                })??;
         if !imported {
             return Err(StudioSyncError::Protocol(
                 "source Studio catalog is missing or the signed-in profile changed".into(),

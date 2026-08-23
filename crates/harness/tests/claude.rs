@@ -349,7 +349,6 @@ async fn steering_lines_are_written_to_stdin_mid_run() {
             prompt: "redirect please".into(),
             message_id: None,
             follow_up: false,
-            follow_up: false,
         })
         .await
         .expect("steer queued");

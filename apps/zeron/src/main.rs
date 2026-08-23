@@ -141,7 +141,10 @@ fn parse_private_env(contents: &str) -> Vec<(&'static str, String)> {
             }
             let (key, value) = line.split_once('=')?;
             let key = key.trim();
-            let key = PRIVATE_ENV_KEYS.iter().copied().find(|known| *known == key)?;
+            let key = PRIVATE_ENV_KEYS
+                .iter()
+                .copied()
+                .find(|known| *known == key)?;
             let value = value.trim();
             let value = value
                 .strip_prefix('"')

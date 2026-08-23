@@ -3,13 +3,16 @@
 //! NATIVE DRIVERS speak each agent's own wire directly: Claude Code over
 //! stream-json ([`ClaudeHarness`]), Codex over the app-server JSON-RPC
 //! ([`CodexHarness`]), Cursor through a pinned @cursor/sdk shim
-//! ([`CursorHarness`]), pi over its own JSONL RPC mode ([`PiHarness`]). The
-//! shared [`AcpHarness`] remains ONLY for agents built ground-up on ACP —
-//! Grok (`grok agent stdio`) and Hermes (`hermes acp`). Adapter-mediated ACP
-//! was retired for claude/codex/cursor and pi alike: the adapters held
-//! prompt turns open for background work the CLIs themselves settle
-//! eagerly, manufacturing done-status bugs the native wires don't have
-//! (decision records: docs/research/acp.md, docs/research/harness.md).
+//! ([`CursorHarness`]), pi over its own JSONL RPC mode ([`PiHarness`]), and
+//! opencode over its own HTTP/SSE server protocol ([`OpencodeHarness`] —
+//! what the opencode desktop app speaks). The shared [`AcpHarness`] remains
+//! ONLY for agents built ground-up on ACP — Grok (`grok agent stdio`) and
+//! Hermes (`hermes acp`). Adapter-mediated ACP was retired for
+//! claude/codex/cursor, pi, and opencode alike: the adapters held prompt
+//! turns open for background work the CLIs themselves settle eagerly (and
+//! opencode's settles on the first uncorrelated idle), manufacturing
+//! done-status bugs the native wires don't have (decision records:
+//! docs/research/acp.md, docs/research/harness.md).
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -84,10 +87,14 @@ pub trait Harness: Send + Sync {
         false
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
-    /// Slash commands the agent advertises. Every harness must implement this
-    /// explicitly: either discover the real command catalog or return a clear
-    /// unsupported-capability error. Never silently substitute a partial list.
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError>;
+    /// Slash commands the agent advertises. Real drivers discover the catalog
+    /// or return [`HarnessError::Unsupported`]. The default is that error so a
+    /// test harness cannot silently advertise an empty list.
+    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+        Err(HarnessError::Unsupported(
+            "slash commands are not implemented".into(),
+        ))
+    }
     /// Run one (persistent) session; the stream ends with `AgentEvent::Done`.
     async fn run(
         &self,
@@ -103,6 +110,7 @@ pub mod codex;
 pub mod cursor;
 pub(crate) mod jsonrpc;
 pub mod mock;
+pub mod opencode;
 pub mod pi;
 pub mod shell_env;
 
@@ -261,6 +269,7 @@ pub use acp::AcpHarness;
 pub use claude::ClaudeHarness;
 pub use codex::CodexHarness;
 pub use cursor::CursorHarness;
+pub use opencode::OpencodeHarness;
 pub use pi::PiHarness;
 
 // ---------------------------------------------------------------------------

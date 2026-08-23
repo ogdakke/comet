@@ -549,36 +549,10 @@ async fn models_enrich_from_the_static_catalog_on_id_match() {
 
 #[tokio::test]
 async fn models_fall_back_to_the_static_catalog_when_the_probe_fails() {
-    let harness = AcpHarness::pi().with_executable("/nonexistent/never-a-pi-acp");
+    let harness = AcpHarness::grok().with_executable("/nonexistent/never-a-grok");
     let models = harness.models().await.expect("static fallback");
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-    assert_eq!(ids, vec!["default"], "{models:?}");
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn opencode_model_timeout_is_not_hidden_by_the_static_catalog() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = tempfile::tempdir().unwrap();
-    let script = dir.path().join("slow-opencode.sh");
-    std::fs::write(&script, "#!/bin/sh\nexec sleep 1000\n").unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-    let harness = AcpHarness::opencode()
-        .with_executable(&script)
-        .with_graces(Duration::from_millis(10), Duration::from_millis(10))
-        .with_model_discovery_timeout(Duration::from_millis(20));
-    let error = harness
-        .models()
-        .await
-        .expect_err("OpenCode must surface discovery failure so the picker can retry");
-    assert!(
-        error
-            .to_string()
-            .contains("OpenCode model discovery did not complete within"),
-        "{error}"
-    );
+    assert_eq!(ids, vec!["grok-4.5"], "{models:?}");
 }
 
 #[cfg(unix)]
@@ -611,48 +585,13 @@ async fn hung_handshake_errors_instead_of_spinning_forever() {
     );
 }
 #[test]
-fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
+fn hermes_descriptor_surfaces_match_registry_expectations() {
     let hermes = AcpHarness::hermes();
     assert_eq!(hermes.id(), HarnessId::Hermes);
     assert_eq!(hermes.display_name(), "Hermes");
     assert!(hermes.supports_steering());
     assert_eq!(hermes.steering_mode(), SteeringMode::TurnBoundary);
     assert!(hermes.reasoning_levels().is_empty());
-
-    let opencode = AcpHarness::opencode();
-    assert_eq!(opencode.id(), HarnessId::Opencode);
-    assert_eq!(opencode.display_name(), "OpenCode");
-    assert!(opencode.supports_steering());
-    assert_eq!(opencode.steering_mode(), SteeringMode::TurnBoundary);
-    // Effort rides opencode's model variants (the session's `effort` config
-    // option, category thought_level); variant-less models skip the set.
-    assert_eq!(
-        opencode.reasoning_levels(),
-        &[
-            zeron_proto::ReasoningLevel::Low,
-            zeron_proto::ReasoningLevel::Medium,
-            zeron_proto::ReasoningLevel::High,
-            zeron_proto::ReasoningLevel::XHigh,
-            zeron_proto::ReasoningLevel::Max,
-        ]
-    );
-
-    let pi = AcpHarness::pi();
-    assert_eq!(pi.id(), HarnessId::Pi);
-    assert_eq!(pi.display_name(), "Pi");
-    assert!(pi.supports_steering());
-    assert_eq!(pi.steering_mode(), SteeringMode::TurnBoundary);
-    assert_eq!(
-        pi.reasoning_levels(),
-        &[
-            zeron_proto::ReasoningLevel::Minimal,
-            zeron_proto::ReasoningLevel::Low,
-            zeron_proto::ReasoningLevel::Medium,
-            zeron_proto::ReasoningLevel::High,
-            zeron_proto::ReasoningLevel::XHigh,
-            zeron_proto::ReasoningLevel::Max,
-        ]
-    );
 }
 
 #[tokio::test]

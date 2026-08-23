@@ -1306,8 +1306,11 @@ impl Actor {
                             if row.seq <= sh.cursor + 1 {
                                 sh.cursor = sh.cursor.max(row.seq);
                             } else {
-                                tracing::warn!(seq = row.seq, cursor = sh.cursor,
-                                    "chat2: pull row gap; holding cursor");
+                                tracing::warn!(
+                                    seq = row.seq,
+                                    cursor = sh.cursor,
+                                    "chat2: pull row gap; holding cursor"
+                                );
                             }
                             sh.cursor
                         };
@@ -1343,7 +1346,11 @@ impl Actor {
             tracing::warn!("chat2: gap repairs exhausted; redialing for a full catch-up");
             return false;
         }
-        tracing::info!(after, attempt = *repairs, "chat2: backfilling over a row gap");
+        tracing::info!(
+            after,
+            attempt = *repairs,
+            "chat2: backfilling over a row gap"
+        );
         let req = wire::encode(
             frame_type::ROWS_REQ,
             &wire::RowsReqHeader {
