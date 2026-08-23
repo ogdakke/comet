@@ -384,10 +384,10 @@ impl EngineCore {
         self.studio_sync.clone()
     }
 
-    /// Pull at boot, publish a first empty-or-local snapshot when necessary,
-    /// then check the tiny manifest every 30 seconds. The gallery always reads
-    /// local files; transfer work runs outside UI calls and only an actual new
-    /// generation causes media downloads.
+    /// Pull at boot and announce every committed manifest revision through the
+    /// existing realtime registry. The gallery always reads local files;
+    /// transfer work runs outside UI calls and only an announced new generation
+    /// causes media downloads. There is intentionally no manifest polling loop.
     pub fn start_studio_sync(&self) {
         let Some(sync) = self.studio_sync() else {
             return;
@@ -400,45 +400,63 @@ impl EngineCore {
             return;
         }
         let store = self.studio.clone();
+        let workspace = self.workspace.clone();
         *task = Some(tokio::spawn(async move {
             // Subscribe before the initial pass so a preview backfill or a
             // just-finished run cannot slip into the gap and wait forever for
-            // an unrelated edit. We consume the initial install notification
-            // below, since pulling does not need an immediate re-publish.
+            // an unrelated edit.
             let mut changes = store.subscribe_changes();
+            let mut registry_changes = workspace.watch_registry_changes();
             match sync.pull().await {
                 Ok(StudioSyncOutcome::NoRemoteSnapshot) => {
-                    if let Err(error) = sync.publish().await {
-                        tracing::warn!(%error, "initial Studio publish failed");
-                    }
+                    publish_studio_revision(&sync, &workspace, "initial").await;
                 }
                 Ok(_) => {}
                 Err(error) => tracing::warn!(%error, "initial Studio pull failed"),
             }
+            let mut observed_generation = workspace.studio_generation();
             changes.borrow_and_update();
-            let mut poll = tokio::time::interval(std::time::Duration::from_secs(30));
-            poll.tick().await; // consume interval's immediate first tick
+            registry_changes.borrow_and_update();
             loop {
                 tokio::select! {
                     changed = changes.changed() => {
                         if changed.is_err() {
                             return;
                         }
+                        if *changes.borrow_and_update() == studio::StudioChange::RemoteInstall {
+                            continue;
+                        }
                         // One run can stamp several rows and files. A short
                         // quiet period collapses that churn into one snapshot.
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        if let Err(error) = sync.publish().await {
-                            tracing::warn!(%error, "Studio publish failed");
+                        // A remote install may have landed during the debounce.
+                        // Never convert that pull into a fresh manifest revision.
+                        if *changes.borrow_and_update() != studio::StudioChange::RemoteInstall {
+                            publish_studio_revision(&sync, &workspace, "local change").await;
                         }
                     }
-                    _ = poll.tick() => match sync.pull().await {
-                        Ok(StudioSyncOutcome::NoRemoteSnapshot) => {
-                            if let Err(error) = sync.publish().await {
-                                tracing::warn!(%error, "Studio publish after empty remote failed");
+                    changed = registry_changes.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        registry_changes.borrow_and_update();
+                        let generation = workspace.studio_generation();
+                        if generation == observed_generation {
+                            continue;
+                        }
+                        observed_generation = generation;
+                        if let Some(generation) = generation {
+                            match sync.pull().await {
+                                Ok(StudioSyncOutcome::Pulled { .. } | StudioSyncOutcome::UpToDate { .. }) => {
+                                    tracing::debug!(generation, "Studio pulled announced manifest revision");
+                                }
+                                Ok(StudioSyncOutcome::NoRemoteSnapshot) => {
+                                    tracing::warn!(generation, "Studio registry revision arrived before its manifest");
+                                }
+                                Ok(StudioSyncOutcome::Published { .. }) => unreachable!("pull never publishes"),
+                                Err(error) => tracing::warn!(generation, %error, "announced Studio pull failed"),
                             }
                         }
-                        Ok(_) => {}
-                        Err(error) => tracing::warn!(%error, "Studio pull failed"),
                     }
                 }
             }
@@ -673,6 +691,23 @@ impl EngineCore {
         // Break the sessions ⇄ doc-host retain cycle so the replaced graph can
         // actually be freed once the last handle drops.
         self.sessions.clear_doc_host();
+    }
+}
+
+/// Commit the immutable Studio snapshot first, then publish its generation to
+/// the existing registry stream. That ordering means a peer can never be told
+/// to fetch a generation which has not yet reached R2.
+async fn publish_studio_revision(sync: &StudioSync, workspace: &WorkspaceHost, reason: &str) {
+    match sync.publish().await {
+        Ok(StudioSyncOutcome::Published { generation, .. }) => {
+            workspace.set_studio_generation(generation);
+            tracing::debug!(generation, reason, "announced Studio manifest revision");
+        }
+        Ok(StudioSyncOutcome::NoRemoteSnapshot | StudioSyncOutcome::UpToDate { .. }) => {}
+        Ok(StudioSyncOutcome::Pulled { .. }) => {
+            unreachable!("publish never pulls a Studio snapshot")
+        }
+        Err(error) => tracing::warn!(reason, %error, "Studio publish failed"),
     }
 }
 

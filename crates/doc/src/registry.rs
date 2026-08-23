@@ -30,6 +30,12 @@ pub const KIND_DEVICES: &str = "devices";
 pub const KIND_SPACES: &str = "spaces";
 pub const KIND_CHATS: &str = "chats";
 pub const KIND_SESSIONS: &str = "sessions";
+/// Singleton control row for the Studio R2 manifest. It is deliberately part
+/// of the registry rather than a separate room: every signed-in engine already
+/// has this stream open, so a manifest revision is delivered in real time
+/// without a polling loop.
+pub const KIND_STUDIO: &str = "studio";
+const STUDIO_CATALOG_ID: &str = "catalog";
 
 /// Snapshot row id in the local `DocsStore` for the persisted registry state.
 pub const REGISTRY_DOC_ID: &str = "registry1";
@@ -958,6 +964,28 @@ impl RegistryDoc {
             fields([("roomGen", json!(room_gen))]),
         );
         Ok(true)
+    }
+
+    /// Announce the R2 manifest generation that was successfully committed.
+    /// The manifest itself remains the authority; this row is only the
+    /// realtime invalidation signal that tells peers when to pull it.
+    pub fn set_studio_generation(&mut self, generation: u64) {
+        if self.studio_generation() == Some(generation) {
+            return;
+        }
+        self.write(
+            KIND_STUDIO,
+            STUDIO_CATALOG_ID,
+            OpKind::Upsert,
+            fields([("generation", json!(generation))]),
+        );
+    }
+
+    /// The most recently announced Studio manifest generation, if Studio has
+    /// ever been published by a signed-in device.
+    pub fn studio_generation(&self) -> Option<u64> {
+        self.overlay_row(KIND_STUDIO, STUDIO_CATALOG_ID)
+            .and_then(|row| row.fields.get("generation").and_then(Value::as_u64))
     }
 
     pub fn set_chat_branch(&mut self, chat_id: &str, branch: &str) -> Result<bool, DocError> {

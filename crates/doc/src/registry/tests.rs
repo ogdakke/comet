@@ -368,6 +368,24 @@ fn rows_round_trip_and_upsert_refreshes() {
 }
 
 #[test]
+fn studio_generation_is_a_singleton_lww_invalidation_row() {
+    let mut doc = RegistryDoc::new("dev-a");
+    assert_eq!(doc.studio_generation(), None);
+
+    doc.set_studio_generation(7);
+    assert_eq!(doc.studio_generation(), Some(7));
+    let batches = doc.take_pushable();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].ops[0].kind, KIND_STUDIO);
+    assert_eq!(batches[0].ops[0].id, STUDIO_CATALOG_ID);
+
+    // Re-announcing the same committed manifest must not produce a new
+    // registry write and wake every peer again.
+    doc.set_studio_generation(7);
+    assert!(doc.take_pushable().is_empty());
+}
+
+#[test]
 fn field_mutators_round_trip() {
     let mut ws = RegistryDoc::new("dev-a");
     ws.upsert_device(&device("dev-a", "laptop")).unwrap();

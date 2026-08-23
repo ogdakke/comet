@@ -119,16 +119,16 @@ async fn serve(
         tokio::select! {
             frame = stream.next() => {
                 let text = match frame {
+                    Some(Ok(WsMessage::Ping(payload))) => {
+                        if sink.send(WsMessage::Pong(payload)).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
                     Some(Ok(WsMessage::Text(text))) => text.to_string(),
                     Some(Ok(WsMessage::Close(_))) | None | Some(Err(_)) => return,
                     Some(Ok(_)) => continue,
                 };
-                if text == "ping" {
-                    if sink.send(WsMessage::Text("pong".into())).await.is_err() {
-                        return;
-                    }
-                    continue;
-                }
                 let Ok(frame) = serde_json::from_str::<Value>(&text) else {
                     return;
                 };

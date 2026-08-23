@@ -197,38 +197,40 @@ async fn serve_daemon_edge(
     let (mut sink, mut source) = ws.split();
     while let Some(frame) = source.next().await {
         let Ok(frame) = frame else { return };
-        if path.starts_with("/registry/")
-            && let WsMessage::Text(text) = frame
-        {
-            if text == "ping" {
-                if sink.send(WsMessage::Text("pong".into())).await.is_err() {
+        if path.starts_with("/registry/") {
+            if let WsMessage::Ping(payload) = frame {
+                if sink.send(WsMessage::Pong(payload)).await.is_err() {
                     return;
                 }
-            } else if serde_json::from_str::<serde_json::Value>(&text)
-                .ok()
-                .and_then(|frame| {
-                    frame
-                        .get("t")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_string)
-                })
-                .as_deref()
-                == Some("hello")
-            {
-                let state = serde_json::json!({
-                    "t": "state",
-                    "seq": 0,
-                    "full": true,
-                    "gcFloor": 0,
-                    "rows": [],
-                    "presence": {}
-                });
-                if sink
-                    .send(WsMessage::Text(state.to_string().into()))
-                    .await
-                    .is_err()
+                continue;
+            }
+            if let WsMessage::Text(text) = frame {
+                if serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|frame| {
+                        frame
+                            .get("t")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string)
+                    })
+                    .as_deref()
+                    == Some("hello")
                 {
-                    return;
+                    let state = serde_json::json!({
+                        "t": "state",
+                        "seq": 0,
+                        "full": true,
+                        "gcFloor": 0,
+                        "rows": [],
+                        "presence": {}
+                    });
+                    if sink
+                        .send(WsMessage::Text(state.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
         }

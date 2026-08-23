@@ -218,8 +218,9 @@ impl BinConnector for WsBinConnector {
     }
 }
 
-/// Shuttle binary frames between the WebSocket and the actor's channels; the
-/// text `"ping"` keepalive rides the same socket (runtime-answered pair).
+/// Shuttle binary frames between the WebSocket and the actor's channels. A
+/// native WebSocket ping keeps the transport alive without becoming a Durable
+/// Object application message.
 async fn pump(
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     mut out_rx: mpsc::Receiver<Vec<u8>>,
@@ -257,7 +258,7 @@ async fn pump(
                 Some(Err(_)) | None => break,
             },
             _ = ping.tick() => {
-                if sink.send(WsMessage::Text("ping".into())).await.is_err() {
+                if sink.send(WsMessage::Ping(Vec::new().into())).await.is_err() {
                     break;
                 }
             }

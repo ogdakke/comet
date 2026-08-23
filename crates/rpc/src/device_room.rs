@@ -46,8 +46,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Text `"ping"` keepalive — answered by the DO's hibernation-safe auto-response
-/// pair (`edge/src/device-room.ts`) without waking it.
+/// Native WebSocket ping keepalive. Cloudflare answers it without waking the
+/// hibernating Durable Object.
 ///
 /// 10s, not 30: a laptop's uplink (corporate proxy, VPN split-tunnel extension,
 /// consumer NAT) can reap an idle flow well inside a minute, and a keepalive
@@ -487,7 +487,7 @@ async fn host_session(
                 Some(Ok(_)) => last_rx = tokio::time::Instant::now(),
             },
             _ = ping.tick() => {
-                if let Err(err) = sink.send(WsMessage::Text("ping".into())).await {
+                if let Err(err) = sink.send(WsMessage::Ping(Vec::new().into())).await {
                     // The usual way a silently-reaped uplink surfaces: reads
                     // saw nothing, the keepalive write is what finds the body.
                     tracing::warn!(error = %err, "device-room: host keepalive failed; reconnecting");
@@ -674,7 +674,7 @@ impl DeviceLink {
                         Some(Ok(_)) => last_rx = tokio::time::Instant::now(),
                     },
                     _ = ping.tick() => {
-                        if sink.send(WsMessage::Text("ping".into())).await.is_err() {
+                        if sink.send(WsMessage::Ping(Vec::new().into())).await.is_err() {
                             break "connection lost".to_string();
                         }
                         if !echo_frame.is_empty()
