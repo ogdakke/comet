@@ -24,5 +24,10 @@ struct AppShellView: View {
         // iOS does not minimize tab bars under the automatic policy. Opt in
         // to the compact leading icon while someone scrolls through content.
         .tabBarMinimizeBehavior(.onScrollDown)
+        .task {
+            if ProcessInfo.processInfo.arguments.contains("-studio") {
+                section = .studio
+            }
+        }
     }
 }

@@ -12,6 +12,47 @@ private enum StudioLibraryMode: String, CaseIterable, Identifiable {
     var id: Self { self }
 }
 
+private struct StudioLibrarySwitcher: View {
+    @Binding var selection: StudioLibraryMode
+    @Namespace private var selectionMotion
+
+    var body: some View {
+        GlassEffectContainer(spacing: 0) {
+            HStack(spacing: 0) {
+                ForEach(StudioLibraryMode.allCases) { mode in
+                    Button {
+                        withAnimation(.snappy(duration: 0.24)) {
+                            selection = mode
+                        }
+                    } label: {
+                        Text(mode.rawValue)
+                            .font(Theme.sans(16, weight: .medium))
+                            .foregroundStyle(Theme.text)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .background {
+                                if selection == mode {
+                                    Capsule()
+                                        .fill(Theme.bg.opacity(0.66))
+                                        .matchedGeometryEffect(
+                                            id: "studio-library-selection",
+                                            in: selectionMotion
+                                        )
+                                }
+                            }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(selection == mode ? .isSelected : [])
+                }
+            }
+            .padding(5)
+            .frame(width: 220, height: 52)
+            .glassEffect(.regular.interactive(), in: Capsule())
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Studio view")
+    }
+}
+
 struct StudioRootView: View {
     @Environment(AppModel.self) private var model
     @State private var browser = StudioBrowserStore()
@@ -25,21 +66,15 @@ struct StudioRootView: View {
     var body: some View {
         NavigationStack(path: $path) {
             content
-                .safeAreaBar(edge: .top, spacing: 0) {
-                Picker("Studio view", selection: $mode) {
-                    ForEach(StudioLibraryMode.allCases) { mode in
-                        Text(mode.rawValue).tag(mode)
+                .background(Theme.surface.ignoresSafeArea())
+                .navigationTitle("")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .principal) {
+                        StudioLibrarySwitcher(selection: $mode)
                     }
                 }
-                .pickerStyle(.segmented)
-                .controlSize(.large)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
-                }
-            .background(Theme.surface.ignoresSafeArea())
-            .navigationTitle("Studio")
-            .navigationBarTitleDisplayMode(.large)
-            .scrollEdgeEffectStyle(.soft, for: .top)
+                .scrollEdgeEffectStyle(.soft, for: .top)
             .navigationDestination(for: StudioRoute.self) { route in
                 switch route {
                 case .thread:
