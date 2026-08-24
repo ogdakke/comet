@@ -645,7 +645,7 @@ pub fn diff_to_file(diff: &zeron_proto::ToolDiff) -> crate::changes::FileDiff {
                     kind,
                     old_no,
                     new_no,
-                    text: change.value().trim_end_matches('\n').to_owned(),
+                    text: change.value().trim_end_matches('\n').to_owned().into(),
                 });
             }
         }

@@ -61,6 +61,11 @@ pub const MARKER_WIDTH: f32 = 28.0;
 /// Width of the coloured accent bar on the left edge of +/− rows.
 pub const ACCENT_BAR_WIDTH: f32 = 3.0;
 const DIFF_TEXT_SIZE: f32 = 12.0;
+/// Rows outside this band have no effect on the next frame. Keeping roughly
+/// twelve spare lines in each direction absorbs a fast wheel tick without
+/// shaping several extra viewports of code on every scroll update.
+const DIFF_OVERDRAW: f32 = 256.0;
+const DIFF_LINE_LAYOUT_CACHE_CAP: usize = 512;
 
 // ---------------------------------------------------------------------------
 // Patch model + parser (pure)
@@ -80,7 +85,74 @@ pub struct DiffLine {
     pub kind: LineKind,
     pub old_no: Option<u32>,
     pub new_no: Option<u32>,
-    pub text: String,
+    pub text: SharedString,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DiffLineLayoutKey {
+    file: u32,
+    hunk: u32,
+    line: u32,
+}
+
+struct CachedDiffLineLayout {
+    line: gpui::ShapedLine,
+    last_used: u64,
+}
+
+/// CoreText line layouts survive normal gpui frame-cache turnover, but only
+/// for a bounded working set. This matters when a scrollbar drag revisits a
+/// region after more than one frame.
+#[derive(Default)]
+struct DiffLineLayoutCache {
+    entries: HashMap<DiffLineLayoutKey, CachedDiffLineLayout>,
+    clock: u64,
+    theme_generation: u32,
+}
+
+impl DiffLineLayoutCache {
+    fn get(&mut self, key: DiffLineLayoutKey) -> Option<gpui::ShapedLine> {
+        self.sync_theme();
+        self.clock = self.clock.wrapping_add(1);
+        let entry = self.entries.get_mut(&key)?;
+        entry.last_used = self.clock;
+        Some(entry.line.clone())
+    }
+
+    fn insert(&mut self, key: DiffLineLayoutKey, line: gpui::ShapedLine) -> gpui::ShapedLine {
+        self.sync_theme();
+        self.clock = self.clock.wrapping_add(1);
+        if self.entries.len() >= DIFF_LINE_LAYOUT_CACHE_CAP
+            && !self.entries.contains_key(&key)
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| *key)
+        {
+            self.entries.remove(&oldest);
+        }
+        self.entries.insert(
+            key,
+            CachedDiffLineLayout {
+                line: line.clone(),
+                last_used: self.clock,
+            },
+        );
+        line
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn sync_theme(&mut self) {
+        let generation = crate::theme::theme_generation();
+        if generation != self.theme_generation {
+            self.clear();
+            self.theme_generation = generation;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -292,7 +364,7 @@ pub fn parse_patch(patch: &str) -> Vec<FileDiff> {
         if in_hunk {
             let mut chars = raw.chars();
             let marker = chars.next();
-            let body: String = chars.collect();
+            let body: SharedString = chars.collect::<String>().into();
             let line = match marker {
                 Some('+') => {
                     file.additions += 1;
@@ -331,7 +403,7 @@ pub fn parse_patch(patch: &str) -> Vec<FileDiff> {
                     kind: LineKind::Meta,
                     old_no: None,
                     new_no: None,
-                    text: raw.trim_start_matches('\\').trim().to_string(),
+                    text: raw.trim_start_matches('\\').trim().to_string().into(),
                 }),
                 _ => {
                     // A non-hunk line ends the hunk; reprocess as a header.
@@ -1083,6 +1155,7 @@ pub struct Changes {
     parse_task: Option<Task<()>>,
     folds: HashMap<String, FileFold>,
     highlights: HashMap<String, HighlightSlot>,
+    line_layouts: DiffLineLayoutCache,
     /// The flattened row model the list virtualizes over (line granularity;
     /// collapsed bodies excluded) + each file's row span within it.
     rows: Vec<DiffRow>,
@@ -1149,14 +1222,13 @@ impl Changes {
             parse_task: None,
             folds: HashMap::new(),
             highlights: HashMap::new(),
+            line_layouts: DiffLineLayoutCache::default(),
             rows: Vec::new(),
             row_ranges: Vec::new(),
             fold_settle: None,
-            // Rows are single lines now — a deep overdraw is cheap and keeps
-            // fast wheel flicks from outrunning measurement. Off-screen rows
-            // keep an analytic line-height hint, so the scrollbar knows the
-            // full extent without materializing the whole diff.
-            list: ListState::new(0, ListAlignment::Top, px(1024.0))
+            // Off-screen rows keep an analytic line-height hint, so the
+            // scrollbar knows the full extent without materializing the diff.
+            list: ListState::new(0, ListAlignment::Top, px(DIFF_OVERDRAW))
                 .with_uniform_item_height(px(DIFF_LINE_HEIGHT)),
             list_hint_repair_scheduled: false,
             scope: DiffScope::default(),
@@ -1632,6 +1704,7 @@ impl Changes {
                 self.list.reset(0);
                 self.folds.clear();
                 self.highlights.clear();
+                self.line_layouts.clear();
                 cx.notify();
             }
             return;
@@ -1665,6 +1738,7 @@ impl Changes {
                 };
                 changes.folds.clear();
                 changes.highlights.clear();
+                changes.line_layouts.clear();
                 let staged = changes.staged_comments(cx);
                 let draft = changes.draft_anchor();
                 let (rows, ranges) = flatten_rows(
@@ -2259,6 +2333,7 @@ impl Changes {
                         Some(highlights) => DiffHighlightState::Excerpt(highlights),
                         None => DiffHighlightState::Plain,
                     };
+                    changes.line_layouts.clear();
                     cx.notify();
                 }
             })
@@ -2326,6 +2401,7 @@ impl Changes {
                         && let Some(highlights) = highlights
                     {
                         slot.state = DiffHighlightState::Ready(highlights);
+                        changes.line_layouts.clear();
                         cx.notify();
                     }
                 })
@@ -2347,12 +2423,7 @@ impl Changes {
 
     // ---- rendering ----
 
-    fn render_row(
-        &mut self,
-        ix: usize,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(parsed) = &self.parsed else {
             return gpui::Empty.into_any_element();
         };
@@ -2383,7 +2454,7 @@ impl Changes {
             DiffRow::Line {
                 file,
                 hunk,
-                line,
+                line: line_ix,
                 flat: _,
             } => {
                 let Some(file_diff) = files.get(file as usize) else {
@@ -2393,7 +2464,7 @@ impl Changes {
                 let Some(line) = file_diff
                     .hunks
                     .get(hunk as usize)
-                    .and_then(|h| h.lines.get(line as usize))
+                    .and_then(|h| h.lines.get(line_ix as usize))
                 else {
                     return gpui::Empty.into_any_element();
                 };
@@ -2402,7 +2473,29 @@ impl Changes {
                     .map(|highlights| highlights.spans(line))
                     .unwrap_or(&[]);
                 let gutter_px = gutter_width(file_diff);
-                let row = diff_line_row(line, spans, &theme, gutter_px);
+                let layout_key = DiffLineLayoutKey {
+                    file,
+                    hunk,
+                    line: line_ix,
+                };
+                let shaped = self.line_layouts.get(layout_key).unwrap_or_else(|| {
+                    let mono = font(theme.font_mono.clone());
+                    let runs = render::runs_for_syntax_line_with_plain(
+                        &line.text,
+                        spans,
+                        &mono,
+                        theme.text.opacity(0.92),
+                        &theme,
+                    );
+                    let shaped = window.text_system().shape_line(
+                        line.text.clone(),
+                        px(DIFF_TEXT_SIZE),
+                        &runs,
+                        None,
+                    );
+                    self.line_layouts.insert(layout_key, shaped)
+                });
+                let row = diff_line_row_shaped(line, shaped, &theme, gutter_px);
                 let Some((side, line_no)) = line_anchor(line) else {
                     return row;
                 };
@@ -3130,6 +3223,35 @@ fn diff_line_row(
     theme: &Theme,
     gutter_px: f32,
 ) -> AnyElement {
+    let mono = font(theme.font_mono.clone());
+    let runs = render::runs_for_syntax_line_with_plain(
+        &line.text,
+        spans,
+        &mono,
+        theme.text.opacity(0.92),
+        theme,
+    );
+    let code = gpui::StyledText::new(line.text.clone())
+        .with_runs(runs)
+        .into_any_element();
+    diff_line_row_with_code(line, code, theme, gutter_px)
+}
+
+fn diff_line_row_shaped(
+    line: &DiffLine,
+    shaped: gpui::ShapedLine,
+    theme: &Theme,
+    gutter_px: f32,
+) -> AnyElement {
+    diff_line_row_with_code(line, shaped_diff_text(shaped), theme, gutter_px)
+}
+
+fn diff_line_row_with_code(
+    line: &DiffLine,
+    code: AnyElement,
+    theme: &Theme,
+    gutter_px: f32,
+) -> AnyElement {
     if line.kind == LineKind::Meta {
         return div()
             .h(px(DIFF_LINE_HEIGHT))
@@ -3141,7 +3263,7 @@ fn diff_line_row(
             .text_size(px(10.5))
             .text_color(theme.text_faint)
             .italic()
-            .child(SharedString::from(line.text.clone()))
+            .child(line.text.clone())
             .into_any_element();
     }
 
@@ -3188,14 +3310,6 @@ fn diff_line_row(
                 no.map(|n| n.to_string()).unwrap_or_default(),
             ))
     };
-    let mono = font(theme.font_mono.clone());
-    let runs = render::runs_for_syntax_line_with_plain(
-        &line.text,
-        spans,
-        &mono,
-        theme.text.opacity(0.92),
-        theme,
-    );
     div()
         .h(px(DIFF_LINE_HEIGHT))
         .w_full()
@@ -3246,12 +3360,35 @@ fn diff_line_row(
                 .min_w_0()
                 .overflow_hidden()
                 .pl(px(12.0))
+                .h_full()
                 .font_family(theme.font_mono.clone())
                 .text_size(px(DIFF_TEXT_SIZE))
                 .whitespace_nowrap()
-                .child(gpui::StyledText::new(line.text.clone()).with_runs(runs)),
+                .child(code),
         )
         .into_any_element()
+}
+
+/// Paint an already-shaped code line. The surrounding row owns clipping and
+/// interaction; this element only reuses CoreText's immutable glyph layout.
+fn shaped_diff_text(shaped: gpui::ShapedLine) -> AnyElement {
+    gpui::canvas(
+        move |_, _, _| shaped.clone(),
+        |bounds, shaped, window, cx| {
+            window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                let _ = shaped.paint(
+                    bounds.origin,
+                    bounds.size.height,
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+            });
+        },
+    )
+    .size_full()
+    .into_any_element()
 }
 
 pub const COMMENT_ADDER_SIZE: f32 = 16.0;
@@ -3956,7 +4093,7 @@ rename to new_name.rs
         use std::{cell::Cell, rc::Rc};
 
         const ROWS: usize = 16_714;
-        let list_state = ListState::new(0, ListAlignment::Top, px(1024.0))
+        let list_state = ListState::new(0, ListAlignment::Top, px(DIFF_OVERDRAW))
             .with_uniform_item_height(px(DIFF_LINE_HEIGHT));
         let rendered = Rc::new(Cell::new(0usize));
 
@@ -4002,11 +4139,11 @@ rename to new_name.rs
         rendered.set(0);
         draw(cx);
 
-        // 1,200px viewport + 1,024px overdraw on each edge fits fewer than
-        // 160 line rows. Leave headroom for GPUI's boundary rows while still
-        // catching the old `measure_all` behavior, which rendered all 16,714.
+        // 1,200px viewport + bounded overdraw fits fewer than 96 line rows.
+        // This catches both the old `measure_all` behavior and an accidental
+        // return to several viewports of speculative text shaping.
         assert!(
-            rendered.get() < 256,
+            rendered.get() < 96,
             "virtual list rendered {} of {ROWS} rows",
             rendered.get()
         );
@@ -4016,6 +4153,42 @@ rename to new_name.rs
         assert!(
             (max_offset - expected_height).abs() < 1.0,
             "scrollbar extent {max_offset} != {expected_height}"
+        );
+    }
+
+    #[test]
+    fn shaped_diff_line_cache_has_a_hard_entry_cap() {
+        let mut cache = DiffLineLayoutCache::default();
+        for line in 0..DIFF_LINE_LAYOUT_CACHE_CAP as u32 + 32 {
+            cache.insert(
+                DiffLineLayoutKey {
+                    file: 0,
+                    hunk: 0,
+                    line,
+                },
+                gpui::ShapedLine::default(),
+            );
+        }
+        assert_eq!(cache.entries.len(), DIFF_LINE_LAYOUT_CACHE_CAP);
+        assert!(
+            cache
+                .get(DiffLineLayoutKey {
+                    file: 0,
+                    hunk: 0,
+                    line: 0,
+                })
+                .is_none(),
+            "the oldest line should be evicted"
+        );
+        assert!(
+            cache
+                .get(DiffLineLayoutKey {
+                    file: 0,
+                    hunk: 0,
+                    line: DIFF_LINE_LAYOUT_CACHE_CAP as u32 + 31,
+                })
+                .is_some(),
+            "the newest line should remain cached"
         );
     }
 
