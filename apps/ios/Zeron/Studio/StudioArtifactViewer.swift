@@ -179,11 +179,9 @@ private final class StudioViewerMediaStore {
     private func trimOutsideNeighborhood() {
         for id in previewTasks.keys.filter({ !retainedIds.contains($0) }) {
             previewTasks[id]?.cancel()
-            previewTasks.removeValue(forKey: id)
         }
         for id in originalTasks.keys.filter({ !retainedIds.contains($0) }) {
             originalTasks[id]?.cancel()
-            originalTasks.removeValue(forKey: id)
         }
         for id in previews.keys.filter({ !retainedIds.contains($0) }) { previews.removeValue(forKey: id) }
         for id in images.keys.filter({ !retainedIds.contains($0) }) { images.removeValue(forKey: id) }
@@ -207,8 +205,6 @@ private final class StudioViewerMediaStore {
     private func trimVideoOriginals(keeping selectedId: String, videoIds: Set<String>) {
         for id in originalTasks.keys.filter({ videoIds.contains($0) && $0 != selectedId }) {
             originalTasks[id]?.cancel()
-            originalTasks.removeValue(forKey: id)
-            loadingOriginals.remove(id)
         }
         for id in players.keys.filter({ $0 != selectedId }) {
             players[id]?.pause()
@@ -251,9 +247,11 @@ struct StudioArtifactViewer: View {
     @State private var actionError: String?
     @State private var saving = false
     @State private var filmstripPosition: String?
+    @State private var filmstripUserDriven = false
+    @State private var chromeReady = false
 
     private var selected: StudioArtifactDetail? { session.selected }
-    private var showingChrome: Bool { detailOffset < 72 }
+    private var showingChrome: Bool { chromeReady && detailOffset < 72 }
 
     var body: some View {
         GeometryReader { geometry in
@@ -275,7 +273,7 @@ struct StudioArtifactViewer: View {
                 detailOffset = value
                 if value < -110, !pullDismissed {
                     pullDismissed = true
-                    dismiss()
+                    closeViewer()
                 }
             }
             .background(Color.black.ignoresSafeArea())
@@ -295,16 +293,28 @@ struct StudioArtifactViewer: View {
                 deviceId: deviceId
             )
         }
-        .onAppear { filmstripPosition = session.selectedId }
+        .onAppear {
+            filmstripPosition = session.selectedId
+            chromeReady = false
+        }
+        .task {
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.16)) {
+                chromeReady = true
+            }
+        }
         .onChange(of: session.selectedId) { _, selectedId in
-            if filmstripPosition != selectedId {
+            if !filmstripUserDriven, filmstripPosition != selectedId {
                 withAnimation(.snappy(duration: 0.2)) {
                     filmstripPosition = selectedId
                 }
             }
         }
         .onChange(of: filmstripPosition) { _, centeredId in
-            guard let centeredId, centeredId != session.selectedId else { return }
+            guard filmstripUserDriven,
+                  let centeredId,
+                  centeredId != session.selectedId else { return }
             session.selectedId = centeredId
         }
         .onChange(of: session.artifacts.count) {
@@ -328,7 +338,10 @@ struct StudioArtifactViewer: View {
             await browser.loadMoreGallery(workspace: workspace, deviceId: deviceId)
             session.append(browser.gallery.map(StudioArtifactDetail.init(item:)))
         }
-        .onDisappear { media.reset() }
+        .onDisappear {
+            chromeReady = false
+            media.reset()
+        }
         .confirmationDialog(
             "Delete this creation?",
             isPresented: $confirmDelete,
@@ -418,13 +431,13 @@ struct StudioArtifactViewer: View {
     private var topControls: some View {
         GlassEffectContainer(spacing: 16) {
             HStack {
-                Button { dismiss() } label: {
+                Button { closeViewer() } label: {
                     Image(systemName: "chevron.backward")
-                        .font(.system(size: 16, weight: .semibold))
-                        .frame(width: 42, height: 42)
+                        .font(.system(size: 14, weight: .semibold))
                 }
                 .buttonStyle(.glass)
                 .buttonBorderShape(.circle)
+                .controlSize(.small)
                 .accessibilityLabel("Close")
 
                 Spacer()
@@ -445,11 +458,11 @@ struct StudioArtifactViewer: View {
                     }
                 } label: {
                     Image(systemName: "ellipsis")
-                        .font(.system(size: 17, weight: .semibold))
-                        .frame(width: 42, height: 42)
+                        .font(.system(size: 15, weight: .semibold))
                 }
                 .buttonStyle(.glass)
                 .buttonBorderShape(.circle)
+                .controlSize(.small)
                 .accessibilityLabel("More actions")
             }
         }
@@ -500,20 +513,19 @@ struct StudioArtifactViewer: View {
             .scrollIndicators(.hidden)
             .scrollTargetBehavior(.viewAligned)
             .scrollPosition(id: $filmstripPosition, anchor: .center)
+            .onScrollPhaseChange { _, phase in
+                switch phase {
+                case .tracking, .interacting, .decelerating:
+                    filmstripUserDriven = true
+                case .idle, .animating:
+                    filmstripUserDriven = false
+                @unknown default:
+                    filmstripUserDriven = false
+                }
+            }
 
-            GlassEffectContainer(spacing: 12) {
-                HStack(spacing: 12) {
-                    Button {
-                        if let selected { showThread(selected.conversationId) }
-                    } label: {
-                        Image(systemName: "rectangle.stack")
-                            .frame(width: 42, height: 42)
-                    }
-                    .buttonStyle(.glass)
-                    .buttonBorderShape(.circle)
-                    .disabled(session.selected == nil)
-                    .accessibilityLabel("Show in Thread")
-
+            GlassEffectContainer(spacing: 0) {
+                HStack {
                     Button { downloadSelected() } label: {
                         Group {
                             if saving {
@@ -522,24 +534,27 @@ struct StudioArtifactViewer: View {
                                 Image(systemName: "square.and.arrow.down")
                             }
                         }
-                        .frame(width: 42, height: 42)
                     }
                     .buttonStyle(.glass)
                     .buttonBorderShape(.circle)
+                    .controlSize(.small)
                     .disabled(selected == nil || saving)
                     .accessibilityLabel("Download")
 
+                    Spacer()
+
                     Button(role: .destructive) { confirmDelete = true } label: {
                         Image(systemName: "trash")
-                            .frame(width: 42, height: 42)
                     }
                     .buttonStyle(.glass)
                     .buttonBorderShape(.circle)
+                    .controlSize(.small)
                     .disabled(selected == nil)
                     .accessibilityLabel("Delete")
                 }
+                .padding(.horizontal, 14)
             }
-            .font(.system(size: 20, weight: .regular))
+            .font(.system(size: 15, weight: .regular))
             .foregroundStyle(.white)
         }
         .padding(.top, 8)
@@ -611,6 +626,20 @@ struct StudioArtifactViewer: View {
             } catch {
                 actionError = error.localizedDescription
             }
+        }
+    }
+
+    private func closeViewer() {
+        guard chromeReady else {
+            dismiss()
+            return
+        }
+        withAnimation(.easeIn(duration: 0.1)) {
+            chromeReady = false
+        }
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(100))
+            dismiss()
         }
     }
 
