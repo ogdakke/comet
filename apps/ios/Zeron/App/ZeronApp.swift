@@ -46,7 +46,7 @@ struct RootView: View {
             case .pickingOrg(let tokens, let orgs):
                 OrgPickerView(tokens: tokens, orgs: orgs)
             case .ready:
-                HomeView()
+                AppShellView()
             }
         }
         .task { model.restore() }
