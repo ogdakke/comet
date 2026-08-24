@@ -336,7 +336,7 @@ struct StudioArtifactViewer: View {
                   let workspace = model.workspace,
                   let deviceId = browser.selectedDeviceId else { return }
             await browser.loadMoreGallery(workspace: workspace, deviceId: deviceId)
-            session.append(browser.gallery.map(StudioArtifactDetail.init(item:)))
+            session.replaceArtifacts(with: browser.gallery.reversed().map(StudioArtifactDetail.init(item:)))
         }
         .onDisappear {
             chromeReady = false

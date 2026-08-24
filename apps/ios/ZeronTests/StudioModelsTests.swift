@@ -68,6 +68,25 @@ final class StudioModelsTests: XCTestCase {
         XCTAssertEqual(session.selected?.id, "artifact-59")
     }
 
+    @MainActor
+    func testViewerSessionAdoptsInvertedGalleryOrderWithoutLosingSelection() {
+        let initial = (0..<3).map(galleryItem).map(StudioArtifactDetail.init(item:))
+        let session = StudioViewerSession(
+            artifacts: initial,
+            selectedId: "artifact-1",
+            openedFromGallery: true
+        )
+        let inverted = [galleryItem(4), galleryItem(3), galleryItem(2), galleryItem(1), galleryItem(0)]
+            .map(StudioArtifactDetail.init(item:))
+
+        session.replaceArtifacts(with: inverted)
+
+        XCTAssertEqual(session.artifacts.map(\.id), [
+            "artifact-4", "artifact-3", "artifact-2", "artifact-1", "artifact-0",
+        ])
+        XCTAssertEqual(session.selected?.id, "artifact-1")
+    }
+
     private func galleryItem(_ index: Int) -> StudioGalleryItem {
         StudioGalleryItem(
             id: "artifact-\(index)",

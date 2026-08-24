@@ -210,6 +210,11 @@ final class StudioViewerSession: Identifiable {
         let existing = Set(artifacts.map(\.id))
         artifacts.append(contentsOf: additions.filter { !existing.contains($0.id) })
     }
+
+    func replaceArtifacts(with orderedArtifacts: [StudioArtifactDetail]) {
+        var seen = Set<String>()
+        artifacts = orderedArtifacts.filter { seen.insert($0.id).inserted }
+    }
 }
 
 struct StudioThreadListResponse: Codable {

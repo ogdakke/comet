@@ -217,11 +217,16 @@ private struct StudioGalleryView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             ScrollView {
+                if browser.galleryLoadingMore {
+                    ProgressView()
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 16)
+                }
                 LazyVGrid(columns: columns, spacing: 2) {
-                    ForEach(browser.gallery) { item in
+                    ForEach(browser.gallery.reversed()) { item in
                         Button {
                             openViewer(StudioViewerSession(
-                                artifacts: browser.gallery.map(StudioArtifactDetail.init(item:)),
+                                artifacts: browser.gallery.reversed().map(StudioArtifactDetail.init(item:)),
                                 selectedId: item.id,
                                 openedFromGallery: true
                             ))
@@ -275,12 +280,8 @@ private struct StudioGalleryView: View {
                         }
                     }
                 }
-                if browser.galleryLoadingMore {
-                    ProgressView()
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 16)
-                }
             }
+            .defaultScrollAnchor(.bottom)
             .scrollEdgeEffectStyle(.soft, for: .top)
             .confirmationDialog(
                 "Delete this creation?",
