@@ -105,9 +105,10 @@ impl StudioPage {
         if busy {
             primary = primary
                 .opacity(0.72)
-                .child(loaders::mini_gradient_spinner(
+                .child(loaders::mini_glyph_spinner(
                     format!("studio-upscale-spinner-{}", artifact_id.0),
                     2.0,
+                    theme.glyph,
                     cx.entity_id(),
                     cx,
                 ))

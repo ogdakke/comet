@@ -1061,12 +1061,12 @@ impl StudioPage {
             .rounded(px(12.0))
             .border_1()
             .border_color(hairline(0.10))
-            .bg(if theme.is_glass() {
+            .bg(if theme.is_frost() {
                 theme.glass_overlay()
             } else {
                 theme.surface_overlay
             })
-            .when(!theme.is_glass(), |card| card.shadow_lg())
+            .when(!theme.is_frost(), |card| card.shadow_lg())
             .child(
                 div()
                     .id("studio-gallery-clear-selection")

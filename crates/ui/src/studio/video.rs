@@ -36,7 +36,7 @@ pub(super) fn duration_overlay_badge(theme: &Theme, seconds: Option<f64>) -> gpu
         .px(px(6.0))
         .py(px(2.0))
         .rounded(px(4.0))
-        .bg(if theme.is_glass() {
+        .bg(if theme.is_frost() {
             theme.glass_overlay()
         } else {
             theme.surface_overlay

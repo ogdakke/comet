@@ -1688,7 +1688,6 @@ impl Composer {
             None,
         ))
     }
-
     fn render_input_with_completion(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         div()
             .relative()
@@ -2003,7 +2002,6 @@ impl Composer {
             None,
         ))
     }
-
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
         let (key, pending) = {
             let s = self.state.read(cx);
@@ -2995,8 +2993,12 @@ impl Composer {
         let input_focused = self.input.focus_handle(cx).is_focused(window);
         let input_empty = self.input.read(cx).is_empty();
         let key = event.keystroke.key.as_str();
+        // A BARE digit picks an option. With a modifier held the keystroke
+        // belongs to an app shortcut — ⌘1..⌘9 jump to a sidebar row — and the
+        // panel must not also consume it as a selection.
         if let Ok(digit) = key.parse::<usize>()
             && (1..=9).contains(&digit)
+            && !event.keystroke.modifiers.modified()
         {
             if !input_focused || input_empty {
                 self.wizard_select(digit - 1, cx);
@@ -3242,7 +3244,7 @@ impl Composer {
                     ),
             );
 
-        let card_bg = if theme.is_glass() {
+        let card_bg = if theme.is_frost() {
             theme.glass_overlay()
         } else {
             theme.surface_overlay
@@ -3261,7 +3263,7 @@ impl Composer {
             .border_1()
             .border_color(theme.border)
             .bg(card_bg)
-            .when(!theme.is_glass(), |el| el.shadow_lg())
+            .when(!theme.is_frost(), |el| el.shadow_lg())
             .flex()
             .flex_col()
             .overflow_hidden()
@@ -3993,7 +3995,7 @@ impl Render for Composer {
             .bg(pill_bg)
             .border_1()
             .border_color(theme.border)
-            .when(!theme.is_glass(), |el| el.shadow_lg());
+            .when(!theme.is_frost(), |el| el.shadow_lg());
         // The pill's bottom edge is stationary on screen (the composer sits at
         // the bottom of the shell column; growth moves the TOP edge), so the
         // controls pin to the bottom and only the text glides with the reveal
@@ -4131,6 +4133,18 @@ impl Render for Composer {
                         ),
                 )
         };
+        // New sessions: the TARGET row (device + project chips) sits ABOVE
+        // the pill, left-aligned like the checkout toolbar below it (user
+        // request — moved off the canvas). Existing sessions name their
+        // target in the titlebar instead.
+        let container = if new_chat {
+            let selectors = self
+                .pickers
+                .update(cx, |pickers, cx| pickers.render_target_selectors(cx));
+            container.child(selectors)
+        } else {
+            container
+        };
         // The file dropzone lives in the shell (the whole conversation column,
         // not just the pill — shell.rs `chat-dropzone`); drops land back here
         // via `add_paths`.
@@ -4260,6 +4274,7 @@ mod tests {
             cwd: None,
             branch: None,
             checkout_id: None,
+            source_context: None,
             config: Some(zeron_proto::ChatConfig {
                 harness: HarnessId::Pi,
                 model: None,

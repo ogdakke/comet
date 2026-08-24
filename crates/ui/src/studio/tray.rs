@@ -439,9 +439,10 @@ impl StudioPage {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .child(crate::loaders::mini_gradient_spinner(
+                                .child(crate::loaders::mini_glyph_spinner(
                                     format!("studio-att-spin-{}", asset_id.0),
                                     2.0,
+                                    theme.glyph,
                                     cx.entity_id(),
                                     cx,
                                 )),
