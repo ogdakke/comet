@@ -34,9 +34,13 @@ The workflow uses the `AC_API_KEY_P8`, `AC_API_KEY_ID`, and
 
 ### Connecting
 
-- **WorkOS**: enter the edge URL, open the sign-in page on any device, paste
-  the code it shows (`/auth/exchange`), pick an org (`/auth/refresh` re-scopes
-  the token with the `org_id` claim).
+- **Self-hosted edge**: Debug reads the ignored
+  `Zeron/Private.staging.xcconfig`; Release and TestFlight read
+  `Zeron/Private.production.xcconfig`. Each defines only `ZERON_EDGE_URL`.
+  The app starts at `/auth/ios/authorize`; that Worker selects its WorkOS
+  client, relays `/auth/ios/callback` back into the app, and exchanges the code
+  at `/auth/exchange`. Register each Worker's callback in its matching WorkOS
+  environment. Switching build environments clears identity and synced docs.
 - **Dev**: against an `AUTH_MODE=dev` edge (e.g. `wrangler dev`), enter a user
   id + org id; the bearer is `userId@orgId`.
 - **Demo mode**: fully offline dataset with a scripted streaming reply —

@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "wrangler dev --config wrangler.personal.jsonc --port 27640 --var AUTH_MODE:dev",
     "deploy": "wrangler deploy --config wrangler.personal.jsonc",
+    "deploy:production": "node scripts/deploy-production.mjs",
     "build": "wrangler deploy --config wrangler.personal.jsonc --dry-run --outdir dist",
+    "build:production": "node scripts/deploy-production.mjs --dry-run --outdir dist",
     "typecheck": "tsc --noEmit",
     "test": "npm run test:unit && npm run test:workerd",
     "test:unit": "vitest run",

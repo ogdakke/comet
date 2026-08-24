@@ -1,0 +1,4 @@
+// Debug builds use the isolated staging Worker, WorkOS environment, and data.
+ZERON_DEPLOYMENT = staging
+ZERON_AUTH_CALLBACK_SCHEME = zeron
+#include? "Zeron/Private.staging.xcconfig"

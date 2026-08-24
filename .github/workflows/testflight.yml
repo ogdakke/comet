@@ -29,6 +29,8 @@ jobs:
       AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
       AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
       AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+      IOS_STAGING_EDGE_URL: ${{ secrets.IOS_STAGING_EDGE_URL }}
+      IOS_PRODUCTION_EDGE_URL: ${{ secrets.IOS_PRODUCTION_EDGE_URL }}
       AUDIENCE: ${{ inputs.audience || 'internal' }}
     steps:
       - uses: actions/checkout@v4
@@ -37,7 +39,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for name in AC_API_KEY_P8 AC_API_KEY_ID AC_API_ISSUER_ID; do
+          for name in AC_API_KEY_P8 AC_API_KEY_ID AC_API_ISSUER_ID IOS_STAGING_EDGE_URL IOS_PRODUCTION_EDGE_URL; do
             if [ -z "${!name:-}" ]; then
               echo "Required repository secret $name is not configured." >&2
               exit 2
@@ -103,7 +105,8 @@ jobs:
         run: |
           xcodebuild -project Zeron.xcodeproj -scheme Zeron \
             -destination 'generic/platform=iOS Simulator' \
-            CODE_SIGNING_ALLOWED=NO build-for-testing
+            CODE_SIGNING_ALLOWED=NO \
+            ZERON_EDGE_URL="$IOS_STAGING_EDGE_URL" build-for-testing
 
       - name: Archive build
         working-directory: apps/ios
@@ -115,6 +118,7 @@ jobs:
             -authenticationKeyPath "$AC_KEY_PATH" \
             -authenticationKeyID "$AC_API_KEY_ID" \
             -authenticationKeyIssuerID "$AC_API_ISSUER_ID" \
+            ZERON_EDGE_URL="$IOS_PRODUCTION_EDGE_URL" \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
 
       - name: Upload to TestFlight

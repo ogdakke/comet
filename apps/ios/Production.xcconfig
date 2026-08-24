@@ -1,0 +1,4 @@
+// Release and TestFlight builds use production only.
+ZERON_DEPLOYMENT = production
+ZERON_AUTH_CALLBACK_SCHEME = zeron
+#include? "Zeron/Private.production.xcconfig"
