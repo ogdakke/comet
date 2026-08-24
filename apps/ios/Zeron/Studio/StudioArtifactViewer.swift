@@ -7,78 +7,212 @@ import UIKit
 @MainActor
 @Observable
 private final class StudioViewerMediaStore {
-    var preview: UIImage?
-    var image: UIImage?
-    var player: AVPlayer?
-    var loadingOriginal = false
-    var error: String?
+    var previews: [String: UIImage] = [:]
+    var images: [String: UIImage] = [:]
+    var players: [String: AVPlayer] = [:]
+    var loadingOriginals: Set<String> = []
+    var errors: [String: String] = [:]
 
-    @ObservationIgnored private var temporaryURL: URL?
+    @ObservationIgnored private var temporaryURLs: [String: URL] = [:]
+    @ObservationIgnored private var previewTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var originalTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var retainedIds: Set<String> = []
+    @ObservationIgnored private var selectedId: String?
 
-    var originalURL: URL? { temporaryURL }
+    func preview(for artifactId: String) -> UIImage? { previews[artifactId] }
+    func image(for artifactId: String) -> UIImage? { images[artifactId] }
+    func player(for artifactId: String) -> AVPlayer? { players[artifactId] }
+    func error(for artifactId: String) -> String? { errors[artifactId] }
+    func originalURL(for artifactId: String) -> URL? { temporaryURLs[artifactId] }
 
-    func load(
-        artifact: StudioArtifactDetail,
+    func prepare(
+        selectedId: String,
+        artifacts: [StudioArtifactDetail],
         browser: StudioBrowserStore,
         workspace: WorkspaceStore,
         deviceId: String
-    ) async {
-        reset()
-        error = nil
-        preview = await browser.preview(
-            artifactId: artifact.id,
-            deviceId: deviceId,
-            workspace: workspace
-        )
-        guard !Task.isCancelled else { return }
-
-        loadingOriginal = true
-        do {
-            let file = try await workspace.downloadStudioArtifact(
-                deviceId: deviceId,
-                artifactId: artifact.id,
-                declaredSize: artifact.sizeBytes
-            )
-            guard !Task.isCancelled else {
-                try? FileManager.default.removeItem(at: file.url)
-                loadingOriginal = false
-                return
-            }
-            temporaryURL = file.url
-            if artifact.mediaKind == .video {
-                let player = AVPlayer(url: file.url)
-                self.player = player
-                player.play()
-            } else {
-                let longestEdge = max(Int(artifact.width ?? 0), Int(artifact.height ?? 0))
-                image = await Task.detached(priority: .userInitiated) {
-                    Self.decodeImage(
-                        at: file.url,
-                        maximumPixelSize: min(max(longestEdge, 2_048), 6_144)
-                    )
-                }.value
-                if image == nil {
-                    throw RelayError.rpc("The downloaded image couldn't be decoded")
-                }
-            }
-        } catch is CancellationError {
-            // Selection changes are ordinary navigation, not viewer errors.
-        } catch {
-            guard !Task.isCancelled else { return }
-            self.error = error.localizedDescription
+    ) {
+        guard let selectedIndex = artifacts.firstIndex(where: { $0.id == selectedId }) else {
+            return
         }
-        loadingOriginal = false
+        self.selectedId = selectedId
+
+        // Start the selected item first, then walk outward. The relay can
+        // multiplex these reads, but request order still determines which
+        // original gets its first chunk first.
+        let neighborhood = [0, -1, 1, -2, 2].compactMap { offset in
+            let index = selectedIndex + offset
+            return artifacts.indices.contains(index) ? artifacts[index] : nil
+        }
+        retainedIds = Set(neighborhood.map(\.id))
+        trimOutsideNeighborhood()
+        trimTemporaryFiles(keeping: selectedId)
+        trimVideoOriginals(
+            keeping: selectedId,
+            videoIds: Set(artifacts.filter { $0.mediaKind == .video }.map(\.id))
+        )
+
+        for player in players.values { player.pause() }
+        players[selectedId]?.play()
+
+        for artifact in neighborhood {
+            loadPreview(
+                artifact,
+                browser: browser,
+                workspace: workspace,
+                deviceId: deviceId
+            )
+            // Images are small enough to keep a five-item display-quality
+            // window. Videos can be much larger, so only fetch the selected
+            // original while their neighboring thumbnails stay warm.
+            if artifact.mediaKind == .image || artifact.id == selectedId {
+                loadOriginal(
+                    artifact,
+                    browser: browser,
+                    workspace: workspace,
+                    deviceId: deviceId
+                )
+            }
+        }
     }
 
     func reset() {
-        player?.pause()
-        player = nil
-        image = nil
-        preview = nil
-        loadingOriginal = false
-        if let temporaryURL {
-            try? FileManager.default.removeItem(at: temporaryURL)
-            self.temporaryURL = nil
+        previewTasks.values.forEach { $0.cancel() }
+        originalTasks.values.forEach { $0.cancel() }
+        previewTasks.removeAll()
+        originalTasks.removeAll()
+        for player in players.values { player.pause() }
+        for url in temporaryURLs.values { try? FileManager.default.removeItem(at: url) }
+        temporaryURLs.removeAll()
+        previews.removeAll()
+        images.removeAll()
+        players.removeAll()
+        loadingOriginals.removeAll()
+        errors.removeAll()
+    }
+
+    private func loadPreview(
+        _ artifact: StudioArtifactDetail,
+        browser: StudioBrowserStore,
+        workspace: WorkspaceStore,
+        deviceId: String
+    ) {
+        if previews[artifact.id] == nil,
+           let cached = browser.cachedPreview(artifactId: artifact.id) {
+            previews[artifact.id] = cached
+        }
+        guard previews[artifact.id] == nil, previewTasks[artifact.id] == nil else { return }
+        let artifactId = artifact.id
+        previewTasks[artifactId] = Task { [weak self] in
+            defer { self?.previewTasks.removeValue(forKey: artifactId) }
+            let image = await browser.preview(
+                artifactId: artifactId,
+                deviceId: deviceId,
+                workspace: workspace
+            )
+            guard let self else { return }
+            guard !Task.isCancelled, self.retainedIds.contains(artifactId), let image else { return }
+            self.previews[artifactId] = image
+        }
+    }
+
+    private func loadOriginal(
+        _ artifact: StudioArtifactDetail,
+        browser: StudioBrowserStore,
+        workspace: WorkspaceStore,
+        deviceId: String
+    ) {
+        guard images[artifact.id] == nil,
+              players[artifact.id] == nil,
+              originalTasks[artifact.id] == nil else { return }
+        let artifactId = artifact.id
+        loadingOriginals.insert(artifactId)
+        errors.removeValue(forKey: artifactId)
+        originalTasks[artifactId] = Task(priority: artifactId == selectedId ? .userInitiated : .utility) {
+            defer {
+                originalTasks.removeValue(forKey: artifactId)
+                loadingOriginals.remove(artifactId)
+            }
+            do {
+                let file = try await workspace.downloadStudioArtifact(
+                    deviceId: deviceId,
+                    artifactId: artifactId,
+                    declaredSize: artifact.sizeBytes
+                )
+                guard !Task.isCancelled, retainedIds.contains(artifactId) else {
+                    try? FileManager.default.removeItem(at: file.url)
+                    return
+                }
+                temporaryURLs[artifactId] = file.url
+                if artifact.mediaKind == .video {
+                    let player = AVPlayer(url: file.url)
+                    players[artifactId] = player
+                    if selectedId == artifactId { player.play() }
+                } else {
+                    let longestEdge = max(Int(artifact.width ?? 0), Int(artifact.height ?? 0))
+                    let image = await Task.detached(priority: .userInitiated) {
+                        Self.decodeImage(
+                            at: file.url,
+                            maximumPixelSize: min(max(longestEdge, 2_048), 6_144)
+                        )
+                    }.value
+                    guard !Task.isCancelled, retainedIds.contains(artifactId) else { return }
+                    if let image {
+                        images[artifactId] = image
+                    } else {
+                        errors[artifactId] = "The downloaded image couldn't be decoded"
+                    }
+                    if selectedId != artifactId {
+                        try? FileManager.default.removeItem(at: file.url)
+                        temporaryURLs.removeValue(forKey: artifactId)
+                    }
+                }
+            } catch is CancellationError {
+                // Moving through the filmstrip cancels work outside the window.
+            } catch {
+                guard !Task.isCancelled else { return }
+                errors[artifactId] = error.localizedDescription
+            }
+        }
+    }
+
+    private func trimOutsideNeighborhood() {
+        for id in previewTasks.keys.filter({ !retainedIds.contains($0) }) {
+            previewTasks[id]?.cancel()
+            previewTasks.removeValue(forKey: id)
+        }
+        for id in originalTasks.keys.filter({ !retainedIds.contains($0) }) {
+            originalTasks[id]?.cancel()
+            originalTasks.removeValue(forKey: id)
+        }
+        for id in previews.keys.filter({ !retainedIds.contains($0) }) { previews.removeValue(forKey: id) }
+        for id in images.keys.filter({ !retainedIds.contains($0) }) { images.removeValue(forKey: id) }
+        for id in players.keys.filter({ !retainedIds.contains($0) }) {
+            players[id]?.pause()
+            players.removeValue(forKey: id)
+        }
+        for id in temporaryURLs.keys.filter({ !retainedIds.contains($0) }) {
+            if let url = temporaryURLs[id] { try? FileManager.default.removeItem(at: url) }
+            temporaryURLs.removeValue(forKey: id)
+        }
+    }
+
+    private func trimTemporaryFiles(keeping selectedId: String) {
+        for id in temporaryURLs.keys.filter({ $0 != selectedId }) {
+            if let url = temporaryURLs[id] { try? FileManager.default.removeItem(at: url) }
+            temporaryURLs.removeValue(forKey: id)
+        }
+    }
+
+    private func trimVideoOriginals(keeping selectedId: String, videoIds: Set<String>) {
+        for id in originalTasks.keys.filter({ videoIds.contains($0) && $0 != selectedId }) {
+            originalTasks[id]?.cancel()
+            originalTasks.removeValue(forKey: id)
+            loadingOriginals.remove(id)
+        }
+        for id in players.keys.filter({ $0 != selectedId }) {
+            players[id]?.pause()
+            players.removeValue(forKey: id)
         }
     }
 
@@ -116,6 +250,7 @@ struct StudioArtifactViewer: View {
     @State private var confirmDelete = false
     @State private var actionError: String?
     @State private var saving = false
+    @State private var filmstripPosition: String?
 
     private var selected: StudioArtifactDetail? { session.selected }
     private var showingChrome: Bool { detailOffset < 72 }
@@ -145,15 +280,40 @@ struct StudioArtifactViewer: View {
             }
             .background(Color.black.ignoresSafeArea())
             .overlay(alignment: .top) { topControls }
-            .overlay(alignment: .bottom) { bottomChrome }
+            .overlay(alignment: .bottom) { bottomChrome(width: geometry.size.width) }
         }
         .ignoresSafeArea()
         .task(id: session.selectedId) {
             guard let selected,
                   let workspace = model.workspace,
                   let deviceId = browser.selectedDeviceId else { return }
-            await media.load(
-                artifact: selected,
+            media.prepare(
+                selectedId: selected.id,
+                artifacts: session.artifacts,
+                browser: browser,
+                workspace: workspace,
+                deviceId: deviceId
+            )
+        }
+        .onAppear { filmstripPosition = session.selectedId }
+        .onChange(of: session.selectedId) { _, selectedId in
+            if filmstripPosition != selectedId {
+                withAnimation(.snappy(duration: 0.2)) {
+                    filmstripPosition = selectedId
+                }
+            }
+        }
+        .onChange(of: filmstripPosition) { _, centeredId in
+            guard let centeredId, centeredId != session.selectedId else { return }
+            session.selectedId = centeredId
+        }
+        .onChange(of: session.artifacts.count) {
+            guard let selected,
+                  let workspace = model.workspace,
+                  let deviceId = browser.selectedDeviceId else { return }
+            media.prepare(
+                selectedId: selected.id,
+                artifacts: session.artifacts,
                 browser: browser,
                 workspace: workspace,
                 deviceId: deviceId
@@ -195,6 +355,12 @@ struct StudioArtifactViewer: View {
                 Group {
                     if artifact.id == session.selectedId {
                         selectedMedia(artifact)
+                    } else if let image = media.image(for: artifact.id)
+                                ?? media.preview(for: artifact.id)
+                                ?? browser.cachedPreview(artifactId: artifact.id) {
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFit()
                     } else {
                         StudioMediaPreviewView(
                             artifactId: artifact.id,
@@ -226,72 +392,78 @@ struct StudioArtifactViewer: View {
     }
 
     @ViewBuilder private func selectedMedia(_ artifact: StudioArtifactDetail) -> some View {
-        if artifact.mediaKind == .video, let player = media.player {
+        if artifact.mediaKind == .video, let player = media.player(for: artifact.id) {
             VideoPlayer(player: player)
-        } else if artifact.mediaKind == .image, let image = media.image ?? media.preview {
+        } else if artifact.mediaKind == .image,
+                  let image = media.image(for: artifact.id)
+                    ?? media.preview(for: artifact.id)
+                    ?? browser.cachedPreview(artifactId: artifact.id) {
             StudioZoomableImage(image: image)
                 .id(artifact.id)
-        } else if let preview = media.preview {
+        } else if let preview = media.preview(for: artifact.id)
+                    ?? browser.cachedPreview(artifactId: artifact.id) {
             Image(uiImage: preview)
                 .resizable()
                 .scaledToFit()
         } else {
-            ProgressView()
-                .tint(.white)
+            StudioMediaPreviewView(
+                artifactId: artifact.id,
+                mediaKind: artifact.mediaKind,
+                browser: browser,
+                contentMode: .fit
+            )
         }
     }
 
     private var topControls: some View {
-        HStack {
-            Button { dismiss() } label: {
-                Image(systemName: "chevron.backward")
-                    .font(.system(size: 16, weight: .semibold))
-                    .frame(width: 42, height: 42)
-            }
-            .accessibilityLabel("Close")
-
-            Spacer()
-
-            Menu {
-                if let selected {
-                    Button { downloadSelected() } label: {
-                        Label("Download", systemImage: "square.and.arrow.down")
-                    }
-                    Button {
-                        showThread(selected.conversationId)
-                    } label: {
-                        Label("Show in Thread", systemImage: "rectangle.stack")
-                    }
-                    Button(role: .destructive) { confirmDelete = true } label: {
-                        Label("Delete", systemImage: "trash")
-                    }
+        GlassEffectContainer(spacing: 16) {
+            HStack {
+                Button { dismiss() } label: {
+                    Image(systemName: "chevron.backward")
+                        .font(.system(size: 16, weight: .semibold))
+                        .frame(width: 42, height: 42)
                 }
-            } label: {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 17, weight: .semibold))
-                    .frame(width: 42, height: 42)
+                .buttonStyle(.glass)
+                .buttonBorderShape(.circle)
+                .accessibilityLabel("Close")
+
+                Spacer()
+
+                Menu {
+                    if let selected {
+                        Button { downloadSelected() } label: {
+                            Label("Download", systemImage: "square.and.arrow.down")
+                        }
+                        Button {
+                            showThread(selected.conversationId)
+                        } label: {
+                            Label("Show in Thread", systemImage: "rectangle.stack")
+                        }
+                        Button(role: .destructive) { confirmDelete = true } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 17, weight: .semibold))
+                        .frame(width: 42, height: 42)
+                }
+                .buttonStyle(.glass)
+                .buttonBorderShape(.circle)
+                .accessibilityLabel("More actions")
             }
-            .accessibilityLabel("More actions")
         }
         .foregroundStyle(.white)
         .padding(.horizontal, 14)
         .padding(.top, 54)
         .padding(.bottom, 12)
-        .background(.ultraThinMaterial.opacity(0.45))
         .opacity(showingChrome ? 1 : 0)
         .allowsHitTesting(showingChrome)
         .animation(.easeOut(duration: 0.18), value: showingChrome)
     }
 
-    private var bottomChrome: some View {
+    private func bottomChrome(width: CGFloat) -> some View {
         VStack(spacing: 10) {
-            if media.loadingOriginal {
-                ProgressView()
-                    .controlSize(.small)
-                    .tint(.white)
-                    .accessibilityLabel("Loading full quality")
-            }
-
             ScrollView(.horizontal) {
                 LazyHStack(spacing: 5) {
                     ForEach(session.artifacts) { artifact in
@@ -320,48 +492,58 @@ struct StudioArtifactViewer: View {
                         .accessibilityAddTraits(session.selectedId == artifact.id ? .isSelected : [])
                     }
                 }
-                .padding(.horizontal, 16)
                 .padding(.vertical, 4)
+                .scrollTargetLayout()
             }
             .frame(height: 58)
+            .contentMargins(.horizontal, max(0, (width - 48) / 2), for: .scrollContent)
             .scrollIndicators(.hidden)
-            .scrollPosition(id: Binding(
-                get: { session.selectedId as String? },
-                set: { _ in }
-            ), anchor: .center)
+            .scrollTargetBehavior(.viewAligned)
+            .scrollPosition(id: $filmstripPosition, anchor: .center)
 
-            HStack(spacing: 44) {
-                Button {
-                    if let selected { showThread(selected.conversationId) }
-                } label: {
-                    Image(systemName: "rectangle.stack")
-                }
-                .disabled(session.selected == nil)
-                .accessibilityLabel("Show in Thread")
-
-                Button { downloadSelected() } label: {
-                    if saving {
-                        ProgressView().controlSize(.small).tint(.white)
-                    } else {
-                        Image(systemName: "square.and.arrow.down")
+            GlassEffectContainer(spacing: 12) {
+                HStack(spacing: 12) {
+                    Button {
+                        if let selected { showThread(selected.conversationId) }
+                    } label: {
+                        Image(systemName: "rectangle.stack")
+                            .frame(width: 42, height: 42)
                     }
-                }
-                .disabled(selected == nil || saving)
-                .accessibilityLabel("Download")
+                    .buttonStyle(.glass)
+                    .buttonBorderShape(.circle)
+                    .disabled(session.selected == nil)
+                    .accessibilityLabel("Show in Thread")
 
-                Button(role: .destructive) { confirmDelete = true } label: {
-                    Image(systemName: "trash")
+                    Button { downloadSelected() } label: {
+                        Group {
+                            if saving {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Image(systemName: "square.and.arrow.down")
+                            }
+                        }
+                        .frame(width: 42, height: 42)
+                    }
+                    .buttonStyle(.glass)
+                    .buttonBorderShape(.circle)
+                    .disabled(selected == nil || saving)
+                    .accessibilityLabel("Download")
+
+                    Button(role: .destructive) { confirmDelete = true } label: {
+                        Image(systemName: "trash")
+                            .frame(width: 42, height: 42)
+                    }
+                    .buttonStyle(.glass)
+                    .buttonBorderShape(.circle)
+                    .disabled(selected == nil)
+                    .accessibilityLabel("Delete")
                 }
-                .disabled(selected == nil)
-                .accessibilityLabel("Delete")
             }
             .font(.system(size: 20, weight: .regular))
             .foregroundStyle(.white)
-            .frame(height: 42)
         }
-        .padding(.top, 10)
+        .padding(.top, 8)
         .padding(.bottom, 26)
-        .background(.ultraThinMaterial.opacity(0.5))
         .opacity(showingChrome ? 1 : 0)
         .allowsHitTesting(showingChrome)
         .animation(.easeOut(duration: 0.18), value: showingChrome)
@@ -398,7 +580,7 @@ struct StudioArtifactViewer: View {
             .font(Theme.sans(13))
             .foregroundStyle(Theme.textMuted)
 
-            if let error = media.error {
+            if let error = media.error(for: artifact.id) {
                 Label(error, systemImage: "exclamationmark.triangle")
                     .font(Theme.sans(12))
                     .foregroundStyle(Theme.dangerSoft)
@@ -424,7 +606,7 @@ struct StudioArtifactViewer: View {
                     artifact,
                     workspace: workspace,
                     deviceId: deviceId,
-                    existingFile: media.originalURL
+                    existingFile: media.originalURL(for: artifact.id)
                 )
             } catch {
                 actionError = error.localizedDescription

@@ -188,6 +188,10 @@ final class StudioBrowserStore {
         previewTasks.removeValue(forKey: artifactId)
     }
 
+    func cachedPreview(artifactId: String) -> UIImage? {
+        previews.object(forKey: artifactId as NSString)
+    }
+
     func preview(
         artifactId: String,
         deviceId: String,
