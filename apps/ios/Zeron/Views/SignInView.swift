@@ -1,33 +1,32 @@
-// Sign-in — the OAuth authorization-code flow against WorkOS AuthKit, with
-// the secret-bearing exchange delegated to the edge (`POST /auth/exchange`).
+// Sign-in through the self-hosted edge. The Worker owns the WorkOS client,
+// redirects through its registered HTTPS callback, and returns control through
+// zeron://callback. The app only needs the edge URL.
 // The zeron mark on black, one white button — the old mobile app's Gate.
 //
 import AuthenticationServices
 import SwiftUI
 
-/// Deployment values are compiled from the ignored `Private.xcconfig` file.
+/// Deployment values come from the active staging or production xcconfig.
 enum Endpoints {
-    static let edgeURL = Bundle.main.object(forInfoDictionaryKey: "ZeronEdgeURL")
-        .flatMap { $0 as? String }
-        .filter { !$0.isEmpty && !$0.contains("$") }
+    static let edgeURL = configuredString(forKey: "ZeronEdgeURL")
         .flatMap(URL.init(string:))
-    static let workosClientId = Bundle.main.object(forInfoDictionaryKey: "ZeronWorkOSClientID")
-        .flatMap { $0 as? String }
-        .filter { !$0.isEmpty && !$0.contains("$") }
-    static let workosAPIBase = "https://api.workos.com"
-    static let callbackScheme = "zeron"
+    static let deploymentID = configuredString(forKey: "ZeronDeployment")
+    static let callbackScheme = configuredString(forKey: "ZeronAuthCallbackScheme")
 
-    static func authorizeURL(state: String) -> URL? {
-        guard let workosClientId else { return nil }
-        var components = URLComponents(string: "\(workosAPIBase)/user_management/authorize")!
-        components.queryItems = [
-            URLQueryItem(name: "response_type", value: "code"),
-            URLQueryItem(name: "client_id", value: workosClientId),
-            URLQueryItem(name: "redirect_uri", value: "\(callbackScheme)://callback"),
-            URLQueryItem(name: "provider", value: "authkit"),
-            URLQueryItem(name: "state", value: state),
-        ]
-        return components.url
+    private static func configuredString(forKey key: String) -> String? {
+        guard let value = Bundle.main.object(forInfoDictionaryKey: key) as? String,
+              !value.isEmpty,
+              !value.contains("$") else { return nil }
+        return value
+    }
+
+    static func authorizeURL(edgeURL: URL, state: String) -> URL? {
+        var components = URLComponents(
+            url: edgeURL.appending(path: "auth/ios/authorize"),
+            resolvingAgainstBaseURL: false
+        )
+        components?.queryItems = [URLQueryItem(name: "state", value: state)]
+        return components?.url
     }
 }
 
@@ -100,14 +99,15 @@ struct SignInView: View {
     private func signIn() {
         let state = UUID().uuidString
         guard let edgeURL = Endpoints.edgeURL,
-              let authorizeURL = Endpoints.authorizeURL(state: state) else {
+              let callbackScheme = Endpoints.callbackScheme,
+              let authorizeURL = Endpoints.authorizeURL(edgeURL: edgeURL, state: state) else {
             error = "This build has no private deployment configuration."
             return
         }
         busy = true
         error = nil
         authSession.start(url: authorizeURL,
-                          callbackScheme: Endpoints.callbackScheme) { result in
+                          callbackScheme: callbackScheme) { result in
             Task { @MainActor in
                 switch result {
                 case .cancelled:
@@ -118,11 +118,21 @@ struct SignInView: View {
                 case .success(let callbackURL):
                     let params = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?
                         .queryItems ?? []
-                    let code = params.first { $0.name == "code" }?.value
                     let cbState = params.first { $0.name == "state" }?.value
-                    guard let code, cbState == state else {
+                    guard cbState == state else {
                         busy = false
-                        error = "Callback missing code or state mismatch"
+                        error = "Sign-in state mismatch. Please try again."
+                        return
+                    }
+                    if let authError = params.first(where: { $0.name == "error_description" })?.value
+                        ?? params.first(where: { $0.name == "error" })?.value {
+                        busy = false
+                        error = authError
+                        return
+                    }
+                    guard let code = params.first(where: { $0.name == "code" })?.value else {
+                        busy = false
+                        error = "Sign-in returned no authorization code."
                         return
                     }
                     do {

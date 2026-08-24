@@ -24,8 +24,10 @@
 	<false/>
 	<key>ZeronEdgeURL</key>
 	<string>$(ZERON_EDGE_URL)</string>
-	<key>ZeronWorkOSClientID</key>
-	<string>$(ZERON_WORKOS_CLIENT_ID)</string>
+	<key>ZeronDeployment</key>
+	<string>$(ZERON_DEPLOYMENT)</string>
+	<key>ZeronAuthCallbackScheme</key>
+	<string>$(ZERON_AUTH_CALLBACK_SCHEME)</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -33,7 +35,7 @@
 			<string>sh.zeron.ios.auth</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>zeron</string>
+				<string>$(ZERON_AUTH_CALLBACK_SCHEME)</string>
 			</array>
 		</dict>
 	</array>

@@ -52,14 +52,18 @@ export const verifyToken = async (env: Env, token: string): Promise<Verified | u
   } catch {
     return undefined;
   }
-  // AuthKit access tokens use the WorkOS API origin as their standard issuer.
-  // A private deployment may still provide WORKOS_ISSUER for a custom AuthKit
-  // domain, but deriving an issuer from the client ID rejects normal tokens.
+  // Single-application environments use the WorkOS API origin. In a WorkOS
+  // multi-application environment, `iss` identifies the environment's default
+  // application rather than the application that initiated this login, so the
+  // deployment must set WORKOS_ISSUER to that exact value.
   const issuer = env.WORKOS_ISSUER ?? "https://api.workos.com";
   const jwksUrl = env.WORKOS_JWKS_URL ?? `https://api.workos.com/sso/jwks/${clientId}`;
   try {
     const { payload } = await jwtVerify(token, getJwks(jwksUrl), { issuer });
     if (typeof payload.sub !== "string" || payload.sub.length === 0) return undefined;
+    // `iss` is shared by every application in the WorkOS environment. Bind the
+    // token to this deployment's application as a separate trust check.
+    if (payload.client_id !== clientId) return undefined;
     return {
       userId: payload.sub,
       sessionId: typeof payload.sid === "string" ? payload.sid : undefined,

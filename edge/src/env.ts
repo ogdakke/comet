@@ -18,7 +18,9 @@ export interface Env {
   WORKOS_CLIENT_ID: SecretsStoreSecret;
   /** "workos" (verify AuthKit JWTs) or "dev" (bearer == userId, never prod). */
   AUTH_MODE: string;
-  /** Optional overrides for the WorkOS trust anchor. */
+  /** WorkOS trust-anchor overrides. WORKOS_ISSUER is required when the
+   * environment uses multiple WorkOS Applications because their shared issuer
+   * identifies the environment's default application. */
   WORKOS_ISSUER?: string;
   WORKOS_JWKS_URL?: string;
   /** WorkOS API key from Cloudflare Secrets Store. Unbound or unreadable

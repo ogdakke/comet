@@ -5,6 +5,8 @@
  *  - POST /auth/refresh      — WorkOS refresh → fresh tokens (org-scopable).
  *  - GET  /auth/orgs         — the caller's active org memberships.
  *  - POST /auth/orgs         — create an org + first (admin) membership.
+ *  - GET  /auth/ios/authorize — begin iOS OAuth at the self-hosted origin.
+ *  - GET  /auth/ios/callback  — relay the HTTPS callback to zeron://.
  *  - GET  /auth/cli/callback — headless sign-in: shows a paste-able code.
  *
  * Exchange/refresh/callback run BEFORE the bearer gate (the caller has no
@@ -24,6 +26,12 @@ const json = (value: unknown, status = 200): Response =>
   });
 
 const notConfigured = (): Response => json({ error: "workos not configured" }, 501);
+
+const redirect = (location: string): Response =>
+  new Response(null, {
+    status: 302,
+    headers: { location, "cache-control": "no-store" }
+  });
 
 const authFailed = (e: unknown): Response =>
   json({ error: e instanceof WorkOsAuthFailed ? e.message : "authentication failed" }, 401);
@@ -52,6 +60,29 @@ export const handleAuthRoute = async (
       return undefined;
     }
   };
+
+  // iOS starts OAuth at the self-hosted Worker. The app only knows this
+  // origin; the Worker selects its WorkOS client and uses its HTTPS callback
+  // before returning control to the fixed zeron:// app scheme.
+  if (parts[1] === "ios" && parts[2] === "authorize" && parts.length === 3 && request.method === "GET") {
+    const clientId = await readSecret(env.WORKOS_CLIENT_ID);
+    if (!clientId) return notConfigured();
+    const state = url.searchParams.get("state");
+    if (!state || !/^[A-Za-z0-9-]{1,128}$/.test(state)) {
+      return json({ error: "invalid state" }, 400);
+    }
+    const authorize = new URL("https://api.workos.com/user_management/authorize");
+    authorize.searchParams.set("response_type", "code");
+    authorize.searchParams.set("client_id", clientId);
+    authorize.searchParams.set("redirect_uri", new URL("/auth/ios/callback", url).toString());
+    authorize.searchParams.set("provider", "authkit");
+    authorize.searchParams.set("state", state);
+    return redirect(authorize.toString());
+  }
+
+  if (parts[1] === "ios" && parts[2] === "callback" && parts.length === 3 && request.method === "GET") {
+    return iosCallback(url);
+  }
 
   if (parts[1] === "exchange" && parts.length === 2 && request.method === "POST") {
     const [apiKey, clientId] = await Promise.all([
@@ -129,6 +160,28 @@ export const handleAuthRoute = async (
   }
 
   return undefined;
+};
+
+/** Relay the registered HTTPS WorkOS callback into the iOS app. The target is
+ * fixed, so query input can never turn this into an open redirect. The app
+ * consumes and verifies the state before exchanging the code. */
+const iosCallback = (url: URL): Response => {
+  const app = new URL("zeron://callback");
+  const state = url.searchParams.get("state");
+  if (state) app.searchParams.set("state", state);
+
+  const code = url.searchParams.get("code");
+  const providerError = url.searchParams.get("error");
+  if (code && state) {
+    app.searchParams.set("code", code);
+  } else {
+    app.searchParams.set("error", providerError ?? "invalid_request");
+    app.searchParams.set(
+      "error_description",
+      url.searchParams.get("error_description") ?? "Authentication did not return a code and state."
+    );
+  }
+  return redirect(app.toString());
 };
 
 // ---------------------------------------------------------------------------

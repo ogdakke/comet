@@ -86,7 +86,12 @@ struct AuthClient {
 // MARK: - Keychain storage
 
 enum Keychain {
-    private static let service = "sh.zeron.ios"
+    static func serviceName(deployment: String?) -> String {
+        guard let deployment, !deployment.isEmpty else { return "sh.zeron.ios" }
+        return "sh.zeron.ios.\(deployment)"
+    }
+
+    private static var service: String { serviceName(deployment: Endpoints.deploymentID) }
 
     static func save(_ value: String, key: String) {
         let data = Data(value.utf8)
@@ -116,10 +121,10 @@ enum Keychain {
         return String(data: data, encoding: .utf8)
     }
 
-    static func delete(key: String) {
+    static func delete(key: String, deployment: String? = Endpoints.deploymentID) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
+            kSecAttrService as String: serviceName(deployment: deployment),
             kSecAttrAccount as String: key,
         ]
         SecItemDelete(query as CFDictionary)

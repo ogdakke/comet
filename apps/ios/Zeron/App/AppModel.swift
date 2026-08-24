@@ -34,6 +34,7 @@ final class AppModel {
     @ObservationIgnored @AppStorage("userId") var storedUserId = ""
     @ObservationIgnored @AppStorage("orgId") var storedOrgId = ""
     @ObservationIgnored @AppStorage("deviceId") var storedDeviceId = ""
+    @ObservationIgnored @AppStorage("deploymentId") var storedDeploymentId = ""
 
     var deviceId: String {
         if storedDeviceId.isEmpty {
@@ -61,6 +62,27 @@ final class AppModel {
         if demo != nil { return }
         DocDisk.prune(keep: 80)
         let args = ProcessInfo.processInfo.arguments
+        if let deployment = Endpoints.deploymentID, storedDeploymentId != deployment {
+            // A staging build must never reuse production identity or docs,
+            // and vice versa. Remove the previous namespace plus the legacy
+            // pre-split keychain entries during the one-time migration.
+            if !storedDeploymentId.isEmpty {
+                Keychain.delete(key: "accessToken", deployment: storedDeploymentId)
+                Keychain.delete(key: "refreshToken", deployment: storedDeploymentId)
+            }
+            Keychain.delete(key: "accessToken")
+            Keychain.delete(key: "refreshToken")
+            Keychain.delete(key: "accessToken", deployment: nil)
+            Keychain.delete(key: "refreshToken", deployment: nil)
+            DocDisk.wipeAll()
+            storedUserId = ""
+            storedOrgId = ""
+            authModeRaw = AppConfig.Mode.workos.rawValue
+            storedDeploymentId = deployment
+        }
+        // The build configuration is authoritative. Persisting the URL only
+        // supports the dev and screenshot launch overrides below.
+        edgeURLString = Endpoints.edgeURL?.absoluteString ?? ""
         // Debug-rig config overrides (cfprefsd caching defeats external
         // defaults writes; the app applying them itself always sticks).
         func override(_ flag: String, _ apply: (String) -> Void) {
