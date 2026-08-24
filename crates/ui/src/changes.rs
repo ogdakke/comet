@@ -1091,6 +1091,10 @@ pub struct Changes {
     /// once their tween window elapses.
     fold_settle: Option<Task<()>>,
     list: ListState,
+    /// A width change makes gpui discard every cached row height, including
+    /// uniform estimates. Repair those estimates after layout instead of
+    /// falling back to an eager whole-list measurement.
+    list_hint_repair_scheduled: bool,
     /// What the pane diffs against (toolbar dropdown).
     scope: DiffScope,
     /// Comparison ref for [`DiffScope::Branch`] — preset to the repo's
@@ -1149,8 +1153,12 @@ impl Changes {
             row_ranges: Vec::new(),
             fold_settle: None,
             // Rows are single lines now — a deep overdraw is cheap and keeps
-            // fast wheel flicks from outrunning measurement.
-            list: ListState::new(0, ListAlignment::Top, px(1024.0)).measure_all(),
+            // fast wheel flicks from outrunning measurement. Off-screen rows
+            // keep an analytic line-height hint, so the scrollbar knows the
+            // full extent without materializing the whole diff.
+            list: ListState::new(0, ListAlignment::Top, px(1024.0))
+                .with_uniform_item_height(px(DIFF_LINE_HEIGHT)),
+            list_hint_repair_scheduled: false,
             scope: DiffScope::default(),
             base_ref: None,
             branches: Vec::new(),
@@ -1668,13 +1676,15 @@ impl Changes {
                     |_| false,
                 );
                 changes.comment_key = comment_state_key(&staged, draft.as_ref());
-                // The uniform hint keeps offsets for never-rendered rows
-                // sane (most rows ARE lines); real heights land as rows
-                // render.
+                // The uniform hint gives the scrollbar a complete height
+                // model immediately. Visible headers, notices, comments, and
+                // lines replace their hints with measured heights as they
+                // enter the overdraw window. Never call `measure_all` here:
+                // a 12k-line diff would otherwise build every GPUI row and
+                // upload the whole scene in one frame.
                 changes
                     .list
                     .reset_with_uniform_height(rows.len(), px(DIFF_LINE_HEIGHT));
-                changes.list.clone().measure_all();
                 changes.rows = rows;
                 changes.row_ranges = ranges;
                 changes.parsed = Some(ParsedDiff {
@@ -1725,7 +1735,9 @@ impl Changes {
         let changed = body.start + prefix..body.end - suffix;
         let mid: Vec<DiffRow> = new_body[prefix..new_body.len() - suffix].to_vec();
         self.list.splice(changed.clone(), mid.len());
-        self.list.clone().measure_all();
+        self.list
+            .clone()
+            .with_uniform_item_height(px(DIFF_LINE_HEIGHT));
         self.rows.splice(changed, mid);
         self.row_ranges[file_ix] = range.start..(range.end as isize + delta) as usize;
         for r in &mut self.row_ranges[file_ix + 1..] {
@@ -1888,7 +1900,9 @@ impl Changes {
             };
             if body.len() != new_len {
                 self.list.splice(body, new_len);
-                self.list.clone().measure_all();
+                self.list
+                    .clone()
+                    .with_uniform_item_height(px(DIFF_LINE_HEIGHT));
             }
         }
         let (rows, ranges) = flatten_rows(
@@ -3581,13 +3595,37 @@ fn render_file_body_upto(
 }
 
 impl Render for Changes {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.scope == DiffScope::History {
             let history = self.history_pane(cx);
             history.update(cx, |history, cx| history.ensure_loaded(cx));
             return div().size_full().child(history).into_any_element();
         }
         let theme = Theme::of(cx).clone();
+        // `ListState` intentionally invalidates measured heights when its
+        // width changes, but the gpui fork also drops uniform estimates in
+        // that pass. Check after layout and restore only the cheap estimates.
+        // The next frame then has a full scrollbar model while continuing to
+        // build elements solely for the visible + overdraw window.
+        if self.rows.len() >= 512 && !self.list_hint_repair_scheduled {
+            self.list_hint_repair_scheduled = true;
+            let entity = cx.weak_entity();
+            window.on_next_frame(move |_, cx| {
+                entity
+                    .update(cx, |changes: &mut Changes, cx| {
+                        changes.list_hint_repair_scheduled = false;
+                        if changes.rows.len() >= 512 && changes.list.is_scrolled_to_end().is_none()
+                        {
+                            changes
+                                .list
+                                .clone()
+                                .with_uniform_item_height(px(DIFF_LINE_HEIGHT));
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+            });
+        }
         let active = self.active_diff(cx);
         let scope = self.scope;
         let base = self.base_ref.clone();
@@ -3911,6 +3949,74 @@ rename to new_name.rs
         // Notices lead the body: the added file carries "New file".
         let added_rows = &rows[ranges[1].clone()];
         assert_eq!(added_rows[1], DiffRow::Notice { file: 1, notice: 0 });
+    }
+
+    #[gpui::test]
+    fn large_diff_paints_a_bounded_row_window(cx: &mut gpui::TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+
+        const ROWS: usize = 16_714;
+        let list_state = ListState::new(0, ListAlignment::Top, px(1024.0))
+            .with_uniform_item_height(px(DIFF_LINE_HEIGHT));
+        let rendered = Rc::new(Cell::new(0usize));
+
+        struct LargeDiffList {
+            state: ListState,
+            rendered: Rc<Cell<usize>>,
+        }
+
+        impl gpui::Render for LargeDiffList {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                let rendered = self.rendered.clone();
+                list(self.state.clone(), move |_, _, _| {
+                    rendered.set(rendered.get() + 1);
+                    div().h(px(DIFF_LINE_HEIGHT)).w_full().into_any_element()
+                })
+                .size_full()
+            }
+        }
+
+        let cx = cx.add_empty_window();
+        let draw = |cx: &mut gpui::VisualTestContext| {
+            cx.draw(
+                gpui::point(px(0.0), px(0.0)),
+                gpui::size(px(1_200.0), px(1_200.0)),
+                |_, cx| {
+                    cx.new(|_| LargeDiffList {
+                        state: list_state.clone(),
+                        rendered: rendered.clone(),
+                    })
+                    .into_any_element()
+                },
+            );
+        };
+
+        // Establish the list width while it is empty, matching the real view
+        // while its patch is parsed on the background executor.
+        draw(cx);
+        list_state.reset_with_uniform_height(ROWS, px(DIFF_LINE_HEIGHT));
+        rendered.set(0);
+        draw(cx);
+
+        // 1,200px viewport + 1,024px overdraw on each edge fits fewer than
+        // 160 line rows. Leave headroom for GPUI's boundary rows while still
+        // catching the old `measure_all` behavior, which rendered all 16,714.
+        assert!(
+            rendered.get() < 256,
+            "virtual list rendered {} of {ROWS} rows",
+            rendered.get()
+        );
+        assert_eq!(list_state.item_count(), ROWS);
+        let expected_height = ROWS as f32 * DIFF_LINE_HEIGHT - 1_200.0;
+        let max_offset = f32::from(list_state.max_offset_for_scrollbar().y);
+        assert!(
+            (max_offset - expected_height).abs() < 1.0,
+            "scrollbar extent {max_offset} != {expected_height}"
+        );
     }
 
     #[test]
