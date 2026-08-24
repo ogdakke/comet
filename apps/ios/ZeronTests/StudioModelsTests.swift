@@ -1,0 +1,53 @@
+import XCTest
+@testable import Zeron
+
+final class StudioModelsTests: XCTestCase {
+    func testDecodesThreadSummaryFromEngineWireShape() throws {
+        let data = Data(#"""
+        {
+          "id":"thread-1","title":"Night harbor","turnCount":2,
+          "createdAt":"2026-08-24T18:00:00Z","updatedAt":"2026-08-24T18:02:03.456Z",
+          "archived":false,"creating":true,"done":false
+        }
+        """#.utf8)
+
+        let summary = try JSONDecoder().decode(StudioThreadSummary.self, from: data)
+
+        XCTAssertEqual(summary.id, "thread-1")
+        XCTAssertEqual(summary.turnCount, 2)
+        XCTAssertTrue(summary.creating)
+        XCTAssertGreaterThan(summary.updatedDate, .distantPast)
+    }
+
+    func testDecodesMinimalConversationProjection() throws {
+        let data = Data(#"""
+        {
+          "conversation":{
+            "id":"thread-1","title":"Night harbor","turnCount":1,
+            "createdAt":"2026-08-24T18:00:00Z","updatedAt":"2026-08-24T18:02:00Z",
+            "archived":false,"creating":false,"done":true
+          },
+          "turns":[{
+            "id":"turn-1","position":0,"prompt":"A quiet harbor at night",
+            "sourceTurnId":null,"batchId":"batch-1","createdAt":"2026-08-24T18:00:00Z",
+            "runs":[{
+              "id":"run-1","position":0,"providerId":"venice",
+              "model":{"id":"flux","displayName":"Flux"},
+              "state":"succeeded","progress":null,"error":null,
+              "artifacts":[{
+                "id":"artifact-1","outputPosition":0,"mediaKind":"image",
+                "mimeType":"image/jpeg","sizeBytes":1024,"width":1024,"height":1024,
+                "durationSeconds":null,"metadata":{},"createdAt":"2026-08-24T18:01:00Z",
+                "thumbhash":"AQID","contentHash":"abc"
+              }]
+            }]
+          }]
+        }
+        """#.utf8)
+
+        let thread = try JSONDecoder().decode(StudioThread.self, from: data)
+
+        XCTAssertEqual(thread.turns.first?.runs.first?.model.displayName, "Flux")
+        XCTAssertEqual(thread.turns.first?.runs.first?.artifacts.first?.aspectRatio, 1)
+    }
+}

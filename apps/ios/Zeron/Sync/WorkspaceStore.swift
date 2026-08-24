@@ -584,6 +584,64 @@ final class WorkspaceStore {
         }
     }
 
+    // MARK: Studio relay
+
+    func watchStudioThreads(
+        deviceId: String,
+        includeArchived: Bool = false
+    ) async throws -> AsyncThrowingStream<StudioThreadListResponse, Error> {
+        try await relay(for: deviceId).stream(
+            method: "WatchStudioConversations",
+            params: ["includeArchived": includeArchived]
+        )
+    }
+
+    func watchStudioGallery(
+        deviceId: String
+    ) async throws -> AsyncThrowingStream<StudioGalleryResponse, Error> {
+        try await relay(for: deviceId).stream(method: "WatchStudioGallery", params: [:])
+    }
+
+    func watchStudioThread(
+        deviceId: String,
+        threadId: String
+    ) async throws -> AsyncThrowingStream<StudioThread, Error> {
+        try await relay(for: deviceId).stream(
+            method: "WatchStudioConversation",
+            params: ["conversationId": threadId]
+        )
+    }
+
+    /// Preview reads stay bounded. Originals are deliberately absent from the
+    /// first mobile slice so opening Studio can never fill the phone with the
+    /// desktop's artifact set.
+    func readStudioPreview(deviceId: String, artifactId: String) async throws -> Data {
+        let maximumPreviewBytes = 8 * 1024 * 1024
+        var result = Data()
+        var offset: UInt64 = 0
+        repeat {
+            let chunk: StudioArtifactChunk = try await relay(for: deviceId).call(
+                method: "ReadStudioPreviewChunk",
+                params: ["artifactId": artifactId, "offset": offset],
+                timeoutSeconds: 30
+            )
+            guard chunk.artifactId == artifactId,
+                  chunk.nextOffset >= offset,
+                  let bytes = Data(base64Encoded: chunk.data) else {
+                throw RelayError.rpc("Studio returned an invalid preview chunk")
+            }
+            guard result.count + bytes.count <= maximumPreviewBytes else {
+                throw RelayError.rpc("Studio preview exceeds the mobile size limit")
+            }
+            result.append(bytes)
+            if chunk.done { return result }
+            guard chunk.nextOffset > offset else {
+                throw RelayError.rpc("Studio preview did not advance")
+            }
+            offset = chunk.nextOffset
+        } while true
+    }
+
     /// SwitchRef — `git checkout` in the given folder on the target device.
     /// Returns git's error message on failure (dirty tree, held ref, …).
     func switchRef(deviceId: String, repoPath: String, refName: String) async -> String? {
