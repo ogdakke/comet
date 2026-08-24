@@ -27,6 +27,12 @@ enum RelayError: LocalizedError {
     }
 }
 
+struct StudioDownloadedFile: Sendable {
+    let url: URL
+    let fileName: String
+    let mimeType: String
+}
+
 /// Routes multiplexed RPC replies without coupling the wire protocol to the
 /// WebSocket lifecycle. Access is serialized by `DeviceRelayClient`'s actor.
 final class DeviceRpcPending {
@@ -372,6 +378,72 @@ actor DeviceRelayClient {
             }
             offset = chunk.nextOffset
         } while true
+    }
+
+    /// Stream an original artifact to one short-lived temporary file. Videos
+    /// never accumulate in RAM, and callers remove the file as soon as the
+    /// viewer moves away or closes.
+    func downloadStudioArtifact(
+        artifactId: String,
+        maximumBytes: UInt64
+    ) async throws -> StudioDownloadedFile {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "ZeronStudioViewer", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        var outputURL: URL?
+        var handle: FileHandle?
+        var written: UInt64 = 0
+        var offset: UInt64 = 0
+        do {
+            repeat {
+                try Task.checkCancellation()
+                let chunk: StudioArtifactChunk = try await call(
+                    method: "ReadStudioArtifactChunk",
+                    params: ["artifactId": artifactId, "offset": offset],
+                    timeoutSeconds: 30
+                )
+                guard chunk.artifactId == artifactId,
+                      chunk.nextOffset >= offset,
+                      let bytes = Data(base64Encoded: chunk.data) else {
+                    throw RelayError.rpc("Studio returned an invalid artifact chunk")
+                }
+                guard written + UInt64(bytes.count) <= maximumBytes else {
+                    throw RelayError.rpc("Studio artifact exceeds its declared size")
+                }
+                if outputURL == nil {
+                    let ext = URL(filePath: chunk.fileName).pathExtension
+                    let name = UUID().uuidString + (ext.isEmpty ? "" : ".\(ext)")
+                    let url = directory.appending(path: name)
+                    guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
+                        throw RelayError.rpc("Couldn't create a temporary Studio file")
+                    }
+                    outputURL = url
+                    handle = try FileHandle(forWritingTo: url)
+                }
+                try handle?.write(contentsOf: bytes)
+                written += UInt64(bytes.count)
+                if chunk.done {
+                    try handle?.close()
+                    guard let outputURL else {
+                        throw RelayError.rpc("Studio returned an empty artifact")
+                    }
+                    return StudioDownloadedFile(
+                        url: outputURL,
+                        fileName: chunk.fileName,
+                        mimeType: chunk.mimeType
+                    )
+                }
+                guard chunk.nextOffset > offset else {
+                    throw RelayError.rpc("Studio artifact read did not advance")
+                }
+                offset = chunk.nextOffset
+            } while true
+        } catch {
+            try? handle?.close()
+            if let outputURL { try? FileManager.default.removeItem(at: outputURL) }
+            throw error
+        }
     }
 
     private func callOnce<Response: Decodable>(

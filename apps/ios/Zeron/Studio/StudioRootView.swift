@@ -2,7 +2,6 @@ import SwiftUI
 
 enum StudioRoute: Hashable {
     case thread(String)
-    case artifact(StudioArtifactDetail)
 }
 
 private enum StudioLibraryMode: String, CaseIterable, Identifiable {
@@ -56,6 +55,8 @@ struct StudioRootView: View {
     @State private var browser = StudioBrowserStore()
     @State private var mode = StudioLibraryMode.gallery
     @State private var path: [StudioRoute] = []
+    @State private var viewer: StudioViewerSession?
+    @Namespace private var artifactTransition
 
     private var hostKey: String {
         "\(browser.selectedDeviceId ?? "none")-\(browser.reloadGeneration)"
@@ -71,14 +72,20 @@ struct StudioRootView: View {
                     ToolbarItem(placement: .principal) {
                         StudioLibrarySwitcher(selection: $mode)
                     }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        machineMenu
+                    }
                 }
                 .scrollEdgeEffectStyle(.soft, for: .top)
             .navigationDestination(for: StudioRoute.self) { route in
                 switch route {
                 case .thread(let threadId):
-                    StudioThreadView(threadId: threadId, browser: browser, path: $path)
-                case .artifact(let artifact):
-                    StudioArtifactView(artifact: artifact, browser: browser)
+                    StudioThreadView(
+                        threadId: threadId,
+                        browser: browser,
+                        artifactTransition: artifactTransition,
+                        openViewer: { viewer = $0 }
+                    )
                 }
             }
             .task(id: model.studioHosts.map(\.id).joined()) {
@@ -95,6 +102,20 @@ struct StudioRootView: View {
                       let deviceId = browser.selectedDeviceId,
                       let workspace = model.workspace else { return }
                 await browser.watchGallery(workspace: workspace, deviceId: deviceId)
+            }
+            .fullScreenCover(item: $viewer) { session in
+                StudioArtifactViewer(
+                    session: session,
+                    browser: browser,
+                    showThread: { threadId in
+                        viewer = nil
+                        mode = .threads
+                        path = [.thread(threadId)]
+                    }
+                )
+                .navigationTransition(
+                    .zoom(sourceID: session.selectedId, in: artifactTransition)
+                )
             }
         }
     }
@@ -118,7 +139,15 @@ struct StudioRootView: View {
         } else {
             switch mode {
             case .gallery:
-                StudioGalleryView(browser: browser, path: $path)
+                StudioGalleryView(
+                    browser: browser,
+                    artifactTransition: artifactTransition,
+                    openViewer: { viewer = $0 },
+                    showThread: { threadId in
+                        mode = .threads
+                        path = [.thread(threadId)]
+                    }
+                )
             case .threads:
                 StudioThreadsView(browser: browser, path: $path)
             }
@@ -136,12 +165,41 @@ struct StudioRootView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    private var machineMenu: some View {
+        Menu {
+            ForEach(model.studioHosts) { device in
+                Button {
+                    browser.selectDevice(device.id)
+                } label: {
+                    Label {
+                        Text(model.deviceName(device.id))
+                    } icon: {
+                        if browser.selectedDeviceId == device.id {
+                            Image(systemName: "checkmark")
+                        } else {
+                            Image(systemName: model.deviceOnline(device.id)
+                                  ? "desktopcomputer" : "desktopcomputer.trianglebadge.exclamationmark")
+                        }
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "desktopcomputer")
+        }
+        .accessibilityLabel("Studio machine")
+        .accessibilityValue(browser.selectedDeviceId.map(model.deviceName) ?? "None")
+    }
+
 }
 
 private struct StudioGalleryView: View {
     @Environment(AppModel.self) private var model
     let browser: StudioBrowserStore
-    @Binding var path: [StudioRoute]
+    let artifactTransition: Namespace.ID
+    let openViewer: (StudioViewerSession) -> Void
+    let showThread: (String) -> Void
+    @State private var artifactToDelete: StudioArtifactDetail?
+    @State private var actionError: String?
 
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 2), count: 3)
 
@@ -162,7 +220,11 @@ private struct StudioGalleryView: View {
                 LazyVGrid(columns: columns, spacing: 2) {
                     ForEach(browser.gallery) { item in
                         Button {
-                            path.append(.artifact(StudioArtifactDetail(item: item)))
+                            openViewer(StudioViewerSession(
+                                artifacts: browser.gallery.map(StudioArtifactDetail.init(item:)),
+                                selectedId: item.id,
+                                openedFromGallery: true
+                            ))
                         } label: {
                             Rectangle()
                                 .fill(Theme.elementHover)
@@ -183,6 +245,24 @@ private struct StudioGalleryView: View {
                         }
                         .buttonStyle(.plain)
                         .contentShape(Rectangle())
+                        .matchedTransitionSource(id: item.id, in: artifactTransition)
+                        .contextMenu {
+                            Button {
+                                download(StudioArtifactDetail(item: item))
+                            } label: {
+                                Label("Download", systemImage: "square.and.arrow.down")
+                            }
+                            Button {
+                                pathToThread(item.conversationId)
+                            } label: {
+                                Label("Show in Thread", systemImage: "rectangle.stack")
+                            }
+                            Button(role: .destructive) {
+                                artifactToDelete = StudioArtifactDetail(item: item)
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                        }
                         .accessibilityLabel("\(item.modelDisplayName), \(item.prompt)")
                         .task {
                             guard browser.shouldLoadMore(after: item),
@@ -202,6 +282,31 @@ private struct StudioGalleryView: View {
                 }
             }
             .scrollEdgeEffectStyle(.soft, for: .top)
+            .confirmationDialog(
+                "Delete this creation?",
+                isPresented: Binding(
+                    get: { artifactToDelete != nil },
+                    set: { if !$0 { artifactToDelete = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button("Delete", role: .destructive) {
+                    guard let artifact = artifactToDelete else { return }
+                    artifactToDelete = nil
+                    delete(artifact)
+                }
+                Button("Cancel", role: .cancel) { artifactToDelete = nil }
+            } message: {
+                Text("This removes it from Studio on the selected machine.")
+            }
+            .alert("Studio action failed", isPresented: Binding(
+                get: { actionError != nil },
+                set: { if !$0 { actionError = nil } }
+            )) {
+                Button("OK") { actionError = nil }
+            } message: {
+                Text(actionError ?? "")
+            }
         }
     }
 
@@ -228,6 +333,42 @@ private struct StudioGalleryView: View {
         guard let seconds else { return "Video" }
         let total = max(0, Int(seconds.rounded()))
         return String(format: "%d:%02d", total / 60, total % 60)
+    }
+
+    private func pathToThread(_ threadId: String) {
+        showThread(threadId)
+    }
+
+    private func download(_ artifact: StudioArtifactDetail) {
+        guard let workspace = model.workspace,
+              let deviceId = browser.selectedDeviceId else { return }
+        Task {
+            do {
+                try await StudioArtifactActions.download(
+                    artifact,
+                    workspace: workspace,
+                    deviceId: deviceId
+                )
+            } catch {
+                actionError = error.localizedDescription
+            }
+        }
+    }
+
+    private func delete(_ artifact: StudioArtifactDetail) {
+        guard let workspace = model.workspace,
+              let deviceId = browser.selectedDeviceId else { return }
+        Task {
+            do {
+                try await workspace.deleteStudioArtifact(
+                    deviceId: deviceId,
+                    artifactId: artifact.id
+                )
+                browser.removeArtifact(artifact.id)
+            } catch {
+                actionError = error.localizedDescription
+            }
+        }
     }
 }
 

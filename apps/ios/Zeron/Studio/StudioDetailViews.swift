@@ -33,7 +33,8 @@ struct StudioThreadView: View {
     @Environment(AppModel.self) private var model
     let threadId: String
     let browser: StudioBrowserStore
-    @Binding var path: [StudioRoute]
+    let artifactTransition: Namespace.ID
+    let openViewer: (StudioViewerSession) -> Void
     @State private var store = StudioThreadStore()
 
     private let columns = [
@@ -110,11 +111,12 @@ struct StudioThreadView: View {
                     ForEach(run.artifacts.sorted(by: { $0.outputPosition < $1.outputPosition })) {
                         artifact in
                         Button {
-                            path.append(.artifact(StudioArtifactDetail(
-                                artifact: artifact,
-                                turn: turn,
-                                run: run
-                            )))
+                            guard let thread = store.thread else { return }
+                            openViewer(StudioViewerSession(
+                                artifacts: viewerArtifacts(in: thread),
+                                selectedId: artifact.id,
+                                openedFromGallery: false
+                            ))
                         } label: {
                             Rectangle()
                                 .fill(Theme.elementHover)
@@ -139,6 +141,8 @@ struct StudioThreadView: View {
                                 }
                         }
                         .buttonStyle(.plain)
+                        .contentShape(Rectangle())
+                        .matchedTransitionSource(id: artifact.id, in: artifactTransition)
                         .accessibilityLabel("Open \(artifact.mediaKind.rawValue) from \(run.model.displayName)")
                     }
                 }
@@ -169,6 +173,27 @@ struct StudioThreadView: View {
                 .font(Theme.sans(11, weight: .medium))
                 .foregroundStyle(run.state == .succeeded ? Theme.statusCompleted : Theme.textFaint)
         }
+    }
+
+    private func viewerArtifacts(in thread: StudioThread) -> [StudioArtifactDetail] {
+        thread.turns
+            .sorted { $0.position < $1.position }
+            .flatMap { turn in
+                turn.runs
+                    .sorted { $0.position < $1.position }
+                    .flatMap { run in
+                        run.artifacts
+                            .sorted { $0.outputPosition < $1.outputPosition }
+                            .map {
+                                StudioArtifactDetail(
+                                    artifact: $0,
+                                    turn: turn,
+                                    run: run,
+                                    conversationId: thread.conversation.id
+                                )
+                            }
+                    }
+            }
     }
 }
 

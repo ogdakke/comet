@@ -652,6 +652,34 @@ final class WorkspaceStore {
         )
     }
 
+    func downloadStudioArtifact(
+        deviceId: String,
+        artifactId: String,
+        declaredSize: UInt64
+    ) async throws -> StudioDownloadedFile {
+        let client = relay(for: deviceId)
+        // Allow a small metadata discrepancy, but don't permit an unbounded
+        // relay response to consume the phone's temporary storage.
+        let allowance = max(declaredSize / 20, 1_048_576)
+        let (maximumBytes, overflow) = declaredSize.addingReportingOverflow(allowance)
+        guard !overflow else { throw RelayError.rpc("Studio reported an invalid artifact size") }
+        return try await client.downloadStudioArtifact(
+            artifactId: artifactId,
+            maximumBytes: maximumBytes
+        )
+    }
+
+    func deleteStudioArtifact(deviceId: String, artifactId: String) async throws {
+        struct Response: Decodable { let ok: Bool }
+        let response: Response = try await relay(for: deviceId).call(
+            method: "DeleteStudioArtifact",
+            params: ["artifactId": artifactId]
+        )
+        guard response.ok else {
+            throw RelayError.rpc("Studio didn't delete the artifact")
+        }
+    }
+
     /// SwitchRef — `git checkout` in the given folder on the target device.
     /// Returns git's error message on failure (dirty tree, held ref, …).
     func switchRef(deviceId: String, repoPath: String, refName: String) async -> String? {

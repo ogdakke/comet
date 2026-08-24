@@ -79,6 +79,21 @@ final class StudioBrowserStore {
             ?? devices.first?.id
     }
 
+    func selectDevice(_ deviceId: String) {
+        guard selectedDeviceId != deviceId else { return }
+        selectedDeviceId = deviceId
+        UserDefaults.standard.set(deviceId, forKey: "studioDeviceId")
+        threads = []
+        gallery = []
+        galleryCursor = nil
+        threadsError = nil
+        galleryError = nil
+        previews.removeAllObjects()
+        previewTasks.values.forEach { $0.cancel() }
+        previewTasks.removeAll()
+        reloadGeneration += 1
+    }
+
     func reload() {
         threadsError = nil
         galleryError = nil
@@ -164,6 +179,13 @@ final class StudioBrowserStore {
 
     func shouldLoadMore(after item: StudioGalleryItem) -> Bool {
         galleryCursor != nil && gallery.suffix(12).contains(where: { $0.id == item.id })
+    }
+
+    func removeArtifact(_ artifactId: String) {
+        gallery.removeAll { $0.id == artifactId }
+        previews.removeObject(forKey: artifactId as NSString)
+        previewTasks[artifactId]?.cancel()
+        previewTasks.removeValue(forKey: artifactId)
     }
 
     func preview(

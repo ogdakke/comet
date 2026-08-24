@@ -4,6 +4,7 @@
 // the phone.
 
 import Foundation
+import Observation
 
 enum StudioMediaKind: String, Codable, Hashable {
     case image
@@ -122,6 +123,7 @@ struct StudioGalleryItem: Codable, Hashable, Identifiable {
 
 struct StudioArtifactDetail: Hashable, Identifiable {
     var id: String
+    var conversationId: String
     var mediaKind: StudioMediaKind
     var width: UInt32?
     var height: UInt32?
@@ -133,6 +135,7 @@ struct StudioArtifactDetail: Hashable, Identifiable {
 
     init(item: StudioGalleryItem) {
         id = item.id
+        conversationId = item.conversationId
         mediaKind = item.mediaKind
         width = item.width
         height = item.height
@@ -143,8 +146,9 @@ struct StudioArtifactDetail: Hashable, Identifiable {
         createdAt = item.createdAt
     }
 
-    init(artifact: StudioArtifact, turn: StudioTurn, run: StudioRun) {
+    init(artifact: StudioArtifact, turn: StudioTurn, run: StudioRun, conversationId: String) {
         id = artifact.id
+        self.conversationId = conversationId
         mediaKind = artifact.mediaKind
         width = artifact.width
         height = artifact.height
@@ -159,6 +163,30 @@ struct StudioArtifactDetail: Hashable, Identifiable {
     var aspectRatio: CGFloat {
         guard let width, let height, height > 0 else { return 1 }
         return CGFloat(width) / CGFloat(height)
+    }
+}
+
+@MainActor
+@Observable
+final class StudioViewerSession: Identifiable {
+    let id = UUID()
+    var artifacts: [StudioArtifactDetail]
+    let openedFromGallery: Bool
+    var selectedId: String
+
+    init(artifacts: [StudioArtifactDetail], selectedId: String, openedFromGallery: Bool) {
+        self.artifacts = artifacts
+        self.selectedId = selectedId
+        self.openedFromGallery = openedFromGallery
+    }
+
+    var selected: StudioArtifactDetail? {
+        artifacts.first { $0.id == selectedId }
+    }
+
+    func append(_ additions: [StudioArtifactDetail]) {
+        let existing = Set(artifacts.map(\.id))
+        artifacts.append(contentsOf: additions.filter { !existing.contains($0.id) })
     }
 }
 
