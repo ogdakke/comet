@@ -339,6 +339,41 @@ actor DeviceRelayClient {
         throw RelayError.notConnected
     }
 
+    /// Read a Studio file over the relay without making the MainActor assemble
+    /// and base64-decode every chunk. Keeping this work on the relay actor is
+    /// especially important for a gallery that starts several preview reads
+    /// while someone is scrolling.
+    func readStudioData(
+        method: String,
+        artifactId: String,
+        maximumBytes: Int
+    ) async throws -> Data {
+        var result = Data()
+        var offset: UInt64 = 0
+        repeat {
+            try Task.checkCancellation()
+            let chunk: StudioArtifactChunk = try await call(
+                method: method,
+                params: ["artifactId": artifactId, "offset": offset],
+                timeoutSeconds: 30
+            )
+            guard chunk.artifactId == artifactId,
+                  chunk.nextOffset >= offset,
+                  let bytes = Data(base64Encoded: chunk.data) else {
+                throw RelayError.rpc("Studio returned an invalid media chunk")
+            }
+            guard result.count + bytes.count <= maximumBytes else {
+                throw RelayError.rpc("Studio media exceeds the mobile size limit")
+            }
+            result.append(bytes)
+            if chunk.done { return result }
+            guard chunk.nextOffset > offset else {
+                throw RelayError.rpc("Studio media read did not advance")
+            }
+            offset = chunk.nextOffset
+        } while true
+    }
+
     private func callOnce<Response: Decodable>(
         method: String,
         params: [String: Any],

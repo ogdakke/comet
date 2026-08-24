@@ -3,6 +3,46 @@ import ImageIO
 import Observation
 import UIKit
 
+private actor StudioPreviewGate {
+    private let limit: Int
+    private var active = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(limit: Int) {
+        self.limit = limit
+    }
+
+    func load(
+        artifactId: String,
+        deviceId: String,
+        workspace: WorkspaceStore
+    ) async throws -> Data {
+        await acquire()
+        defer { release() }
+        try Task.checkCancellation()
+        return try await workspace.readStudioPreview(
+            deviceId: deviceId,
+            artifactId: artifactId
+        )
+    }
+
+    private func acquire() async {
+        if active < limit {
+            active += 1
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    private func release() {
+        if waiters.isEmpty {
+            active -= 1
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+}
+
 @MainActor
 @Observable
 final class StudioBrowserStore {
@@ -17,6 +57,7 @@ final class StudioBrowserStore {
     var reloadGeneration = 0
 
     @ObservationIgnored private let previews = NSCache<NSString, UIImage>()
+    @ObservationIgnored private let previewGate = StudioPreviewGate(limit: 4)
     @ObservationIgnored private var previewTasks: [String: Task<UIImage?, Never>] = [:]
     @ObservationIgnored private var galleryCursor: StudioGalleryCursor?
 
@@ -135,11 +176,14 @@ final class StudioBrowserStore {
         if let task = previewTasks[artifactId] { return await task.value }
 
         let task = Task<UIImage?, Never> {
-            guard let data = try? await workspace.readStudioPreview(
+            guard let data = try? await previewGate.load(
+                artifactId: artifactId,
                 deviceId: deviceId,
-                artifactId: artifactId
+                workspace: workspace
             ) else { return nil }
-            return Self.downsample(data: data, maximumPixelSize: 768)
+            return await Task.detached(priority: .utility) {
+                Self.downsample(data: data, maximumPixelSize: 512)
+            }.value
         }
         previewTasks[artifactId] = task
         let image = await task.value

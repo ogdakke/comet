@@ -182,6 +182,7 @@ private struct StudioGalleryView: View {
                                 }
                         }
                         .buttonStyle(.plain)
+                        .contentShape(Rectangle())
                         .accessibilityLabel("\(item.modelDisplayName), \(item.prompt)")
                         .task {
                             guard browser.shouldLoadMore(after: item),
