@@ -16,10 +16,10 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeron_proto::{
     AttachmentOrigin, ComposerAttachment, ComposerMediaKind, ImportStudioAssetChunk,
-    ImportStudioAssetResponse, LEGACY_UNTITLED_STUDIO_TITLE, ListStudioModelsResponse,
-    StudioArtifactChunk, StudioArtifactView, StudioConversationSummary, StudioConversationView,
-    StudioGalleryItem, StudioModelRunSpec, StudioRunState, StudioRunView, StudioTurnView,
-    UNTITLED_STUDIO_TITLE,
+    ImportStudioAssetResponse, LEGACY_UNTITLED_STUDIO_TITLE, ListStudioArtifactsResponse,
+    ListStudioModelsResponse, StudioArtifactChunk, StudioArtifactView, StudioConversationSummary,
+    StudioConversationView, StudioGalleryCursor, StudioGalleryItem, StudioModelRunSpec,
+    StudioRunState, StudioRunView, StudioTurnView, UNTITLED_STUDIO_TITLE,
 };
 use zeron_studio::{
     GenerationInput, GenerationInputSource, GenerationRequest, InputRole, MediaKind, MediaModel,
@@ -965,7 +965,19 @@ impl StudioStore {
     }
 
     pub fn list_gallery(&self) -> Result<Vec<StudioGalleryItem>, StudioStoreError> {
+        Ok(self.list_gallery_page(None, None)?.artifacts)
+    }
+
+    pub fn list_gallery_page(
+        &self,
+        limit: Option<u32>,
+        cursor: Option<&StudioGalleryCursor>,
+    ) -> Result<ListStudioArtifactsResponse, StudioStoreError> {
         let connection = self.connection()?;
+        let bounded_limit = limit.map(|value| value.clamp(1, 200));
+        let query_limit = bounded_limit.map(|value| i64::from(value) + 1);
+        let cursor_millis = cursor.map(|value| value.created_at.timestamp_millis());
+        let cursor_id = cursor.map(|value| value.artifact_id.0.to_string());
         let mut statement = connection.prepare(
             "SELECT a.id, a.output_position, a.media_kind, a.mime_type, a.size_bytes,
                     a.width, a.height, a.created_at,
@@ -997,10 +1009,31 @@ impl StudioStore {
              JOIN studio_batches b ON b.id = r.batch_id
              JOIN studio_turns t ON t.id = b.turn_id
              WHERE a.deleted_at IS NULL AND a.media_kind IN ('image', 'video')
-             ORDER BY a.created_at DESC, a.id DESC",
+               AND (?1 IS NULL OR a.created_at < ?1 OR (a.created_at = ?1 AND a.id < ?2))
+             ORDER BY a.created_at DESC, a.id DESC
+             LIMIT COALESCE(?3, -1)",
         )?;
-        let rows = statement.query_map([], gallery_item_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let rows = statement.query_map(
+            rusqlite::params![cursor_millis, cursor_id, query_limit],
+            gallery_item_from_row,
+        )?;
+        let mut artifacts = rows.collect::<Result<Vec<_>, _>>()?;
+        let has_more = bounded_limit.is_some_and(|value| artifacts.len() > value as usize);
+        if has_more {
+            artifacts.pop();
+        }
+        let next_cursor = has_more && !artifacts.is_empty();
+        let next_cursor = next_cursor.then(|| {
+            let last = artifacts.last().expect("non-empty gallery page");
+            StudioGalleryCursor {
+                created_at: last.created_at,
+                artifact_id: last.id,
+            }
+        });
+        Ok(ListStudioArtifactsResponse {
+            artifacts,
+            next_cursor,
+        })
     }
 
     pub fn rename_conversation(

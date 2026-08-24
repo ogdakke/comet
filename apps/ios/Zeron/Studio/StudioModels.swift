@@ -124,8 +124,14 @@ struct StudioThreadListResponse: Codable {
     var conversations: [StudioThreadSummary]
 }
 
+struct StudioGalleryCursor: Codable, Hashable {
+    var createdAt: String
+    var artifactId: String
+}
+
 struct StudioGalleryResponse: Codable {
     var artifacts: [StudioGalleryItem]
+    var nextCursor: StudioGalleryCursor?
 }
 
 struct StudioArtifactChunk: Codable {

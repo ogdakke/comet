@@ -24,22 +24,22 @@ struct StudioRootView: View {
 
     var body: some View {
         NavigationStack(path: $path) {
-            VStack(spacing: 0) {
+            content
+                .safeAreaBar(edge: .top, spacing: 0) {
                 Picker("Studio view", selection: $mode) {
                     ForEach(StudioLibraryMode.allCases) { mode in
                         Text(mode.rawValue).tag(mode)
                     }
                 }
                 .pickerStyle(.segmented)
+                .controlSize(.large)
                 .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-
-                content
-            }
+                .padding(.vertical, 12)
+                }
             .background(Theme.surface.ignoresSafeArea())
             .navigationTitle("Studio")
             .navigationBarTitleDisplayMode(.large)
-            .toolbar { deviceMenu }
+            .scrollEdgeEffectStyle(.soft, for: .top)
             .navigationDestination(for: StudioRoute.self) { route in
                 switch route {
                 case .thread:
@@ -80,7 +80,7 @@ struct StudioRootView: View {
         } else if let deviceId = browser.selectedDeviceId, !model.deviceOnline(deviceId) {
             unavailable(
                 title: "Desktop is offline",
-                message: "Choose an online device or reconnect \(model.deviceName(deviceId))."
+                message: "Reconnect \(model.deviceName(deviceId)) to browse its Studio library."
             )
         } else {
             switch mode {
@@ -103,32 +103,6 @@ struct StudioRootView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    @ToolbarContentBuilder private var deviceMenu: some ToolbarContent {
-        ToolbarItem(placement: .topBarTrailing) {
-            Menu {
-                if model.studioHosts.isEmpty {
-                    Text("No desktop devices")
-                } else {
-                    ForEach(model.studioHosts) { device in
-                        Button {
-                            browser.selectDevice(device.id)
-                        } label: {
-                            Label {
-                                Text(device.name)
-                                Text(model.deviceOnline(device.id) ? "Online" : "Offline")
-                            } icon: {
-                                Image(systemName: browser.selectedDeviceId == device.id
-                                      ? "checkmark" : "desktopcomputer")
-                            }
-                        }
-                    }
-                }
-            } label: {
-                Image(systemName: "desktopcomputer")
-            }
-            .accessibilityLabel("Studio device")
-        }
-    }
 }
 
 private struct StudioGalleryView: View {
@@ -157,8 +131,12 @@ private struct StudioGalleryView: View {
                         Button {
                             path.append(.artifact(item.id))
                         } label: {
-                            StudioPreviewView(item: item, browser: browser)
-                                .aspectRatio(1, contentMode: .fill)
+                            Rectangle()
+                                .fill(Theme.elementHover)
+                                .aspectRatio(1, contentMode: .fit)
+                                .overlay {
+                                    StudioPreviewView(item: item, browser: browser)
+                                }
                                 .clipped()
                                 .overlay(alignment: .bottomTrailing) {
                                     if item.mediaKind == .video {
@@ -172,7 +150,21 @@ private struct StudioGalleryView: View {
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel("\(item.modelDisplayName), \(item.prompt)")
+                        .task {
+                            guard browser.shouldLoadMore(after: item),
+                                  let workspace = model.workspace,
+                                  let deviceId = browser.selectedDeviceId else { return }
+                            await browser.loadMoreGallery(
+                                workspace: workspace,
+                                deviceId: deviceId
+                            )
+                        }
                     }
+                }
+                if browser.galleryLoadingMore {
+                    ProgressView()
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 16)
                 }
             }
             .scrollEdgeEffectStyle(.soft, for: .top)
@@ -323,6 +315,8 @@ struct StudioPreviewView: View {
                     .foregroundStyle(Theme.textFaint.opacity(0.5))
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipped()
         .task(id: "\(browser.selectedDeviceId ?? "none")-\(item.id)") {
             guard let deviceId = browser.selectedDeviceId,
                   let workspace = model.workspace else { return }

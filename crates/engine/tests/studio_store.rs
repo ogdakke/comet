@@ -2764,6 +2764,33 @@ async fn gallery_lists_images_across_conversations_newest_first() {
     )
     .unwrap();
     assert_eq!(listed.artifacts.len(), 2);
+    assert!(listed.next_cursor.is_none());
+
+    let first_page: ListStudioArtifactsResponse = serde_json::from_value(
+        client
+            .call(
+                methods::LIST_STUDIO_ARTIFACTS,
+                serde_json::json!({ "limit": 1 }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first_page.artifacts.len(), 1);
+    assert_eq!(first_page.artifacts[0].prompt, "newer comet");
+    let second_page: ListStudioArtifactsResponse = serde_json::from_value(
+        client
+            .call(
+                methods::LIST_STUDIO_ARTIFACTS,
+                serde_json::json!({ "limit": 1, "cursor": first_page.next_cursor }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(second_page.artifacts.len(), 1);
+    assert_eq!(second_page.artifacts[0].prompt, "older comet");
+    assert!(second_page.next_cursor.is_none());
 
     client
         .call(

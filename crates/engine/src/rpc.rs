@@ -63,7 +63,7 @@ use zeron_proto::{
     CheckStudioRunRequest, CreateStudioConversationRequest, CreateStudioTurnRequest,
     DeleteStudioArtifactRequest, DeleteStudioConversationRequest, EngineInfo,
     EvaluateStudioComposerRequest, ExtendStudioTurnRequest, HarnessId, ImportStudioAssetRequest,
-    ListStudioArtifactsResponse, ListStudioConversationsRequest, ListStudioConversationsResponse,
+    ListStudioArtifactsRequest, ListStudioConversationsRequest, ListStudioConversationsResponse,
     ListStudioModelsRequest, ListStudioModelsResponse, ListStudioProvidersResponse,
     MarkStudioConversationSeenRequest, ProviderValidationState, QuoteStudioBatchRequest,
     QuoteStudioBatchResponse, QuoteStudioRunView, ReadStudioArtifactChunkRequest,
@@ -1586,25 +1586,28 @@ impl RpcService for EngineRpc {
                 Ok(RpcReply::Stream(stream.boxed()))
             }
             methods::LIST_STUDIO_ARTIFACTS => {
-                let artifacts = self
+                let request: ListStudioArtifactsRequest = parse_params(params)?;
+                let response = self
                     .studio
-                    .list_gallery()
+                    .list_gallery_page(request.limit, request.cursor.as_ref())
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
-                RpcReply::value(&ListStudioArtifactsResponse { artifacts })
+                RpcReply::value(&response)
             }
             methods::WATCH_STUDIO_GALLERY => {
+                let request: ListStudioArtifactsRequest = parse_params(params)?;
                 let changes = self.studio.subscribe_changes();
                 let store = self.studio.clone();
                 let stream = futures::stream::unfold(
-                    (changes, store, true),
-                    |(mut changes, store, first)| async move {
+                    (changes, store, request, true),
+                    |(mut changes, store, request, first)| async move {
                         if !first && changes.changed().await.is_err() {
                             return None;
                         }
-                        let value = store.list_gallery().ok().and_then(|artifacts| {
-                            serde_json::to_value(ListStudioArtifactsResponse { artifacts }).ok()
-                        })?;
-                        Some((value, (changes, store, false)))
+                        let value = store
+                            .list_gallery_page(request.limit, request.cursor.as_ref())
+                            .ok()
+                            .and_then(|response| serde_json::to_value(response).ok())?;
+                        Some((value, (changes, store, request, false)))
                     },
                 );
                 Ok(RpcReply::Stream(stream.boxed()))

@@ -11,12 +11,16 @@ final class StudioBrowserStore {
     var gallery: [StudioGalleryItem] = []
     var threadsLoading = false
     var galleryLoading = false
+    var galleryLoadingMore = false
     var threadsError: String?
     var galleryError: String?
     var reloadGeneration = 0
 
     @ObservationIgnored private let previews = NSCache<NSString, UIImage>()
     @ObservationIgnored private var previewTasks: [String: Task<UIImage?, Never>] = [:]
+    @ObservationIgnored private var galleryCursor: StudioGalleryCursor?
+
+    private let galleryPageSize = 60
 
     init() {
         previews.countLimit = 48
@@ -24,24 +28,14 @@ final class StudioBrowserStore {
     }
 
     func resolveDevice(from devices: [DeviceRow], online: (String) -> Bool) {
-        if let selectedDeviceId, devices.contains(where: { $0.id == selectedDeviceId }) {
+        if let selectedDeviceId,
+           devices.contains(where: { $0.id == selectedDeviceId && online($0.id) }) {
             return
         }
         let remembered = UserDefaults.standard.string(forKey: "studioDeviceId")
         selectedDeviceId = devices.first(where: { $0.id == remembered && online($0.id) })?.id
             ?? devices.first(where: { online($0.id) })?.id
             ?? devices.first?.id
-    }
-
-    func selectDevice(_ id: String) {
-        guard selectedDeviceId != id else { return }
-        selectedDeviceId = id
-        UserDefaults.standard.set(id, forKey: "studioDeviceId")
-        threads = []
-        gallery = []
-        threadsError = nil
-        galleryError = nil
-        reloadGeneration += 1
     }
 
     func reload() {
@@ -77,13 +71,25 @@ final class StudioBrowserStore {
         galleryLoading = true
         galleryError = nil
         do {
-            let stream = try await workspace.watchStudioGallery(deviceId: deviceId)
+            let stream = try await workspace.watchStudioGallery(
+                deviceId: deviceId,
+                pageSize: galleryPageSize
+            )
             for try await response in stream {
                 guard !Task.isCancelled, selectedDeviceId == deviceId else { return }
-                gallery = response.artifacts.sorted {
+                let firstPage = response.artifacts.sorted {
                     if $0.createdDate != $1.createdDate { return $0.createdDate > $1.createdDate }
                     return $0.id < $1.id
                 }
+                if gallery.count <= galleryPageSize {
+                    gallery = firstPage
+                } else if let anchor = firstPage.last,
+                          let anchorIndex = gallery.firstIndex(where: { $0.id == anchor.id }) {
+                    gallery = firstPage + gallery.dropFirst(anchorIndex + 1)
+                } else {
+                    gallery = firstPage
+                }
+                galleryCursor = response.nextCursor
                 galleryLoading = false
             }
         } catch {
@@ -91,6 +97,32 @@ final class StudioBrowserStore {
             galleryLoading = false
             galleryError = error.localizedDescription
         }
+    }
+
+    func loadMoreGallery(workspace: WorkspaceStore, deviceId: String) async {
+        guard selectedDeviceId == deviceId,
+              let cursor = galleryCursor,
+              !galleryLoadingMore else { return }
+        galleryLoadingMore = true
+        defer { galleryLoadingMore = false }
+        do {
+            let response = try await workspace.listStudioGalleryPage(
+                deviceId: deviceId,
+                pageSize: galleryPageSize,
+                cursor: cursor
+            )
+            guard !Task.isCancelled, selectedDeviceId == deviceId else { return }
+            let existing = Set(gallery.map(\.id))
+            gallery.append(contentsOf: response.artifacts.filter { !existing.contains($0.id) })
+            galleryCursor = response.nextCursor
+        } catch {
+            guard !Task.isCancelled, selectedDeviceId == deviceId else { return }
+            galleryError = error.localizedDescription
+        }
+    }
+
+    func shouldLoadMore(after item: StudioGalleryItem) -> Bool {
+        galleryCursor != nil && gallery.suffix(12).contains(where: { $0.id == item.id })
     }
 
     func preview(

@@ -408,10 +408,30 @@ pub struct StudioGalleryItem {
     pub duration_seconds: Option<f64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudioGalleryCursor {
+    pub created_at: DateTime<Utc>,
+    pub artifact_id: StudioArtifactId,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListStudioArtifactsRequest {
+    /// Omitted for the desktop's backwards-compatible full gallery stream.
+    /// Mobile clients set a bounded page size so large libraries stay cheap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<StudioGalleryCursor>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListStudioArtifactsResponse {
     pub artifacts: Vec<StudioGalleryItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<StudioGalleryCursor>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

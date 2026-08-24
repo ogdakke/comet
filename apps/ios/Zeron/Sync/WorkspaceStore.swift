@@ -597,9 +597,30 @@ final class WorkspaceStore {
     }
 
     func watchStudioGallery(
-        deviceId: String
+        deviceId: String,
+        pageSize: Int
     ) async throws -> AsyncThrowingStream<StudioGalleryResponse, Error> {
-        try await relay(for: deviceId).stream(method: "WatchStudioGallery", params: [:])
+        try await relay(for: deviceId).stream(
+            method: "WatchStudioGallery",
+            params: ["limit": pageSize]
+        )
+    }
+
+    func listStudioGalleryPage(
+        deviceId: String,
+        pageSize: Int,
+        cursor: StudioGalleryCursor
+    ) async throws -> StudioGalleryResponse {
+        try await relay(for: deviceId).call(
+            method: "ListStudioArtifacts",
+            params: [
+                "limit": pageSize,
+                "cursor": [
+                    "createdAt": cursor.createdAt,
+                    "artifactId": cursor.artifactId,
+                ],
+            ]
+        )
     }
 
     func watchStudioThread(
