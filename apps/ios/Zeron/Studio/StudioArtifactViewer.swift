@@ -406,31 +406,46 @@ struct StudioArtifactViewer: View {
     }
 
     @ViewBuilder private func selectedMedia(_ artifact: StudioArtifactDetail) -> some View {
-        Group {
-            if artifact.mediaKind == .video, let player = media.player(for: artifact.id) {
-                VideoPlayer(player: player)
-            } else if artifact.mediaKind == .image,
-                      let image = media.image(for: artifact.id) {
-                StudioZoomableImage(image: image)
-                    .id(artifact.id)
-                    .transition(.opacity)
-            } else if let preview = media.preview(for: artifact.id)
-                        ?? session.openingPreview(for: artifact.id)
-                        ?? browser.cachedPreview(artifactId: artifact.id) {
-                Image(uiImage: preview)
-                    .resizable()
-                    .scaledToFit()
-                    .transition(.opacity)
-            } else {
-                StudioMediaPreviewView(
-                    artifactId: artifact.id,
-                    mediaKind: artifact.mediaKind,
-                    browser: browser,
-                    contentMode: .fit
-                )
+        if artifact.mediaKind == .video, let player = media.player(for: artifact.id) {
+            VideoPlayer(player: player)
+        } else if artifact.mediaKind == .image {
+            ZStack {
+                if let preview = media.preview(for: artifact.id)
+                    ?? session.openingPreview(for: artifact.id)
+                    ?? browser.cachedPreview(artifactId: artifact.id) {
+                    Image(uiImage: preview)
+                        .resizable()
+                        .scaledToFit()
+                } else if media.image(for: artifact.id) == nil {
+                    StudioMediaPreviewView(
+                        artifactId: artifact.id,
+                        mediaKind: artifact.mediaKind,
+                        browser: browser,
+                        contentMode: .fit
+                    )
+                }
+
+                if let image = media.image(for: artifact.id) {
+                    StudioZoomableImage(image: image)
+                        .id(artifact.id)
+                        .transition(.opacity)
+                }
             }
+            .animation(.easeOut(duration: 0.16), value: media.image(for: artifact.id) != nil)
+        } else if let preview = media.preview(for: artifact.id)
+                    ?? session.openingPreview(for: artifact.id)
+                    ?? browser.cachedPreview(artifactId: artifact.id) {
+            Image(uiImage: preview)
+                .resizable()
+                .scaledToFit()
+        } else {
+            StudioMediaPreviewView(
+                artifactId: artifact.id,
+                mediaKind: artifact.mediaKind,
+                browser: browser,
+                contentMode: .fit
+            )
         }
-        .animation(.easeOut(duration: 0.16), value: media.image(for: artifact.id) != nil)
     }
 
     private var topControls: some View {
@@ -439,10 +454,9 @@ struct StudioArtifactViewer: View {
                 Button { closeViewer() } label: {
                     Image(systemName: "chevron.backward")
                         .font(.system(size: 14, weight: .semibold))
+                        .studioViewerGlassControl()
                 }
-                .buttonStyle(.glass)
-                .buttonBorderShape(.circle)
-                .controlSize(.regular)
+                .buttonStyle(.plain)
                 .accessibilityLabel("Close")
 
                 Spacer()
@@ -464,10 +478,9 @@ struct StudioArtifactViewer: View {
                 } label: {
                     Image(systemName: "ellipsis")
                         .font(.system(size: 15, weight: .semibold))
+                        .studioViewerGlassControl()
                 }
-                .buttonStyle(.glass)
-                .buttonBorderShape(.circle)
-                .controlSize(.regular)
+                .buttonStyle(.plain)
                 .accessibilityLabel("More actions")
             }
         }
@@ -539,10 +552,9 @@ struct StudioArtifactViewer: View {
                                 Image(systemName: "square.and.arrow.down")
                             }
                         }
+                        .studioViewerGlassControl()
                     }
-                    .buttonStyle(.glass)
-                    .buttonBorderShape(.circle)
-                    .controlSize(.regular)
+                    .buttonStyle(.plain)
                     .disabled(selected == nil || saving)
                     .accessibilityLabel("Download")
 
@@ -550,10 +562,9 @@ struct StudioArtifactViewer: View {
 
                     Button(role: .destructive) { confirmDelete = true } label: {
                         Image(systemName: "trash")
+                            .studioViewerGlassControl()
                     }
-                    .buttonStyle(.glass)
-                    .buttonBorderShape(.circle)
-                    .controlSize(.regular)
+                    .buttonStyle(.plain)
                     .disabled(selected == nil)
                     .accessibilityLabel("Delete")
                 }
@@ -672,21 +683,22 @@ private struct StudioZoomableImage: UIViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    func makeUIView(context: Context) -> UIScrollView {
-        let scroll = UIScrollView()
+    func makeUIView(context: Context) -> StudioImageScrollView {
+        let scroll = StudioImageScrollView()
         scroll.delegate = context.coordinator
         scroll.minimumZoomScale = 1
         scroll.maximumZoomScale = 6
         scroll.bouncesZoom = true
         scroll.showsHorizontalScrollIndicator = false
         scroll.showsVerticalScrollIndicator = false
-        scroll.backgroundColor = .black
+        scroll.backgroundColor = .clear
         scroll.panGestureRecognizer.isEnabled = false
 
         let imageView = context.coordinator.imageView
         imageView.contentMode = .scaleAspectFit
         imageView.clipsToBounds = true
         scroll.addSubview(imageView)
+        scroll.zoomImageView = imageView
 
         let doubleTap = UITapGestureRecognizer(
             target: context.coordinator,
@@ -698,11 +710,11 @@ private struct StudioZoomableImage: UIViewRepresentable {
         return scroll
     }
 
-    func updateUIView(_ scroll: UIScrollView, context: Context) {
-        context.coordinator.imageView.frame = scroll.bounds
+    func updateUIView(_ scroll: StudioImageScrollView, context: Context) {
         if context.coordinator.imageView.image !== image {
             context.coordinator.imageView.image = image
         }
+        scroll.setNeedsLayout()
     }
 
     final class Coordinator: NSObject, UIScrollViewDelegate {
@@ -731,5 +743,25 @@ private struct StudioZoomableImage: UIViewRepresentable {
                 ), animated: true)
             }
         }
+    }
+}
+
+private final class StudioImageScrollView: UIScrollView {
+    weak var zoomImageView: UIView?
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        if zoomScale <= minimumZoomScale + 0.001 {
+            zoomImageView?.frame = bounds
+        }
+    }
+}
+
+private extension View {
+    func studioViewerGlassControl() -> some View {
+        frame(width: 40, height: 40)
+            .glassEffect(.regular.interactive(), in: Circle())
+            .contentShape(Circle())
+            .padding(2)
     }
 }
