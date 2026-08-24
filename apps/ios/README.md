@@ -80,6 +80,8 @@ Transcript/
                         1−(1−p)^1.6 curve)
 Composer/               glass pill, Send→Steer→Stop morph, QuestionPanel
                         (paged, numbered options, 220ms auto-advance)
+Studio/                 paginated Gallery + Threads library, live thread feed,
+                        bounded in-memory previews, read-only artifact detail
 Theme/                  theme.rs port: oklch→sRGB converter, exact palette,
                         Geist/Geist Mono, motion timings + flavour words
 ```
@@ -98,6 +100,7 @@ Theme/                  theme.rs port: oklch→sRGB converter, exact palette,
 | Harness/model picker popover + curated catalogs | Brand-mark cards + catalog menu + reasoning-ladder chips (`HarnessCatalog.swift`, ported from crates/harness) |
 | Add-space palette (device + folder browser) | New-space sheet: device tabs + remote folder browser (ListFolders over the device-room relay, git repos badged) |
 | ControlRpc over device-room relay | `DeviceRelayClient` — binary `uleb128(len)+header+payload` frames, `{"s","k","to","from"}` header, ndjson ControlRpc; used for ListFolders + direct-to-host `Mutate {createSpace}` (local doc-write fallback when the host is offline) |
+| Studio gallery + conversations | Native Gallery/Threads switcher; cursor-paged metadata, lazy square tiles, watched thread feed, and bounded previews over the owning desktop's relay. No Studio disk cache or original-media download. |
 | Hover timestamps / copy | Context menus |
 | gpui `list()` sum-tree virtualization | `LazyVStack` + stable row ids + version fingerprints |
 | Stick-to-bottom spring, wheel-up breaks pin | Scroll-phase-gated pin + spring scrollTo, same 70/320pt thresholds |
