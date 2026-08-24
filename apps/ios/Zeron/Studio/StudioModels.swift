@@ -67,6 +67,28 @@ struct StudioArtifact: Codable, Hashable, Identifiable {
 struct StudioRunModel: Codable, Hashable {
     var id: String
     var displayName: String
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case displayName
+        case legacyDisplayName = "display_name"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        if let value = try container.decodeIfPresent(String.self, forKey: .displayName) {
+            displayName = value
+        } else {
+            displayName = try container.decode(String.self, forKey: .legacyDisplayName)
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(displayName, forKey: .displayName)
+    }
 }
 
 struct StudioRun: Codable, Hashable, Identifiable {

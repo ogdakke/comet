@@ -32,7 +32,7 @@ final class StudioModelsTests: XCTestCase {
             "sourceTurnId":null,"batchId":"batch-1","createdAt":"2026-08-24T18:00:00Z",
             "runs":[{
               "id":"run-1","position":0,"providerId":"venice",
-              "model":{"id":"flux","displayName":"Flux"},
+              "model":{"id":"flux","display_name":"Flux"},
               "state":"succeeded","progress":null,"error":null,
               "artifacts":[{
                 "id":"artifact-1","outputPosition":0,"mediaKind":"image",
