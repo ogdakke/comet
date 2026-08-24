@@ -64,6 +64,7 @@ struct StudioThreadView: View {
         .background(Theme.bg.ignoresSafeArea())
         .navigationTitle(store.thread?.conversation.title ?? "Thread")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.hidden, for: .tabBar)
         .task(id: "\(browser.selectedDeviceId ?? "none")-\(threadId)") {
             guard let workspace = model.workspace,
                   let deviceId = browser.selectedDeviceId else { return }

@@ -50,6 +50,9 @@ struct SessionView: View {
         }
         .navigationTitle(chat?.displayTitle ?? "Session")  // feeds the back menu
         .navigationBarTitleDisplayMode(.inline)
+        // Chat and Studio are top-level destinations. Once someone enters a
+        // thread, give its transcript and composer the full vertical canvas.
+        .toolbar(.hidden, for: .tabBar)
         .toolbar(removing: .title)  // the leading header owns the bar
         .toolbarBackground(.hidden, for: .navigationBar)
         .toolbar {
