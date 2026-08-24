@@ -500,7 +500,7 @@ impl RenderOnce for VideoControls {
             return div().into_any_element();
         }
         let theme = Theme::of(cx);
-        let fill = if theme.is_glass() {
+        let fill = if theme.is_frost() {
             theme.wash(0.3)
         } else {
             theme.surface_overlay

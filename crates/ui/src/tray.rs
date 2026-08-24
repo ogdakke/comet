@@ -196,7 +196,7 @@ pub fn render_tray(
                     .border_b_0()
                     .border_color(theme.border)
                     .bg(theme.surface_raised)
-                    .when(!theme.is_glass(), |el| el.shadow_md())
+                    .when(!theme.is_frost(), |el| el.shadow_md())
                     .child(faded_list),
             )
             .into_any_element(),

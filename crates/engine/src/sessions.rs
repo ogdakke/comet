@@ -1025,8 +1025,14 @@ impl SessionsEngine {
                 request.resume = None; // dispatch re-injects the remembered session
                 request.attachments = Vec::new();
                 let harness_id = host.harness_for_request(&chat_id, &request);
-                match sessions
-                    .dispatch(&chat_id, harness_id, request, Some(user_id))
+                match host
+                    .dispatch_with_source_context(
+                        &sessions,
+                        &chat_id,
+                        harness_id,
+                        request,
+                        Some(user_id),
+                    )
                     .await
                 {
                     Ok(_) => {
@@ -1653,6 +1659,12 @@ async fn drive_run(
             None => Some(std::time::Duration::from_secs(20)),
         };
     let mut self_continued_turn = false;
+    // Spawn chips that have SETTLED (tagged Done seen). Content events for a
+    // settled chip with no live sink are dropped — a straggler frame after
+    // the freeze must not mint a new doc entry or wedge the transcript back
+    // into Streaming. Only a steer (UserMessage) legitimately REOPENS a
+    // settled subagent: it announces more work is coming.
+    let mut settled_subagents: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Live subagent sinks, parent tool-use id → transcript doc state.
     let mut subagents: std::collections::HashMap<String, SubagentSink> =
         std::collections::HashMap::new();
@@ -1824,6 +1836,16 @@ async fn drive_run(
         } = &event
         {
             inner.publish(&chat_id, &event);
+            let is_steer = matches!(sub_event.as_ref(), AgentEvent::UserMessage { .. });
+            if is_steer {
+                settled_subagents.remove(parent_tool_use_id);
+            } else if settled_subagents.contains(parent_tool_use_id)
+                && !subagents.contains_key(parent_tool_use_id)
+            {
+                // Straggler after the freeze: chip-only silence, never a
+                // reopened doc.
+                continue;
+            }
             let sub_id = subagent_doc_id(&chat_id, parent_tool_use_id);
             let chip_streaming = folded
                 .iter()
@@ -1886,6 +1908,9 @@ async fn drive_run(
                 }
             }
             let done = matches!(sub_event.as_ref(), AgentEvent::Done { .. });
+            if done {
+                settled_subagents.insert(parent_tool_use_id.clone());
+            }
             if let Some(sink) = subagents.get_mut(parent_tool_use_id) {
                 zeron_doc::fold_event_into_parts(&mut sink.folded, sub_event);
                 sink.dirty = true;
@@ -2360,8 +2385,18 @@ async fn drive_run(
                 request.resume = None;
                 request.attachments = Vec::new();
                 tracing::info!(chat = %chat, "re-dispatching steer orphaned by a dying run");
-                if let Err(err) = engine
-                    .dispatch(&chat, harness_id, request, Some(steer.message_id.clone()))
+                let Some(host) = engine.inner.doc_host() else {
+                    tracing::warn!(chat = %chat, "orphaned steer lost: doc host unavailable");
+                    break;
+                };
+                if let Err(err) = host
+                    .dispatch_with_source_context(
+                        &engine,
+                        &chat,
+                        harness_id,
+                        request,
+                        Some(steer.message_id.clone()),
+                    )
                     .await
                 {
                     tracing::warn!(chat = %chat, error = %err, "orphaned steer re-dispatch failed");
