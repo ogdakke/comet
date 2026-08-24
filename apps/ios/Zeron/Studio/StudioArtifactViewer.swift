@@ -370,6 +370,7 @@ struct StudioArtifactViewer: View {
                         selectedMedia(artifact)
                     } else if let image = media.image(for: artifact.id)
                                 ?? media.preview(for: artifact.id)
+                                ?? session.openingPreview(for: artifact.id)
                                 ?? browser.cachedPreview(artifactId: artifact.id) {
                         Image(uiImage: image)
                             .resizable()
@@ -405,27 +406,31 @@ struct StudioArtifactViewer: View {
     }
 
     @ViewBuilder private func selectedMedia(_ artifact: StudioArtifactDetail) -> some View {
-        if artifact.mediaKind == .video, let player = media.player(for: artifact.id) {
-            VideoPlayer(player: player)
-        } else if artifact.mediaKind == .image,
-                  let image = media.image(for: artifact.id)
-                    ?? media.preview(for: artifact.id)
-                    ?? browser.cachedPreview(artifactId: artifact.id) {
-            StudioZoomableImage(image: image)
-                .id(artifact.id)
-        } else if let preview = media.preview(for: artifact.id)
-                    ?? browser.cachedPreview(artifactId: artifact.id) {
-            Image(uiImage: preview)
-                .resizable()
-                .scaledToFit()
-        } else {
-            StudioMediaPreviewView(
-                artifactId: artifact.id,
-                mediaKind: artifact.mediaKind,
-                browser: browser,
-                contentMode: .fit
-            )
+        Group {
+            if artifact.mediaKind == .video, let player = media.player(for: artifact.id) {
+                VideoPlayer(player: player)
+            } else if artifact.mediaKind == .image,
+                      let image = media.image(for: artifact.id) {
+                StudioZoomableImage(image: image)
+                    .id(artifact.id)
+                    .transition(.opacity)
+            } else if let preview = media.preview(for: artifact.id)
+                        ?? session.openingPreview(for: artifact.id)
+                        ?? browser.cachedPreview(artifactId: artifact.id) {
+                Image(uiImage: preview)
+                    .resizable()
+                    .scaledToFit()
+                    .transition(.opacity)
+            } else {
+                StudioMediaPreviewView(
+                    artifactId: artifact.id,
+                    mediaKind: artifact.mediaKind,
+                    browser: browser,
+                    contentMode: .fit
+                )
+            }
         }
+        .animation(.easeOut(duration: 0.16), value: media.image(for: artifact.id) != nil)
     }
 
     private var topControls: some View {
@@ -437,7 +442,7 @@ struct StudioArtifactViewer: View {
                 }
                 .buttonStyle(.glass)
                 .buttonBorderShape(.circle)
-                .controlSize(.small)
+                .controlSize(.regular)
                 .accessibilityLabel("Close")
 
                 Spacer()
@@ -462,7 +467,7 @@ struct StudioArtifactViewer: View {
                 }
                 .buttonStyle(.glass)
                 .buttonBorderShape(.circle)
-                .controlSize(.small)
+                .controlSize(.regular)
                 .accessibilityLabel("More actions")
             }
         }
@@ -537,7 +542,7 @@ struct StudioArtifactViewer: View {
                     }
                     .buttonStyle(.glass)
                     .buttonBorderShape(.circle)
-                    .controlSize(.small)
+                    .controlSize(.regular)
                     .disabled(selected == nil || saving)
                     .accessibilityLabel("Download")
 
@@ -548,7 +553,7 @@ struct StudioArtifactViewer: View {
                     }
                     .buttonStyle(.glass)
                     .buttonBorderShape(.circle)
-                    .controlSize(.small)
+                    .controlSize(.regular)
                     .disabled(selected == nil)
                     .accessibilityLabel("Delete")
                 }

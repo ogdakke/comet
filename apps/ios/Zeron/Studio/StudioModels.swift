@@ -5,6 +5,7 @@
 
 import Foundation
 import Observation
+import UIKit
 
 enum StudioMediaKind: String, Codable, Hashable {
     case image
@@ -195,15 +196,26 @@ final class StudioViewerSession: Identifiable {
     var artifacts: [StudioArtifactDetail]
     let openedFromGallery: Bool
     var selectedId: String
+    let openingPreview: UIImage?
 
-    init(artifacts: [StudioArtifactDetail], selectedId: String, openedFromGallery: Bool) {
+    init(
+        artifacts: [StudioArtifactDetail],
+        selectedId: String,
+        openedFromGallery: Bool,
+        openingPreview: UIImage? = nil
+    ) {
         self.artifacts = artifacts
         self.selectedId = selectedId
         self.openedFromGallery = openedFromGallery
+        self.openingPreview = openingPreview
     }
 
     var selected: StudioArtifactDetail? {
         artifacts.first { $0.id == selectedId }
+    }
+
+    func openingPreview(for artifactId: String) -> UIImage? {
+        artifactId == selectedId ? openingPreview : nil
     }
 
     func append(_ additions: [StudioArtifactDetail]) {

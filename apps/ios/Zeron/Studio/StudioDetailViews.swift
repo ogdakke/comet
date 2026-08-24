@@ -115,7 +115,8 @@ struct StudioThreadView: View {
                             openViewer(StudioViewerSession(
                                 artifacts: viewerArtifacts(in: thread),
                                 selectedId: artifact.id,
-                                openedFromGallery: false
+                                openedFromGallery: false,
+                                openingPreview: browser.cachedPreview(artifactId: artifact.id)
                             ))
                         } label: {
                             Rectangle()

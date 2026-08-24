@@ -228,7 +228,8 @@ private struct StudioGalleryView: View {
                             openViewer(StudioViewerSession(
                                 artifacts: browser.gallery.reversed().map(StudioArtifactDetail.init(item:)),
                                 selectedId: item.id,
-                                openedFromGallery: true
+                                openedFromGallery: true,
+                                openingPreview: browser.cachedPreview(artifactId: item.id)
                             ))
                         } label: {
                             Rectangle()
@@ -493,6 +494,19 @@ struct StudioMediaPreviewView: View {
     let browser: StudioBrowserStore
     var contentMode: ContentMode = .fill
     @State private var image: UIImage?
+
+    init(
+        artifactId: String,
+        mediaKind: StudioMediaKind,
+        browser: StudioBrowserStore,
+        contentMode: ContentMode = .fill
+    ) {
+        self.artifactId = artifactId
+        self.mediaKind = mediaKind
+        self.browser = browser
+        self.contentMode = contentMode
+        _image = State(initialValue: browser.cachedPreview(artifactId: artifactId))
+    }
 
     var body: some View {
         ZStack {
