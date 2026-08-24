@@ -633,6 +633,13 @@ final class WorkspaceStore {
         )
     }
 
+    func markStudioThreadSeen(deviceId: String, threadId: String) async {
+        let _: StudioThreadSummary? = try? await relay(for: deviceId).call(
+            method: "MarkStudioConversationSeen",
+            params: ["conversationId": threadId]
+        )
+    }
+
     /// Preview reads stay bounded. Originals are deliberately absent from the
     /// first mobile slice so opening Studio can never fill the phone with the
     /// desktop's artifact set.

@@ -2,7 +2,7 @@ import SwiftUI
 
 enum StudioRoute: Hashable {
     case thread(String)
-    case artifact(String)
+    case artifact(StudioArtifactDetail)
 }
 
 private enum StudioLibraryMode: String, CaseIterable, Identifiable {
@@ -26,17 +26,15 @@ private struct StudioLibrarySwitcher: View {
                         }
                     } label: {
                         Text(mode.rawValue)
-                            .font(Theme.sans(16, weight: .medium))
-                            .foregroundStyle(Theme.text)
+                            .font(Theme.sans(14, weight: .medium))
+                            .foregroundStyle(selection == mode ? Theme.text : Theme.textMuted)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .background {
                                 if selection == mode {
                                     Capsule()
-                                        .fill(Theme.bg.opacity(0.66))
-                                        .matchedGeometryEffect(
-                                            id: "studio-library-selection",
-                                            in: selectionMotion
-                                        )
+                                        .fill(.clear)
+                                        .glassEffect(.regular.interactive(), in: Capsule())
+                                        .glassEffectID("studio-library-selection", in: selectionMotion)
                                 }
                             }
                     }
@@ -44,8 +42,8 @@ private struct StudioLibrarySwitcher: View {
                     .accessibilityAddTraits(selection == mode ? .isSelected : [])
                 }
             }
-            .padding(5)
-            .frame(width: 220, height: 52)
+            .padding(4)
+            .frame(width: 188, height: 44)
             .glassEffect(.regular.interactive(), in: Capsule())
         }
         .accessibilityElement(children: .contain)
@@ -77,10 +75,10 @@ struct StudioRootView: View {
                 .scrollEdgeEffectStyle(.soft, for: .top)
             .navigationDestination(for: StudioRoute.self) { route in
                 switch route {
-                case .thread:
-                    StudioDestinationPlaceholder(title: "Thread", symbol: "rectangle.stack")
-                case .artifact:
-                    StudioDestinationPlaceholder(title: "Artifact", symbol: "photo")
+                case .thread(let threadId):
+                    StudioThreadView(threadId: threadId, browser: browser, path: $path)
+                case .artifact(let artifact):
+                    StudioArtifactView(artifact: artifact, browser: browser)
                 }
             }
             .task(id: model.studioHosts.map(\.id).joined()) {
@@ -164,7 +162,7 @@ private struct StudioGalleryView: View {
                 LazyVGrid(columns: columns, spacing: 2) {
                     ForEach(browser.gallery) { item in
                         Button {
-                            path.append(.artifact(item.id))
+                            path.append(.artifact(StudioArtifactDetail(item: item)))
                         } label: {
                             Rectangle()
                                 .fill(Theme.elementHover)
@@ -332,9 +330,25 @@ private struct StudioThreadsView: View {
 }
 
 struct StudioPreviewView: View {
-    @Environment(AppModel.self) private var model
     let item: StudioGalleryItem
     let browser: StudioBrowserStore
+
+    var body: some View {
+        StudioMediaPreviewView(
+            artifactId: item.id,
+            mediaKind: item.mediaKind,
+            browser: browser,
+            contentMode: .fill
+        )
+    }
+}
+
+struct StudioMediaPreviewView: View {
+    @Environment(AppModel.self) private var model
+    let artifactId: String
+    let mediaKind: StudioMediaKind
+    let browser: StudioBrowserStore
+    var contentMode: ContentMode = .fill
     @State private var image: UIImage?
 
     var body: some View {
@@ -343,35 +357,23 @@ struct StudioPreviewView: View {
             if let image {
                 Image(uiImage: image)
                     .resizable()
-                    .scaledToFill()
+                    .aspectRatio(contentMode: contentMode)
             } else {
-                Image(systemName: item.mediaKind == .video ? "film" : "photo")
+                Image(systemName: mediaKind == .video ? "film" : "photo")
                     .font(.system(size: 20, weight: .light))
                     .foregroundStyle(Theme.textFaint.opacity(0.5))
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipped()
-        .task(id: "\(browser.selectedDeviceId ?? "none")-\(item.id)") {
+        .task(id: "\(browser.selectedDeviceId ?? "none")-\(artifactId)") {
             guard let deviceId = browser.selectedDeviceId,
                   let workspace = model.workspace else { return }
             image = await browser.preview(
-                artifactId: item.id,
+                artifactId: artifactId,
                 deviceId: deviceId,
                 workspace: workspace
             )
         }
-    }
-}
-
-private struct StudioDestinationPlaceholder: View {
-    let title: String
-    let symbol: String
-
-    var body: some View {
-        ContentUnavailableView(title, systemImage: symbol)
-            .background(Theme.bg.ignoresSafeArea())
-            .navigationTitle(title)
-            .navigationBarTitleDisplayMode(.inline)
     }
 }

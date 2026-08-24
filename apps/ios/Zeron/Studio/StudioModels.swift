@@ -120,6 +120,48 @@ struct StudioGalleryItem: Codable, Hashable, Identifiable {
     }
 }
 
+struct StudioArtifactDetail: Hashable, Identifiable {
+    var id: String
+    var mediaKind: StudioMediaKind
+    var width: UInt32?
+    var height: UInt32?
+    var durationSeconds: Double?
+    var sizeBytes: UInt64
+    var prompt: String
+    var modelDisplayName: String
+    var createdAt: String
+
+    init(item: StudioGalleryItem) {
+        id = item.id
+        mediaKind = item.mediaKind
+        width = item.width
+        height = item.height
+        durationSeconds = item.durationSeconds
+        sizeBytes = item.sizeBytes
+        prompt = item.prompt
+        modelDisplayName = item.modelDisplayName
+        createdAt = item.createdAt
+    }
+
+    init(artifact: StudioArtifact, turn: StudioTurn, run: StudioRun) {
+        id = artifact.id
+        mediaKind = artifact.mediaKind
+        width = artifact.width
+        height = artifact.height
+        durationSeconds = artifact.durationSeconds
+        sizeBytes = artifact.sizeBytes
+        prompt = turn.prompt
+        modelDisplayName = run.model.displayName
+        createdAt = artifact.createdAt
+    }
+
+    var createdDate: Date { studioDate(createdAt) }
+    var aspectRatio: CGFloat {
+        guard let width, let height, height > 0 else { return 1 }
+        return CGFloat(width) / CGFloat(height)
+    }
+}
+
 struct StudioThreadListResponse: Codable {
     var conversations: [StudioThreadSummary]
 }
