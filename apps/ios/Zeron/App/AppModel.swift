@@ -305,6 +305,15 @@ final class AppModel {
     // MARK: Unified data accessors (demo or live — one path for views)
 
     var spaces: [Space] { demo?.spaces ?? workspace?.spaces ?? [] }
+    var devices: [DeviceRow] { demo?.devices ?? workspace?.devices ?? [] }
+
+    /// Devices that can host the Studio engine. The phone is a viewport and
+    /// never advertises itself as an execution target.
+    var studioHosts: [DeviceRow] {
+        devices.filter { device in
+            device.id != deviceId && ["macos", "linux", "windows"].contains(device.platform)
+        }
+    }
 
     // "Connected" for the header spinner means "server state has reached this
     // session" — over the socket OR the HTTPS pull (which lands in ~1 RTT and
