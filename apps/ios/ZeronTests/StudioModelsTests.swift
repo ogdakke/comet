@@ -50,4 +50,41 @@ final class StudioModelsTests: XCTestCase {
         XCTAssertEqual(thread.turns.first?.runs.first?.model.displayName, "Flux")
         XCTAssertEqual(thread.turns.first?.runs.first?.artifacts.first?.aspectRatio, 1)
     }
+
+    @MainActor
+    func testViewerSessionAppendsLargeGalleryPagesWithoutDuplicates() {
+        let first = (0..<60).map(galleryItem)
+        let session = StudioViewerSession(
+            artifacts: first.map(StudioArtifactDetail.init(item:)),
+            selectedId: first[59].id,
+            openedFromGallery: true
+        )
+        let remaining = (40..<1_100).map(galleryItem)
+
+        session.append(remaining.map(StudioArtifactDetail.init(item:)))
+
+        XCTAssertEqual(session.artifacts.count, 1_100)
+        XCTAssertEqual(Set(session.artifacts.map(\.id)).count, 1_100)
+        XCTAssertEqual(session.selected?.id, "artifact-59")
+    }
+
+    private func galleryItem(_ index: Int) -> StudioGalleryItem {
+        StudioGalleryItem(
+            id: "artifact-\(index)",
+            conversationId: "thread-\(index / 4)",
+            turnId: "turn-\(index / 4)",
+            outputPosition: UInt32(index % 4),
+            mediaKind: .image,
+            mimeType: "image/jpeg",
+            sizeBytes: 1_024,
+            width: 1_024,
+            height: 1_024,
+            prompt: "Prompt \(index)",
+            modelDisplayName: "Model",
+            createdAt: "2026-08-24T18:00:00Z",
+            thumbhash: nil,
+            sourceArtifactId: nil,
+            durationSeconds: nil
+        )
+    }
 }
