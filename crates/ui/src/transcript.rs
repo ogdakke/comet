@@ -67,6 +67,11 @@ const MAX_SAVED_VIEWPORTS: usize = 256;
 /// smooth enough to track text while avoiding a permanent animation-frame loop
 /// on low-end devices.
 const SELECTION_SCROLL_TICK_MS: u64 = 24;
+/// Cosmetic streaming veils share one transcript-level 30fps clock. Token
+/// commits still render immediately; only intermediate opacity frames are
+/// coalesced so a 120Hz display does not rebuild the live markdown tail four
+/// times more often than the working indicator beside it.
+const VEIL_TICK_MS: u64 = 33;
 const SELECTION_SCROLL_EDGE_PX: f32 = 36.0;
 const SELECTION_SCROLL_MAX_STEP_PX: f32 = 24.0;
 /// Transcript column max width (zeron 46rem).
@@ -2051,6 +2056,9 @@ pub struct Transcript {
     /// One-shot timer rescheduled only while the pointer remains in an edge
     /// zone. Dropping it on mouse-up stops all selection scroll work.
     selection_scroll_task: Option<Task<()>>,
+    /// At most one cosmetic live-text fade tick per transcript. All visible
+    /// live rows share it, avoiding one animation-frame callback per row.
+    veil_frame_task: Option<Task<()>>,
     /// MessageRail width gate (set by the shell from the container width).
     rail_enabled: bool,
     /// Height of the shell's composer/status/terminal stack overlaying the
@@ -2228,6 +2236,7 @@ impl Transcript {
             scroll_anim: None,
             selection_drag_position: None,
             selection_scroll_task: None,
+            veil_frame_task: None,
             rail_enabled,
             bottom_clearance: 0.0,
             rail_hover: None,
@@ -2639,6 +2648,21 @@ impl Transcript {
     fn stop_selection_scroll(&mut self) {
         self.selection_drag_position = None;
         self.selection_scroll_task = None;
+    }
+
+    fn schedule_veil_frame(&mut self, cx: &mut Context<Self>) {
+        if self.veil_frame_task.is_some() {
+            return;
+        }
+        self.veil_frame_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(VEIL_TICK_MS))
+                .await;
+            let _ = this.update(cx, |transcript, cx| {
+                transcript.veil_frame_task = None;
+                cx.notify();
+            });
+        }));
     }
 
     fn schedule_selection_scroll(&mut self, cx: &mut Context<Self>) {
@@ -4143,11 +4167,11 @@ impl Transcript {
                 if let Some(veil) = &veil {
                     veil.borrow_mut().finish_seeding();
                 }
-                // Drive the veil clock: while any chunk is still dissolving,
-                // repaint next frame (self-limiting — one callback per frame).
+                // Drive cosmetic opacity from one transcript-level clock.
+                // Commits notify immediately; intermediate fade frames do not
+                // need to follow a 120Hz display refresh rate.
                 if veil.is_some_and(|v| v.borrow().is_fading()) {
-                    let id = cx.entity_id();
-                    window.on_next_frame(move |_, cx| cx.notify(id));
+                    self.schedule_veil_frame(cx);
                 }
                 el
             }
