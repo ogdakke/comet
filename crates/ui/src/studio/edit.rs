@@ -626,7 +626,7 @@ impl StudioPage {
             .border_1()
             .border_color(theme.border)
             .bg(theme.input_glass_bg())
-            .when(!theme.is_glass(), |card| card.shadow_lg())
+            .when(!theme.is_frost(), |card| card.shadow_lg())
             .flex()
             .flex_row()
             .items_center()

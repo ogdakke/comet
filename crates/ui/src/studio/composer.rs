@@ -1665,7 +1665,7 @@ impl StudioPage {
             .border_1()
             .border_color(theme.border)
             .bg(theme.input_glass_bg())
-            .when(!theme.is_glass(), |composer| composer.shadow_lg())
+            .when(!theme.is_frost(), |composer| composer.shadow_lg())
             .on_drag_move::<ExternalPaths>(cx.listener(
                 |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
                     let inside = e.bounds.contains(&e.event.position);
@@ -2489,10 +2489,7 @@ fn filter_rail_row(
 }
 
 fn filter_rail_indicator(theme: &Theme) -> gpui::Div {
-    let tint = match theme.appearance {
-        crate::theme::Appearance::Dark => crate::theme::oklch(0.702, 0.183, 293.541),
-        crate::theme::Appearance::Light => crate::theme::oklch(0.541, 0.281, 293.009),
-    };
+    let tint = theme.accent;
     div()
         .absolute()
         .right(px(-4.0))

@@ -1,5 +1,5 @@
 //! Text input primitive: caret, selection, IME, undo, wrap, and pointer
-//! gestures (click, double-click word, triple-click line, drag-select).
+//! gestures (click, double-click selects the whole value, drag-select).
 //! Adapted from gpui's `examples/input.rs`.
 //!
 //! Dialogs, pickers, and the composer well all share this editor. Composer-
@@ -2051,34 +2051,23 @@ impl TextInput {
         self.drag_position = Some(event.position);
         self.drag_generation = self.drag_generation.wrapping_add(1);
         self.drag_autoscroll_active = false;
+        // Two clicks or more take the whole field. Arming a drag here would
+        // collapse that selection on the next mouse move.
+        if event.click_count >= 2 {
+            self.is_selecting = false;
+            self.drag_position = None;
+            self.select_all(&SelectAll, window, cx);
+            return;
+        }
         let index = self.index_for_mouse_position(event.position);
         if event.modifiers.shift {
             self.select_granularity = Granularity::Char;
             self.select_to(index, cx);
             return;
         }
-        self.select_granularity = match event.click_count {
-            2 => Granularity::Word,
-            n if n >= 3 => Granularity::Paragraph,
-            _ => Granularity::Char,
-        };
-        if self.select_granularity == Granularity::Char {
-            self.select_anchor = index..index;
-            self.move_to(index, cx);
-            return;
-        }
-        let unit = self.projection.normalize_range(input_snap_unit(
-            &self.content,
-            index,
-            self.select_granularity,
-        ));
-        self.select_anchor = unit.clone();
-        self.selected_range = unit;
-        self.selection_reversed = false;
-        self.follow_cursor = true;
-        self.reset_blink();
-        cx.emit(TextInputEvent::CursorMoved);
-        cx.notify();
+        self.select_granularity = Granularity::Char;
+        self.select_anchor = index..index;
+        self.move_to(index, cx);
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {

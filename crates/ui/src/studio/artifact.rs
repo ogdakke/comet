@@ -2990,7 +2990,7 @@ impl StudioPage {
 
         // Same flush glass column as the chat changes pane: translucent
         // `bg` over the window frost, no extra menu blur or overlay tint.
-        let inspector_bg = if theme.is_glass() {
+        let inspector_bg = if theme.is_frost() {
             theme.bg.opacity(0.4)
         } else {
             theme.bg

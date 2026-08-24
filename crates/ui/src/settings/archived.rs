@@ -398,6 +398,7 @@ mod tests {
             cwd: None,
             branch: None,
             checkout_id: None,
+            source_context: None,
             config: None,
             last_message_preview: None,
             last_message_at: Some(Utc::now() - Duration::minutes(minutes_ago)),
