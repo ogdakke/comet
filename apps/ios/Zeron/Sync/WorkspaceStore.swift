@@ -11,6 +11,7 @@
 // Field names are identical to the old Loro rows (camelCase, epoch-ms
 // timestamps) so the projection — and every view above it — is unchanged.
 
+import CryptoKit
 import Foundation
 import Observation
 
@@ -585,6 +586,108 @@ final class WorkspaceStore {
     }
 
     // MARK: Studio relay
+
+    func listStudioProviders(deviceId: String) async throws -> [StudioProviderConnection] {
+        let response: StudioProviderListResponse = try await relay(for: deviceId).call(
+            method: "ListStudioProviders",
+            params: [:]
+        )
+        return response.providers
+    }
+
+    func listStudioModels(
+        deviceId: String,
+        providerId: String,
+        refresh: Bool = false
+    ) async throws -> StudioModelListResponse {
+        try await relay(for: deviceId).call(
+            method: "ListStudioModels",
+            params: ["providerId": providerId, "refresh": refresh]
+        )
+    }
+
+    func evaluateStudioComposer(
+        deviceId: String,
+        snapshot: StudioComposerSnapshot,
+        providerId: String
+    ) async throws -> StudioComposerEvaluation {
+        try await relay(for: deviceId).call(
+            method: "EvaluateStudioComposer",
+            params: [
+                "composer": try Self.studioJSONObject(snapshot),
+                "providerId": providerId,
+            ]
+        )
+    }
+
+    func importStudioAsset(
+        deviceId: String,
+        assetId: String,
+        data: Data,
+        mimeType: String
+    ) async throws -> StudioComposerAttachment {
+        guard !data.isEmpty else { throw RelayError.rpc("The selected Studio attachment is empty") }
+        guard data.count <= 64 * 1024 * 1024 else {
+            throw RelayError.rpc("Studio attachments must be 64 MB or smaller")
+        }
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        let chunkSize = 256 * 1024
+        var offset = 0
+        while offset < data.count {
+            try Task.checkCancellation()
+            let end = min(offset + chunkSize, data.count)
+            let last = end == data.count
+            var params: [String: Any] = [
+                "assetId": assetId,
+                "offset": offset,
+                "data": data[offset..<end].base64EncodedString(),
+                "last": last,
+                "mimeHint": mimeType,
+            ]
+            if last { params["expectedHash"] = digest }
+            let response: JSONValue = try await relay(for: deviceId).call(
+                method: "ImportStudioAsset",
+                params: params,
+                timeoutSeconds: last ? 150 : 90
+            )
+            if last {
+                let encoded = try JSONEncoder().encode(response)
+                return try JSONDecoder().decode(StudioComposerAttachment.self, from: encoded)
+            }
+            guard let nextOffset = response.objectValue?["nextOffset"]?.int64Value,
+                  nextOffset > Int64(offset), nextOffset <= Int64(data.count) else {
+                throw RelayError.rpc("Studio attachment upload stopped advancing")
+            }
+            offset = Int(nextOffset)
+        }
+        throw RelayError.rpc("Studio did not commit the attachment")
+    }
+
+    func createStudioTurn(
+        deviceId: String,
+        snapshot: StudioComposerSnapshot
+    ) async throws -> StudioTurn {
+        let request = StudioCreateTurnRequest(
+            conversationId: snapshot.conversationId ?? "",
+            prompt: snapshot.prompt,
+            sourceTurnId: snapshot.sourceTurnId,
+            composer: snapshot
+        )
+        return try await relay(for: deviceId).call(
+            method: "CreateStudioTurn",
+            params: try Self.studioJSONObject(request)
+        )
+    }
+
+    private nonisolated static func studioJSONObject<T: Encodable>(
+        _ value: T
+    ) throws -> [String: Any] {
+        let data = try JSONEncoder().encode(value)
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw RelayError.rpc("Studio request could not be encoded")
+        }
+        return object
+    }
 
     func watchStudioThreads(
         deviceId: String,
