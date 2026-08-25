@@ -69,6 +69,7 @@ struct StudioRootView: View {
                 .background(Theme.surface.ignoresSafeArea())
                 .navigationTitle("")
                 .navigationBarTitleDisplayMode(.inline)
+                .toolbarBackground(.hidden, for: .navigationBar)
                 .toolbar {
                     ToolbarItem(placement: .principal) {
                         StudioLibrarySwitcher(selection: $mode)
@@ -233,6 +234,7 @@ private struct StudioGalleryView: View {
                 deleteItem: { artifactToDelete = StudioArtifactDetail(item: $0) },
                 loadOlder: loadOlder
             )
+            .ignoresSafeArea(.container, edges: [.top, .bottom])
             .confirmationDialog(
                 "Delete this creation?",
                 isPresented: Binding(
