@@ -3,46 +3,6 @@ import ImageIO
 import Observation
 import UIKit
 
-private actor StudioPreviewGate {
-    private let limit: Int
-    private var active = 0
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-
-    init(limit: Int) {
-        self.limit = limit
-    }
-
-    func load(
-        artifactId: String,
-        deviceId: String,
-        workspace: WorkspaceStore
-    ) async throws -> Data {
-        await acquire()
-        defer { release() }
-        try Task.checkCancellation()
-        return try await workspace.readStudioPreview(
-            deviceId: deviceId,
-            artifactId: artifactId
-        )
-    }
-
-    private func acquire() async {
-        if active < limit {
-            active += 1
-            return
-        }
-        await withCheckedContinuation { waiters.append($0) }
-    }
-
-    private func release() {
-        if waiters.isEmpty {
-            active -= 1
-        } else {
-            waiters.removeFirst().resume()
-        }
-    }
-}
-
 @MainActor
 @Observable
 final class StudioBrowserStore {
@@ -57,7 +17,6 @@ final class StudioBrowserStore {
     var reloadGeneration = 0
 
     @ObservationIgnored private let previews = NSCache<NSString, UIImage>()
-    @ObservationIgnored private let previewGate = StudioPreviewGate(limit: 4)
     @ObservationIgnored private var previewTasks: [String: Task<UIImage?, Never>] = [:]
     @ObservationIgnored private var previewTaskGenerations: [String: UUID] = [:]
     @ObservationIgnored private var previewDemand: [String: Int] = [:]
@@ -237,10 +196,9 @@ final class StudioBrowserStore {
 
         let generation = UUID()
         let task = Task<UIImage?, Never> {
-            guard let data = try? await previewGate.load(
-                artifactId: artifactId,
+            guard let data = try? await workspace.readStudioPreview(
                 deviceId: deviceId,
-                workspace: workspace
+                artifactId: artifactId
             ) else { return nil }
             let image = await Task.detached(priority: .utility) {
                 Self.downsample(data: data, maximumPixelSize: 448)

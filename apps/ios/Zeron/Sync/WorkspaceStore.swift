@@ -15,6 +15,58 @@ import CryptoKit
 import Foundation
 import Observation
 
+enum StudioMediaRequestPriority {
+    case foreground
+    case background
+}
+
+/// The device relay carries control traffic and Studio media over one socket.
+/// Keep chunked media transfers ordered so gallery prefetch cannot create a
+/// wall of RPCs that starves the relay keepalive or the image being opened.
+actor StudioMediaRequestGate {
+    private struct Waiter {
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
+    private var occupied = false
+    private var foreground: [Waiter] = []
+    private var background: [Waiter] = []
+
+    func acquire(priority: StudioMediaRequestPriority) async throws {
+        if !occupied {
+            occupied = true
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            let waiter = Waiter(continuation: continuation)
+            switch priority {
+            case .foreground: foreground.append(waiter)
+            case .background: background.append(waiter)
+            }
+        }
+        if Task.isCancelled {
+            release()
+            throw CancellationError()
+        }
+    }
+
+    func release() {
+        if let waiter = popNext() {
+            waiter.continuation.resume()
+        } else {
+            occupied = false
+        }
+    }
+
+    private func popNext() -> Waiter? {
+        if !foreground.isEmpty { return foreground.removeFirst() }
+        if !background.isEmpty { return background.removeFirst() }
+        return nil
+    }
+
+}
+
 @MainActor
 @Observable
 final class WorkspaceStore {
@@ -49,6 +101,7 @@ final class WorkspaceStore {
     /// When the registry room (re)joined — the dial-gate warm-up clock
     /// restarts on every rejoin.
     @ObservationIgnored private var registryJoinedAt: Int64?
+    @ObservationIgnored private let studioMediaGate = StudioMediaRequestGate()
     private let config: AppConfig
 
     init(config: AppConfig) {
@@ -747,12 +800,20 @@ final class WorkspaceStore {
     /// first mobile slice so opening Studio can never fill the phone with the
     /// desktop's artifact set.
     func readStudioPreview(deviceId: String, artifactId: String) async throws -> Data {
+        try await studioMediaGate.acquire(priority: .background)
         let client = relay(for: deviceId)
-        return try await client.readStudioData(
-            method: "ReadStudioPreviewChunk",
-            artifactId: artifactId,
-            maximumBytes: 8 * 1024 * 1024
-        )
+        do {
+            let data = try await client.readStudioData(
+                method: "ReadStudioPreviewChunk",
+                artifactId: artifactId,
+                maximumBytes: 8 * 1024 * 1024
+            )
+            await studioMediaGate.release()
+            return data
+        } catch {
+            await studioMediaGate.release()
+            throw error
+        }
     }
 
     func downloadStudioArtifact(
@@ -760,16 +821,24 @@ final class WorkspaceStore {
         artifactId: String,
         declaredSize: UInt64
     ) async throws -> StudioDownloadedFile {
-        let client = relay(for: deviceId)
         // Allow a small metadata discrepancy, but don't permit an unbounded
         // relay response to consume the phone's temporary storage.
         let allowance = max(declaredSize / 20, 1_048_576)
         let (maximumBytes, overflow) = declaredSize.addingReportingOverflow(allowance)
         guard !overflow else { throw RelayError.rpc("Studio reported an invalid artifact size") }
-        return try await client.downloadStudioArtifact(
-            artifactId: artifactId,
-            maximumBytes: maximumBytes
-        )
+        try await studioMediaGate.acquire(priority: .foreground)
+        let client = relay(for: deviceId)
+        do {
+            let file = try await client.downloadStudioArtifact(
+                artifactId: artifactId,
+                maximumBytes: maximumBytes
+            )
+            await studioMediaGate.release()
+            return file
+        } catch {
+            await studioMediaGate.release()
+            throw error
+        }
     }
 
     func readStudioArtifactChunk(
@@ -777,10 +846,18 @@ final class WorkspaceStore {
         artifactId: String,
         offset: UInt64
     ) async throws -> StudioArtifactBytes {
-        try await relay(for: deviceId).readStudioArtifactChunk(
-            artifactId: artifactId,
-            offset: offset
-        )
+        try await studioMediaGate.acquire(priority: .foreground)
+        do {
+            let chunk = try await relay(for: deviceId).readStudioArtifactChunk(
+                artifactId: artifactId,
+                offset: offset
+            )
+            await studioMediaGate.release()
+            return chunk
+        } catch {
+            await studioMediaGate.release()
+            throw error
+        }
     }
 
     func deleteStudioArtifact(deviceId: String, artifactId: String) async throws {

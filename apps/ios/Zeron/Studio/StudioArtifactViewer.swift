@@ -22,7 +22,6 @@ final class StudioViewerMediaStore {
     @ObservationIgnored private var videoStreams: [String: StudioVideoStream] = [:]
     @ObservationIgnored private var previewTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var originalTasks: [String: Task<Void, Never>] = [:]
-    @ObservationIgnored private var neighborWarmTask: Task<Void, Never>?
     @ObservationIgnored private var retainedIds: Set<String> = []
     @ObservationIgnored private var selectedId: String?
 
@@ -52,7 +51,6 @@ final class StudioViewerMediaStore {
             return artifacts.indices.contains(index) ? artifacts[index] : nil
         }
         retainedIds = Set(neighborhood.map(\.id))
-        neighborWarmTask?.cancel()
         trimOutsideNeighborhood()
         trimTemporaryFiles(keeping: selectedId)
         trimVideoStreams(keeping: selectedId)
@@ -78,28 +76,14 @@ final class StudioViewerMediaStore {
             )
         }
 
-        // Do not compete with an active swipe or filmstrip fling. Once the
-        // selection rests, warm the neighboring images for the next swipe.
-        let neighbors = neighborhood.dropFirst().prefix(2).filter { $0.mediaKind == .image }
-        neighborWarmTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(220))
-            guard let self, !Task.isCancelled, self.selectedId == selectedId else { return }
-            for artifact in neighbors {
-                self.loadOriginal(
-                    artifact,
-                    browser: browser,
-                    workspace: workspace,
-                    deviceId: deviceId
-                )
-            }
-        }
+        // Neighboring previews are already held in memory. Fetch full quality
+        // only when an item becomes selected; downloading multiple originals
+        // during a swipe delays the selected image and congests the relay.
     }
 
     func reset() {
         previewTasks.values.forEach { $0.cancel() }
         originalTasks.values.forEach { $0.cancel() }
-        neighborWarmTask?.cancel()
-        neighborWarmTask = nil
         previewTasks.removeAll()
         originalTasks.removeAll()
         for player in players.values { player.pause() }
