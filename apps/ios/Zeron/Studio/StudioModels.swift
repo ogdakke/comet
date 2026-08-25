@@ -201,6 +201,7 @@ final class StudioViewerSession: Identifiable {
     var selectedId: String
     var presentationActive = false
     let openingPreview: UIImage?
+    let openingPreviewArtifactId: String
     private(set) var artifactRevision = 0
     @ObservationIgnored private var artifactIndex: [String: Int]
 
@@ -214,6 +215,7 @@ final class StudioViewerSession: Identifiable {
         self.selectedId = selectedId
         self.openedFromGallery = openedFromGallery
         self.openingPreview = openingPreview
+        openingPreviewArtifactId = selectedId
         artifactIndex = Dictionary(uniqueKeysWithValues: artifacts.indices.map { (artifacts[$0].id, $0) })
     }
 
@@ -222,7 +224,7 @@ final class StudioViewerSession: Identifiable {
     }
 
     func openingPreview(for artifactId: String) -> UIImage? {
-        artifactId == selectedId ? openingPreview : nil
+        artifactId == openingPreviewArtifactId ? openingPreview : nil
     }
 
     func append(_ additions: [StudioArtifactDetail]) {

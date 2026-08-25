@@ -11,7 +11,7 @@ private struct StudioViewerScrollState: Equatable {
 
 @MainActor
 @Observable
-private final class StudioViewerMediaStore {
+final class StudioViewerMediaStore {
     var previews: [String: UIImage] = [:]
     var images: [String: UIImage] = [:]
     var players: [String: AVPlayer] = [:]
@@ -300,8 +300,6 @@ struct StudioArtifactViewer: View {
     @State private var saving = false
     @State private var filmstripPosition: String?
     @State private var filmstripUserDriven = false
-    @State private var pagerPosition: String?
-    @State private var pagerUserDriven = false
     @State private var settledMediaId: String
     @State private var chromeReady = false
     @State private var backdropReady = false
@@ -320,7 +318,6 @@ struct StudioArtifactViewer: View {
         self.onDismiss = onDismiss
         self.showThread = showThread
         _filmstripPosition = State(initialValue: session.selectedId)
-        _pagerPosition = State(initialValue: session.selectedId)
         _settledMediaId = State(initialValue: session.selectedId)
     }
 
@@ -370,7 +367,6 @@ struct StudioArtifactViewer: View {
         }
         .onAppear {
             filmstripPosition = session.selectedId
-            pagerPosition = session.selectedId
             settledMediaId = session.selectedId
             chromeReady = session.presentationActive
             backdropReady = session.presentationActive
@@ -384,9 +380,6 @@ struct StudioArtifactViewer: View {
         .onChange(of: session.selectedId) { _, selectedId in
             if !filmstripUserDriven, filmstripPosition != selectedId {
                 filmstripPosition = selectedId
-            }
-            if !pagerUserDriven, !filmstripUserDriven, pagerPosition != selectedId {
-                pagerPosition = selectedId
             }
         }
         .onChange(of: filmstripPosition) { _, centeredId in
@@ -430,56 +423,24 @@ struct StudioArtifactViewer: View {
     }
 
     private var mediaPager: some View {
-        ScrollView(.horizontal) {
-            LazyHStack(spacing: 0) {
-                ForEach(session.artifacts) { artifact in
-                    Group {
-                        if artifact.id == session.selectedId {
-                            selectedMedia(artifact)
-                        } else if let image = media.image(for: artifact.id)
-                                    ?? media.preview(for: artifact.id)
-                                    ?? session.openingPreview(for: artifact.id)
-                                    ?? browser.cachedPreview(artifactId: artifact.id) {
-                            Image(uiImage: image)
-                                .resizable()
-                                .scaledToFit()
-                        } else {
-                            StudioMediaPreviewView(
-                                artifactId: artifact.id,
-                                mediaKind: artifact.mediaKind,
-                                browser: browser,
-                                contentMode: .fit
-                            )
-                        }
-                    }
-                    .containerRelativeFrame(.horizontal)
-                    .frame(maxHeight: .infinity)
-                    .id(artifact.id)
-                }
+        StudioViewerPager(
+            artifacts: session.artifacts,
+            artifactRevision: session.artifactRevision,
+            selectedId: session.selectedId,
+            previews: media.previews,
+            images: media.images,
+            players: media.players,
+            openingPreview: session.openingPreview,
+            openingPreviewArtifactId: session.openingPreviewArtifactId,
+            browser: browser,
+            selectionChanged: { selectedId in
+                session.selectedId = selectedId
+            },
+            selectionSettled: { selectedId in
+                session.selectedId = selectedId
+                settledMediaId = selectedId
             }
-            .scrollTargetLayout()
-        }
-        .scrollIndicators(.hidden)
-        .scrollTargetBehavior(.paging)
-        .scrollPosition(id: $pagerPosition, anchor: .center)
-        .onScrollPhaseChange { _, phase in
-            pagerUserDriven = phase.isUserDriven
-            if phase == .idle, let pagerPosition {
-                session.selectedId = pagerPosition
-                settledMediaId = pagerPosition
-            }
-        }
-        .overlay {
-            if filmstripUserDriven,
-               let selected,
-               let preview = media.preview(for: selected.id)
-                    ?? browser.cachedPreview(artifactId: selected.id) {
-                Image(uiImage: preview)
-                    .resizable()
-                    .scaledToFit()
-                    .allowsHitTesting(false)
-            }
-        }
+        )
         .contextMenu {
             Button { downloadSelected() } label: {
                 Label("Download", systemImage: "square.and.arrow.down")
@@ -596,7 +557,6 @@ struct StudioArtifactViewer: View {
                     guard !interacting, let filmstripPosition else { return }
                     session.selectedId = filmstripPosition
                     settledMediaId = filmstripPosition
-                    pagerPosition = filmstripPosition
                 }
             )
             .frame(height: 58)
@@ -920,6 +880,14 @@ private struct StudioViewerFilmstrip: UIViewRepresentable {
             collectionView.scrollToItem(at: indexPath, at: .centeredHorizontally, animated: true)
         }
 
+        func collectionView(
+            _ collectionView: UICollectionView,
+            didEndDisplaying cell: UICollectionViewCell,
+            forItemAt indexPath: IndexPath
+        ) {
+            (cell as? StudioFilmstripCell)?.cancelPreviewRequest()
+        }
+
         func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
             userInteracting = true
             parent.interactionChanged(true)
@@ -1000,6 +968,8 @@ private final class StudioFilmstripCell: UICollectionViewCell {
     private let placeholder = UIImageView()
     private var representedId: String?
     private var loadTask: Task<Void, Never>?
+    private var browser: StudioBrowserStore?
+    private var requestActive = false
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -1026,8 +996,7 @@ private final class StudioFilmstripCell: UICollectionViewCell {
 
     override func prepareForReuse() {
         super.prepareForReuse()
-        loadTask?.cancel()
-        loadTask = nil
+        cancelPreviewRequest()
         representedId = nil
         imageView.image = nil
         placeholder.image = nil
@@ -1042,6 +1011,7 @@ private final class StudioFilmstripCell: UICollectionViewCell {
         deviceId: String?
     ) {
         representedId = artifact.id
+        self.browser = browser
         setSelected(selected)
         placeholder.image = UIImage(systemName: artifact.mediaKind == .video ? "film" : "photo")
         if let cached = browser.cachedPreview(artifactId: artifact.id) {
@@ -1058,15 +1028,27 @@ private final class StudioFilmstripCell: UICollectionViewCell {
             // Reused cells crossed during a fling should never enqueue relay work.
             try? await Task.sleep(for: .milliseconds(80))
             guard !Task.isCancelled else { return }
-            let image = await browser.preview(
+            guard let self, self.representedId == artifactId else { return }
+            self.requestActive = true
+            let request = browser.beginPreviewRequest(
                 artifactId: artifactId,
                 deviceId: deviceId,
                 workspace: workspace
             )
-            guard !Task.isCancelled, self?.representedId == artifactId else { return }
-            self?.imageView.image = image
-            self?.placeholder.isHidden = image != nil
+            let image = await request.value
+            guard !Task.isCancelled, self.representedId == artifactId else { return }
+            self.imageView.image = image
+            self.placeholder.isHidden = image != nil
         }
+    }
+
+    func cancelPreviewRequest() {
+        loadTask?.cancel()
+        loadTask = nil
+        if requestActive, let representedId {
+            browser?.endPreviewRequest(artifactId: representedId)
+        }
+        requestActive = false
     }
 
     func setSelected(_ selected: Bool) {
