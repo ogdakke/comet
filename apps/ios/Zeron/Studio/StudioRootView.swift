@@ -107,12 +107,14 @@ struct StudioRootView: View {
                 StudioArtifactViewer(
                     session: session,
                     browser: browser,
+                    onDismiss: { viewer = nil },
                     showThread: { threadId in
                         viewer = nil
                         mode = .threads
                         path = [.thread(threadId)]
                     }
                 )
+                .presentationBackground(.clear)
                 .navigationTransition(
                     .zoom(sourceID: session.selectedId, in: artifactTransition)
                 )

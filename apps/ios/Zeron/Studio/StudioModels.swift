@@ -148,6 +148,7 @@ struct StudioArtifactDetail: Hashable, Identifiable {
     var id: String
     var conversationId: String
     var mediaKind: StudioMediaKind
+    var mimeType: String
     var width: UInt32?
     var height: UInt32?
     var durationSeconds: Double?
@@ -160,6 +161,7 @@ struct StudioArtifactDetail: Hashable, Identifiable {
         id = item.id
         conversationId = item.conversationId
         mediaKind = item.mediaKind
+        mimeType = item.mimeType
         width = item.width
         height = item.height
         durationSeconds = item.durationSeconds
@@ -173,6 +175,7 @@ struct StudioArtifactDetail: Hashable, Identifiable {
         id = artifact.id
         self.conversationId = conversationId
         mediaKind = artifact.mediaKind
+        mimeType = artifact.mimeType
         width = artifact.width
         height = artifact.height
         durationSeconds = artifact.durationSeconds
@@ -197,6 +200,7 @@ final class StudioViewerSession: Identifiable {
     let openedFromGallery: Bool
     var selectedId: String
     let openingPreview: UIImage?
+    @ObservationIgnored private var artifactIndex: [String: Int]
 
     init(
         artifacts: [StudioArtifactDetail],
@@ -208,10 +212,11 @@ final class StudioViewerSession: Identifiable {
         self.selectedId = selectedId
         self.openedFromGallery = openedFromGallery
         self.openingPreview = openingPreview
+        artifactIndex = Dictionary(uniqueKeysWithValues: artifacts.indices.map { (artifacts[$0].id, $0) })
     }
 
     var selected: StudioArtifactDetail? {
-        artifacts.first { $0.id == selectedId }
+        artifactIndex[selectedId].map { artifacts[$0] }
     }
 
     func openingPreview(for artifactId: String) -> UIImage? {
@@ -221,11 +226,17 @@ final class StudioViewerSession: Identifiable {
     func append(_ additions: [StudioArtifactDetail]) {
         let existing = Set(artifacts.map(\.id))
         artifacts.append(contentsOf: additions.filter { !existing.contains($0.id) })
+        rebuildArtifactIndex()
     }
 
     func replaceArtifacts(with orderedArtifacts: [StudioArtifactDetail]) {
         var seen = Set<String>()
         artifacts = orderedArtifacts.filter { seen.insert($0.id).inserted }
+        rebuildArtifactIndex()
+    }
+
+    private func rebuildArtifactIndex() {
+        artifactIndex = Dictionary(uniqueKeysWithValues: artifacts.indices.map { (artifacts[$0].id, $0) })
     }
 }
 
@@ -248,6 +259,14 @@ struct StudioArtifactChunk: Codable {
     var fileName: String
     var mimeType: String
     var data: String
+    var nextOffset: UInt64
+    var done: Bool
+}
+
+struct StudioArtifactBytes: Sendable {
+    var fileName: String
+    var mimeType: String
+    var data: Data
     var nextOffset: UInt64
     var done: Bool
 }

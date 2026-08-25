@@ -4,6 +4,11 @@ import Observation
 import SwiftUI
 import UIKit
 
+private struct StudioViewerScrollState: Equatable {
+    let detailsVisible: Bool
+    let shouldDismiss: Bool
+}
+
 @MainActor
 @Observable
 private final class StudioViewerMediaStore {
@@ -14,8 +19,10 @@ private final class StudioViewerMediaStore {
     var errors: [String: String] = [:]
 
     @ObservationIgnored private var temporaryURLs: [String: URL] = [:]
+    @ObservationIgnored private var videoStreams: [String: StudioVideoStream] = [:]
     @ObservationIgnored private var previewTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var originalTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var neighborWarmTask: Task<Void, Never>?
     @ObservationIgnored private var retainedIds: Set<String> = []
     @ObservationIgnored private var selectedId: String?
 
@@ -45,12 +52,10 @@ private final class StudioViewerMediaStore {
             return artifacts.indices.contains(index) ? artifacts[index] : nil
         }
         retainedIds = Set(neighborhood.map(\.id))
+        neighborWarmTask?.cancel()
         trimOutsideNeighborhood()
         trimTemporaryFiles(keeping: selectedId)
-        trimVideoOriginals(
-            keeping: selectedId,
-            videoIds: Set(artifacts.filter { $0.mediaKind == .video }.map(\.id))
-        )
+        trimVideoStreams(keeping: selectedId)
 
         for player in players.values { player.pause() }
         players[selectedId]?.play()
@@ -62,11 +67,25 @@ private final class StudioViewerMediaStore {
                 workspace: workspace,
                 deviceId: deviceId
             )
-            // Images are small enough to keep a five-item display-quality
-            // window. Videos can be much larger, so only fetch the selected
-            // original while their neighboring thumbnails stay warm.
-            if artifact.mediaKind == .image || artifact.id == selectedId {
-                loadOriginal(
+        }
+
+        if let selected = neighborhood.first {
+            loadOriginal(
+                selected,
+                browser: browser,
+                workspace: workspace,
+                deviceId: deviceId
+            )
+        }
+
+        // Do not compete with an active swipe or filmstrip fling. Once the
+        // selection rests, warm the neighboring images for the next swipe.
+        let neighbors = neighborhood.dropFirst().filter { $0.mediaKind == .image }
+        neighborWarmTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(220))
+            guard let self, !Task.isCancelled, self.selectedId == selectedId else { return }
+            for artifact in neighbors {
+                self.loadOriginal(
                     artifact,
                     browser: browser,
                     workspace: workspace,
@@ -79,9 +98,13 @@ private final class StudioViewerMediaStore {
     func reset() {
         previewTasks.values.forEach { $0.cancel() }
         originalTasks.values.forEach { $0.cancel() }
+        neighborWarmTask?.cancel()
+        neighborWarmTask = nil
         previewTasks.removeAll()
         originalTasks.removeAll()
         for player in players.values { player.pause() }
+        videoStreams.values.forEach { $0.cancel() }
+        videoStreams.removeAll()
         for url in temporaryURLs.values { try? FileManager.default.removeItem(at: url) }
         temporaryURLs.removeAll()
         previews.removeAll()
@@ -122,6 +145,14 @@ private final class StudioViewerMediaStore {
         workspace: WorkspaceStore,
         deviceId: String
     ) {
+        if artifact.mediaKind == .video {
+            loadVideo(
+                artifact,
+                workspace: workspace,
+                deviceId: deviceId
+            )
+            return
+        }
         guard images[artifact.id] == nil,
               players[artifact.id] == nil,
               originalTasks[artifact.id] == nil else { return }
@@ -144,28 +175,22 @@ private final class StudioViewerMediaStore {
                     return
                 }
                 temporaryURLs[artifactId] = file.url
-                if artifact.mediaKind == .video {
-                    let player = AVPlayer(url: file.url)
-                    players[artifactId] = player
-                    if selectedId == artifactId { player.play() }
+                let longestEdge = max(Int(artifact.width ?? 0), Int(artifact.height ?? 0))
+                let image = await Task.detached(priority: .userInitiated) {
+                    Self.decodeImage(
+                        at: file.url,
+                        maximumPixelSize: min(max(longestEdge, 2_048), 6_144)
+                    )
+                }.value
+                guard !Task.isCancelled, retainedIds.contains(artifactId) else { return }
+                if let image {
+                    images[artifactId] = image
                 } else {
-                    let longestEdge = max(Int(artifact.width ?? 0), Int(artifact.height ?? 0))
-                    let image = await Task.detached(priority: .userInitiated) {
-                        Self.decodeImage(
-                            at: file.url,
-                            maximumPixelSize: min(max(longestEdge, 2_048), 6_144)
-                        )
-                    }.value
-                    guard !Task.isCancelled, retainedIds.contains(artifactId) else { return }
-                    if let image {
-                        images[artifactId] = image
-                    } else {
-                        errors[artifactId] = "The downloaded image couldn't be decoded"
-                    }
-                    if selectedId != artifactId {
-                        try? FileManager.default.removeItem(at: file.url)
-                        temporaryURLs.removeValue(forKey: artifactId)
-                    }
+                    errors[artifactId] = "The downloaded image couldn't be decoded"
+                }
+                if selectedId != artifactId {
+                    try? FileManager.default.removeItem(at: file.url)
+                    temporaryURLs.removeValue(forKey: artifactId)
                 }
             } catch is CancellationError {
                 // Moving through the filmstrip cancels work outside the window.
@@ -174,6 +199,30 @@ private final class StudioViewerMediaStore {
                 errors[artifactId] = error.localizedDescription
             }
         }
+    }
+
+    private func loadVideo(
+        _ artifact: StudioArtifactDetail,
+        workspace: WorkspaceStore,
+        deviceId: String
+    ) {
+        guard videoStreams[artifact.id] == nil else { return }
+        let artifactId = artifact.id
+        let stream = StudioVideoStream(
+            artifactId: artifactId,
+            mimeType: artifact.mimeType,
+            declaredSize: artifact.sizeBytes,
+            readChunk: { offset in
+                try await workspace.readStudioArtifactChunk(
+                    deviceId: deviceId,
+                    artifactId: artifactId,
+                    offset: offset
+                )
+            }
+        )
+        videoStreams[artifactId] = stream
+        players[artifactId] = stream.player
+        if selectedId == artifactId { stream.player.play() }
     }
 
     private func trimOutsideNeighborhood() {
@@ -188,6 +237,7 @@ private final class StudioViewerMediaStore {
         for id in players.keys.filter({ !retainedIds.contains($0) }) {
             players[id]?.pause()
             players.removeValue(forKey: id)
+            videoStreams.removeValue(forKey: id)?.cancel()
         }
         for id in temporaryURLs.keys.filter({ !retainedIds.contains($0) }) {
             if let url = temporaryURLs[id] { try? FileManager.default.removeItem(at: url) }
@@ -202,13 +252,11 @@ private final class StudioViewerMediaStore {
         }
     }
 
-    private func trimVideoOriginals(keeping selectedId: String, videoIds: Set<String>) {
-        for id in originalTasks.keys.filter({ videoIds.contains($0) && $0 != selectedId }) {
-            originalTasks[id]?.cancel()
-        }
+    private func trimVideoStreams(keeping selectedId: String) {
         for id in players.keys.filter({ $0 != selectedId }) {
             players[id]?.pause()
             players.removeValue(forKey: id)
+            videoStreams.removeValue(forKey: id)?.cancel()
         }
     }
 
@@ -235,53 +283,74 @@ private final class StudioViewerMediaStore {
 
 struct StudioArtifactViewer: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.dismiss) private var dismiss
     @Bindable var session: StudioViewerSession
     let browser: StudioBrowserStore
+    let onDismiss: () -> Void
     let showThread: (String) -> Void
 
     @State private var media = StudioViewerMediaStore()
-    @State private var detailOffset: CGFloat = 0
+    @State private var detailsVisible = false
     @State private var pullDismissed = false
     @State private var confirmDelete = false
     @State private var actionError: String?
     @State private var saving = false
     @State private var filmstripPosition: String?
     @State private var filmstripUserDriven = false
+    @State private var pagerPosition: String?
+    @State private var pagerUserDriven = false
     @State private var chromeReady = false
+    @State private var backdropReady = false
 
     private var selected: StudioArtifactDetail? { session.selected }
-    private var showingChrome: Bool { chromeReady && detailOffset < 72 }
+    private var showingChrome: Bool { chromeReady && !detailsVisible }
+
+    init(
+        session: StudioViewerSession,
+        browser: StudioBrowserStore,
+        onDismiss: @escaping () -> Void,
+        showThread: @escaping (String) -> Void
+    ) {
+        self.session = session
+        self.browser = browser
+        self.onDismiss = onDismiss
+        self.showThread = showThread
+        _filmstripPosition = State(initialValue: session.selectedId)
+        _pagerPosition = State(initialValue: session.selectedId)
+    }
 
     var body: some View {
         GeometryReader { geometry in
             ScrollView(.vertical) {
-                LazyVStack(spacing: 0) {
+                VStack(spacing: 0) {
                     mediaPager
                         .frame(height: geometry.size.height)
-                        .containerRelativeFrame(.vertical)
                     if let selected {
                         artifactDetails(selected)
                     }
                 }
             }
             .scrollIndicators(.hidden)
-            .scrollTargetBehavior(.viewAligned)
-            .onScrollGeometryChange(for: CGFloat.self) { geometry in
-                geometry.contentOffset.y + geometry.contentInsets.top
+            .onScrollGeometryChange(for: StudioViewerScrollState.self) { geometry in
+                let offset = geometry.contentOffset.y + geometry.contentInsets.top
+                return StudioViewerScrollState(
+                    detailsVisible: offset >= 72,
+                    shouldDismiss: offset < -110
+                )
             } action: { _, value in
-                detailOffset = value
-                if value < -110, !pullDismissed {
+                detailsVisible = value.detailsVisible
+                if value.shouldDismiss, !pullDismissed {
                     pullDismissed = true
                     closeViewer()
                 }
             }
-            .background(Color.black.ignoresSafeArea())
+            .background(Color.black.opacity(backdropReady ? 1 : 0).ignoresSafeArea())
             .overlay(alignment: .top) { topControls }
             .overlay(alignment: .bottom) { bottomChrome(width: geometry.size.width) }
         }
         .ignoresSafeArea()
-        .task(id: session.selectedId) {
+        .task(id: "media-\(session.selectedId)-\(session.artifacts.count)") {
+            try? await Task.sleep(for: .milliseconds(90))
+            guard !Task.isCancelled else { return }
             guard let selected,
                   let workspace = model.workspace,
                   let deviceId = browser.selectedDeviceId else { return }
@@ -295,13 +364,16 @@ struct StudioArtifactViewer: View {
         }
         .onAppear {
             filmstripPosition = session.selectedId
+            pagerPosition = session.selectedId
             chromeReady = false
+            backdropReady = false
         }
         .task {
             try? await Task.sleep(for: .milliseconds(300))
             guard !Task.isCancelled else { return }
             withAnimation(.easeOut(duration: 0.16)) {
                 chromeReady = true
+                backdropReady = true
             }
         }
         .onChange(of: session.selectedId) { _, selectedId in
@@ -310,6 +382,9 @@ struct StudioArtifactViewer: View {
                     filmstripPosition = selectedId
                 }
             }
+            if !pagerUserDriven, pagerPosition != selectedId {
+                pagerPosition = selectedId
+            }
         }
         .onChange(of: filmstripPosition) { _, centeredId in
             guard filmstripUserDriven,
@@ -317,17 +392,11 @@ struct StudioArtifactViewer: View {
                   centeredId != session.selectedId else { return }
             session.selectedId = centeredId
         }
-        .onChange(of: session.artifacts.count) {
-            guard let selected,
-                  let workspace = model.workspace,
-                  let deviceId = browser.selectedDeviceId else { return }
-            media.prepare(
-                selectedId: selected.id,
-                artifacts: session.artifacts,
-                browser: browser,
-                workspace: workspace,
-                deviceId: deviceId
-            )
+        .onChange(of: pagerPosition) { _, centeredId in
+            guard pagerUserDriven,
+                  let centeredId,
+                  centeredId != session.selectedId else { return }
+            session.selectedId = centeredId
         }
         .task(id: "gallery-page-\(session.selectedId)") {
             guard session.openedFromGallery,
@@ -340,6 +409,7 @@ struct StudioArtifactViewer: View {
         }
         .onDisappear {
             chromeReady = false
+            backdropReady = false
             media.reset()
         }
         .confirmationDialog(
@@ -363,33 +433,41 @@ struct StudioArtifactViewer: View {
     }
 
     private var mediaPager: some View {
-        TabView(selection: $session.selectedId) {
-            ForEach(session.artifacts) { artifact in
-                Group {
-                    if artifact.id == session.selectedId {
-                        selectedMedia(artifact)
-                    } else if let image = media.image(for: artifact.id)
-                                ?? media.preview(for: artifact.id)
-                                ?? session.openingPreview(for: artifact.id)
-                                ?? browser.cachedPreview(artifactId: artifact.id) {
-                        Image(uiImage: image)
-                            .resizable()
-                            .scaledToFit()
-                    } else {
-                        StudioMediaPreviewView(
-                            artifactId: artifact.id,
-                            mediaKind: artifact.mediaKind,
-                            browser: browser,
-                            contentMode: .fit
-                        )
+        ScrollView(.horizontal) {
+            LazyHStack(spacing: 0) {
+                ForEach(session.artifacts) { artifact in
+                    Group {
+                        if artifact.id == session.selectedId {
+                            selectedMedia(artifact)
+                        } else if let image = media.image(for: artifact.id)
+                                    ?? media.preview(for: artifact.id)
+                                    ?? session.openingPreview(for: artifact.id)
+                                    ?? browser.cachedPreview(artifactId: artifact.id) {
+                            Image(uiImage: image)
+                                .resizable()
+                                .scaledToFit()
+                        } else {
+                            StudioMediaPreviewView(
+                                artifactId: artifact.id,
+                                mediaKind: artifact.mediaKind,
+                                browser: browser,
+                                contentMode: .fit
+                            )
+                        }
                     }
+                    .containerRelativeFrame(.horizontal)
+                    .frame(maxHeight: .infinity)
+                    .id(artifact.id)
                 }
-                .tag(artifact.id)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color.black)
             }
+            .scrollTargetLayout()
         }
-        .tabViewStyle(.page(indexDisplayMode: .never))
+        .scrollIndicators(.hidden)
+        .scrollTargetBehavior(.paging)
+        .scrollPosition(id: $pagerPosition, anchor: .center)
+        .onScrollPhaseChange { _, phase in
+            pagerUserDriven = phase.isUserDriven
+        }
         .contextMenu {
             Button { downloadSelected() } label: {
                 Label("Download", systemImage: "square.and.arrow.down")
@@ -408,6 +486,7 @@ struct StudioArtifactViewer: View {
     @ViewBuilder private func selectedMedia(_ artifact: StudioArtifactDetail) -> some View {
         if artifact.mediaKind == .video, let player = media.player(for: artifact.id) {
             VideoPlayer(player: player)
+                .aspectRatio(artifact.aspectRatio, contentMode: .fit)
         } else if artifact.mediaKind == .image {
             ZStack {
                 if let preview = media.preview(for: artifact.id)
@@ -428,10 +507,8 @@ struct StudioArtifactViewer: View {
                 if let image = media.image(for: artifact.id) {
                     StudioZoomableImage(image: image)
                         .id(artifact.id)
-                        .transition(.opacity)
                 }
             }
-            .animation(.easeOut(duration: 0.16), value: media.image(for: artifact.id) != nil)
         } else if let preview = media.preview(for: artifact.id)
                     ?? session.openingPreview(for: artifact.id)
                     ?? browser.cachedPreview(artifactId: artifact.id) {
@@ -499,9 +576,7 @@ struct StudioArtifactViewer: View {
                 LazyHStack(spacing: 5) {
                     ForEach(session.artifacts) { artifact in
                         Button {
-                            withAnimation(.snappy(duration: 0.22)) {
-                                session.selectedId = artifact.id
-                            }
+                            session.selectedId = artifact.id
                         } label: {
                             StudioMediaPreviewView(
                                 artifactId: artifact.id,
@@ -515,7 +590,6 @@ struct StudioArtifactViewer: View {
                                 RoundedRectangle(cornerRadius: 5)
                                     .stroke(.white, lineWidth: session.selectedId == artifact.id ? 2 : 0)
                             }
-                            .scaleEffect(session.selectedId == artifact.id ? 1.08 : 1)
                         }
                         .buttonStyle(.plain)
                         .id(artifact.id)
@@ -532,14 +606,7 @@ struct StudioArtifactViewer: View {
             .scrollTargetBehavior(.viewAligned)
             .scrollPosition(id: $filmstripPosition, anchor: .center)
             .onScrollPhaseChange { _, phase in
-                switch phase {
-                case .tracking, .interacting, .decelerating:
-                    filmstripUserDriven = true
-                case .idle, .animating:
-                    filmstripUserDriven = false
-                @unknown default:
-                    filmstripUserDriven = false
-                }
+                filmstripUserDriven = phase.isUserDriven
             }
 
             GlassEffectContainer(spacing: 0) {
@@ -647,15 +714,16 @@ struct StudioArtifactViewer: View {
 
     private func closeViewer() {
         guard chromeReady else {
-            dismiss()
+            onDismiss()
             return
         }
         withAnimation(.easeIn(duration: 0.1)) {
             chromeReady = false
+            backdropReady = false
         }
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(100))
-            dismiss()
+            onDismiss()
         }
     }
 
@@ -670,7 +738,7 @@ struct StudioArtifactViewer: View {
                     artifactId: artifact.id
                 )
                 browser.removeArtifact(artifact.id)
-                dismiss()
+                onDismiss()
             } catch {
                 actionError = error.localizedDescription
             }
@@ -763,5 +831,19 @@ private extension View {
             .glassEffect(.regular.interactive(), in: Circle())
             .contentShape(Circle())
             .padding(2)
+    }
+
+}
+
+private extension ScrollPhase {
+    var isUserDriven: Bool {
+        switch self {
+        case .tracking, .interacting, .decelerating:
+            true
+        case .idle, .animating:
+            false
+        @unknown default:
+            false
+        }
     }
 }

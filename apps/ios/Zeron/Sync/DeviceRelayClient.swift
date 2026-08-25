@@ -380,6 +380,33 @@ actor DeviceRelayClient {
         } while true
     }
 
+    func readStudioArtifactChunk(
+        artifactId: String,
+        offset: UInt64
+    ) async throws -> StudioArtifactBytes {
+        let chunk: StudioArtifactChunk = try await call(
+            method: "ReadStudioArtifactChunk",
+            params: ["artifactId": artifactId, "offset": offset],
+            timeoutSeconds: 30
+        )
+        guard chunk.artifactId == artifactId,
+              chunk.nextOffset >= offset,
+              let bytes = Data(base64Encoded: chunk.data),
+              bytes.count <= 512 * 1024 else {
+            throw RelayError.rpc("Studio returned an invalid artifact chunk")
+        }
+        if !chunk.done, chunk.nextOffset == offset {
+            throw RelayError.rpc("Studio artifact read did not advance")
+        }
+        return StudioArtifactBytes(
+            fileName: chunk.fileName,
+            mimeType: chunk.mimeType,
+            data: bytes,
+            nextOffset: chunk.nextOffset,
+            done: chunk.done
+        )
+    }
+
     /// Stream an original artifact to one short-lived temporary file. Videos
     /// never accumulate in RAM, and callers remove the file as soon as the
     /// viewer moves away or closes.

@@ -669,6 +669,17 @@ final class WorkspaceStore {
         )
     }
 
+    func readStudioArtifactChunk(
+        deviceId: String,
+        artifactId: String,
+        offset: UInt64
+    ) async throws -> StudioArtifactBytes {
+        try await relay(for: deviceId).readStudioArtifactChunk(
+            artifactId: artifactId,
+            offset: offset
+        )
+    }
+
     func deleteStudioArtifact(deviceId: String, artifactId: String) async throws {
         struct Response: Decodable { let ok: Bool }
         let response: Response = try await relay(for: deviceId).call(
