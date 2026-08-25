@@ -176,6 +176,18 @@ struct StudioComposerModel: Codable, Hashable, Identifiable {
     var maximumOutputCount: UInt32
     var controls: [StudioModelControl]
     var manifestVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case providerId = "provider_id"
+        case id
+        case displayName = "display_name"
+        case description
+        case operation
+        case outputKind = "output_kind"
+        case maximumOutputCount = "maximum_output_count"
+        case controls
+        case manifestVersion = "manifest_version"
+    }
 }
 
 struct StudioProviderConnection: Codable, Hashable, Identifiable {

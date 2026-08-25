@@ -3,6 +3,21 @@ import Testing
 @testable import Zeron
 
 struct StudioComposerModelsTests {
+    @Test func modelDecodesSharedSnakeCaseWireShape() throws {
+        let data = Data(#"""
+        {
+          "provider_id":"venice","id":"model","display_name":"Model","description":null,
+          "operation":"text_to_image","output_kind":"image","maximum_output_count":4,
+          "controls":[],"manifest_version":"v1",
+          "input_constraints":[],"output_mime_types":["image/png"],"fetched_at":"2026-08-25T00:00:00Z"
+        }
+        """#.utf8)
+        let model = try JSONDecoder().decode(StudioComposerModel.self, from: data)
+        #expect(model.providerId == "venice")
+        #expect(model.displayName == "Model")
+        #expect(model.maximumOutputCount == 4)
+    }
+
     @Test func snapshotEncodesEngineControlTags() throws {
         var snapshot = StudioComposerSnapshot(conversationId: "conversation")
         snapshot.duration = .durationSeconds(6)
