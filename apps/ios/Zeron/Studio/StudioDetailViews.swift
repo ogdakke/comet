@@ -36,11 +36,26 @@ struct StudioThreadView: View {
     let artifactTransition: Namespace.ID
     let openViewer: (StudioViewerSession) -> Void
     @State private var store = StudioThreadStore()
+    @State private var composer: StudioComposerStore
+    @State private var viewWidth: CGFloat = 0
 
     private let columns = [
         GridItem(.flexible(), spacing: 3),
         GridItem(.flexible(), spacing: 3),
     ]
+
+    init(
+        threadId: String,
+        browser: StudioBrowserStore,
+        artifactTransition: Namespace.ID,
+        openViewer: @escaping (StudioViewerSession) -> Void
+    ) {
+        self.threadId = threadId
+        self.browser = browser
+        self.artifactTransition = artifactTransition
+        self.openViewer = openViewer
+        _composer = State(initialValue: StudioComposerStore(threadId: threadId))
+    }
 
     var body: some View {
         Group {
@@ -66,23 +81,53 @@ struct StudioThreadView: View {
         .navigationTitle(store.thread?.conversation.title ?? "Thread")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .tabBar)
+        .toolbar(removing: .title)
+        .toolbarBackground(.hidden, for: .navigationBar)
+        .toolbar {
+            if let thread = store.thread {
+                ToolbarItem(placement: .topBarLeading) {
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "photo.stack")
+                            .font(.system(size: 12, weight: .semibold))
+                            .padding(.top, 2)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(thread.conversation.title)
+                                .font(Theme.sans(13, weight: .medium))
+                                .foregroundStyle(Theme.text)
+                                .lineLimit(1)
+                            if let deviceId = browser.selectedDeviceId {
+                                Text("Studio @ \(model.deviceName(deviceId))")
+                                    .font(Theme.sans(10.5))
+                                    .foregroundStyle(Theme.textMuted.opacity(0.6))
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                    .frame(width: max(140, viewWidth - 170), alignment: .leading)
+                }
+                .sharedBackgroundVisibility(.hidden)
+            }
+        }
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { viewWidth = $0 }
         .task(id: "\(browser.selectedDeviceId ?? "none")-\(threadId)") {
             guard let workspace = model.workspace,
                   let deviceId = browser.selectedDeviceId else { return }
             await workspace.markStudioThreadSeen(deviceId: deviceId, threadId: threadId)
             await store.watch(workspace: workspace, deviceId: deviceId, threadId: threadId)
         }
+        .task(id: "composer-\(browser.selectedDeviceId ?? "none")-\(threadId)") {
+            guard let workspace = model.workspace,
+                  let deviceId = browser.selectedDeviceId else { return }
+            await composer.load(workspace: workspace, deviceId: deviceId)
+        }
     }
 
     private func threadFeed(_ thread: StudioThread) -> some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 24) {
+            LazyVStack(alignment: .leading, spacing: 28) {
                 ForEach(thread.turns.sorted(by: { $0.position < $1.position })) { turn in
-                    VStack(alignment: .leading, spacing: 14) {
-                        Text(turn.prompt)
-                            .font(Theme.sans(16, weight: .medium))
-                            .foregroundStyle(Theme.text)
-                            .fixedSize(horizontal: false, vertical: true)
+                    VStack(alignment: .leading, spacing: 16) {
+                        UserBubble(text: turn.prompt)
 
                         ForEach(turn.runs.sorted(by: { $0.position < $1.position })) { run in
                             runView(run, turn: turn)
@@ -91,9 +136,51 @@ struct StudioThreadView: View {
                 }
             }
             .padding(.horizontal, 16)
-            .padding(.vertical, 18)
+            .padding(.top, 18)
+            .padding(.bottom, 12)
         }
+        .defaultScrollAnchor(.bottom)
+        .scrollDismissesKeyboard(.interactively)
         .scrollEdgeEffectStyle(.soft, for: .top)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(spacing: 0) {
+                studioStatus(thread)
+                    .frame(height: 24)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.leading, 26)
+                StudioComposerView(store: composer, browser: browser)
+                    .padding(.bottom, 8)
+            }
+            .background {
+                LinearGradient(
+                    stops: [
+                        .init(color: Theme.bg.opacity(0), location: 0),
+                        .init(color: Theme.bg.opacity(0.45), location: 0.25),
+                        .init(color: Theme.bg.opacity(0.72), location: 0.6),
+                        .init(color: Theme.bg, location: 1),
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .padding(.top, -44)
+                .ignoresSafeArea(.container, edges: .bottom)
+                .allowsHitTesting(false)
+            }
+        }
+    }
+
+    @ViewBuilder private func studioStatus(_ thread: StudioThread) -> some View {
+        let active = thread.turns
+            .flatMap(\.runs)
+            .first(where: { $0.state.isCreating })
+        if let active {
+            HStack(spacing: 7) {
+                MiniSpinner()
+                Text(active.state.label)
+            }
+            .font(Theme.sans(11))
+            .foregroundStyle(Theme.textMuted)
+        }
     }
 
     private func runView(_ run: StudioRun, turn: StudioTurn) -> some View {
@@ -154,6 +241,7 @@ struct StudioThreadView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder private func runStatus(_ run: StudioRun) -> some View {

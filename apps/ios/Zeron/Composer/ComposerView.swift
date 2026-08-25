@@ -34,6 +34,11 @@ struct ComposerShell<Chips: View>: View {
     /// Present the photo picker; nil hides the attach button.
     var onAttach: (() -> Void)? = nil
     var onRemoveAttachment: (String) -> Void = { _ in }
+    /// Studio uses the same morphing shell with its richer, engine-evaluated
+    /// reference tray. Keeping it inside this shell preserves the chat
+    /// composer's focus, keyboard, and compact-layout behavior.
+    var externalTray: AnyView?
+    var externalTrayForcesExpanded = false
     /// Screenshot rig (-focuscomposer): take keyboard focus shortly after
     /// appearing, so the keyboard-up transcript states can be driven headless.
     var autoFocus = false
@@ -42,7 +47,7 @@ struct ComposerShell<Chips: View>: View {
     @FocusState private var focused: Bool
 
     private var expanded: Bool {
-        alwaysExpanded || keepExpanded || focused || !attachments.isEmpty
+        alwaysExpanded || keepExpanded || focused || !attachments.isEmpty || externalTrayForcesExpanded
             || draft.contains("\n") || draft.count > 26
     }
 
@@ -85,6 +90,10 @@ struct ComposerShell<Chips: View>: View {
         shellLayout {
             if expanded, !attachments.isEmpty {
                 AttachmentStripView(attachments: attachments, remove: onRemoveAttachment)
+                    .padding(.bottom, 10)
+            }
+            if expanded, let externalTray {
+                externalTray
                     .padding(.bottom, 10)
             }
             input
