@@ -56,9 +56,10 @@ struct StudioComposerView: View {
                 externalTray: tray,
                 externalTrayForcesExpanded: !store.snapshot.attachments.isEmpty
             ) {
-                ComposerChip(label: store.snapshot.mode == .image ? "Image" : "Video") {
-                    switchMode()
-                }
+                StudioModeSegment(mode: Binding(
+                    get: { store.snapshot.mode },
+                    set: { setMode($0) }
+                ))
                 if store.snapshot.mode == .video,
                    let duration = store.evaluation?.globals.duration {
                     StudioDurationChip(
@@ -147,10 +148,10 @@ struct StudioComposerView: View {
         ))
     }
 
-    private func switchMode() {
+    private func setMode(_ mode: StudioComposerMode) {
         guard let workspace, let deviceId else { return }
         store.setMode(
-            store.snapshot.mode == .image ? .video : .image,
+            mode,
             workspace: workspace,
             deviceId: deviceId
         )
@@ -237,6 +238,24 @@ struct StudioComposerView: View {
                 }
             }
         }
+    }
+}
+
+private struct StudioModeSegment: View {
+    @Binding var mode: StudioComposerMode
+
+    var body: some View {
+        Picker("Media type", selection: $mode) {
+            Label("Image", systemImage: "photo")
+                .labelStyle(.iconOnly)
+                .tag(StudioComposerMode.image)
+            Label("Video", systemImage: "video")
+                .labelStyle(.iconOnly)
+                .tag(StudioComposerMode.video)
+        }
+        .pickerStyle(.segmented)
+        .frame(width: 84, height: 40)
+        .accessibilityLabel("Media type")
     }
 }
 
