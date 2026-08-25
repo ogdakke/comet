@@ -397,13 +397,6 @@ struct StudioArtifactViewer: View {
                   centeredId != session.selectedId else { return }
             session.selectedId = centeredId
         }
-        .onChange(of: pagerPosition) { _, centeredId in
-            guard pagerUserDriven,
-                  let centeredId,
-                  centeredId != session.selectedId else { return }
-            session.selectedId = centeredId
-            settledMediaId = centeredId
-        }
         .task(id: "gallery-page-\(settledMediaId)") {
             guard session.openedFromGallery,
                   let item = browser.gallery.first(where: { $0.id == settledMediaId }),
@@ -474,6 +467,7 @@ struct StudioArtifactViewer: View {
         .onScrollPhaseChange { _, phase in
             pagerUserDriven = phase.isUserDriven
             if phase == .idle, let pagerPosition {
+                session.selectedId = pagerPosition
                 settledMediaId = pagerPosition
             }
         }
@@ -594,6 +588,7 @@ struct StudioArtifactViewer: View {
         VStack(spacing: 10) {
             StudioViewerFilmstrip(
                 artifacts: session.artifacts,
+                artifactRevision: session.artifactRevision,
                 selectedId: $filmstripPosition,
                 browser: browser,
                 workspace: model.workspace,
@@ -826,6 +821,7 @@ private final class StudioImageScrollView: UIScrollView {
 
 private struct StudioViewerFilmstrip: UIViewRepresentable {
     let artifacts: [StudioArtifactDetail]
+    let artifactRevision: Int
     @Binding var selectedId: String?
     let browser: StudioBrowserStore
     let workspace: WorkspaceStore?
@@ -857,9 +853,9 @@ private struct StudioViewerFilmstrip: UIViewRepresentable {
 
     func updateUIView(_ collection: UICollectionView, context: Context) {
         context.coordinator.parent = self
-        let ids = artifacts.map(\.id)
-        if ids != context.coordinator.artifactIds {
-            context.coordinator.artifactIds = ids
+        if artifactRevision != context.coordinator.artifactRevision {
+            context.coordinator.artifactRevision = artifactRevision
+            context.coordinator.artifactIds = artifacts.map(\.id)
             collection.reloadData()
         }
 
@@ -877,12 +873,15 @@ private struct StudioViewerFilmstrip: UIViewRepresentable {
 
     final class Coordinator: NSObject, UICollectionViewDataSource, UICollectionViewDelegate {
         var parent: StudioViewerFilmstrip
-        var artifactIds: [String] = []
+        var artifactIds: [String]
+        var artifactRevision: Int
         weak var collectionView: UICollectionView?
         private var userInteracting = false
 
         init(_ parent: StudioViewerFilmstrip) {
             self.parent = parent
+            artifactIds = parent.artifacts.map(\.id)
+            artifactRevision = parent.artifactRevision
         }
 
         func collectionView(

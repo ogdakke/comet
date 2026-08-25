@@ -200,6 +200,7 @@ final class StudioViewerSession: Identifiable {
     let openedFromGallery: Bool
     var selectedId: String
     let openingPreview: UIImage?
+    private(set) var artifactRevision = 0
     @ObservationIgnored private var artifactIndex: [String: Int]
 
     init(
@@ -225,13 +226,19 @@ final class StudioViewerSession: Identifiable {
 
     func append(_ additions: [StudioArtifactDetail]) {
         let existing = Set(artifacts.map(\.id))
-        artifacts.append(contentsOf: additions.filter { !existing.contains($0.id) })
+        let additions = additions.filter { !existing.contains($0.id) }
+        guard !additions.isEmpty else { return }
+        artifacts.append(contentsOf: additions)
+        artifactRevision &+= 1
         rebuildArtifactIndex()
     }
 
     func replaceArtifacts(with orderedArtifacts: [StudioArtifactDetail]) {
         var seen = Set<String>()
-        artifacts = orderedArtifacts.filter { seen.insert($0.id).inserted }
+        let next = orderedArtifacts.filter { seen.insert($0.id).inserted }
+        guard next != artifacts else { return }
+        artifacts = next
+        artifactRevision &+= 1
         rebuildArtifactIndex()
     }
 
