@@ -199,6 +199,7 @@ final class StudioViewerSession: Identifiable {
     var artifacts: [StudioArtifactDetail]
     let openedFromGallery: Bool
     var selectedId: String
+    var presentationActive = false
     let openingPreview: UIImage?
     private(set) var artifactRevision = 0
     @ObservationIgnored private var artifactIndex: [String: Int]

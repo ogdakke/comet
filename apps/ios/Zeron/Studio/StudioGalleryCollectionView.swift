@@ -1,11 +1,26 @@
 import SwiftUI
 import UIKit
 
+@MainActor
+final class StudioGalleryTransitionSource {
+    weak var provider: StudioGalleryTransitionSourceProvider?
+
+    func imageView(for artifactId: String) -> UIView? {
+        provider?.transitionImageView(for: artifactId)
+    }
+}
+
+@MainActor
+protocol StudioGalleryTransitionSourceProvider: AnyObject {
+    func transitionImageView(for artifactId: String) -> UIView?
+}
+
 struct StudioGalleryCollectionView: UIViewRepresentable {
     let items: [StudioGalleryItem]
     let browser: StudioBrowserStore
     let workspace: WorkspaceStore?
     let deviceId: String?
+    let transitionSource: StudioGalleryTransitionSource
     let openItem: (StudioGalleryItem, UIImage?) -> Void
     let downloadItem: (StudioGalleryItem) -> Void
     let showThread: (String) -> Void
@@ -33,6 +48,7 @@ struct StudioGalleryCollectionView: UIViewRepresentable {
             forCellWithReuseIdentifier: StudioGalleryCell.reuseIdentifier
         )
         context.coordinator.installDataSource(on: collectionView)
+        transitionSource.provider = context.coordinator
         context.coordinator.apply(items: items, to: collectionView, initial: true)
         return collectionView
     }
@@ -46,12 +62,14 @@ struct StudioGalleryCollectionView: UIViewRepresentable {
     final class Coordinator: NSObject,
         UICollectionViewDelegate,
         UICollectionViewDelegateFlowLayout,
-        UICollectionViewDataSourcePrefetching
+        UICollectionViewDataSourcePrefetching,
+        StudioGalleryTransitionSourceProvider
     {
         private enum Section { case gallery }
 
         var parent: StudioGalleryCollectionView
         private var dataSource: UICollectionViewDiffableDataSource<Section, String>?
+        private weak var collectionView: UICollectionView?
         private var items: [StudioGalleryItem] = []
         private var itemsById: [String: StudioGalleryItem] = [:]
         private var prefetchedIds: Set<String> = []
@@ -63,6 +81,7 @@ struct StudioGalleryCollectionView: UIViewRepresentable {
         }
 
         func installDataSource(on collectionView: UICollectionView) {
+            self.collectionView = collectionView
             dataSource = UICollectionViewDiffableDataSource<Section, String>(
                 collectionView: collectionView
             ) { [weak self] collectionView, indexPath, artifactId in
@@ -77,6 +96,16 @@ struct StudioGalleryCollectionView: UIViewRepresentable {
                 self.configure(cell, with: item)
                 return cell
             }
+        }
+
+        func transitionImageView(for artifactId: String) -> UIView? {
+            guard let collectionView,
+                  let indexPath = dataSource?.indexPath(for: artifactId) else { return nil }
+            if collectionView.cellForItem(at: indexPath) == nil {
+                collectionView.scrollToItem(at: indexPath, at: .centeredVertically, animated: false)
+                collectionView.layoutIfNeeded()
+            }
+            return (collectionView.cellForItem(at: indexPath) as? StudioGalleryCell)?.imageView
         }
 
         func apply(items newItems: [StudioGalleryItem], to collectionView: UICollectionView, initial: Bool) {

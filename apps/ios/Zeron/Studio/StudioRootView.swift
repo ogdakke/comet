@@ -56,6 +56,7 @@ struct StudioRootView: View {
     @State private var mode = StudioLibraryMode.gallery
     @State private var path: [StudioRoute] = []
     @State private var viewer: StudioViewerSession?
+    @State private var galleryTransitionSource = StudioGalleryTransitionSource()
     @Namespace private var artifactTransition
 
     private var hostKey: String {
@@ -103,21 +104,18 @@ struct StudioRootView: View {
                       let workspace = model.workspace else { return }
                 await browser.watchGallery(workspace: workspace, deviceId: deviceId)
             }
-            .fullScreenCover(item: $viewer) { session in
-                StudioArtifactViewer(
-                    session: session,
+            .background {
+                StudioViewerPresentationBridge(
+                    session: $viewer,
                     browser: browser,
-                    onDismiss: { viewer = nil },
+                    model: model,
+                    transitionSource: galleryTransitionSource,
                     showThread: { threadId in
-                        viewer = nil
                         mode = .threads
                         path = [.thread(threadId)]
                     }
                 )
-                .presentationBackground(.clear)
-                .navigationTransition(
-                    .zoom(sourceID: session.selectedId, in: artifactTransition)
-                )
+                .frame(width: 0, height: 0)
             }
         }
     }
@@ -143,7 +141,7 @@ struct StudioRootView: View {
             case .gallery:
                 StudioGalleryView(
                     browser: browser,
-                    artifactTransition: artifactTransition,
+                    transitionSource: galleryTransitionSource,
                     openViewer: { viewer = $0 },
                     showThread: { threadId in
                         mode = .threads
@@ -197,13 +195,11 @@ struct StudioRootView: View {
 private struct StudioGalleryView: View {
     @Environment(AppModel.self) private var model
     let browser: StudioBrowserStore
-    let artifactTransition: Namespace.ID
+    let transitionSource: StudioGalleryTransitionSource
     let openViewer: (StudioViewerSession) -> Void
     let showThread: (String) -> Void
     @State private var artifactToDelete: StudioArtifactDetail?
     @State private var actionError: String?
-
-    private let columns = Array(repeating: GridItem(.flexible(), spacing: 2), count: 3)
 
     var body: some View {
         if browser.galleryLoading, browser.gallery.isEmpty {
@@ -223,6 +219,7 @@ private struct StudioGalleryView: View {
                 browser: browser,
                 workspace: model.workspace,
                 deviceId: browser.selectedDeviceId,
+                transitionSource: transitionSource,
                 openItem: { item, preview in
                     openViewer(StudioViewerSession(
                         artifacts: browser.gallery.map(StudioArtifactDetail.init(item:)),

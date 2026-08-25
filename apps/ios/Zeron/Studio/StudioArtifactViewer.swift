@@ -372,15 +372,13 @@ struct StudioArtifactViewer: View {
             filmstripPosition = session.selectedId
             pagerPosition = session.selectedId
             settledMediaId = session.selectedId
-            chromeReady = false
-            backdropReady = false
+            chromeReady = session.presentationActive
+            backdropReady = session.presentationActive
         }
-        .task {
-            try? await Task.sleep(for: .milliseconds(300))
-            guard !Task.isCancelled else { return }
+        .onChange(of: session.presentationActive) { _, active in
             withAnimation(.easeOut(duration: 0.16)) {
-                chromeReady = true
-                backdropReady = true
+                chromeReady = active
+                backdropReady = active
             }
         }
         .onChange(of: session.selectedId) { _, selectedId in
@@ -711,6 +709,7 @@ struct StudioArtifactViewer: View {
             onDismiss()
             return
         }
+        session.presentationActive = false
         withAnimation(.easeIn(duration: 0.1)) {
             chromeReady = false
             backdropReady = false
