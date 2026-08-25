@@ -80,7 +80,7 @@ private final class StudioViewerMediaStore {
 
         // Do not compete with an active swipe or filmstrip fling. Once the
         // selection rests, warm the neighboring images for the next swipe.
-        let neighbors = neighborhood.dropFirst().filter { $0.mediaKind == .image }
+        let neighbors = neighborhood.dropFirst().prefix(2).filter { $0.mediaKind == .image }
         neighborWarmTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(220))
             guard let self, !Task.isCancelled, self.selectedId == selectedId else { return }
@@ -176,10 +176,14 @@ private final class StudioViewerMediaStore {
                 }
                 temporaryURLs[artifactId] = file.url
                 let longestEdge = max(Int(artifact.width ?? 0), Int(artifact.height ?? 0))
+                // A display-sized decode avoids uploading multi-hundred-megabyte
+                // textures while paging. The original file remains available to
+                // Download, while 3072 px covers the current phone displays.
+                let displayEdge = artifactId == selectedId ? 3_072 : 2_048
                 let image = await Task.detached(priority: .userInitiated) {
                     Self.decodeImage(
                         at: file.url,
-                        maximumPixelSize: min(max(longestEdge, 2_048), 6_144)
+                        maximumPixelSize: min(max(longestEdge, 2_048), displayEdge)
                     )
                 }.value
                 guard !Task.isCancelled, retainedIds.contains(artifactId) else { return }
@@ -298,6 +302,7 @@ struct StudioArtifactViewer: View {
     @State private var filmstripUserDriven = false
     @State private var pagerPosition: String?
     @State private var pagerUserDriven = false
+    @State private var settledMediaId: String
     @State private var chromeReady = false
     @State private var backdropReady = false
 
@@ -316,6 +321,7 @@ struct StudioArtifactViewer: View {
         self.showThread = showThread
         _filmstripPosition = State(initialValue: session.selectedId)
         _pagerPosition = State(initialValue: session.selectedId)
+        _settledMediaId = State(initialValue: session.selectedId)
     }
 
     var body: some View {
@@ -348,10 +354,10 @@ struct StudioArtifactViewer: View {
             .overlay(alignment: .bottom) { bottomChrome(width: geometry.size.width) }
         }
         .ignoresSafeArea()
-        .task(id: "media-\(session.selectedId)-\(session.artifacts.count)") {
+        .task(id: "media-\(settledMediaId)-\(session.artifacts.count)") {
             try? await Task.sleep(for: .milliseconds(90))
             guard !Task.isCancelled else { return }
-            guard let selected,
+            guard let selected = session.artifacts.first(where: { $0.id == settledMediaId }),
                   let workspace = model.workspace,
                   let deviceId = browser.selectedDeviceId else { return }
             media.prepare(
@@ -365,6 +371,7 @@ struct StudioArtifactViewer: View {
         .onAppear {
             filmstripPosition = session.selectedId
             pagerPosition = session.selectedId
+            settledMediaId = session.selectedId
             chromeReady = false
             backdropReady = false
         }
@@ -378,11 +385,9 @@ struct StudioArtifactViewer: View {
         }
         .onChange(of: session.selectedId) { _, selectedId in
             if !filmstripUserDriven, filmstripPosition != selectedId {
-                withAnimation(.snappy(duration: 0.2)) {
-                    filmstripPosition = selectedId
-                }
+                filmstripPosition = selectedId
             }
-            if !pagerUserDriven, pagerPosition != selectedId {
+            if !pagerUserDriven, !filmstripUserDriven, pagerPosition != selectedId {
                 pagerPosition = selectedId
             }
         }
@@ -397,10 +402,11 @@ struct StudioArtifactViewer: View {
                   let centeredId,
                   centeredId != session.selectedId else { return }
             session.selectedId = centeredId
+            settledMediaId = centeredId
         }
-        .task(id: "gallery-page-\(session.selectedId)") {
+        .task(id: "gallery-page-\(settledMediaId)") {
             guard session.openedFromGallery,
-                  let item = browser.gallery.first(where: { $0.id == session.selectedId }),
+                  let item = browser.gallery.first(where: { $0.id == settledMediaId }),
                   browser.shouldLoadMore(after: item),
                   let workspace = model.workspace,
                   let deviceId = browser.selectedDeviceId else { return }
@@ -467,6 +473,20 @@ struct StudioArtifactViewer: View {
         .scrollPosition(id: $pagerPosition, anchor: .center)
         .onScrollPhaseChange { _, phase in
             pagerUserDriven = phase.isUserDriven
+            if phase == .idle, let pagerPosition {
+                settledMediaId = pagerPosition
+            }
+        }
+        .overlay {
+            if filmstripUserDriven,
+               let selected,
+               let preview = media.preview(for: selected.id)
+                    ?? browser.cachedPreview(artifactId: selected.id) {
+                Image(uiImage: preview)
+                    .resizable()
+                    .scaledToFit()
+                    .allowsHitTesting(false)
+            }
         }
         .contextMenu {
             Button { downloadSelected() } label: {
@@ -572,42 +592,21 @@ struct StudioArtifactViewer: View {
 
     private func bottomChrome(width: CGFloat) -> some View {
         VStack(spacing: 10) {
-            ScrollView(.horizontal) {
-                LazyHStack(spacing: 5) {
-                    ForEach(session.artifacts) { artifact in
-                        Button {
-                            session.selectedId = artifact.id
-                        } label: {
-                            StudioMediaPreviewView(
-                                artifactId: artifact.id,
-                                mediaKind: artifact.mediaKind,
-                                browser: browser,
-                                contentMode: .fill
-                            )
-                            .frame(width: 48, height: 48)
-                            .clipShape(RoundedRectangle(cornerRadius: 5))
-                            .overlay {
-                                RoundedRectangle(cornerRadius: 5)
-                                    .stroke(.white, lineWidth: session.selectedId == artifact.id ? 2 : 0)
-                            }
-                        }
-                        .buttonStyle(.plain)
-                        .id(artifact.id)
-                        .accessibilityLabel("View item")
-                        .accessibilityAddTraits(session.selectedId == artifact.id ? .isSelected : [])
-                    }
+            StudioViewerFilmstrip(
+                artifacts: session.artifacts,
+                selectedId: $filmstripPosition,
+                browser: browser,
+                workspace: model.workspace,
+                deviceId: browser.selectedDeviceId,
+                interactionChanged: { interacting in
+                    filmstripUserDriven = interacting
+                    guard !interacting, let filmstripPosition else { return }
+                    session.selectedId = filmstripPosition
+                    settledMediaId = filmstripPosition
+                    pagerPosition = filmstripPosition
                 }
-                .padding(.vertical, 4)
-                .scrollTargetLayout()
-            }
+            )
             .frame(height: 58)
-            .contentMargins(.horizontal, max(0, (width - 48) / 2), for: .scrollContent)
-            .scrollIndicators(.hidden)
-            .scrollTargetBehavior(.viewAligned)
-            .scrollPosition(id: $filmstripPosition, anchor: .center)
-            .onScrollPhaseChange { _, phase in
-                filmstripUserDriven = phase.isUserDriven
-            }
 
             GlassEffectContainer(spacing: 0) {
                 HStack {
@@ -822,6 +821,258 @@ private final class StudioImageScrollView: UIScrollView {
         if zoomScale <= minimumZoomScale + 0.001 {
             zoomImageView?.frame = bounds
         }
+    }
+}
+
+private struct StudioViewerFilmstrip: UIViewRepresentable {
+    let artifacts: [StudioArtifactDetail]
+    @Binding var selectedId: String?
+    let browser: StudioBrowserStore
+    let workspace: WorkspaceStore?
+    let deviceId: String?
+    let interactionChanged: (Bool) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIView(context: Context) -> UICollectionView {
+        let layout = UICollectionViewFlowLayout()
+        layout.scrollDirection = .horizontal
+        layout.itemSize = CGSize(width: 48, height: 48)
+        layout.minimumLineSpacing = 5
+
+        let collection = UICollectionView(frame: .zero, collectionViewLayout: layout)
+        collection.backgroundColor = .clear
+        collection.showsHorizontalScrollIndicator = false
+        collection.decelerationRate = .fast
+        collection.contentInsetAdjustmentBehavior = .never
+        collection.dataSource = context.coordinator
+        collection.delegate = context.coordinator
+        collection.register(
+            StudioFilmstripCell.self,
+            forCellWithReuseIdentifier: StudioFilmstripCell.reuseIdentifier
+        )
+        context.coordinator.collectionView = collection
+        return collection
+    }
+
+    func updateUIView(_ collection: UICollectionView, context: Context) {
+        context.coordinator.parent = self
+        let ids = artifacts.map(\.id)
+        if ids != context.coordinator.artifactIds {
+            context.coordinator.artifactIds = ids
+            collection.reloadData()
+        }
+
+        if let layout = collection.collectionViewLayout as? UICollectionViewFlowLayout {
+            let horizontalInset = max(0, (collection.bounds.width - layout.itemSize.width) / 2)
+            if layout.sectionInset.left != horizontalInset {
+                layout.sectionInset = UIEdgeInsets(top: 5, left: horizontalInset, bottom: 5, right: horizontalInset)
+                layout.invalidateLayout()
+            }
+        }
+
+        context.coordinator.updateVisibleSelection()
+        context.coordinator.centerExternalSelectionIfNeeded()
+    }
+
+    final class Coordinator: NSObject, UICollectionViewDataSource, UICollectionViewDelegate {
+        var parent: StudioViewerFilmstrip
+        var artifactIds: [String] = []
+        weak var collectionView: UICollectionView?
+        private var userInteracting = false
+
+        init(_ parent: StudioViewerFilmstrip) {
+            self.parent = parent
+        }
+
+        func collectionView(
+            _ collectionView: UICollectionView,
+            numberOfItemsInSection section: Int
+        ) -> Int {
+            parent.artifacts.count
+        }
+
+        func collectionView(
+            _ collectionView: UICollectionView,
+            cellForItemAt indexPath: IndexPath
+        ) -> UICollectionViewCell {
+            guard let cell = collectionView.dequeueReusableCell(
+                withReuseIdentifier: StudioFilmstripCell.reuseIdentifier,
+                for: indexPath
+            ) as? StudioFilmstripCell,
+            parent.artifacts.indices.contains(indexPath.item) else {
+                return UICollectionViewCell()
+            }
+            let artifact = parent.artifacts[indexPath.item]
+            cell.configure(
+                artifact: artifact,
+                selected: artifact.id == parent.selectedId,
+                browser: parent.browser,
+                workspace: parent.workspace,
+                deviceId: parent.deviceId
+            )
+            return cell
+        }
+
+        func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
+            guard parent.artifacts.indices.contains(indexPath.item) else { return }
+            let id = parent.artifacts[indexPath.item].id
+            parent.selectedId = id
+            updateVisibleSelection()
+            collectionView.scrollToItem(at: indexPath, at: .centeredHorizontally, animated: true)
+        }
+
+        func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+            userInteracting = true
+            parent.interactionChanged(true)
+        }
+
+        func scrollViewDidScroll(_ scrollView: UIScrollView) {
+            guard userInteracting, let id = centeredArtifactId(), id != parent.selectedId else { return }
+            parent.selectedId = id
+            updateVisibleSelection()
+        }
+
+        func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+            if !decelerate { finishInteraction() }
+        }
+
+        func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+            finishInteraction()
+        }
+
+        func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
+            guard !userInteracting, let id = centeredArtifactId() else { return }
+            parent.selectedId = id
+            updateVisibleSelection()
+        }
+
+        func updateVisibleSelection() {
+            guard let collectionView else { return }
+            for case let cell as StudioFilmstripCell in collectionView.visibleCells {
+                guard let indexPath = collectionView.indexPath(for: cell),
+                      parent.artifacts.indices.contains(indexPath.item) else { continue }
+                cell.setSelected(parent.artifacts[indexPath.item].id == parent.selectedId)
+            }
+        }
+
+        func centerExternalSelectionIfNeeded() {
+            guard !userInteracting,
+                  let collectionView,
+                  let selectedId = parent.selectedId,
+                  let index = artifactIds.firstIndex(of: selectedId),
+                  collectionView.bounds.width > 0 else { return }
+            let target = IndexPath(item: index, section: 0)
+            if collectionView.indexPathsForVisibleItems.contains(target),
+               centeredArtifactId() == selectedId { return }
+            collectionView.scrollToItem(at: target, at: .centeredHorizontally, animated: false)
+        }
+
+        private func finishInteraction() {
+            guard userInteracting else { return }
+            userInteracting = false
+            if let id = centeredArtifactId() {
+                parent.selectedId = id
+                updateVisibleSelection()
+            }
+            parent.interactionChanged(false)
+        }
+
+        private func centeredArtifactId() -> String? {
+            guard let collectionView else { return nil }
+            let center = CGPoint(
+                x: collectionView.contentOffset.x + collectionView.bounds.midX,
+                y: collectionView.bounds.midY
+            )
+            let closest = collectionView.indexPathsForVisibleItems.min { lhs, rhs in
+                let lhsCenter = collectionView.layoutAttributesForItem(at: lhs)?.center.x ?? 0
+                let rhsCenter = collectionView.layoutAttributesForItem(at: rhs)?.center.x ?? 0
+                return abs(lhsCenter - center.x) < abs(rhsCenter - center.x)
+            }
+            guard let index = closest?.item, parent.artifacts.indices.contains(index) else { return nil }
+            return parent.artifacts[index].id
+        }
+    }
+}
+
+private final class StudioFilmstripCell: UICollectionViewCell {
+    static let reuseIdentifier = "StudioFilmstripCell"
+
+    private let imageView = UIImageView()
+    private let placeholder = UIImageView()
+    private var representedId: String?
+    private var loadTask: Task<Void, Never>?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        contentView.backgroundColor = UIColor(Theme.elementHover)
+        contentView.layer.cornerRadius = 5
+        contentView.clipsToBounds = true
+        contentView.layer.borderColor = UIColor.white.cgColor
+
+        imageView.frame = contentView.bounds
+        imageView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        imageView.contentMode = .scaleAspectFill
+        imageView.clipsToBounds = true
+        contentView.addSubview(imageView)
+
+        placeholder.frame = contentView.bounds
+        placeholder.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        placeholder.contentMode = .center
+        placeholder.tintColor = UIColor(Theme.textFaint.opacity(0.5))
+        contentView.addSubview(placeholder)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        loadTask?.cancel()
+        loadTask = nil
+        representedId = nil
+        imageView.image = nil
+        placeholder.image = nil
+        setSelected(false)
+    }
+
+    func configure(
+        artifact: StudioArtifactDetail,
+        selected: Bool,
+        browser: StudioBrowserStore,
+        workspace: WorkspaceStore?,
+        deviceId: String?
+    ) {
+        representedId = artifact.id
+        setSelected(selected)
+        placeholder.image = UIImage(systemName: artifact.mediaKind == .video ? "film" : "photo")
+        if let cached = browser.cachedPreview(artifactId: artifact.id) {
+            imageView.image = cached
+            placeholder.isHidden = true
+            return
+        }
+        imageView.image = nil
+        placeholder.isHidden = false
+        guard let workspace, let deviceId else { return }
+        let artifactId = artifact.id
+        loadTask?.cancel()
+        loadTask = Task { @MainActor [weak self] in
+            // Reused cells crossed during a fling should never enqueue relay work.
+            try? await Task.sleep(for: .milliseconds(80))
+            guard !Task.isCancelled else { return }
+            let image = await browser.preview(
+                artifactId: artifactId,
+                deviceId: deviceId,
+                workspace: workspace
+            )
+            guard !Task.isCancelled, self?.representedId == artifactId else { return }
+            self?.imageView.image = image
+            self?.placeholder.isHidden = image != nil
+        }
+    }
+
+    func setSelected(_ selected: Bool) {
+        contentView.layer.borderWidth = selected ? 2 : 0
     }
 }
 
