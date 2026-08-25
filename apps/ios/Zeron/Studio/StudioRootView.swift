@@ -218,74 +218,24 @@ private struct StudioGalleryView: View {
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            ScrollView {
-                if browser.galleryLoadingMore {
-                    ProgressView()
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 16)
-                }
-                LazyVGrid(columns: columns, spacing: 2) {
-                    ForEach(browser.gallery.reversed()) { item in
-                        Button {
-                            openViewer(StudioViewerSession(
-                                artifacts: browser.gallery.reversed().map(StudioArtifactDetail.init(item:)),
-                                selectedId: item.id,
-                                openedFromGallery: true,
-                                openingPreview: browser.cachedPreview(artifactId: item.id)
-                            ))
-                        } label: {
-                            Rectangle()
-                                .fill(Theme.elementHover)
-                                .aspectRatio(1, contentMode: .fit)
-                                .overlay {
-                                    StudioPreviewView(item: item, browser: browser)
-                                }
-                                .clipped()
-                                .overlay(alignment: .bottomTrailing) {
-                                    if item.mediaKind == .video {
-                                        Label(duration(item.durationSeconds), systemImage: "play.fill")
-                                            .font(Theme.sans(10, weight: .semibold))
-                                            .foregroundStyle(.white)
-                                            .padding(5)
-                                            .shadow(radius: 2)
-                                    }
-                                }
-                        }
-                        .buttonStyle(.plain)
-                        .contentShape(Rectangle())
-                        .matchedTransitionSource(id: item.id, in: artifactTransition)
-                        .contextMenu {
-                            Button {
-                                download(StudioArtifactDetail(item: item))
-                            } label: {
-                                Label("Download", systemImage: "square.and.arrow.down")
-                            }
-                            Button {
-                                pathToThread(item.conversationId)
-                            } label: {
-                                Label("Show in Thread", systemImage: "rectangle.stack")
-                            }
-                            Button(role: .destructive) {
-                                artifactToDelete = StudioArtifactDetail(item: item)
-                            } label: {
-                                Label("Delete", systemImage: "trash")
-                            }
-                        }
-                        .accessibilityLabel("\(item.modelDisplayName), \(item.prompt)")
-                        .task {
-                            guard browser.shouldLoadMore(after: item),
-                                  let workspace = model.workspace,
-                                  let deviceId = browser.selectedDeviceId else { return }
-                            await browser.loadMoreGallery(
-                                workspace: workspace,
-                                deviceId: deviceId
-                            )
-                        }
-                    }
-                }
-            }
-            .defaultScrollAnchor(.bottom)
-            .scrollEdgeEffectStyle(.soft, for: .top)
+            StudioGalleryCollectionView(
+                items: browser.gallery,
+                browser: browser,
+                workspace: model.workspace,
+                deviceId: browser.selectedDeviceId,
+                openItem: { item, preview in
+                    openViewer(StudioViewerSession(
+                        artifacts: browser.gallery.map(StudioArtifactDetail.init(item:)),
+                        selectedId: item.id,
+                        openedFromGallery: true,
+                        openingPreview: preview ?? browser.cachedPreview(artifactId: item.id)
+                    ))
+                },
+                downloadItem: { download(StudioArtifactDetail(item: $0)) },
+                showThread: pathToThread,
+                deleteItem: { artifactToDelete = StudioArtifactDetail(item: $0) },
+                loadOlder: loadOlder
+            )
             .confirmationDialog(
                 "Delete this creation?",
                 isPresented: Binding(
@@ -333,14 +283,16 @@ private struct StudioGalleryView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func duration(_ seconds: Double?) -> String {
-        guard let seconds else { return "Video" }
-        let total = max(0, Int(seconds.rounded()))
-        return String(format: "%d:%02d", total / 60, total % 60)
-    }
-
     private func pathToThread(_ threadId: String) {
         showThread(threadId)
+    }
+
+    private func loadOlder() {
+        guard let workspace = model.workspace,
+              let deviceId = browser.selectedDeviceId else { return }
+        Task {
+            await browser.loadMoreGallery(workspace: workspace, deviceId: deviceId)
+        }
     }
 
     private func download(_ artifact: StudioArtifactDetail) {
@@ -429,7 +381,7 @@ private struct StudioThreadsView: View {
             path.append(.thread(thread.id))
         } label: {
             HStack(spacing: 12) {
-                if let item = browser.gallery.first(where: { $0.conversationId == thread.id }) {
+                if let item = browser.gallery.last(where: { $0.conversationId == thread.id }) {
                     StudioPreviewView(item: item, browser: browser)
                         .frame(width: 52, height: 52)
                         .clipShape(RoundedRectangle(cornerRadius: 9))
