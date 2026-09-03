@@ -382,7 +382,7 @@ impl ProvidersPage {
                     )
                     .child(
                         div()
-                            .text_size(px(14.0))
+                            .text_size(crate::typography::ui_rems(14.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text)
                             .child(SharedString::from(label)),
@@ -455,7 +455,7 @@ impl Render for ProvidersPage {
                     .child(
                         div()
                             .mt(px(24.0))
-                            .text_size(px(12.0))
+                            .text_size(crate::typography::ui_rems(12.0))
                             .line_height(px(19.0))
                             .text_color(theme.text_muted.opacity(0.6))
                             .child(SharedString::from(

@@ -938,14 +938,14 @@ impl StudioPage {
                         .child(
                             div()
                                 .mt(px(12.0))
-                                .text_size(px(14.0))
+                                .text_size(crate::typography::ui_rems(14.0))
                                 .text_color(theme.text_muted.opacity(0.6))
                                 .child("No generations yet"),
                         )
                         .child(
                             div()
                                 .mt(px(4.0))
-                                .text_size(px(12.0))
+                                .text_size(crate::typography::ui_rems(12.0))
                                 .text_color(theme.text_faint)
                                 .child("Open a thread and generate to fill the gallery."),
                         ),
@@ -1080,7 +1080,7 @@ impl StudioPage {
                     .on_click(cx.listener(|page, _, _, cx| page.clear_gallery_selection(cx)))
                     .child(
                         div()
-                            .text_size(px(12.0))
+                            .text_size(crate::typography::ui_rems(12.0))
                             .text_color(theme.text_muted)
                             .child(SharedString::from(label)),
                     ),
@@ -1270,7 +1270,7 @@ impl StudioPage {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .text_size(px(16.0))
+                                    .text_size(crate::typography::ui_rems(16.0))
                                     .text_color(gpui::hsla(0.0, 0.0, 1.0, 0.96))
                                     .child(SharedString::from("▶")),
                             ),
@@ -1304,7 +1304,7 @@ fn gallery_bar_action(
         .child(icons::icon(icon).size(px(13.0)).text_color(color))
         .child(
             div()
-                .text_size(px(12.0))
+                .text_size(crate::typography::ui_rems(12.0))
                 .text_color(if label == "Delete" {
                     theme.danger
                 } else {

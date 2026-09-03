@@ -100,7 +100,7 @@ impl StudioPage {
             } else {
                 theme.text_faint
             })
-            .text_size(px(12.0))
+            .text_size(crate::typography::ui_rems(12.0))
             .font_weight(gpui::FontWeight::MEDIUM);
         if busy {
             primary = primary
@@ -260,7 +260,7 @@ impl StudioPage {
                 div()
                     .flex_1()
                     .text_center()
-                    .text_size(px(11.0))
+                    .text_size(crate::typography::ui_rems(11.0))
                     .text_color(theme.text)
                     .child(SharedString::from(value)),
             )

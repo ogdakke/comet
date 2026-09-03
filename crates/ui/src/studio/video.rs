@@ -41,7 +41,7 @@ pub(super) fn duration_overlay_badge(theme: &Theme, seconds: Option<f64>) -> gpu
         } else {
             theme.surface_overlay
         })
-        .text_size(px(11.0))
+        .text_size(crate::typography::ui_rems(11.0))
         .line_height(px(14.0))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(hsla(0.0, 0.0, 1.0, 0.96))

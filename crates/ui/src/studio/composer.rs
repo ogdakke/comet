@@ -837,7 +837,7 @@ impl StudioPage {
                         div()
                             .min_w(px(28.0))
                             .text_center()
-                            .text_size(px(10.5))
+                            .text_size(crate::typography::ui_rems(10.5))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .child(SharedString::from(value)),
                     )
@@ -899,7 +899,7 @@ impl StudioPage {
                             div()
                                 .min_w(px(28.0))
                                 .text_center()
-                                .text_size(px(11.5))
+                                .text_size(crate::typography::ui_rems(11.5))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .child(SharedString::from(count.to_string())),
                         )
@@ -970,7 +970,7 @@ impl StudioPage {
             .child(
                 div()
                     .mb(px(12.0))
-                    .text_size(px(13.0))
+                    .text_size(crate::typography::ui_rems(13.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child(SharedString::from(model.display_name.clone())),
             )
@@ -1059,7 +1059,7 @@ impl StudioPage {
                 div()
                     .max_w(px(132.0))
                     .truncate()
-                    .text_size(px(11.0))
+                    .text_size(crate::typography::ui_rems(11.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .child(SharedString::from(display_name)),
             )
@@ -1213,7 +1213,7 @@ impl StudioPage {
                                 div()
                                     .w_full()
                                     .truncate()
-                                    .text_size(px(12.0))
+                                    .text_size(crate::typography::ui_rems(12.0))
                                     .font_weight(gpui::FontWeight::MEDIUM)
                                     .child(SharedString::from(model.display_name)),
                             );
@@ -1304,7 +1304,7 @@ impl StudioPage {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .text_size(px(13.0))
+                        .text_size(crate::typography::ui_rems(13.0))
                         .child(self.model_search.clone()),
                 );
             let mut rail = div()
@@ -1331,7 +1331,7 @@ impl StudioPage {
                             )
                             .child(
                                 div()
-                                    .text_size(px(11.0))
+                                    .text_size(crate::typography::ui_rems(11.0))
                                     .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(if favorites_view {
                                         theme.text
@@ -1357,7 +1357,7 @@ impl StudioPage {
                             |row| {
                                 row.child(
                                     div()
-                                        .text_size(px(11.0))
+                                        .text_size(crate::typography::ui_rems(11.0))
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                         .text_color(if selected {
                                             theme.text
@@ -1385,7 +1385,7 @@ impl StudioPage {
                         |row| {
                             row.child(
                                 div()
-                                    .text_size(px(11.0))
+                                    .text_size(crate::typography::ui_rems(11.0))
                                     .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(if selected {
                                         theme.text
@@ -1418,7 +1418,7 @@ impl StudioPage {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_size(px(12.0))
+                            .text_size(crate::typography::ui_rems(12.0))
                             .text_color(theme.text_muted)
                             .child(empty_copy),
                     )
@@ -1572,7 +1572,7 @@ impl StudioPage {
                     .when(self.source_turn.is_some() && prompt_expanded, |row| {
                         row.child(
                             div()
-                                .text_size(px(10.5))
+                                .text_size(crate::typography::ui_rems(10.5))
                                 .text_color(theme.text_faint)
                                 .child("Using previous settings"),
                         )
@@ -1609,7 +1609,7 @@ impl StudioPage {
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(11.0))
+                                            .text_size(crate::typography::ui_rems(11.0))
                                             .font_weight(gpui::FontWeight::MEDIUM)
                                             .child(SharedString::from(format!(
                                                 "{} model{}",
@@ -1626,7 +1626,7 @@ impl StudioPage {
                     .when_some(batch_quote.as_ref(), |row, quote| {
                         row.child(
                             div()
-                                .text_size(px(11.0))
+                                .text_size(crate::typography::ui_rems(11.0))
                                 .text_color(theme.text_muted)
                                 .child(SharedString::from(super::cost::format_quote(quote))),
                         )
@@ -1893,7 +1893,7 @@ impl StudioPage {
                     .child(
                         div()
                             .opacity(0.0)
-                            .text_size(px(12.0))
+                            .text_size(crate::typography::ui_rems(12.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .child(SharedString::from(sizer)),
                     )
@@ -1904,7 +1904,7 @@ impl StudioPage {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_size(px(12.0))
+                            .text_size(crate::typography::ui_rems(12.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .child(SharedString::from(label)),
                     ),
@@ -2047,13 +2047,13 @@ impl StudioPage {
                     })
                     .child(
                         div()
-                            .text_size(px(13.0))
+                            .text_size(crate::typography::ui_rems(13.0))
                             .text_color(theme.text_muted)
                             .child(SharedString::from("+")),
                     )
                     .child(
                         div()
-                            .text_size(px(13.0))
+                            .text_size(crate::typography::ui_rems(13.0))
                             .text_color(theme.text)
                             .child(SharedString::from("Generate more")),
                     ),
@@ -2099,7 +2099,7 @@ fn mode_segment_chip(
 fn config_section(label: impl Into<SharedString>, theme: &Theme) -> gpui::Div {
     div().flex().flex_col().gap(px(6.0)).child(
         div()
-            .text_size(px(10.0))
+            .text_size(crate::typography::ui_rems(10.0))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(theme.text_faint)
             .child(label.into()),
@@ -2130,7 +2130,7 @@ fn config_choice(
         } else {
             crate::theme::wash(0.035)
         })
-        .text_size(px(10.5))
+        .text_size(crate::typography::ui_rems(10.5))
         .text_color(if active { theme.text } else { theme.text_muted })
         .cursor_pointer()
         .hover(|style| style.bg(crate::theme::wash(0.09)))
@@ -2177,7 +2177,7 @@ fn config_aspect_choice(
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_size(px(8.0))
+                        .text_size(crate::typography::ui_rems(8.0))
                         .text_color(theme.text_faint)
                         .child("A")
                 }),
@@ -2204,7 +2204,7 @@ fn config_aspect_choice(
         } else {
             crate::theme::wash(0.035)
         })
-        .text_size(px(9.5))
+        .text_size(crate::typography::ui_rems(9.5))
         .text_color(if active { theme.text } else { theme.text_muted })
         .cursor_pointer()
         .hover(|style| style.bg(crate::theme::wash(0.09)))
@@ -2406,7 +2406,7 @@ fn config_readout(label: SharedString, theme: &Theme) -> gpui::Div {
         .py(px(2.0))
         .rounded(px(5.0))
         .bg(crate::theme::wash(0.065))
-        .text_size(px(10.0))
+        .text_size(crate::typography::ui_rems(10.0))
         .text_color(theme.text_muted)
         .child(label)
 }
@@ -2420,7 +2420,7 @@ fn chip_status_badge(label: SharedString, theme: &Theme) -> gpui::Div {
         .py(px(2.0))
         .rounded(px(5.0))
         .bg(theme.warning.opacity(0.14))
-        .text_size(px(10.0))
+        .text_size(crate::typography::ui_rems(10.0))
         .text_color(theme.warning)
         .child(label)
 }
@@ -2451,7 +2451,7 @@ fn feature_badge(theme: &Theme, feature: ModelFeature) -> gpui::Div {
         .py(px(1.0))
         .rounded(px(4.0))
         .bg(crate::theme::wash(0.08))
-        .text_size(px(10.0))
+        .text_size(crate::typography::ui_rems(10.0))
         .text_color(theme.text_muted)
         .child(SharedString::from(feature.label()))
 }

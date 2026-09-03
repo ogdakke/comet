@@ -549,7 +549,7 @@ impl StudioPage {
             div()
                 .id("studio-prompt-budget")
                 .flex_none()
-                .text_size(px(11.0))
+                .text_size(crate::typography::ui_rems(11.0))
                 .text_color(if overflow {
                     theme.danger
                 } else {
@@ -580,7 +580,7 @@ impl StudioPage {
                 .gap(px(8.0))
                 .children(labels.into_iter().map(|label| {
                     div()
-                        .text_size(px(11.0))
+                        .text_size(crate::typography::ui_rems(11.0))
                         .text_color(theme.text_muted)
                         .child(SharedString::from(label))
                 })),
@@ -603,7 +603,7 @@ impl StudioPage {
             .rounded(px(8.0))
             .bg(crate::theme::wash(0.06))
             .text_color(theme.text)
-            .text_size(px(12.0))
+            .text_size(crate::typography::ui_rems(12.0))
             .font_weight(gpui::FontWeight::MEDIUM)
             .cursor_pointer()
             .hover(|style| style.bg(crate::theme::wash(0.10)))

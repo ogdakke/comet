@@ -1797,7 +1797,7 @@ impl Render for StudioPage {
                         .child(
                             div()
                                 .mt(px(24.0))
-                                .text_size(px(16.0))
+                                .text_size(crate::typography::ui_rems(16.0))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(theme.text)
                                 .child("Connect a provider to begin"),
@@ -1805,7 +1805,7 @@ impl Render for StudioPage {
                         .child(
                             div()
                                 .mt(px(6.0))
-                                .text_size(px(13.0))
+                                .text_size(crate::typography::ui_rems(13.0))
                                 .text_color(theme.text_muted.opacity(0.7))
                                 .child("Connect an image provider to start generating."),
                         )
@@ -1831,7 +1831,7 @@ impl Render for StudioPage {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(13.0))
+                    .text_size(crate::typography::ui_rems(13.0))
                     .text_color(theme.text)
                     .child(SharedString::from(super::tray::studio_drop_veil_copy(
                         &self.composer_view.attachments.accept,

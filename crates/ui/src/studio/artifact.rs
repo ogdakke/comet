@@ -130,7 +130,7 @@ pub(super) fn render_run_error_chip(theme: &Theme, message: &str) -> AnyElement 
         .bg(danger.opacity(0.05))
         .px(px(8.0))
         .py(px(7.0))
-        .text_size(px(12.0))
+        .text_size(crate::typography::ui_rems(12.0))
         .child(
             div()
                 .flex_none()
@@ -199,7 +199,7 @@ pub(super) fn render_run_failed_overlay(theme: &Theme, error: Option<&str>) -> A
         )
         .child(
             div()
-                .text_size(px(12.0))
+                .text_size(crate::typography::ui_rems(12.0))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(red.opacity(0.9))
                 .text_center()
@@ -208,7 +208,7 @@ pub(super) fn render_run_failed_overlay(theme: &Theme, error: Option<&str>) -> A
         .when_some(message, |el, message| {
             el.child(
                 div()
-                    .text_size(px(11.0))
+                    .text_size(crate::typography::ui_rems(11.0))
                     .text_color(theme.text.opacity(0.8))
                     .text_center()
                     .child(message),
@@ -2484,7 +2484,7 @@ impl StudioPage {
                                     .child(render_run_failed_overlay(theme, error))
                             })
                             .when(show_fallback, |box_| {
-                                box_.text_size(px(12.0))
+                                box_.text_size(crate::typography::ui_rems(12.0))
                                     .text_color(theme.text_faint)
                                     .child("Loading image…")
                             }),
@@ -2740,7 +2740,7 @@ impl StudioPage {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .text_size(px(11.0))
+                                .text_size(crate::typography::ui_rems(11.0))
                                 .text_color(theme.text_muted)
                                 .child(SharedString::from("▶")),
                         )
@@ -3049,7 +3049,7 @@ impl StudioPage {
                                             .child(
                                                 div()
                                                     .w_full()
-                                                    .text_size(px(12.0))
+                                                    .text_size(crate::typography::ui_rems(12.0))
                                                     .line_height(px(INSPECTOR_PROMPT_LINE_HEIGHT))
                                                     .text_color(theme.text)
                                                     .when(collapsed, |box_| {
@@ -3108,7 +3108,7 @@ impl StudioPage {
                                 div()
                                     .flex_none()
                                     .when(has_prompt, |meta| meta.mt(px(14.0)))
-                                    .text_size(px(11.0))
+                                    .text_size(crate::typography::ui_rems(11.0))
                                     .text_color(theme.text_muted)
                                     .child(SharedString::from(if pending || mime.is_empty() {
                                         model

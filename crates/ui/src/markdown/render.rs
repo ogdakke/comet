@@ -313,12 +313,12 @@ fn from_hex(b: u8) -> Option<u8> {
 /// Cached runs carry a resolved [`gpui::Hsla`] per span, so an entry is only
 /// valid for the palette that produced it — content-only keys silently serve
 /// dark-mode text onto a light background after an appearance switch.
-/// [`RenderCache::sync_palette`] drops everything when the palette moves.
+/// [`RenderCache::sync_style`] drops everything when color or typography moves.
 #[derive(Default)]
 pub struct RenderCache {
     flats: HashMap<(SharedString, usize, usize), Rc<FlatText>>,
     code: HashMap<(SharedString, usize, usize), Rc<CachedCode>>,
-    /// The [`crate::theme::theme_generation`] these entries were shaped under.
+    /// The [`crate::theme::style_generation`] these entries were shaped under.
     generation: u32,
 }
 
@@ -342,10 +342,14 @@ impl RenderCache {
         self.code.clear();
     }
 
-    /// Drop every entry if the palette changed since they were shaped. Cheap
+    /// Drop every entry if the resolved text style changed since shaping. Cheap
     /// enough (one relaxed atomic load) to call on every cache access.
-    fn sync_palette(&mut self) {
-        let generation = crate::theme::theme_generation();
+    fn sync_style(&mut self) {
+        let generation = crate::theme::style_generation();
+        self.sync_generation(generation);
+    }
+
+    fn sync_generation(&mut self, generation: u32) {
         if self.generation != generation {
             self.clear();
             self.generation = generation;
@@ -456,8 +460,8 @@ pub fn render_block(
                     Some(start) => div()
                         .flex_none()
                         .min_w(px(18.0))
-                        .text_size(px(MD_TEXT_SIZE))
-                        .line_height(px(MD_LINE_HEIGHT))
+                        .text_size(crate::typography::ui_rems(MD_TEXT_SIZE))
+                        .line_height(crate::typography::ui_rems(MD_LINE_HEIGHT))
                         .text_color(theme.accent)
                         .child(SharedString::from(format!("{}.", start + item_ix as u64)))
                         .into_any_element(),
@@ -708,8 +712,8 @@ fn render_table(
                 .flex_basis(px(0.0))
                 .min_w(px(geo.minimums[c]))
                 .p(px(TABLE_CELL_PADDING))
-                .text_size(px(MD_TEXT_SIZE))
-                .line_height(px(MD_LINE_HEIGHT));
+                .text_size(crate::typography::ui_rems(MD_TEXT_SIZE))
+                .line_height(crate::typography::ui_rems(MD_LINE_HEIGHT));
             cell = match align.get(c).copied().unwrap_or_default() {
                 TableAlign::Left => cell,
                 TableAlign::Center => cell.text_center(),
@@ -877,7 +881,7 @@ fn flatten_cached(
     match &opts.cache {
         Some(cache) => {
             let mut cache = cache.borrow_mut();
-            cache.sync_palette();
+            cache.sync_style();
             cache
                 .flats
                 .entry((opts.row_key.clone(), top_ix, ix))
@@ -1504,8 +1508,8 @@ fn text_element(
     let flat = flatten_cached(runs, weight, top_ix, ix, opts, theme);
     let inner = flat_text_element(&flat, ix, opts, theme);
     div()
-        .text_size(px(size))
-        .line_height(px(line_height))
+        .text_size(crate::typography::ui_rems(size))
+        .line_height(crate::typography::ui_rems(line_height))
         .child(inner)
         .into_any_element()
 }
@@ -1548,7 +1552,7 @@ fn render_code_block(
     let cached: Rc<CachedCode> = match &opts.cache {
         Some(cache) => {
             let mut cache = cache.borrow_mut();
-            cache.sync_palette();
+            cache.sync_style();
             let entry = cache
                 .code
                 .entry((opts.row_key.clone(), top_ix, ix))
@@ -2068,5 +2072,30 @@ mod tests {
             &[overlay]
         ));
         assert!(!pointer_hits_any_occluder(point(px(180.0), px(120.0)), &[]));
+    }
+
+    #[test]
+    fn style_generation_change_invalidates_cached_runs() {
+        let mut cache = RenderCache {
+            generation: 10,
+            ..Default::default()
+        };
+        cache.flats.insert(
+            ("row".into(), 0, 0),
+            Rc::new(FlatText {
+                text: "cached".into(),
+                runs: Vec::new(),
+                links: Vec::new(),
+                code_ranges: Vec::new(),
+            }),
+        );
+        cache.sync_generation(10);
+        assert_eq!(cache.flats.len(), 1, "same style is idempotent");
+        cache.sync_generation(11);
+        assert!(
+            cache.flats.is_empty(),
+            "font or color changes invalidate runs"
+        );
+        assert!(cache.code.is_empty());
     }
 }

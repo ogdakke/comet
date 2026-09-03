@@ -224,7 +224,7 @@ fn render_row(item: TrayItem, theme: &Theme) -> impl IntoElement {
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_size(px(12.0))
+                .text_size(crate::typography::ui_rems(12.0))
                 .text_color(theme.text)
                 .child(item.label),
         )
@@ -264,7 +264,7 @@ fn render_action(action: TrayAction, theme: &Theme) -> impl IntoElement {
         } else {
             gpui::transparent_black()
         })
-        .text_size(px(11.0))
+        .text_size(crate::typography::ui_rems(11.0))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(label_color)
         .cursor_pointer()

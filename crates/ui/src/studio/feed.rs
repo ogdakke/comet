@@ -606,7 +606,7 @@ pub(super) fn turn_action(
         .items_center()
         .gap(px(4.0))
         .cursor_pointer()
-        .text_size(px(11.0))
+        .text_size(crate::typography::ui_rems(11.0))
         .line_height(px(16.0))
         .text_color(motion::hover_blend(
             &fade,
@@ -1011,7 +1011,7 @@ impl StudioPage {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_size(px(16.0))
+                        .text_size(crate::typography::ui_rems(16.0))
                         .text_color(gpui::hsla(0.0, 0.0, 1.0, 0.96))
                         .child(SharedString::from("▶")),
                 )
@@ -1023,7 +1023,7 @@ impl StudioPage {
             .flex()
             .items_center()
             .justify_center()
-            .text_size(px(11.0))
+            .text_size(crate::typography::ui_rems(11.0))
             .text_color(theme.text_faint)
             .cursor_pointer()
             .when_some(artifact_id, |tile, id| {
@@ -1824,7 +1824,7 @@ impl StudioPage {
                         .child(
                             div()
                                 .mt(px(12.0))
-                                .text_size(px(14.0))
+                                .text_size(crate::typography::ui_rems(14.0))
                                 .text_color(theme.text_muted.opacity(0.6))
                                 .child("Describe an image below to begin"),
                         ),
@@ -2065,7 +2065,7 @@ impl StudioPage {
                                 .rounded(px(Theme::BUBBLE_RADIUS))
                                 .px(px(PROMPT_BUBBLE_PAD_X))
                                 .py(px(10.0))
-                                .text_size(px(14.0))
+                                .text_size(crate::typography::ui_rems(14.0))
                                 .line_height(px(PROMPT_LINE_HEIGHT))
                                 .text_color(theme.text)
                                 .when(!clampable, |el| {
@@ -2115,7 +2115,7 @@ impl StudioPage {
                                     row.child(
                                         div()
                                             .flex_none()
-                                            .text_size(px(11.0))
+                                            .text_size(crate::typography::ui_rems(11.0))
                                             .text_color(theme.text_muted.opacity(0.7))
                                             .child(SharedString::from(cost)),
                                     )
@@ -2294,14 +2294,14 @@ impl StudioPage {
                         .gap(px(6.0))
                         .child(
                             div()
-                                .text_size(px(12.0))
+                                .text_size(crate::typography::ui_rems(12.0))
                                 .text_color(theme.text)
                                 .child(SharedString::from(prompt)),
                         )
                         .when(!models.is_empty(), |el| {
                             el.child(
                                 div()
-                                    .text_size(px(11.0))
+                                    .text_size(crate::typography::ui_rems(11.0))
                                     .text_color(theme.text_muted)
                                     .child(SharedString::from(models)),
                             )
@@ -2309,21 +2309,21 @@ impl StudioPage {
                         .when_some(tick.cost.clone(), |el, cost| {
                             el.child(
                                 div()
-                                    .text_size(px(11.0))
+                                    .text_size(crate::typography::ui_rems(11.0))
                                     .text_color(theme.text_muted)
                                     .child(SharedString::from(cost)),
                             )
                         })
                         .child(
                             div()
-                                .text_size(px(10.0))
+                                .text_size(crate::typography::ui_rems(10.0))
                                 .text_color(theme.text_muted.opacity(0.7))
                                 .child(SharedString::from(sent)),
                         )
                         .when(bucket_len > 1, |el| {
                             el.child(
                                 div()
-                                    .text_size(px(10.0))
+                                    .text_size(crate::typography::ui_rems(10.0))
                                     .text_color(theme.text_muted.opacity(0.7))
                                     .child(SharedString::from(format!("{bucket_len} turns"))),
                             )

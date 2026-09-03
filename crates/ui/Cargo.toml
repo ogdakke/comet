@@ -30,6 +30,8 @@ base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 thumbhash = "0.1"
 unicode-segmentation.workspace = true
+fontdb.workspace = true
+ttf-parser.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 anyhow.workspace = true

@@ -782,7 +782,7 @@ impl StudioPage {
             .items_center()
             .px(px(8.0))
             .rounded(px(8.0))
-            .text_size(px(12.0))
+            .text_size(crate::typography::ui_rems(12.0))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(theme.text.opacity(0.9))
             .cursor_pointer()
@@ -850,7 +850,7 @@ impl StudioPage {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_size(px(15.0))
+                            .text_size(crate::typography::ui_rems(15.0))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(theme.text)
                             .child("Precise Edit"),
@@ -859,7 +859,7 @@ impl StudioPage {
             )
             .child(
                 div()
-                    .text_size(px(13.0))
+                    .text_size(crate::typography::ui_rems(13.0))
                     .text_color(theme.text_muted)
                     .child("Brush size"),
             )
@@ -1054,7 +1054,7 @@ impl StudioPage {
             .rounded(px(8.0))
             .bg(crate::theme::wash(0.06))
             .text_color(theme.text)
-            .text_size(px(12.0))
+            .text_size(crate::typography::ui_rems(12.0))
             .font_weight(gpui::FontWeight::MEDIUM);
         if !available {
             return button
@@ -1125,7 +1125,7 @@ fn precise_edit_button(
             div()
                 .flex_1()
                 .when(center_label, |label_el| label_el.flex().justify_center())
-                .text_size(px(14.0))
+                .text_size(crate::typography::ui_rems(14.0))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(theme.text)
                 .child(SharedString::from(label)),
