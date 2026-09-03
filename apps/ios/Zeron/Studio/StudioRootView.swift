@@ -57,7 +57,6 @@ struct StudioRootView: View {
     @State private var path: [StudioRoute] = []
     @State private var viewer: StudioViewerSession?
     @State private var galleryTransitionSource = StudioGalleryTransitionSource()
-    @Namespace private var artifactTransition
 
     private var hostKey: String {
         "\(browser.selectedDeviceId ?? "none")-\(browser.reloadGeneration)"
@@ -85,7 +84,7 @@ struct StudioRootView: View {
                     StudioThreadView(
                         threadId: threadId,
                         browser: browser,
-                        artifactTransition: artifactTransition,
+                        transitionSource: galleryTransitionSource,
                         openViewer: { viewer = $0 }
                     )
                 }
@@ -132,7 +131,7 @@ struct StudioRootView: View {
                 title: "Studio needs a desktop",
                 message: "Open Zeron on a desktop device, then try again."
             )
-        } else if let deviceId = browser.selectedDeviceId, !model.deviceOnline(deviceId) {
+        } else if let deviceId = browser.selectedDeviceId, desktopDefinitelyOffline(deviceId) {
             unavailable(
                 title: "Desktop is offline",
                 message: "Reconnect \(model.deviceName(deviceId)) to browse its Studio library."
@@ -164,6 +163,12 @@ struct StudioRootView: View {
             Button("Try again") { browser.reload() }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func desktopDefinitelyOffline(_ deviceId: String) -> Bool {
+        guard let workspace = model.workspace else { return true }
+        if case .dark = workspace.peerLiveness(deviceId) { return true }
+        return false
     }
 
     private var machineMenu: some View {
@@ -435,6 +440,8 @@ struct StudioPreviewView: View {
             artifactId: item.id,
             mediaKind: item.mediaKind,
             browser: browser,
+            thumbhash: item.thumbhash,
+            aspectRatio: item.aspectRatio,
             contentMode: .fill
         )
     }
@@ -445,6 +452,9 @@ struct StudioMediaPreviewView: View {
     let artifactId: String
     let mediaKind: StudioMediaKind
     let browser: StudioBrowserStore
+    let thumbhash: String?
+    let aspectRatio: CGFloat?
+    let transitionSource: StudioGalleryTransitionSource?
     var contentMode: ContentMode = .fill
     @State private var image: UIImage?
 
@@ -452,22 +462,32 @@ struct StudioMediaPreviewView: View {
         artifactId: String,
         mediaKind: StudioMediaKind,
         browser: StudioBrowserStore,
+        thumbhash: String? = nil,
+        aspectRatio: CGFloat? = nil,
+        transitionSource: StudioGalleryTransitionSource? = nil,
         contentMode: ContentMode = .fill
     ) {
         self.artifactId = artifactId
         self.mediaKind = mediaKind
         self.browser = browser
+        self.thumbhash = thumbhash
+        self.aspectRatio = aspectRatio
+        self.transitionSource = transitionSource
         self.contentMode = contentMode
-        _image = State(initialValue: browser.cachedPreview(artifactId: artifactId))
+        _image = State(initialValue: browser.cachedPreview(artifactId: artifactId)
+            ?? browser.thumbhashImage(thumbhash, aspectRatio: aspectRatio))
     }
 
     var body: some View {
         ZStack {
             Theme.elementHover
             if let image {
-                Image(uiImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: contentMode)
+                StudioTransitionImageView(
+                    artifactId: artifactId,
+                    image: image,
+                    contentMode: contentMode,
+                    transitionSource: transitionSource
+                )
             } else {
                 Image(systemName: mediaKind == .video ? "film" : "photo")
                     .font(.system(size: 20, weight: .light))
@@ -479,11 +499,59 @@ struct StudioMediaPreviewView: View {
         .task(id: "\(browser.selectedDeviceId ?? "none")-\(artifactId)") {
             guard let deviceId = browser.selectedDeviceId,
                   let workspace = model.workspace else { return }
-            image = await browser.preview(
+            if let loaded = await browser.preview(
                 artifactId: artifactId,
                 deviceId: deviceId,
                 workspace: workspace
-            )
+            ) {
+                image = loaded
+            }
         }
+    }
+}
+
+private struct StudioTransitionImageView: UIViewRepresentable {
+    let artifactId: String
+    let image: UIImage
+    let contentMode: ContentMode
+    let transitionSource: StudioGalleryTransitionSource?
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIView(context: Context) -> UIImageView {
+        let imageView = UIImageView()
+        imageView.clipsToBounds = true
+        imageView.isUserInteractionEnabled = false
+        context.coordinator.artifactId = artifactId
+        context.coordinator.transitionSource = transitionSource
+        transitionSource?.register(imageView, for: artifactId)
+        return imageView
+    }
+
+    func updateUIView(_ imageView: UIImageView, context: Context) {
+        if context.coordinator.artifactId != artifactId {
+            if let previous = context.coordinator.artifactId {
+                context.coordinator.transitionSource?.unregister(imageView, for: previous)
+            }
+            context.coordinator.artifactId = artifactId
+        }
+        if context.coordinator.transitionSource !== transitionSource {
+            if let previous = context.coordinator.artifactId {
+                context.coordinator.transitionSource?.unregister(imageView, for: previous)
+            }
+        }
+        context.coordinator.transitionSource = transitionSource
+        imageView.image = image
+        imageView.contentMode = contentMode == .fill ? .scaleAspectFill : .scaleAspectFit
+        transitionSource?.register(imageView, for: artifactId)
+    }
+
+    static func dismantleUIView(_ imageView: UIImageView, coordinator: Coordinator) {
+        coordinator.transitionSource?.unregister(imageView, for: coordinator.artifactId ?? "")
+    }
+
+    final class Coordinator {
+        var artifactId: String?
+        weak var transitionSource: StudioGalleryTransitionSource?
     }
 }

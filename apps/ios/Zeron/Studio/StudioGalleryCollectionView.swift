@@ -4,15 +4,58 @@ import UIKit
 @MainActor
 final class StudioGalleryTransitionSource {
     weak var provider: StudioGalleryTransitionSourceProvider?
+    private var registeredViews: [String: WeakStudioTransitionView] = [:]
 
     func imageView(for artifactId: String) -> UIView? {
-        provider?.transitionImageView(for: artifactId)
+        if let view = registeredViews[artifactId]?.view,
+           view.window != nil,
+           !view.isHidden,
+           view.alpha > 0.01 {
+            return view
+        }
+        registeredViews[artifactId] = nil
+        return provider?.transitionImageView(for: artifactId)
     }
+
+    func register(_ view: UIView, for artifactId: String) {
+        registeredViews[artifactId] = WeakStudioTransitionView(view)
+    }
+
+    func unregister(_ view: UIView, for artifactId: String) {
+        guard registeredViews[artifactId]?.view === view else { return }
+        registeredViews[artifactId] = nil
+    }
+
+    func prepareForDismissal(to artifactId: String) {
+        provider?.prepareTransitionImageView(for: artifactId)
+    }
+}
+
+private final class WeakStudioTransitionView {
+    weak var view: UIView?
+    init(_ view: UIView) { self.view = view }
 }
 
 @MainActor
 protocol StudioGalleryTransitionSourceProvider: AnyObject {
     func transitionImageView(for artifactId: String) -> UIView?
+    func prepareTransitionImageView(for artifactId: String)
+}
+
+extension StudioGalleryTransitionSourceProvider {
+    func prepareTransitionImageView(for artifactId: String) {}
+}
+
+private final class StudioGalleryUICollectionView: UICollectionView {
+    var layoutChanged: (() -> Void)?
+    private var lastLayoutSize: CGSize = .zero
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard bounds.size != lastLayoutSize else { return }
+        lastLayoutSize = bounds.size
+        layoutChanged?()
+    }
 }
 
 struct StudioGalleryCollectionView: UIViewRepresentable {
@@ -36,11 +79,15 @@ struct StudioGalleryCollectionView: UIViewRepresentable {
         layout.minimumInteritemSpacing = 2
         layout.minimumLineSpacing = 2
 
-        let collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
+        let collectionView = StudioGalleryUICollectionView(
+            frame: .zero,
+            collectionViewLayout: layout
+        )
         collectionView.backgroundColor = .clear
         collectionView.alwaysBounceVertical = true
         collectionView.contentInsetAdjustmentBehavior = .automatic
         collectionView.keyboardDismissMode = .onDrag
+        collectionView.topEdgeEffect.style = .soft
         collectionView.delegate = context.coordinator
         collectionView.prefetchDataSource = context.coordinator
         collectionView.register(
@@ -48,6 +95,9 @@ struct StudioGalleryCollectionView: UIViewRepresentable {
             forCellWithReuseIdentifier: StudioGalleryCell.reuseIdentifier
         )
         context.coordinator.installDataSource(on: collectionView)
+        collectionView.layoutChanged = { [weak coordinator = context.coordinator] in
+            coordinator?.layoutDidChange()
+        }
         transitionSource.provider = context.coordinator
         context.coordinator.apply(items: items, to: collectionView, initial: true)
         return collectionView
@@ -75,6 +125,7 @@ struct StudioGalleryCollectionView: UIViewRepresentable {
         private var prefetchedIds: Set<String> = []
         private var requestedOldestId: String?
         private var didSetInitialPosition = false
+        private var positioningInitialItem = false
 
         init(parent: StudioGalleryCollectionView) {
             self.parent = parent
@@ -101,11 +152,18 @@ struct StudioGalleryCollectionView: UIViewRepresentable {
         func transitionImageView(for artifactId: String) -> UIView? {
             guard let collectionView,
                   let indexPath = dataSource?.indexPath(for: artifactId) else { return nil }
-            if collectionView.cellForItem(at: indexPath) == nil {
-                collectionView.scrollToItem(at: indexPath, at: .centeredVertically, animated: false)
-                collectionView.layoutIfNeeded()
-            }
+            // Never move or synchronously lay out a thousand-item gallery from
+            // inside UIKit's transition callback. If paging moved away from a
+            // visible source, returning nil gives UIKit a clean fade fallback.
             return (collectionView.cellForItem(at: indexPath) as? StudioGalleryCell)?.imageView
+        }
+
+        func prepareTransitionImageView(for artifactId: String) {
+            guard let collectionView,
+                  let indexPath = dataSource?.indexPath(for: artifactId),
+                  collectionView.cellForItem(at: indexPath) == nil else { return }
+            collectionView.scrollToItem(at: indexPath, at: .centeredVertically, animated: false)
+            collectionView.layoutIfNeeded()
         }
 
         func apply(items newItems: [StudioGalleryItem], to collectionView: UICollectionView, initial: Bool) {
@@ -129,13 +187,8 @@ struct StudioGalleryCollectionView: UIViewRepresentable {
             dataSource?.apply(snapshot, animatingDifferences: false) { [weak self, weak collectionView] in
                 guard let self, let collectionView else { return }
                 collectionView.layoutIfNeeded()
-                if !self.didSetInitialPosition, !newItems.isEmpty {
-                    self.didSetInitialPosition = true
-                    collectionView.scrollToItem(
-                        at: IndexPath(item: newItems.count - 1, section: 0),
-                        at: .bottom,
-                        animated: false
-                    )
+                if !self.didSetInitialPosition {
+                    self.positionInitialItemIfPossible()
                 } else if let oldFirstId,
                           let newIndex = newIds.firstIndex(of: oldFirstId),
                           newIndex > 0 {
@@ -151,6 +204,10 @@ struct StudioGalleryCollectionView: UIViewRepresentable {
             }
         }
 
+        func layoutDidChange() {
+            positionInitialItemIfPossible()
+        }
+
         func collectionView(
             _ collectionView: UICollectionView,
             layout collectionViewLayout: UICollectionViewLayout,
@@ -164,6 +221,20 @@ struct StudioGalleryCollectionView: UIViewRepresentable {
             guard let item = item(at: indexPath) else { return }
             let image = (collectionView.cellForItem(at: indexPath) as? StudioGalleryCell)?.displayedImage
             parent.openItem(item, image)
+        }
+
+        func collectionView(
+            _ collectionView: UICollectionView,
+            didHighlightItemAt indexPath: IndexPath
+        ) {
+            guard let item = item(at: indexPath),
+                  let workspace = parent.workspace,
+                  let deviceId = parent.deviceId else { return }
+            parent.browser.preheatDisplayImage(
+                artifact: StudioArtifactDetail(item: item),
+                deviceId: deviceId,
+                workspace: workspace
+            )
         }
 
         func collectionView(
@@ -258,6 +329,25 @@ struct StudioGalleryCollectionView: UIViewRepresentable {
             for id in prefetchedIds { parent.browser.endPreviewRequest(artifactId: id) }
             prefetchedIds.removeAll()
         }
+
+        private func positionInitialItemIfPossible() {
+            guard !didSetInitialPosition,
+                  !positioningInitialItem,
+                  !items.isEmpty,
+                  let collectionView,
+                  collectionView.bounds.width > 0,
+                  collectionView.bounds.height > 0,
+                  dataSource?.snapshot().numberOfItems == items.count else { return }
+            positioningInitialItem = true
+            collectionView.layoutIfNeeded()
+            didSetInitialPosition = true
+            collectionView.scrollToItem(
+                at: IndexPath(item: items.count - 1, section: 0),
+                at: .bottom,
+                animated: false
+            )
+            positioningInitialItem = false
+        }
     }
 }
 
@@ -351,9 +441,10 @@ final class StudioGalleryCell: UICollectionViewCell {
             placeholderView.isHidden = true
             return
         }
+        let thumbhash = browser.thumbhashImage(item.thumbhash, aspectRatio: item.aspectRatio)
+        imageView.image = thumbhash
+        placeholderView.isHidden = thumbhash != nil
         guard !requestActive, let workspace, let deviceId else { return }
-        imageView.image = nil
-        placeholderView.isHidden = false
         requestActive = true
         let artifactId = item.id
         let request = browser.beginPreviewRequest(
@@ -364,8 +455,8 @@ final class StudioGalleryCell: UICollectionViewCell {
         loadTask = Task { @MainActor [weak self] in
             let image = await request.value
             guard !Task.isCancelled, self?.representedId == artifactId else { return }
-            self?.imageView.image = image
-            self?.placeholderView.isHidden = image != nil
+            if let image { self?.imageView.image = image }
+            self?.placeholderView.isHidden = image != nil || thumbhash != nil
         }
     }
 

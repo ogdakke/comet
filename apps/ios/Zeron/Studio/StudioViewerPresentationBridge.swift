@@ -8,16 +8,14 @@ struct StudioViewerPresentationBridge: UIViewControllerRepresentable {
     let transitionSource: StudioGalleryTransitionSource
     let showThread: (String) -> Void
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator(parent: self)
-    }
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
     func makeUIViewController(context: Context) -> StudioPresentationAnchorViewController {
-        let viewController = StudioPresentationAnchorViewController()
-        viewController.view.isUserInteractionEnabled = false
-        viewController.view.backgroundColor = .clear
-        context.coordinator.anchor = viewController
-        return viewController
+        let controller = StudioPresentationAnchorViewController()
+        controller.view.isUserInteractionEnabled = false
+        controller.view.backgroundColor = .clear
+        context.coordinator.anchor = controller
+        return controller
     }
 
     func updateUIViewController(
@@ -32,7 +30,7 @@ struct StudioViewerPresentationBridge: UIViewControllerRepresentable {
     final class Coordinator: NSObject, UIAdaptivePresentationControllerDelegate {
         var parent: StudioViewerPresentationBridge
         weak var anchor: UIViewController?
-        private weak var presentedController: UIViewController?
+        private weak var presentedController: StudioGalleryViewerController?
         private var presentedSessionId: UUID?
 
         init(parent: StudioViewerPresentationBridge) {
@@ -45,7 +43,9 @@ struct StudioViewerPresentationBridge: UIViewControllerRepresentable {
                 return
             }
             guard presentedSessionId != session.id else { return }
-            guard let anchor, anchor.viewIfLoaded?.window != nil else {
+            guard let anchor,
+                  anchor.viewIfLoaded?.window != nil,
+                  let presenter = StudioViewerPresentationHost.resolve(from: anchor) else {
                 Task { @MainActor [weak self] in
                     await Task.yield()
                     self?.updatePresentation()
@@ -53,32 +53,31 @@ struct StudioViewerPresentationBridge: UIViewControllerRepresentable {
                 return
             }
 
-            let hosting = StudioViewerHostingController(
+            let controller = StudioGalleryViewerController(
                 session: session,
-                rootView: StudioArtifactViewer(
-                    session: session,
-                    browser: parent.browser,
-                    onDismiss: { [weak self] in self?.dismissViewer() },
-                    showThread: { [weak self] threadId in
-                        self?.dismissViewer { self?.parent.showThread(threadId) }
-                    }
-                )
-                .environment(parent.model)
-            )
-            hosting.modalPresentationStyle = .fullScreen
-            hosting.view.backgroundColor = .clear
-            let options = UIViewController.Transition.ZoomOptions()
-            options.dimmingColor = .black
-            if session.openedFromGallery {
-                hosting.preferredTransition = .zoom(options: options) { [weak session, weak transitionSource = parent.transitionSource] _ in
-                    guard let session else { return nil }
-                    return transitionSource?.imageView(for: session.selectedId)
+                browser: parent.browser,
+                workspace: parent.model.workspace,
+                deviceId: parent.browser.selectedDeviceId,
+                requestDismissal: { [weak self] in self?.dismissViewer() },
+                requestThread: { [weak self] threadId in
+                    self?.dismissViewer { self?.parent.showThread(threadId) }
+                },
+                selectedArtifactChanged: { [weak transitionSource = parent.transitionSource] artifactId in
+                    transitionSource?.prepareForDismissal(to: artifactId)
                 }
-            }
-            hosting.presentationController?.delegate = self
-            presentedController = hosting
+            )
+            StudioViewerNativeTransition.configure(
+                controller,
+                session: session,
+                source: parent.transitionSource
+            )
+            controller.modalPresentationStyle = .fullScreen
+
+            presentedController = controller
             presentedSessionId = session.id
-            anchor.present(hosting, animated: true)
+            presenter.present(controller, animated: true) { [weak self, weak controller] in
+                controller?.presentationController?.delegate = self
+            }
         }
 
         func dismissViewer(completion: (() -> Void)? = nil) {
@@ -87,7 +86,7 @@ struct StudioViewerPresentationBridge: UIViewControllerRepresentable {
                 completion?()
                 return
             }
-            (controller as? StudioViewerHostingSession)?.viewerSession.presentationActive = false
+            controller.session.presentationActive = false
             controller.dismiss(animated: true) { [weak self] in
                 self?.presentedController = nil
                 self?.presentedSessionId = nil
@@ -101,44 +100,57 @@ struct StudioViewerPresentationBridge: UIViewControllerRepresentable {
             presentedSessionId = nil
             parent.session = nil
         }
+
     }
 }
 
 final class StudioPresentationAnchorViewController: UIViewController {
-    override func loadView() {
-        view = UIView(frame: .zero)
+    override func loadView() { view = UIView(frame: .zero) }
+}
+
+@MainActor
+enum StudioViewerPresentationHost {
+    static func resolve(from anchor: UIViewController) -> UIViewController? {
+        guard let root = anchor.view.window?.rootViewController else { return nil }
+        return visibleController(from: root)
+    }
+
+    static func visibleController(from controller: UIViewController) -> UIViewController {
+        if let presented = controller.presentedViewController,
+           !presented.isBeingDismissed {
+            return visibleController(from: presented)
+        }
+        if let navigation = controller as? UINavigationController,
+           let visible = navigation.visibleViewController {
+            return visibleController(from: visible)
+        }
+        if let tab = controller as? UITabBarController,
+           let selected = tab.selectedViewController {
+            return visibleController(from: selected)
+        }
+        return controller
     }
 }
 
 @MainActor
-private protocol StudioViewerHostingSession: AnyObject {
-    var viewerSession: StudioViewerSession { get }
-}
-
-@MainActor
-final class StudioViewerHostingController<Content: View>: UIHostingController<Content>, StudioViewerHostingSession {
-    let viewerSession: StudioViewerSession
-
-    init(
+enum StudioViewerNativeTransition {
+    static func configure(
+        _ controller: StudioGalleryViewerController,
         session: StudioViewerSession,
-        rootView: Content
+        source: StudioGalleryTransitionSource
     ) {
-        viewerSession = session
-        super.init(rootView: rootView)
-    }
-
-    @available(*, unavailable)
-    dynamic required init?(coder aDecoder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func viewDidAppear(_ animated: Bool) {
-        super.viewDidAppear(animated)
-        viewerSession.presentationActive = true
-    }
-
-    override func viewWillDisappear(_ animated: Bool) {
-        viewerSession.presentationActive = false
-        super.viewWillDisappear(animated)
+        let options = UIViewController.Transition.ZoomOptions()
+        options.dimmingColor = UIColor.black.withAlphaComponent(0.97)
+        options.interactiveDismissShouldBegin = { [weak controller] context in
+            context.willBegin && (controller?.canBeginInteractiveZoomDismissal ?? false)
+        }
+        options.alignmentRectProvider = { [weak controller] _ in
+            guard let controller, controller.isViewLoaded else { return nil }
+            return controller.transitionImageFrame(in: controller.view)
+        }
+        controller.preferredTransition = .zoom(options: options) { [weak source, weak session] _ in
+            guard let session else { return nil }
+            return source?.imageView(for: session.selectedId)
+        }
     }
 }

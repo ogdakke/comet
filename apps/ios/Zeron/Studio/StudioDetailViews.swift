@@ -33,7 +33,7 @@ struct StudioThreadView: View {
     @Environment(AppModel.self) private var model
     let threadId: String
     let browser: StudioBrowserStore
-    let artifactTransition: Namespace.ID
+    let transitionSource: StudioGalleryTransitionSource
     let openViewer: (StudioViewerSession) -> Void
     @State private var store = StudioThreadStore()
     @State private var composer: StudioComposerStore
@@ -47,12 +47,12 @@ struct StudioThreadView: View {
     init(
         threadId: String,
         browser: StudioBrowserStore,
-        artifactTransition: Namespace.ID,
+        transitionSource: StudioGalleryTransitionSource,
         openViewer: @escaping (StudioViewerSession) -> Void
     ) {
         self.threadId = threadId
         self.browser = browser
-        self.artifactTransition = artifactTransition
+        self.transitionSource = transitionSource
         self.openViewer = openViewer
         _composer = State(initialValue: StudioComposerStore(threadId: threadId))
     }
@@ -204,6 +204,10 @@ struct StudioThreadView: View {
                                 selectedId: artifact.id,
                                 openedFromGallery: false,
                                 openingPreview: browser.cachedPreview(artifactId: artifact.id)
+                                    ?? browser.thumbhashImage(
+                                        artifact.thumbhash,
+                                        aspectRatio: artifact.aspectRatio
+                                    )
                             ))
                         } label: {
                             Rectangle()
@@ -214,6 +218,9 @@ struct StudioThreadView: View {
                                         artifactId: artifact.id,
                                         mediaKind: artifact.mediaKind,
                                         browser: browser,
+                                        thumbhash: artifact.thumbhash,
+                                        aspectRatio: artifact.aspectRatio,
+                                        transitionSource: transitionSource,
                                         contentMode: .fill
                                     )
                                 }
@@ -228,9 +235,21 @@ struct StudioThreadView: View {
                                     }
                                 }
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(StudioMediaWarmupButtonStyle {
+                            guard let workspace = model.workspace,
+                                  let deviceId = browser.selectedDeviceId else { return }
+                            browser.preheatDisplayImage(
+                                artifact: StudioArtifactDetail(
+                                    artifact: artifact,
+                                    turn: turn,
+                                    run: run,
+                                    conversationId: threadId
+                                ),
+                                deviceId: deviceId,
+                                workspace: workspace
+                            )
+                        })
                         .contentShape(Rectangle())
-                        .matchedTransitionSource(id: artifact.id, in: artifactTransition)
                         .accessibilityLabel("Open \(artifact.mediaKind.rawValue) from \(run.model.displayName)")
                     }
                 }
@@ -301,6 +320,8 @@ struct StudioArtifactView: View {
                             artifactId: artifact.id,
                             mediaKind: artifact.mediaKind,
                             browser: browser,
+                            thumbhash: artifact.thumbhash,
+                            aspectRatio: artifact.aspectRatio,
                             contentMode: .fit
                         )
                     }
@@ -368,6 +389,17 @@ struct StudioArtifactView: View {
         guard let seconds = artifact.durationSeconds else { return nil }
         let total = max(0, Int(seconds.rounded()))
         return String(format: "%d:%02d", total / 60, total % 60)
+    }
+}
+
+private struct StudioMediaWarmupButtonStyle: ButtonStyle {
+    let pressed: () -> Void
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .onChange(of: configuration.isPressed) { _, isPressed in
+                if isPressed { pressed() }
+            }
     }
 }
 

@@ -25,7 +25,8 @@ enum StudioMediaRequestPriority {
 /// wall of RPCs that starves the relay keepalive or the image being opened.
 actor StudioMediaRequestGate {
     private struct Waiter {
-        let continuation: CheckedContinuation<Void, Never>
+        let id: UUID
+        let continuation: CheckedContinuation<Void, Error>
     }
 
     private var occupied = false
@@ -33,18 +34,28 @@ actor StudioMediaRequestGate {
     private var background: [Waiter] = []
 
     func acquire(priority: StudioMediaRequestPriority) async throws {
+        try Task.checkCancellation()
         if !occupied {
             occupied = true
             return
         }
 
-        await withCheckedContinuation { continuation in
-            let waiter = Waiter(continuation: continuation)
-            switch priority {
-            case .foreground: foreground.append(waiter)
-            case .background: background.append(waiter)
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let waiter = Waiter(id: id, continuation: continuation)
+                switch priority {
+                case .foreground: foreground.append(waiter)
+                case .background: background.append(waiter)
+                }
+                if Task.isCancelled {
+                    cancelWaiter(id: id)
+                }
             }
+        } onCancel: {
+            Task { await self.cancelWaiter(id: id) }
         }
+
         if Task.isCancelled {
             release()
             throw CancellationError()
@@ -63,6 +74,16 @@ actor StudioMediaRequestGate {
         if !foreground.isEmpty { return foreground.removeFirst() }
         if !background.isEmpty { return background.removeFirst() }
         return nil
+    }
+
+    private func cancelWaiter(id: UUID) {
+        if let index = foreground.firstIndex(where: { $0.id == id }) {
+            foreground.remove(at: index).continuation.resume(throwing: CancellationError())
+            return
+        }
+        if let index = background.firstIndex(where: { $0.id == id }) {
+            background.remove(at: index).continuation.resume(throwing: CancellationError())
+        }
     }
 
 }

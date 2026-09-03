@@ -21,6 +21,47 @@ final class DeviceRelayClientTests: XCTestCase {
         XCTAssertEqual(pending.unaryCount, 0)
     }
 
+    func testCancellingUnaryRemovesOnlyThatRequest() throws {
+        let pending = DeviceRpcPending()
+        var first: Result<Data, RelayError>?
+        var second: Result<Data, RelayError>?
+        pending.registerUnary(id: 11) { first = $0 }
+        pending.registerUnary(id: 12) { second = $0 }
+
+        XCTAssertTrue(pending.cancelUnary(id: 11))
+        XCTAssertEqual(pending.unaryCount, 1)
+        if case .some(.failure(.cancelled)) = first {} else {
+            XCTFail("cancelled unary did not finish with cancellation")
+        }
+
+        pending.handlePayload(rpcPayload(#"{"id":12,"ok":{"value":12}}"#))
+        let data = try XCTUnwrap(try second?.get())
+        XCTAssertEqual(try JSONDecoder().decode(RpcValue.self, from: data), RpcValue(value: 12))
+    }
+
+    func testCancelledMediaGateWaiterDoesNotBlockTheQueue() async throws {
+        let gate = StudioMediaRequestGate()
+        try await gate.acquire(priority: .background)
+        let cancelled = Task {
+            try await gate.acquire(priority: .background)
+        }
+        await Task.yield()
+        cancelled.cancel()
+
+        await gate.release()
+        do {
+            try await cancelled.value
+            XCTFail("cancelled waiter acquired the gate")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+
+        try await gate.acquire(priority: .foreground)
+        await gate.release()
+    }
+
     func testStreamDeliversItemsInOrderAndItemKeepsItPending() async throws {
         let pending = DeviceRpcPending()
         let stream: AsyncThrowingStream<RpcValue, Error> = pending.registerStream(

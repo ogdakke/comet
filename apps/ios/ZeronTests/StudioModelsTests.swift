@@ -87,6 +87,21 @@ final class StudioModelsTests: XCTestCase {
         XCTAssertEqual(session.selected?.id, "artifact-1")
     }
 
+    @MainActor
+    func testGalleryNormalizesNewestFirstPagesToNewestAtBottom() {
+        var oldest = galleryItem(1)
+        oldest.createdAt = "2026-08-24T18:00:00Z"
+        var middle = galleryItem(2)
+        middle.createdAt = "2026-08-24T18:01:00Z"
+        var newest = galleryItem(3)
+        newest.createdAt = "2026-08-24T18:02:00Z"
+
+        let ordered = StudioBrowserStore.galleryItemsOldestFirst([newest, oldest, middle])
+
+        XCTAssertEqual(ordered.map(\.id), [oldest.id, middle.id, newest.id])
+        XCTAssertEqual(ordered.last?.id, newest.id, "the collection's bottom item must be newest")
+    }
+
     private func galleryItem(_ index: Int) -> StudioGalleryItem {
         StudioGalleryItem(
             id: "artifact-\(index)",

@@ -156,6 +156,7 @@ struct StudioArtifactDetail: Hashable, Identifiable {
     var prompt: String
     var modelDisplayName: String
     var createdAt: String
+    var thumbhash: String?
 
     init(item: StudioGalleryItem) {
         id = item.id
@@ -169,6 +170,7 @@ struct StudioArtifactDetail: Hashable, Identifiable {
         prompt = item.prompt
         modelDisplayName = item.modelDisplayName
         createdAt = item.createdAt
+        thumbhash = item.thumbhash
     }
 
     init(artifact: StudioArtifact, turn: StudioTurn, run: StudioRun, conversationId: String) {
@@ -183,6 +185,7 @@ struct StudioArtifactDetail: Hashable, Identifiable {
         prompt = turn.prompt
         modelDisplayName = run.model.displayName
         createdAt = artifact.createdAt
+        thumbhash = artifact.thumbhash
     }
 
     var createdDate: Date { studioDate(createdAt) }

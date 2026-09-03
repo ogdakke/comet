@@ -40,6 +40,21 @@ struct RootView: View {
 
     var body: some View {
         Group {
+#if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("-studio-viewer-fixture") {
+                StudioViewerPerformanceFixture()
+            } else {
+                appContent
+            }
+#else
+            appContent
+#endif
+        }
+        .task { model.restore() }
+    }
+
+    @ViewBuilder private var appContent: some View {
+        Group {
             switch model.phase {
             case .signedOut:
                 SignInView()
@@ -49,6 +64,5 @@ struct RootView: View {
                 AppShellView()
             }
         }
-        .task { model.restore() }
     }
 }

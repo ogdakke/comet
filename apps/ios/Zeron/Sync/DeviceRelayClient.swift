@@ -16,6 +16,7 @@ enum RelayError: LocalizedError {
     case hostOffline
     case rpc(String)
     case timeout
+    case cancelled
 
     var errorDescription: String? {
         switch self {
@@ -23,6 +24,7 @@ enum RelayError: LocalizedError {
         case .hostOffline: return "The device is offline"
         case .rpc(let message): return message
         case .timeout: return "The device didn't respond"
+        case .cancelled: return "The request was cancelled"
         }
     }
 }
@@ -109,6 +111,12 @@ final class DeviceRpcPending {
     /// another request sharing the socket.
     func removeStreamForCancellation(id: UInt64) -> Bool {
         streams.removeValue(forKey: id) != nil
+    }
+
+    func cancelUnary(id: UInt64) -> Bool {
+        guard let completion = unary.removeValue(forKey: id) else { return false }
+        completion(.failure(.cancelled))
+        return true
     }
 
     @discardableResult
@@ -339,6 +347,8 @@ actor DeviceRelayClient {
                     try? await Task.sleep(nanoseconds: UInt64(attempt + 1) * 250_000_000)
                 case .rpc, .timeout:
                     throw error
+                case .cancelled:
+                    throw CancellationError()
                 }
             }
         }
@@ -478,7 +488,9 @@ actor DeviceRelayClient {
         params: [String: Any],
         timeoutSeconds: UInt64 = 10
     ) async throws -> Response {
+        try Task.checkCancellation()
         try await connect()
+        try Task.checkCancellation()
         let id = nextId
         nextId += 1
         // Always send a params object — the engine's serde rejects a missing
@@ -490,17 +502,23 @@ actor DeviceRelayClient {
         // Install the waiter before sending. URLSession's async send may yield
         // long enough for a fast host reply to reach handleInbound; registering
         // afterward loses that reply and turns a successful call into a timeout.
-        let result: Result<Data, RelayError> = await withCheckedContinuation { continuation in
-            pending.registerUnary(id: id) { result in
-                continuation.resume(returning: result)
+        let result: Result<Data, RelayError> = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                pending.registerUnary(id: id) { result in
+                    continuation.resume(returning: result)
+                }
+                if Task.isCancelled {
+                    Task { await self.cancelCall(id: id) }
+                } else {
+                    Task { await self.send(data, for: id) }
+                    Task {
+                        try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
+                        self.timeoutCall(id: id)
+                    }
+                }
             }
-            Task {
-                await self.send(data, for: id)
-            }
-            Task {
-                try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
-                self.timeoutCall(id: id)
-            }
+        } onCancel: {
+            Task { await self.cancelCall(id: id) }
         }
         switch result {
         case .failure(let error): throw error
@@ -524,6 +542,19 @@ actor DeviceRelayClient {
 
     private func failRequest(id: UInt64, error: RelayError) {
         pending.fail(id: id, error: error)
+    }
+
+    private func cancelCall(id: UInt64) async {
+        guard pending.cancelUnary(id: id), let socket else { return }
+        let frame: [String: Any] = ["id": id, "cancel": true]
+        guard let payload = try? JSONSerialization.data(withJSONObject: frame) else { return }
+        let data = Self.encodeFrame(header: #"{"s":"rpc","k":"rpc"}"#, payload: payload)
+        do {
+            try await socket.send(.data(data))
+        } catch {
+            // Cancellation is local cleanup. A failed best-effort cancel frame
+            // must not mark an otherwise healthy desktop as offline.
+        }
     }
 
     private func timeoutCall(id: UInt64) {
