@@ -46,13 +46,6 @@ final class SessionStore {
     /// row builder memoizes on it, so a body re-eval that was triggered by
     /// something else (scrolling) costs O(1) instead of re-deriving every row.
     private(set) var revision: UInt64 = 0
-    /// Whether this chat's transcript has already been revealed once.
-    ///
-    /// Lives on the store, not the view: the reveal gate is `@State`, so any
-    /// re-creation of TranscriptView reset it to "hidden" and blanked an
-    /// already-visible transcript until the settle loop finished. The store is
-    /// cached per chat, so it outlives that churn.
-    @ObservationIgnored var hasRevealed = false
     /// Transcript parse/row cache — store-owned so parses survive view
     /// churn, and prewarmed off-main whenever a projection lands so opening
     /// the chat never parses markdown inside the first body pass.
@@ -60,6 +53,16 @@ final class SessionStore {
     private(set) var connected = false
     /// Client-minted ids of sends the host hasn't materialized yet.
     private(set) var pendingSends: [PendingSend] = []
+    /// Messages typed while the agent was busy, in the order they will be sent
+    /// (crates/doc/src/queue.rs). Shared with every other device on the chat:
+    /// what the Mac queued shows up here, and reordering here reorders there.
+    private(set) var queue: [QueuedMessage] = []
+    var queueActionsPending: Set<String> = []
+    var queueActionError: String?
+    /// Local submission only; remote user entries never pull a reader to a new turn.
+    private(set) var lastSubmittedMessageId: String?
+    /// Presentation state survives navigation with the warm session store.
+    var expandedUserMessages: Set<String> = []
 
     let doc = LoroDoc()
     /// The chat2 room cursor — the last server row seq folded into `doc`.
@@ -97,8 +100,13 @@ final class SessionStore {
     /// Registry-presence dial gate for the host relay, wired by AppModel.
     @ObservationIgnored var hostLiveness: (@MainActor @Sendable (String) -> PeerLiveness)?
 
-    private func relayToHost() throws -> DeviceRelayClient {
-        guard let hostDeviceId else { throw RelayError.hostOffline }
+    /// This device's id — what its own doc writes are stamped with.
+    var deviceId: String { config.deviceId }
+
+    /// The shared relay to the chat's host device (uploads, sending a queued
+    /// message now). Nil while the chat has no host to ask.
+    func hostRelayClient() -> DeviceRelayClient? {
+        guard let hostDeviceId else { return nil }
         if let hostRelay, hostRelay.deviceId == hostDeviceId {
             return hostRelay.client
         }
@@ -111,6 +119,11 @@ final class SessionStore {
             relay = DeviceRelayClient(deviceId: target, config: config)
         }
         hostRelay = (target, relay)
+        return relay
+    }
+
+    private func relayToHost() throws -> DeviceRelayClient {
+        guard let relay = hostRelayClient() else { throw RelayError.hostOffline }
         return relay
     }
 
@@ -399,7 +412,7 @@ final class SessionStore {
             guard let self else { return }
             self.projecting = false
             if let decoded {
-                self.apply(decoded)
+                self.apply(decoded.entries, queue: decoded.queue)
             }
             if self.projectPending {
                 self.projectPending = false
@@ -408,8 +421,9 @@ final class SessionStore {
         }
     }
 
-    private func apply(_ decoded: [MessageEntry]) {
+    private func apply(_ decoded: [MessageEntry], queue decodedQueue: [QueuedMessage] = []) {
         entries = decoded
+        if decodedQueue != queue { queue = decodedQueue }
         // Drop echoes the host has materialized.
         let ids = Set(entries.map(\.id))
         pendingSends.removeAll { ids.contains($0.messageId) }
@@ -421,10 +435,13 @@ final class SessionStore {
 
     /// Whole-doc decode. `nil` means the doc has no map root yet — leave the
     /// previous projection standing rather than blanking a live transcript.
-    nonisolated static func decodeEntries(from doc: LoroDoc) -> [MessageEntry]? {
+    nonisolated static func decodeEntries(
+        from doc: LoroDoc
+    ) -> (entries: [MessageEntry], queue: [QueuedMessage])? {
         guard let root = doc.getDeepValue().mapValue else { return nil }
         let raw = (root["messages"]?.listValue ?? []).compactMap(entryFrom)
-        return joinContinuations(raw)
+        let queue = (root["queue"]?.listValue ?? []).compactMap(queuedFrom)
+        return (joinContinuations(raw), queue)
     }
 
     nonisolated private static func entryFrom(_ value: LoroValue) -> MessageEntry? {
@@ -440,13 +457,21 @@ final class SessionStore {
                             continuationOf: m["continuationOf"]?.stringValue)
     }
 
-    nonisolated private static func partFrom(_ value: LoroValue) -> MessagePart? {
+    nonisolated static func partFrom(_ value: LoroValue) -> MessagePart? {
         guard let m = value.mapValue,
               let id = m["id"]?.stringValue,
               let kind = m["kind"]?.stringValue else { return nil }
         switch kind {
         case "text":
             return .text(id: id, text: m["text"]?.stringValue ?? "")
+        case "image":
+            let reference = GeneratedImageReference(path: m["path"]?.stringValue ?? "",
+                                                    name: m["name"]?.stringValue ?? "",
+                                                    mimeType: m["mimeType"]?.stringValue ?? "")
+            guard reference.isValid else {
+                return .error(id: id, message: "Generated image unavailable")
+            }
+            return .image(id: id, reference: reference)
         case "tool":
             guard let callMap = m["call"]?.mapValue else { return nil }
             let tag = callMap["kind"]?.stringValue ?? "unknown"
@@ -525,6 +550,7 @@ final class SessionStore {
                  worktree: WorktreeSpec? = nil) {
         if offline {
             demoResponder?(prompt)
+            lastSubmittedMessageId = entries.last(where: { $0.role == .user })?.id
             return
         }
         let messageId = UUID().uuidString.lowercased()
@@ -544,12 +570,14 @@ final class SessionStore {
         ])
         let now = nowMs()
         pendingSends.append(PendingSend(messageId: messageId, text: prompt, at: now, started: now))
+        lastSubmittedMessageId = messageId
         revision &+= 1
     }
 
     func sendSteer(prompt: String) {
         if offline {
             demoResponder?(prompt)
+            lastSubmittedMessageId = entries.last(where: { $0.role == .user })?.id
             return
         }
         let messageId = UUID().uuidString.lowercased()
@@ -560,6 +588,7 @@ final class SessionStore {
         ])
         let now = nowMs()
         pendingSends.append(PendingSend(messageId: messageId, text: prompt, at: now, started: now))
+        lastSubmittedMessageId = messageId
         revision &+= 1
     }
 
@@ -625,11 +654,19 @@ final class SessionStore {
     /// Durable-nudge the host device so a cold host opens the doc and drains
     /// (doc_host.rs nudge_remote_host). Fire-and-forget; the command is
     /// durable in the doc regardless.
-    private func nudgeHost() {
+    func nudgeHost() {
         guard let hostDeviceId else { return }
         Task { [config, chatId] in
             await config.nudge(deviceId: hostDeviceId, chatId: chatId)
         }
+    }
+
+    /// Re-read the queue after a local write, without waiting for the coalesced
+    /// whole-doc projection: dragging a row must move it this frame.
+    func refreshQueue() {
+        let next = (doc.getDeepValue().mapValue?["queue"]?.listValue ?? [])
+            .compactMap(Self.queuedFrom)
+        if next != queue { queue = next }
     }
 
     // MARK: Delivery escorts (doc_host.rs spawn_command_delivery, phone half)

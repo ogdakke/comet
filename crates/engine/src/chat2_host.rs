@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use zeron_doc::SessionDoc;
-use zeron_sync::chat_client::{ChatDocSink, CheckpointFetcher};
+use zeron_sync::chat_client::{ChatDocSink, CheckpointFetcher, RowImportOutcome};
 use zeron_sync::{DocsStore, SyncError};
 
 use crate::doc_host::EdgeConfig;
@@ -74,20 +74,56 @@ impl EngineChatSink {
 }
 
 impl ChatDocSink for EngineChatSink {
-    fn apply_row(&self, bytes: &[u8], cursor: u64) {
+    fn pending_updates(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let rejected = self
+            .store
+            .rejected_chat_updates(&self.chat_id)
+            .map_err(|e| e.to_string())?;
+        let pending = self
+            .store
+            .pending_chat_updates(&self.chat_id)
+            .map_err(|e| e.to_string())?;
+        let mut updates = Vec::new();
+        for (id, bytes) in pending {
+            if bytes.len() > zeron_sync::chat_client::MAX_PUSH_BYTES {
+                self.store
+                    .reject_chat_update(&self.chat_id, &id)
+                    .map_err(|e| e.to_string())?;
+            } else if !rejected.iter().any(|(r, _)| r == &id) {
+                updates.push((id, bytes));
+            }
+        }
+        Ok(updates)
+    }
+    fn reject_update(&self, batch_id: &str) -> Result<(), String> {
+        self.store
+            .reject_chat_update(&self.chat_id, batch_id)
+            .map_err(|e| e.to_string())
+    }
+    fn persist_update(&self, batch_id: &str, bytes: &[u8]) -> Result<(), String> {
+        self.store
+            .enqueue_chat_update(&self.chat_id, batch_id, bytes)
+            .map_err(|e| e.to_string())
+    }
+    fn acknowledge_update(&self, batch_id: &str) -> Result<(), String> {
+        self.store
+            .acknowledge_chat_update(&self.chat_id, batch_id)
+            .map_err(|e| e.to_string())
+    }
+
+    fn apply_row(&self, bytes: &[u8], cursor: u64) -> RowImportOutcome {
         let Some(doc) = self.doc.upgrade() else {
-            return;
+            return RowImportOutcome::Applied;
         };
         match doc.doc().import(bytes) {
             Ok(status) => {
                 if status.pending.is_some() {
-                    // Missing causal deps: loro parked these ops invisibly.
-                    // The client's cursor contiguity rule keeps `cursor`
-                    // honest (it never jumps a gap), so persisting is safe —
-                    // this warn is the tripwire that the 2026-08-19
-                    // empty-doc/advanced-cursor wedge shape was seen live.
+                    // Room sequence contiguity does not prove causal history
+                    // is present. Snapshot export omits parked operations;
+                    // advancing its cursor would lose them after restart.
                     tracing::warn!(chat = %self.chat_id, cursor,
-                        "chat2 sink: row parked on missing deps (gap repair should follow)");
+                        "chat2 sink: row parked on missing deps; requesting repair");
+                    return RowImportOutcome::PendingDependencies;
                 }
             }
             Err(err) => {
@@ -99,13 +135,18 @@ impl ChatDocSink for EngineChatSink {
             }
         }
         self.persist_with_cursor(cursor);
+        RowImportOutcome::Applied
     }
 
     fn apply_checkpoint(&self, bytes: &[u8], cursor: u64) -> Result<(), String> {
         let doc = self.doc.upgrade().ok_or("doc evicted")?;
-        doc.doc()
+        let status = doc
+            .doc()
             .import(bytes)
             .map_err(|e| format!("checkpoint import: {e}"))?;
+        if status.pending.is_some() {
+            return Err("checkpoint is missing causal dependencies".into());
+        }
         self.persist_with_cursor(cursor);
         Ok(())
     }
@@ -399,4 +440,92 @@ mod frontier_tests {
         assert!(sink.contains_frontier(&vv));
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parked_rows_do_not_persist_a_cursor_until_their_history_arrives() {
+        let source = SessionDoc::init("chat").unwrap();
+        let text = source.doc().get_text("body");
+        text.insert(0, "parent").unwrap();
+        source.doc().commit();
+        let checkpoint = source.export_snapshot().unwrap();
+        let frontier = source.doc().oplog_vv();
+        text.insert(6, " child").unwrap();
+        source.doc().commit();
+        let row = source
+            .doc()
+            .export(loro::ExportMode::updates(&frontier))
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let target = Arc::new(SessionDoc::from_doc(loro::LoroDoc::new()));
+        let sink = EngineChatSink::new(&target, store.clone(), "chat");
+        sink.persist_with_cursor(0);
+        assert_eq!(
+            sink.apply_row(&row, 1),
+            RowImportOutcome::PendingDependencies
+        );
+        let (_, cursor, _) = store.load_snapshot_with_cursor("chat").unwrap().unwrap();
+        assert_eq!(cursor, 0, "a restart must retry the invisible update");
+
+        sink.apply_checkpoint(&checkpoint, 0).unwrap();
+        assert_eq!(sink.apply_row(&row, 1), RowImportOutcome::Applied);
+        let (snapshot, cursor, _) = store.load_snapshot_with_cursor("chat").unwrap().unwrap();
+        assert_eq!(cursor, 1);
+        let restored = loro::LoroDoc::new();
+        restored.import(&snapshot).unwrap();
+        assert_eq!(restored.get_text("body").to_string(), "parent child");
+
+        let incomplete = Arc::new(SessionDoc::from_doc(loro::LoroDoc::new()));
+        let incomplete_sink = EngineChatSink::new(&incomplete, store.clone(), "incomplete");
+        assert!(incomplete_sink.apply_checkpoint(&row, 1).is_err());
+        assert!(
+            store
+                .load_snapshot_with_cursor("incomplete")
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+/// Replay a legacy document in bounded rows. Splitting by operation range
+/// preserves IDs; Loro safely parks cross-peer dependencies until replay completes.
+pub(crate) fn publication_updates(doc: &loro::LoroDoc) -> Result<Vec<Vec<u8>>, String> {
+    fn split(
+        doc: &loro::LoroDoc,
+        peer: u64,
+        start: i32,
+        end: i32,
+        out: &mut Vec<Vec<u8>>,
+    ) -> Result<(), String> {
+        let bytes = doc
+            .export(loro::ExportMode::updates_in_range(vec![loro::IdSpan::new(
+                peer, start, end,
+            )]))
+            .map_err(|e| e.to_string())?;
+        if bytes.len() <= zeron_sync::chat_client::MAX_PUSH_BYTES || end - start <= 1 {
+            // An indivisible oversized op remains durable until checkpointed.
+            out.push(bytes);
+        } else {
+            let middle = start + (end - start) / 2;
+            split(doc, peer, start, middle, out)?;
+            split(doc, peer, middle, end, out)?;
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    let vv = doc.oplog_vv();
+    let mut peers: Vec<_> = vv.iter().collect();
+    peers.sort_by_key(|(peer, _)| **peer);
+    for (&peer, &end) in peers {
+        if end > 0 {
+            split(doc, peer, 0, end, &mut out)?;
+        }
+    }
+    Ok(out)
 }

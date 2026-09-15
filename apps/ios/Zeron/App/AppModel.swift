@@ -116,6 +116,17 @@ final class AppModel {
         }
         if args.contains("-demo") {
             enterDemoMode()
+            // Simulator fixtures for both empty-workspace and viewer-only
+            // accounts. Apply before Home resolves its initial destination.
+            override("-sethomefilter") { UserDefaults.standard.set($0, forKey: "homeSpaceFilter") }
+            if args.contains("-no-projects") {
+                demo?.spaces = []
+                demo?.chats = []
+                demo?.sessions = [:]
+            }
+            if args.contains("-ios-only") {
+                demo?.devices = [DeviceRow(id: "ios-demo", name: "iPhone", platform: "ios")]
+            }
             if let ix = args.firstIndex(of: "-route"), ix + 1 < args.count {
                 let spec = args[ix + 1]
                 if spec.hasPrefix("chat:") {
@@ -305,6 +316,8 @@ final class AppModel {
     // MARK: Unified data accessors (demo or live — one path for views)
 
     var spaces: [Space] { demo?.spaces ?? workspace?.spaces ?? [] }
+    var devices: [DeviceRow] { demo?.devices ?? workspace?.devices ?? [] }
+    var executionDevices: [DeviceRow] { devices.filter(\.canHostSessions) }
 
     // "Connected" for the header spinner means "server state has reached this
     // session" — over the socket OR the HTTPS pull (which lands in ~1 RTT and
@@ -314,7 +327,7 @@ final class AppModel {
     var overviewChats: [Chat] {
         if let demo {
             let liveIds = Set(demo.spaces.map(\.id))
-            let live = demo.chats.filter { !$0.archived && $0.spaceId.map(liveIds.contains) == true }
+            let live = demo.chats.filter { !$0.archived && ($0.spaceId.map(liveIds.contains) ?? true) }
             return sortActive(live)
         }
         return workspace?.overviewChats ?? []
@@ -365,29 +378,29 @@ final class AppModel {
         return workspace?.deviceOnline(deviceId) ?? false
     }
 
-    /// Live harness catalog from the space's owning device (Settings → Agents
+    /// Live harness catalog from the selected execution device (Settings → Agents
     /// gates which agents a device offers); static pair when unreachable.
-    func listHarnesses(space: Space) async -> [HarnessInfo] {
+    func listHarnesses(deviceId: String) async -> [HarnessInfo] {
         if demo != nil {
             try? await Task.sleep(nanoseconds: 100_000_000)
             return HarnessCatalog.harnesses
         }
-        if let live = await workspace?.listHarnesses(deviceId: space.deviceId),
+        if let live = await workspace?.listHarnesses(deviceId: deviceId),
            !live.isEmpty {
             return live
         }
         return HarnessCatalog.harnesses
     }
 
-    /// Live model catalog from the space's owning device (the desktop's
+    /// Live model catalog from the selected execution device (the desktop's
     /// "catalog source = the device that runs the session" rule); static
     /// fallback when the device is unreachable.
-    func listModels(space: Space, harness: String) async -> [ModelInfo] {
+    func listModels(deviceId: String, harness: String) async -> [ModelInfo] {
         if demo != nil {
             try? await Task.sleep(nanoseconds: 100_000_000)
             return HarnessCatalog.models(for: harness)
         }
-        if let live = await workspace?.listModels(deviceId: space.deviceId, harness: harness),
+        if let live = await workspace?.listModels(deviceId: deviceId, harness: harness),
            !live.isEmpty {
             return live
         }
@@ -465,15 +478,32 @@ final class AppModel {
     @discardableResult
     func createChat(space: Space, config chatConfig: ChatConfig,
                     branch: String? = nil, cwd: String? = nil) -> String? {
+        createChat(deviceId: space.deviceId, space: space, config: chatConfig,
+                   branch: branch, cwd: cwd)
+    }
+
+    @discardableResult
+    func createProjectlessChat(deviceId: String, config: ChatConfig) -> String? {
+        guard executionDevices.contains(where: { $0.id == deviceId }) else { return nil }
+        return createChat(deviceId: deviceId, space: nil, config: config)
+    }
+
+    private func createChat(deviceId: String, space: Space?, config chatConfig: ChatConfig,
+                            branch: String? = nil, cwd: String? = nil) -> String? {
         if let demo {
             let id = "chat-\(UUID().uuidString.lowercased().prefix(8))"
-            demo.chats.append(Chat(id: id, deviceId: space.deviceId, title: nil, archived: false,
-                                   cwd: cwd ?? space.path, branch: branch, checkoutId: nil,
+            demo.chats.append(Chat(id: id, deviceId: deviceId, title: nil, archived: false,
+                                   cwd: space.map { cwd ?? $0.path } ?? "~",
+                                   branch: branch, checkoutId: nil,
                                    config: chatConfig, lastMessagePreview: nil, lastMessageAt: nil,
-                                   createdAt: nowMs(), spaceId: space.id, lastSeenAt: nowMs()))
+                                   createdAt: nowMs(), spaceId: space?.id, lastSeenAt: nowMs(),
+                                   roomGen: 2))
             return id
         }
-        return workspace?.createChat(space: space, config: chatConfig, branch: branch, cwd: cwd)
+        if let space {
+            return workspace?.createChat(space: space, config: chatConfig, branch: branch, cwd: cwd)
+        }
+        return workspace?.createProjectlessChat(deviceId: deviceId, config: chatConfig)
     }
 
     /// Browse folders on a remote device (the desktop add-space palette's data
@@ -697,6 +727,31 @@ final class AppModel {
     func hostSupportsQueuedAttachmentsOn(deviceId: String) -> Bool {
         guard demo == nil else { return false }
         return workspace?.deviceVersionAtLeast(deviceId, Self.queuedAttachmentsMin) ?? false
+    }
+
+    /// The visible message queue is a personal-cut capability, not a semver
+    /// promise: an upstream host can have the same version without its doc/RPC
+    /// surface. Attachments require the stronger queue capability.
+    func hostSupportsMessageQueue(_ chat: Chat, attachments: Bool = false) -> Bool {
+        guard demo == nil else { return false }
+        let capability = attachments
+            ? EngineCapability.messageQueueAttachmentsV1
+            : EngineCapability.messageQueueV1
+        return workspace?.deviceSupports(chat.deviceId, capability) ?? false
+    }
+
+    func hostSupportsCleanQueueAttachmentText(_ chat: Chat) -> Bool {
+        guard demo == nil else { return false }
+        return workspace?.deviceSupports(
+            chat.deviceId,
+            EngineCapability.messageQueueCleanAttachmentTextV1
+        ) ?? false
+    }
+
+    func hostSupportsQueueEditLease(_ chat: Chat) -> Bool {
+        guard demo == nil else { return false }
+        return workspace?.deviceSupports(chat.deviceId, EngineCapability.messageQueueEditLeaseV1)
+            ?? false
     }
 
     /// Whether a send to this chat would queue rather than deliver promptly:

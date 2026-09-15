@@ -26,7 +26,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use zeron_doc::{
     DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
-    fold_event_into_parts, sanitize_tool_call,
+    SessionMessageEntry, fold_event_into_parts, sanitize_tool_call,
 };
 use zeron_harness::{CancellationToken, Harness, RunControls, SteerMessage};
 use zeron_proto::{
@@ -35,7 +35,7 @@ use zeron_proto::{
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
-use crate::registry::HarnessRegistry;
+use crate::registry::{HarnessDescriptor, HarnessRegistry};
 use crate::run_journal::RunJournal;
 use crate::{EngineError, new_id, now_ms};
 
@@ -87,9 +87,45 @@ struct HarnessSessionRef {
     cwd: String,
 }
 
+/// Configuration baked into a live harness runtime. The steering mailbox only
+/// carries prompt text, so routing a request whose model/effort/sandbox changed
+/// would silently run it with the old process configuration. Such requests
+/// must replace the runtime and resume its harness-native session instead.
+#[derive(Debug, Clone, PartialEq)]
+struct RuntimeConfig {
+    harness_id: HarnessId,
+    model: Option<String>,
+    reasoning: Option<zeron_proto::ReasoningLevel>,
+    model_options: serde_json::Map<String, serde_json::Value>,
+    cwd: String,
+    sandbox: zeron_proto::SandboxLevel,
+    auto_approve: bool,
+    worktree: Option<zeron_proto::WorktreeSpec>,
+}
+
+impl RuntimeConfig {
+    fn from_request(harness_id: HarnessId, request: &RunRequest) -> Self {
+        Self {
+            harness_id,
+            model: request.model.clone(),
+            reasoning: request.reasoning,
+            model_options: request.model_options.clone(),
+            cwd: request.cwd.clone(),
+            sandbox: request.sandbox,
+            auto_approve: request.auto_approve,
+            worktree: request.worktree.clone(),
+        }
+    }
+
+    fn can_route(&self, harness_id: HarnessId, request: &RunRequest) -> bool {
+        request.attachments.is_empty() && self == &Self::from_request(harness_id, request)
+    }
+}
+
 struct RunHandle {
     run_id: String,
     steerable: bool,
+    runtime_config: RuntimeConfig,
     steer_tx: mpsc::Sender<SteerMessage>,
     /// Harness-level cancellation (protocol interrupt + child teardown).
     interrupt_token: CancellationToken,
@@ -151,6 +187,7 @@ struct Inner {
     shutting_down: std::sync::atomic::AtomicBool,
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
+    generated_images: OnceLock<(crate::uploads::Uploads, std::path::PathBuf)>,
     /// Fired with `(chat_id, cwd)` when a user prompt starts a turn (fresh
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
@@ -192,6 +229,7 @@ impl SessionsEngine {
                 queue_held: Mutex::new(HashMap::new()),
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 titles: OnceLock::new(),
+                generated_images: OnceLock::new(),
                 turn_listener: OnceLock::new(),
             }),
         }
@@ -212,6 +250,15 @@ impl SessionsEngine {
     /// already treats a missing doc host as "not wired".
     pub fn clear_doc_host(&self) {
         lock(&self.inner.doc_host).take();
+    }
+
+    /// Bind generated-image intake to the same profile store used by attachment RPCs.
+    pub fn set_generated_images(
+        &self,
+        uploads: crate::uploads::Uploads,
+        allowed_root: std::path::PathBuf,
+    ) {
+        let _ = self.inner.generated_images.set((uploads, allowed_root));
     }
 
     /// Wire the chat auto-titler (called once at engine assembly). After each
@@ -248,15 +295,33 @@ impl SessionsEngine {
         lock(&self.inner.statuses).get(chat_id).cloned()
     }
 
+    /// Whether this harness takes a prompt *during* a turn, rather than only at
+    /// the boundary between turns. The queue drain's central question: a
+    /// mid-turn agent gets the message now, everything else holds it until the
+    /// turn ends. Catalog lookup only — never spawns.
+    pub fn steers_mid_turn(&self, harness: HarnessId) -> bool {
+        self.inner
+            .registry
+            .descriptors()
+            .iter()
+            .find(|d| d.id == harness)
+            .is_some_and(HarnessDescriptor::steers_mid_turn)
+    }
+
+    /// Whether this chat has a turn in flight — streaming, or parked on a
+    /// question it is still owed an answer to (see [`is_active`]). A persistent
+    /// session parked BETWEEN turns is not: it holds a warm child with nothing
+    /// outstanding, and takes the next prompt straight through its mailbox.
+    pub fn turn_in_flight(&self, chat_id: &str) -> bool {
+        lock(&self.inner.statuses)
+            .get(chat_id)
+            .is_some_and(is_active)
+    }
+
     /// Any run currently working or blocked on input — the auto-updater's
     /// "don't restart from under a session" gate.
     pub fn any_active(&self) -> bool {
-        lock(&self.inner.statuses).values().any(|s| {
-            matches!(
-                s.status,
-                zeron_proto::SessionStatus::Working | zeron_proto::SessionStatus::AwaitingInput
-            )
-        })
+        lock(&self.inner.statuses).values().any(is_active)
     }
 
     /// The last request dispatched for a chat (steer→new-turn fallback).
@@ -338,28 +403,35 @@ impl SessionsEngine {
             (
                 h.run_id.clone(),
                 h.steerable,
+                h.runtime_config.can_route(harness_id, &request),
                 h.steer_tx.clone(),
                 h.routed_steers.clone(),
             )
         });
-        if let Some((run_id, steerable, steer_tx, ledger)) = routed {
-            let message = SteerMessage {
-                prompt: request.prompt.clone(),
-                message_id: message_id.clone(),
-                // A Run command routed into a live run's mailbox is the
-                // engine's own steering fallback — mid-turn injection.
-                follow_up: false,
-            };
-            if steerable && steer_tx.try_send(message).is_ok() {
-                // The run can vanish between the send and here (the idle
-                // reaper, a parked child death): the ledger entry below is
-                // the at-least-once guarantee — the run task's exit drain
-                // re-dispatches any accepted steer no `Steered` confirmed.
-                let user_id = message_id.clone().unwrap_or_else(new_id);
-                lock(&ledger).push_back(RoutedSteer {
+        if let Some((run_id, steerable, same_runtime, steer_tx, ledger)) = routed {
+            let user_id = message_id.clone().unwrap_or_else(new_id);
+            let accepted = if steerable && same_runtime {
+                // Warm dispatch uses the same mailbox as explicit steering.
+                // Register acceptance before a fast boundary can retire it.
+                let mut pending = lock(&ledger);
+                let message = SteerMessage {
                     prompt: request.prompt.clone(),
-                    message_id: user_id.clone(),
-                });
+                    message_id: Some(user_id.clone()),
+                    follow_up: false,
+                };
+                if steer_tx.try_send(message).is_ok() {
+                    pending.push_back(RoutedSteer {
+                        prompt: request.prompt.clone(),
+                        message_id: user_id.clone(),
+                    });
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if accepted {
                 let handle = self.doc_handle(chat_id)?;
                 handle.write_user_message(&user_id, &request.prompt, now_ms())?;
                 if self.is_live(chat_id, &run_id) {
@@ -447,6 +519,7 @@ impl SessionsEngine {
             RunHandle {
                 run_id: run_id.clone(),
                 steerable: harness.supports_steering(),
+                runtime_config: RuntimeConfig::from_request(harness_id, &request),
                 steer_tx,
                 interrupt_token,
                 cancel: cancel_tx,
@@ -510,24 +583,24 @@ impl SessionsEngine {
         let Some((run_id, steer_tx, ledger)) = target else {
             return Ok(SteerOutcome::NotSteerable);
         };
+        let user_id = message_id.unwrap_or_else(new_id);
         let message = SteerMessage {
             prompt: prompt.to_string(),
-            message_id: message_id.clone(),
+            message_id: Some(user_id.clone()),
             follow_up,
         };
-        if steer_tx.try_send(message).is_err() {
-            return Ok(SteerOutcome::NotSteerable);
+        {
+            // Serialize mailbox acceptance with confirmation and Done-time
+            // inspection: a fast consumer must never outrun its ledger entry.
+            let mut pending = lock(&ledger);
+            if steer_tx.try_send(message).is_err() {
+                return Ok(SteerOutcome::NotSteerable);
+            }
+            pending.push_back(RoutedSteer {
+                prompt: prompt.to_string(),
+                message_id: user_id.clone(),
+            });
         }
-        // Accepted: ledger first (at-least-once across a dying run), then the
-        // user entry (client-minted id), then Working BEFORE the
-        // lastMessageAt bump — same causal-order invariant as the dispatch
-        // route (an observer must never hold [new message, settled status]:
-        // the phantom "completed" flash, 2026-07-31).
-        let user_id = message_id.unwrap_or_else(new_id);
-        lock(&ledger).push_back(RoutedSteer {
-            prompt: prompt.to_string(),
-            message_id: user_id.clone(),
-        });
         let handle = self.doc_handle(chat_id)?;
         handle.write_user_message(&user_id, prompt, now_ms())?;
         // A routed steer is a turn too. Fired here (not only on the confirmed
@@ -1076,6 +1149,88 @@ impl SessionsEngine {
 
 impl Inner {
     /// Journal + broadcast one event (the two unconditional legs of the pipeline).
+    /// Sanitize before ANY journal/publish path, including nested subagent events.
+    async fn prepare_generated_image(
+        &self,
+        chat_id: &str,
+        event: AgentEvent,
+        seen: &mut std::collections::HashSet<String>,
+    ) -> Vec<AgentEvent> {
+        let mut parents = Vec::new();
+        let mut leaf = event;
+        while let AgentEvent::Subagent {
+            parent_tool_use_id,
+            event,
+        } = leaf
+        {
+            parents.push(parent_tool_use_id);
+            leaf = *event;
+        }
+        let events = if let AgentEvent::GeneratedImage { id, path, .. } = leaf {
+            let key = std::iter::once(chat_id)
+                .chain(parents.iter().map(String::as_str))
+                .chain(std::iter::once(id.as_str()))
+                .collect::<Vec<_>>()
+                .join("\0");
+            if seen.contains(&key) {
+                return vec![];
+            }
+            let result = if let Some((uploads, allowed_root)) = self.generated_images.get() {
+                let uploads = uploads.clone();
+                let root = allowed_root.clone();
+                let stable_key = key.clone();
+                tokio::task::spawn_blocking(move || {
+                    uploads.import_generated_image(std::path::Path::new(&path), &root, &stable_key)
+                })
+                .await
+                .unwrap_or_else(|err| Err(EngineError::Other(err.to_string())))
+            } else {
+                Err(EngineError::Other(
+                    "Generated image intake is not configured".into(),
+                ))
+            };
+            match result {
+                Ok(image) => {
+                    seen.insert(key);
+                    vec![AgentEvent::GeneratedImage {
+                        id,
+                        path: image.path,
+                        name: image.name,
+                        mime_type: image.mime_type,
+                    }]
+                }
+                Err(err) => {
+                    tracing::warn!(chat = %chat_id, error = %err, "generated image import failed");
+                    vec![
+                        AgentEvent::ToolResult {
+                            id: id.strip_suffix(":image").unwrap_or(&id).into(),
+                            is_error: true,
+                            output: None,
+                            diff: None,
+                        },
+                        AgentEvent::Error {
+                            message: "Generated image unavailable".into(),
+                        },
+                    ]
+                }
+            }
+        } else {
+            vec![leaf]
+        };
+        events
+            .into_iter()
+            .map(|mut event| {
+                for parent in parents.iter().rev() {
+                    event = AgentEvent::Subagent {
+                        parent_tool_use_id: parent.clone(),
+                        event: Box::new(event),
+                    };
+                }
+                event
+            })
+            .collect()
+    }
+
     fn publish(&self, chat_id: &str, event: &AgentEvent) -> u64 {
         let seq = match self.journal.append(chat_id, event) {
             Ok(seq) => seq,
@@ -1125,12 +1280,32 @@ impl Inner {
     }
 
     fn set_status(&self, chat_id: &str, status: SessionStatus, fresh_start: bool) {
+        self.set_status_with_completion(chat_id, status, fresh_start, None);
+    }
+
+    fn has_pending_steers(&self, chat_id: &str, run_id: &str) -> bool {
+        lock(&self.runs)
+            .get(chat_id)
+            .filter(|h| h.run_id == run_id)
+            .is_some_and(|h| !lock(&h.routed_steers).is_empty())
+    }
+
+    /// Publish the completion marker atomically with the settled status. Keep
+    /// it on subsequent Working/heartbeat rows for coalesced and remote watches.
+    fn set_status_with_completion(
+        &self,
+        chat_id: &str,
+        status: SessionStatus,
+        fresh_start: bool,
+        completed_turn: Option<String>,
+    ) {
         let now = Utc::now();
         let session = {
             let mut statuses = lock(&self.statuses);
             let entry = statuses
                 .entry(chat_id.to_string())
                 .or_insert_with(|| Session {
+                    last_completed_turn: None,
                     chat_id: chat_id.to_string(),
                     device_id: self.device_id.clone(),
                     status,
@@ -1147,6 +1322,9 @@ impl Inner {
                 entry.status,
                 SessionStatus::Working | SessionStatus::AwaitingInput
             );
+            if let Some(turn) = completed_turn {
+                entry.last_completed_turn = Some(turn);
+            }
             entry.status = status;
             entry.updated_at = now;
             match status {
@@ -1289,6 +1467,16 @@ impl Inner {
 
 // ── run task ────────────────────────────────────────────────────────────────
 
+/// A turn is in flight: streaming, or parked on a question it is still owed an
+/// answer to. Notably NOT a persistent session that has parked between turns —
+/// that holds a warm child with nothing outstanding.
+fn is_active(session: &Session) -> bool {
+    matches!(
+        session.status,
+        SessionStatus::Working | SessionStatus::AwaitingInput
+    )
+}
+
 // ── subagent docs ───────────────────────────────────────────────────────────
 
 /// The per-subagent doc id: `{chatId}--sub--{suffix}`. Constrained by the
@@ -1361,6 +1549,49 @@ impl SubagentSink {
             // errors the chat.
             tracing::warn!(doc = %self.doc_id, error = %err, "subagent sink flush failed");
         }
+        self.dirty = false;
+    }
+
+    /// A parent→subagent steer ([`AgentEvent::UserMessage`], tagged): close
+    /// the open assistant segment (it reads Complete above the steer), write
+    /// the steer as its own USER entry, and reset so the next tagged delta
+    /// opens a fresh assistant entry below it — the subagent transcript then
+    /// reads like any steered chat.
+    fn push_user(&mut self, device_id: &str, text: &str) {
+        let rendered = render_parts(&self.folded);
+        let closed = match self.entry_index.take() {
+            Some(ix) => SegmentWriter::resume(&self.doc, ix, std::mem::take(&mut self.written))
+                .finish(&rendered, MessageStatus::Complete),
+            None if !self.folded.is_empty() => {
+                match SegmentWriter::begin(&self.doc, &self.entry_id, device_id, self.started_at) {
+                    Ok(w) => w.finish(&rendered, MessageStatus::Complete),
+                    Err(e) => Err(e),
+                }
+            }
+            None => Ok(()),
+        };
+        if let Err(err) = closed {
+            tracing::warn!(doc = %self.doc_id, error = %err, "subagent segment close failed");
+        }
+        let entry = SessionMessageEntry {
+            id: new_id(),
+            role: MessageRole::User,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: text.to_owned(),
+            }],
+            created_at: now_ms(),
+            device_id: device_id.to_owned(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        };
+        if let Err(err) = self.doc.push_message(&entry) {
+            tracing::warn!(doc = %self.doc_id, error = %err, "subagent steer write failed");
+        }
+        self.entry_id = new_id();
+        self.started_at = now_ms();
+        self.written = Vec::new();
+        self.folded = Vec::new();
         self.dirty = false;
     }
 
@@ -1537,6 +1768,9 @@ async fn drive_run(
     let harness_id = harness.id();
     let user_prompt = request.prompt.clone();
     let run_cwd = request.cwd.clone();
+    if request.resume.is_none() {
+        let _ = doc.clear_context_usage();
+    }
     // Kept whole for the startup-crash retry (same user entry; dispatch
     // re-injects the stored resume id). Option so the retry branch (inside
     // the event loop) can take ownership.
@@ -1578,6 +1812,18 @@ async fn drive_run(
     // folding the echo would mint an orphan chip mid-text in the NEXT
     // segment — the mid-word transcript splits.
     let mut seen_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_images = std::collections::HashSet::new();
+    for entry in doc_ref.read_entries().unwrap_or_default() {
+        for part in entry.parts {
+            if let MessagePart::Image { id, .. } = part {
+                seen_images.insert(format!("{chat_id}\0{id}"));
+                if let Some(tool_id) = id.strip_suffix(":image") {
+                    seen_tools.insert(tool_id.to_owned());
+                }
+            }
+        }
+    }
+    let mut prepared_events = std::collections::VecDeque::new();
     let mut entry_id = new_id();
     let mut segment_started = now_ms();
     let mut writer: Option<SegmentWriter<'_>> = None;
@@ -1625,8 +1871,11 @@ async fn drive_run(
     // RETIRED for native drivers: a harness whose every turn shape ends with
     // a deterministic wire Done (claude/codex/cursor native) needs no
     // quiesce backstop — arming one only risks false parks on long silent
-    // work. The env knob still forces a window on for diagnostics.
+    // work. The env knob can configure a diagnostic window, but a prompt
+    // with an authoritative completion signal must still await that signal.
+    // ACP retains the watchdog only for unowned self-continued activity.
     let deterministic_turn_end = harness.deterministic_turn_end();
+    let authoritative_prompt_end = harness.authoritative_prompt_end();
     let quiesce_after: Option<std::time::Duration> = match std::env::var("ZERON_TURN_QUIESCE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -1669,156 +1918,177 @@ async fn drive_run(
     let mut subagents: std::collections::HashMap<String, SubagentSink> =
         std::collections::HashMap::new();
 
+    let mut final_completed_turn = None;
     let final_status = loop {
-        let event: AgentEvent = tokio::select! {
-            biased;
-            changed = cancel_rx.changed(), if !interrupted => {
-                let _ = changed;
-                interrupted = true;
-                interrupt_deadline = Some(
-                    tokio::time::Instant::now() + std::time::Duration::from_secs(3),
-                );
-                continue;
-            }
-            _ = tokio::time::sleep_until(
-                interrupt_deadline.unwrap_or_else(tokio::time::Instant::now)
-            ), if interrupt_deadline.is_some() => AgentEvent::Done {
-                status: DoneStatus::Interrupted,
-                result: None,
-                error: None,
-                session_id: None,
-            },
-            _ = live_heartbeat.tick() => {
-                inner.touch_session(&chat_id);
-                continue;
-            }
-            // Idle reaper (zeron SESSION_IDLE_MS): a parked persistent session
-            // nobody returned to in 30 minutes releases its child. The turn
-            // was finalized at Done, so this end is clean — no aborted stamp.
-            _ = tokio::time::sleep_until(
-                idle_since.map(|at| at + SESSION_IDLE).unwrap_or_else(tokio::time::Instant::now)
-            ), if idle_since.is_some() => {
-                tracing::info!(chat = %chat_id, "reaping idle persistent session");
-                if let Some(token) = lock(&inner.runs)
-                    .get(&chat_id)
-                    .filter(|h| h.run_id == run_id)
-                    .map(|h| h.interrupt_token.clone())
-                {
-                    token.cancel();
+        let event: AgentEvent = if let Some(event) = prepared_events.pop_front() {
+            event
+        } else {
+            let raw_event = tokio::select! {
+                biased;
+                changed = cancel_rx.changed(), if !interrupted => {
+                    let _ = changed;
+                    interrupted = true;
+                    interrupt_deadline = Some(
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(3),
+                    );
+                    continue;
                 }
-                break SessionStatus::Idle;
-            }
-            Some(event) = engine_rx.recv() => event,
-            next = stream.next() => match next {
-                Some(Ok(event)) => event,
-                // A stream error while PARKED is a post-turn child death —
-                // the turn was already finalized, so the run ends clean
-                // instead of stamping a completed session Errored.
-                Some(Err(err)) if idle_since.is_some() => {
-                    tracing::warn!(chat = %chat_id, error = %err, "parked session child died; ending clean");
-                    break SessionStatus::Idle;
-                }
-                Some(Err(err)) => AgentEvent::Done {
-                    status: DoneStatus::Errored,
-                    result: None,
-                    error: Some(err.to_string()),
-                    session_id: None,
-                },
-                None if interrupted => AgentEvent::Done {
+                _ = tokio::time::sleep_until(
+                    interrupt_deadline.unwrap_or_else(tokio::time::Instant::now)
+                ), if interrupt_deadline.is_some() => AgentEvent::Done {
                     status: DoneStatus::Interrupted,
                     result: None,
                     error: None,
                     session_id: None,
                 },
-                // Stream end while PARKED idle: a per-turn adapter closing
-                // after its final Done — a clean end, not a crash (the turn
-                // was already finalized). Persistent adapters keep the
-                // stream open and never hit this.
-                None if idle_since.is_some() => break SessionStatus::Idle,
-                None => AgentEvent::Done {
-                    status: DoneStatus::Errored,
-                    result: None,
-                    error: Some("harness stream ended without Done".into()),
-                    session_id: None,
+                _ = live_heartbeat.tick() => {
+                    inner.touch_session(&chat_id);
+                    continue;
+                }
+                // Idle reaper (zeron SESSION_IDLE_MS): a parked persistent session
+                // nobody returned to in 30 minutes releases its child. The turn
+                // was finalized at Done, so this end is clean — no aborted stamp.
+                _ = tokio::time::sleep_until(
+                    idle_since.map(|at| at + SESSION_IDLE).unwrap_or_else(tokio::time::Instant::now)
+                ), if idle_since.is_some() => {
+                    tracing::info!(chat = %chat_id, "reaping idle persistent session");
+                    if let Some(token) = lock(&inner.runs)
+                        .get(&chat_id)
+                        .filter(|h| h.run_id == run_id)
+                        .map(|h| h.interrupt_token.clone())
+                    {
+                        token.cancel();
+                    }
+                    break SessionStatus::Idle;
+                }
+                Some(event) = engine_rx.recv() => event,
+                next = stream.next() => match next {
+                    Some(Ok(event)) => event,
+                    // A stream error while PARKED is a post-turn child death —
+                    // the turn was already finalized, so the run ends clean
+                    // instead of stamping a completed session Errored.
+                    Some(Err(err)) if idle_since.is_some() => {
+                        tracing::warn!(chat = %chat_id, error = %err, "parked session child died; ending clean");
+                        break SessionStatus::Idle;
+                    }
+                    Some(Err(err)) => AgentEvent::Done {
+                        status: DoneStatus::Errored,
+                        result: None,
+                        error: Some(err.to_string()),
+                        session_id: None,
+                    },
+                    None if interrupted => AgentEvent::Done {
+                        status: DoneStatus::Interrupted,
+                        result: None,
+                        error: None,
+                        session_id: None,
+                    },
+                    // Stream end while PARKED idle: a per-turn adapter closing
+                    // after its final Done — a clean end, not a crash (the turn
+                    // was already finalized). Persistent adapters keep the
+                    // stream open and never hit this.
+                    None if idle_since.is_some() => break SessionStatus::Idle,
+                    None => AgentEvent::Done {
+                        status: DoneStatus::Errored,
+                        result: None,
+                        error: Some("harness stream ended without Done".into()),
+                        session_id: None,
+                    },
                 },
-            },
-            _ = tokio::time::sleep_until(flush_at), if dirty || subagents.values().any(|s| s.dirty) => {
-                // Coalesced STREAM_COMMIT_MS tick: one doc commit per window
-                // (parent + any dirty subagent docs).
-                if dirty {
-                    if let Err(err) = sync_segment(
-                        doc_ref, &mut writer, &entry_id, &device_id, segment_started, &folded,
-                    ) {
-                        tracing::warn!(chat = %chat_id, error = %err, "segment sync failed");
+                _ = tokio::time::sleep_until(flush_at), if dirty || subagents.values().any(|s| s.dirty) => {
+                    // Coalesced STREAM_COMMIT_MS tick: one doc commit per window
+                    // (parent + any dirty subagent docs).
+                    if dirty {
+                        if let Err(err) = sync_segment(
+                            doc_ref, &mut writer, &entry_id, &device_id, segment_started, &folded,
+                        ) {
+                            tracing::warn!(chat = %chat_id, error = %err, "segment sync failed");
+                        }
+                        dirty = false;
                     }
+                    for sink in subagents.values_mut() {
+                        sink.flush(&device_id);
+                    }
+                    continue;
+                }
+                // Turn-quiesce watchdog (see the knob above). Armed only when the
+                // fold says nothing is in flight: an unresolved tool part is a
+                // command still running (legitimately silent for minutes — the
+                // rejected stall-timeout case), an unresolved input part is a
+                // question awaiting the user. The live-plan chip is exempt from
+                // the tool check: it is a singleton that never resolves. An EMPTY
+                // fold still arms — a Steered boundary that no output ever
+                // follows is one of the wedge shapes — it just parks without
+                // writing a segment (an empty finalize would leave a stub entry).
+                _ = tokio::time::sleep_until({
+                    let mut window = quiesce_after.unwrap_or_default();
+                    if self_continued_turn && let Some(short) = self_quiesce_after {
+                        window = window.min(short);
+                    }
+                    last_stream_activity + window
+                }), if quiesce_after.is_some()
+                    && (self_continued_turn || !authoritative_prompt_end)
+                    && idle_since.is_none()
+                    && !interrupted
+                    && steerable
+                    && !folded.iter().any(|p| match p {
+                        MessagePart::Tool { id, resolved: false, .. } => {
+                            id != zeron_proto::LIVE_PLAN_TOOL_ID
+                        }
+                        MessagePart::Input { resolved: false, .. } => true,
+                        _ => false,
+                    }) =>
+                {
+                    tracing::warn!(
+                        chat = %chat_id,
+                        quiet_ms = quiesce_after.unwrap_or_default().as_millis() as u64,
+                        "turn quiesced: stream silent after completed output with no \
+                         turn-end; parking (suspected missing harness Done)"
+                    );
+                    // Some adapters close a completed response through this
+                    // engine watchdog instead of a native Done. Preserve that
+                    // completion notice, but never notify for an empty boundary
+                    // or while an accepted steer still awaits delivery.
+                    let completed_turn = ((!folded.is_empty() || writer.is_some())
+                        && !inner.has_pending_steers(&chat_id, &run_id))
+                        .then(|| entry_id.clone());
+                    if !folded.is_empty() || writer.is_some() {
+                        if let Err(err) = finish_segment(
+                            doc_ref,
+                            writer.take(),
+                            &entry_id,
+                            &device_id,
+                            segment_started,
+                            &folded,
+                            MessageStatus::Complete,
+                        ) {
+                            tracing::warn!(chat = %chat_id, error = %err, "quiesce segment finish failed");
+                        }
+                        inner.note_message(&chat_id, &folded_text(&folded));
+                    }
+                    folded.clear();
                     dirty = false;
+                    entry_id = new_id();
+                    segment_started = now_ms();
+                    idle_since = Some(tokio::time::Instant::now());
+                    self_continued_turn = false;
+                    settle_status_for_turn_end_with_completion(
+                        &inner, &chat_id, &run_id, SessionStatus::Idle, false, completed_turn,
+                    );
+                    spawn_queue_drain(&inner, &chat_id);
+                    continue;
                 }
-                for sink in subagents.values_mut() {
-                    sink.flush(&device_id);
-                }
+            };
+
+            prepared_events.extend(
+                inner
+                    .prepare_generated_image(&chat_id, raw_event, &mut seen_images)
+                    .await,
+            );
+            let Some(event) = prepared_events.pop_front() else {
                 continue;
-            }
-            // Turn-quiesce watchdog (see the knob above). Armed only when the
-            // fold says nothing is in flight: an unresolved tool part is a
-            // command still running (legitimately silent for minutes — the
-            // rejected stall-timeout case), an unresolved input part is a
-            // question awaiting the user. The live-plan chip is exempt from
-            // the tool check: it is a singleton that never resolves. An EMPTY
-            // fold still arms — a Steered boundary that no output ever
-            // follows is one of the wedge shapes — it just parks without
-            // writing a segment (an empty finalize would leave a stub entry).
-            _ = tokio::time::sleep_until({
-                let mut window = quiesce_after.unwrap_or_default();
-                if self_continued_turn && let Some(short) = self_quiesce_after {
-                    window = window.min(short);
-                }
-                last_stream_activity + window
-            }), if quiesce_after.is_some()
-                && idle_since.is_none()
-                && !interrupted
-                && steerable
-                && !folded.iter().any(|p| match p {
-                    MessagePart::Tool { id, resolved: false, .. } => {
-                        id != zeron_proto::LIVE_PLAN_TOOL_ID
-                    }
-                    MessagePart::Input { resolved: false, .. } => true,
-                    _ => false,
-                }) =>
-            {
-                tracing::warn!(
-                    chat = %chat_id,
-                    quiet_ms = quiesce_after.unwrap_or_default().as_millis() as u64,
-                    "turn quiesced: stream silent after completed output with no \
-                     turn-end; parking (suspected missing harness Done)"
-                );
-                if !folded.is_empty() || writer.is_some() {
-                    if let Err(err) = finish_segment(
-                        doc_ref,
-                        writer.take(),
-                        &entry_id,
-                        &device_id,
-                        segment_started,
-                        &folded,
-                        MessageStatus::Complete,
-                    ) {
-                        tracing::warn!(chat = %chat_id, error = %err, "quiesce segment finish failed");
-                    }
-                    inner.note_message(&chat_id, &folded_text(&folded));
-                }
-                folded.clear();
-                dirty = false;
-                entry_id = new_id();
-                segment_started = now_ms();
-                idle_since = Some(tokio::time::Instant::now());
-                self_continued_turn = false;
-                // A quiesced turn is a turn END like any other: the queue
-                // drains here too (a queued prompt must not strand behind a
-                // harness that lost its Done), with the same withheld-Idle
-                // rule while prompts wait.
-                settle_status_for_turn_end(&inner, &chat_id, &run_id, SessionStatus::Idle, false);
-                spawn_queue_drain(&inner, &chat_id);
-                continue;
-            }
+            };
+            event
         };
 
         // ── subagent routing ───────────────────────────────────────────
@@ -1836,7 +2106,10 @@ async fn drive_run(
         } = &event
         {
             inner.publish(&chat_id, &event);
-            let is_steer = matches!(sub_event.as_ref(), AgentEvent::UserMessage { .. });
+            let is_steer = matches!(
+                sub_event.as_ref(),
+                AgentEvent::UserMessage { .. } | AgentEvent::Steered { .. }
+            );
             if is_steer {
                 settled_subagents.remove(parent_tool_use_id);
             } else if settled_subagents.contains(parent_tool_use_id)
@@ -1912,6 +2185,10 @@ async fn drive_run(
                 settled_subagents.insert(parent_tool_use_id.clone());
             }
             if let Some(sink) = subagents.get_mut(parent_tool_use_id) {
+                if let AgentEvent::UserMessage { text } = sub_event.as_ref() {
+                    sink.push_user(&device_id, text);
+                    continue;
+                }
                 zeron_doc::fold_event_into_parts(&mut sink.folded, sub_event);
                 sink.dirty = true;
                 if !chip_streaming && done {
@@ -1988,6 +2265,13 @@ async fn drive_run(
                 continue;
             }
         }
+        // Capacity/occupancy can settle after Done; updating it must not reopen a turn.
+        if let AgentEvent::ContextUsage { tokens, window } = &event {
+            if let Err(err) = doc_ref.update_context_usage(*tokens, *window) {
+                tracing::warn!(%chat_id, error = %err, "context usage write failed");
+            }
+            continue;
+        }
         // PARKED: a steer boundary, a terminal Done, or SELF-CONTINUED OUTPUT
         // re-opens the session; everything else stays gated. The ACP child
         // keeps forwarding `session/update` frames after a turn completes,
@@ -2012,6 +2296,7 @@ async fn drive_run(
         // self-continued turn starts a whole new agent round trip (seconds
         // at minimum, minutes in the incident). Inside the gate everything
         // non-boundary stays inert, exactly as before.
+        let turn_was_active = idle_since.is_none();
         const RESUME_GATE: std::time::Duration = std::time::Duration::from_secs(1);
         if idle_since.is_some() {
             let self_continued = idle_since
@@ -2301,6 +2586,15 @@ async fn drive_run(
             {
                 titles.maybe_generate(&chat_id, harness_id, &user_prompt, &run_cwd);
             }
+            // An accepted steer awaiting its boundary owns the continuation:
+            // the previous Done is an internal handoff, not a completion ping.
+            // Queue continuation is checked again when publishing completion.
+            let pending_steer = inner.has_pending_steers(&chat_id, &run_id);
+            let completed_turn = (*status == DoneStatus::Completed
+                && !interrupted
+                && turn_was_active
+                && !pending_steer)
+                .then(|| entry_id.clone());
             // PERSISTENT SESSION: a cleanly completed turn on a steerable
             // harness PARKS instead of ending — child + mailbox stay warm for
             // the next routed dispatch; per-turn state resets for it.
@@ -2317,10 +2611,18 @@ async fn drive_run(
                 // one. The dispatch routes into this parked session's
                 // mailbox (zero respawn latency), exactly like a
                 // user-sent follow-up; the turn after THAT drains the next.
-                settle_status_for_turn_end(&inner, &chat_id, &run_id, SessionStatus::Idle, false);
+                settle_status_for_turn_end_with_completion(
+                    &inner,
+                    &chat_id,
+                    &run_id,
+                    SessionStatus::Idle,
+                    false,
+                    completed_turn,
+                );
                 spawn_queue_drain(&inner, &chat_id);
                 continue;
             }
+            final_completed_turn = completed_turn;
             break match status {
                 DoneStatus::Errored => SessionStatus::Errored,
                 _ => SessionStatus::Idle,
@@ -2363,7 +2665,14 @@ async fn drive_run(
         .unwrap_or_default();
     inner.remove_run(&chat_id, &run_id);
     let has_orphans = !interrupted && !orphans.is_empty();
-    settle_status_for_turn_end(&inner, &chat_id, &run_id, final_status, has_orphans);
+    settle_status_for_turn_end_with_completion(
+        &inner,
+        &chat_id,
+        &run_id,
+        final_status,
+        has_orphans,
+        final_completed_turn,
+    );
     if has_orphans {
         // The dying run accepted these into its mailbox but never confirmed a
         // Steered boundary (idle-reaper race, a mid-turn error discarding
@@ -2426,6 +2735,7 @@ async fn drive_run(
 /// turns, and per-drain Idle dips rang the done-chime once per queued prompt
 /// (user report). The drain releases the withheld Idle if no delivery
 /// follows (queue emptied by racing removes, or a failed dispatch).
+#[cfg(test)]
 fn settle_status_for_turn_end(
     inner: &Arc<Inner>,
     chat_id: &str,
@@ -2433,13 +2743,43 @@ fn settle_status_for_turn_end(
     final_status: SessionStatus,
     has_orphans: bool,
 ) {
+    settle_status_for_turn_end_with_completion(
+        inner,
+        chat_id,
+        run_id,
+        final_status,
+        has_orphans,
+        None,
+    );
+}
+
+fn settle_status_for_turn_end_with_completion(
+    inner: &Arc<Inner>,
+    chat_id: &str,
+    run_id: &str,
+    final_status: SessionStatus,
+    has_orphans: bool,
+    completed_turn: Option<String>,
+) {
     let queue_waiting = lock(&inner.queued_turns)
         .get(chat_id)
         .is_some_and(|q| !q.is_empty());
     if queue_waiting && !has_orphans {
         lock(&inner.queue_held).insert(chat_id.to_string(), run_id.to_string());
     } else {
-        inner.set_status(chat_id, final_status, false);
+        // Shared queues need Idle to wake their drainer, but our completion
+        // notice belongs to the final turn of a drain, not every queued row.
+        let completed_turn = completed_turn.filter(|_| {
+            let Some(host) = inner.doc_host() else { return true; };
+            match host.queue_will_drain(chat_id) {
+                Ok(waiting) => !waiting,
+                Err(error) => {
+                    tracing::error!(chat = %chat_id, %error, "cannot read queue before completion notice");
+                    false
+                }
+            }
+        });
+        inner.set_status_with_completion(chat_id, final_status, false, completed_turn);
     }
 }
 
@@ -2503,6 +2843,7 @@ mod queue_hold_tests {
             RunHandle {
                 run_id: run_id.into(),
                 steerable: true,
+                runtime_config: RuntimeConfig::from_request(HarnessId::Grok, &request()),
                 steer_tx,
                 interrupt_token: CancellationToken::new(),
                 cancel,
@@ -2511,6 +2852,84 @@ mod queue_hold_tests {
                 routed_steers: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             },
         );
+    }
+
+    #[tokio::test]
+    async fn generated_image_failure_is_sanitized_even_inside_subagents() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = SessionsEngine::new(
+            "host".into(),
+            Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()),
+            Arc::new(HarnessRegistry::new()),
+        );
+        let source = "/outside/private/source.png";
+        let event = AgentEvent::Subagent {
+            parent_tool_use_id: "child".into(),
+            event: Box::new(AgentEvent::GeneratedImage {
+                id: "i:image".into(),
+                path: source.into(),
+                name: "secret".into(),
+                mime_type: "bad".into(),
+            }),
+        };
+        let events = sessions
+            .inner
+            .prepare_generated_image("chat", event, &mut std::collections::HashSet::new())
+            .await;
+        assert_eq!(events.len(), 2);
+        let mut parts = vec![];
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "i".into(),
+                call: zeron_proto::ToolCall::Unknown {
+                    name: "Generate image".into(),
+                    input: None,
+                },
+            },
+        );
+        for event in &events {
+            sessions.inner.publish("chat", event);
+            let AgentEvent::Subagent {
+                parent_tool_use_id,
+                event,
+            } = event
+            else {
+                panic!("lost owner")
+            };
+            assert_eq!(parent_tool_use_id, "child");
+            fold_event_into_parts(&mut parts, event);
+        }
+        assert!(matches!(
+            parts[0],
+            MessagePart::Tool {
+                is_error: true,
+                resolved: true,
+                ..
+            }
+        ));
+        assert!(matches!(parts[1], MessagePart::Error { .. }));
+        let journal =
+            serde_json::to_string(&sessions.inner.journal.replay("chat", 0).unwrap()).unwrap();
+        assert!(!journal.contains(source));
+        assert!(!journal.contains("secret"));
+    }
+
+    fn request() -> RunRequest {
+        RunRequest {
+            prompt: "first".into(),
+            harness: None,
+            model: Some("grok-4.6".into()),
+            reasoning: Some(zeron_proto::ReasoningLevel::High),
+            model_options: serde_json::Map::new(),
+            cwd: "/tmp".into(),
+            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            auto_approve: true,
+            resume: None,
+            attachments: Vec::new(),
+            worktree: None,
+        }
     }
 
     #[test]
@@ -2540,6 +2959,37 @@ mod queue_hold_tests {
             Some(SessionStatus::Idle)
         );
         assert!(lock(&engine.inner.queue_held).get("c1").is_none());
+    }
+
+    #[test]
+    fn completion_marker_is_published_only_after_the_legacy_queue_drains() {
+        let engine = engine();
+        engine.inner.set_status("c1", SessionStatus::Working, true);
+        park_queued(&engine, "c1", "q-1");
+        settle_status_for_turn_end_with_completion(
+            &engine.inner,
+            "c1",
+            "run-1",
+            SessionStatus::Idle,
+            false,
+            Some("turn-1".into()),
+        );
+        assert_eq!(
+            engine.session_status("c1").unwrap().last_completed_turn,
+            None
+        );
+        lock(&engine.inner.queued_turns).remove("c1");
+        settle_status_for_turn_end_with_completion(
+            &engine.inner,
+            "c1",
+            "run-1",
+            SessionStatus::Idle,
+            false,
+            Some("turn-2".into()),
+        );
+        let session = engine.session_status("c1").unwrap();
+        assert_eq!(session.status, SessionStatus::Idle);
+        assert_eq!(session.last_completed_turn.as_deref(), Some("turn-2"));
     }
 
     #[tokio::test]

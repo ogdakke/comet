@@ -18,6 +18,12 @@ Use a different Worker name and different `BLOBS` and `RELEASES` R2 buckets in
 each. A new Worker provisions independent Durable Object namespaces when its
 migrations run.
 
+Retain the `STUDIO_ROOM` binding and the existing v1–v4 migrations when
+updating personal configs. The upstream preview feature also requires
+`PREVIEW_ROOM` with class `PreviewRoom` and a v5 migration listing
+`PreviewRoom` in `new_sqlite_classes`, as shown in the tracked template.
+Update both personal environments before their next explicit deployment.
+
 Cloudflare permits one account Secrets Store. Bind the same Worker-facing names
 to different stored secrets in the two ignored configs:
 

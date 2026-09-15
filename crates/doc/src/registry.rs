@@ -719,6 +719,7 @@ impl RegistryDoc {
             ("lastSeenAt", opt_ms(device.last_seen_at)),
             ("createdAt", opt_ms(device.created_at)),
             ("version", opt_str(device.version.as_deref())),
+            ("capabilities", json!(device.capabilities)),
         ]);
         self.write(KIND_DEVICES, &device.id.clone(), OpKind::Upsert, set);
         Ok(())
@@ -1186,6 +1187,7 @@ impl RegistryDoc {
             ("chatId", json!(session.chat_id)),
             ("deviceId", json!(session.device_id)),
             ("status", serde_json::to_value(session.status)?),
+            ("lastCompletedTurn", json!(session.last_completed_turn)),
             ("startedAt", opt_ms(session.started_at)),
             ("updatedAt", json!(session.updated_at.timestamp_millis())),
         ]);
@@ -1247,6 +1249,7 @@ impl RegistryDoc {
                     ("lastSeenAt", opt_ms(device.last_seen_at)),
                     ("createdAt", opt_ms(device.created_at)),
                     ("version", opt_str(device.version.as_deref())),
+                    ("capabilities", json!(device.capabilities)),
                 ]),
             );
         }
@@ -1320,6 +1323,7 @@ impl RegistryDoc {
                     ("chatId", json!(session.chat_id)),
                     ("deviceId", json!(session.device_id)),
                     ("status", serde_json::to_value(session.status)?),
+                    ("lastCompletedTurn", json!(session.last_completed_turn)),
                     ("startedAt", opt_ms(session.started_at)),
                     ("updatedAt", json!(session.updated_at.timestamp_millis())),
                 ]),

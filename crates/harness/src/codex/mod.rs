@@ -3,8 +3,9 @@
 //! uses. Resurrected from the pre-ACP driver and modernized.
 //!
 //! VERSION PIN: the app-server API is EXPERIMENTAL (`capabilities.
-//! experimentalApi`); this driver is validated against codex-cli 0.146.1 —
-//! revalidate the method/notification surface when bumping past it.
+//! experimentalApi`); this driver is validated against codex-cli 0.153.4 —
+//! imageGeneration additionally follows the 0.154.0 schema (savedPath only).
+//! Revalidate the method/notification surface when bumping past it.
 //!
 //! - `initialize` handshake (clientInfo + `capabilities.experimentalApi`) then
 //!   the `initialized` notification; unknown notification methods tolerated.
@@ -20,11 +21,11 @@
 //!   `item/commandExecution/requestApproval` +
 //!   `item/fileChange/requestApproval` still round-trip through
 //!   [`RunControls::request_input`] as a synthesized yes/no question.
-//! - Subagents are full child app-server threads (`thread/started` with
-//!   `source.subAgent.thread_spawn`, `subAgentActivity` items on the parent).
+//! - Subagents are full child app-server threads. Parent spawn items establish
+//!   their stable ownership; content arriving before the spawn is buffered.
 //!   A registered child's notifications route through an EXPLICIT table
-//!   ([`normalize::route_child_notification`]) — item lifecycles/errors become
-//!   tagged [`AgentEvent::Subagent`] events, child turn bookkeeping is
+//!   ([`normalize::route_child_notification`]) — content, errors and child turns
+//!   become tagged [`AgentEvent::Subagent`] events; unrelated child bookkeeping is
 //!   consumed so it can never settle the parent turn, and unknown methods
 //!   fall through to the parent path (fail open, never silent loss).
 //! - Steering: `turn/steer { expectedTurnId }` into the live turn; a rejected
@@ -37,6 +38,7 @@
 
 pub(crate) mod catalog;
 mod normalize;
+mod subagents;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -53,16 +55,16 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
-    SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, ReasoningLevel,
+    RunRequest, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls};
-use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
+use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, to_effort};
 use normalize::{
-    ChildRoute, Phase, delta_text, item_id, item_type, map_item, notification_thread_id,
-    route_child_notification, turn_error_message, turn_id, usage_event, user_message_text,
+    ChildRoute, Phase, ReasoningStream, delta_text, item_id, item_type, notification_thread_id,
+    route_child_notification, turn_error_message, turn_id, usage_event,
 };
 
 /// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then our own
@@ -115,9 +117,6 @@ pub struct CodexHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
-    /// Command discovery cache: only a successful probe is cached, so a
-    /// broken CLI retries on the next picker open (ACP-harness parity).
-    commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
 }
 
 impl Default for CodexHarness {
@@ -126,7 +125,6 @@ impl Default for CodexHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
-            commands: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -164,12 +162,11 @@ impl CodexHarness {
         })
     }
 
-    /// Short-lived discovery probe: a `codex app-server` handshake followed by
-    /// `skills/list` — the only invocable-listing method the 0.146.x wire has
-    /// (custom `~/.codex/prompts` are NOT exposed; the TUI-only built-ins
-    /// aren't either). Skills are what the codex TUI itself surfaces as
-    /// slash-invocables, listed per-cwd and deduped by name here.
-    async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    /// Short-lived live catalog probe. `model/list` is paginated and already
+    /// applies the signed-in account's rollout/visibility policy, so hidden or
+    /// unavailable models (including staged Astra rollouts) never leak into a
+    /// successful picker response.
+    async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
@@ -189,8 +186,6 @@ impl CodexHarness {
             shutdown_child(&mut child, self.kill_grace).await;
             return Err(HarnessError::Protocol("codex child has no stdio".into()));
         };
-        // The receiver must stay alive for the client's reader loop; agent →
-        // client traffic during the probe is ignored.
         let (client, _incoming) = RpcClient::new(stdin, stdout);
         let discovery = async {
             client
@@ -207,63 +202,222 @@ impl CodexHarness {
                 )
                 .await?;
             client.notify("initialized", None);
-            let skills = client.request("skills/list", json!({})).await?;
-            Ok::<Vec<SlashCommand>, HarnessError>(parse_skill_commands(&skills))
+
+            let mut models = Vec::new();
+            let mut model_ids = HashSet::new();
+            let mut seen_cursors = HashSet::new();
+            let mut cursor: Option<String> = None;
+            let mut default_model_id: Option<String> = None;
+            loop {
+                let mut params = json!({ "limit": 20, "includeHidden": false });
+                if let Some(cursor) = cursor.as_deref() {
+                    params["cursor"] = Value::String(cursor.to_owned());
+                }
+                let page = client.request("model/list", params).await?;
+                if page.get("data").and_then(Value::as_array).is_none() {
+                    return Err(HarnessError::Protocol(
+                        "Codex model/list response has no model catalog".into(),
+                    ));
+                }
+                let (page_models, next_cursor) = parse_model_list_page(&page);
+                for (model, is_default) in page_models {
+                    if model_ids.insert(model.id.clone()) {
+                        if is_default && default_model_id.is_none() {
+                            default_model_id = Some(model.id.clone());
+                        }
+                        models.push(model);
+                    }
+                }
+                let Some(next) = next_cursor.filter(|next| !next.is_empty()) else {
+                    break;
+                };
+                if !seen_cursors.insert(next.clone()) {
+                    return Err(HarnessError::Protocol(
+                        "Codex model/list repeated a pagination cursor".into(),
+                    ));
+                }
+                cursor = Some(next);
+            }
+
+            if let Some(default_id) = default_model_id
+                && let Some(index) = models.iter().position(|model| model.id == default_id)
+                && index != 0
+            {
+                let default_model = models.remove(index);
+                models.insert(0, default_model);
+            }
+            Ok::<Vec<Model>, HarnessError>(models)
         };
         let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
         shutdown_child(&mut child, self.kill_grace).await;
         match result {
             Ok(inner) => inner,
-            Err(_) => Err(HarnessError::Protocol("command discovery timed out".into())),
+            Err(_) => Err(HarnessError::Protocol("model discovery timed out".into())),
         }
     }
 }
 
-/// `skills/list` result → picker commands. `data` groups skills by cwd; the
-/// same skill appears under every root, so dedupe by name keeping first
-/// appearance order. The interface's shortDescription is picker-sized; the
-/// top-level description is a model-facing paragraph, kept only as fallback.
-fn parse_skill_commands(result: &Value) -> Vec<SlashCommand> {
-    let mut seen = std::collections::HashSet::new();
-    let mut commands = Vec::new();
-    for group in result
-        .get("data")
+fn reasoning_level(value: &str) -> Option<ReasoningLevel> {
+    Some(match value {
+        "minimal" => ReasoningLevel::Minimal,
+        "low" => ReasoningLevel::Low,
+        "medium" => ReasoningLevel::Medium,
+        "high" => ReasoningLevel::High,
+        "xhigh" => ReasoningLevel::XHigh,
+        "max" => ReasoningLevel::Max,
+        "ultra" => ReasoningLevel::Ultra,
+        "ultracode" => ReasoningLevel::Ultracode,
+        "ultrathink" => ReasoningLevel::Ultrathink,
+        _ => return None,
+    })
+}
+
+/// Codex accepts both names, but Zeron has historically persisted `fast`.
+/// Normalize the app server's `priority` id so catalog responses do
+/// not produce two different settings for the same tier.
+fn normalized_service_tier(value: &str) -> &str {
+    match value {
+        "priority" => "fast",
+        other => other,
+    }
+}
+
+fn service_tier_label(value: &str) -> String {
+    match value {
+        "fast" | "priority" => "Fast".into(),
+        "flex" => "Flex".into(),
+        "ultrafast" => "Ultra Fast".into(),
+        other => other.to_owned(),
+    }
+}
+
+fn model_service_tier(item: &Value) -> Option<ModelOption> {
+    let mut choices = vec![ModelOptionChoice {
+        id: "default".into(),
+        label: "Standard".into(),
+    }];
+    let mut seen = HashSet::from(["default".to_owned()]);
+    for tier in item
+        .get("serviceTiers")
         .and_then(Value::as_array)
-        .map(|a| a.as_slice())
+        .map(Vec::as_slice)
         .unwrap_or_default()
     {
-        for skill in group
-            .get("skills")
-            .and_then(Value::as_array)
-            .map(|a| a.as_slice())
-            .unwrap_or_default()
-        {
-            let Some(name) = skill
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|n| !n.is_empty())
-            else {
-                continue;
-            };
-            if !seen.insert(name.to_owned()) {
-                continue;
-            }
-            let interface = skill.get("interface");
-            let description = interface
-                .and_then(|i| i.get("shortDescription"))
-                .and_then(Value::as_str)
-                .filter(|d| !d.is_empty())
-                .or_else(|| skill.get("description").and_then(Value::as_str))
-                .unwrap_or_default();
-            commands.push(SlashCommand {
-                name: name.to_owned(),
-                description: description.to_owned(),
-                input_hint: None,
+        let Some(wire_id) = tier.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let id = normalized_service_tier(wire_id).to_owned();
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let label = tier
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| service_tier_label(wire_id));
+        choices.push(ModelOptionChoice { id, label });
+    }
+    for tier in item
+        .get("additionalSpeedTiers")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        let Some(wire_id) = tier.as_str() else {
+            continue;
+        };
+        let id = normalized_service_tier(wire_id).to_owned();
+        if seen.insert(id.clone()) {
+            choices.push(ModelOptionChoice {
+                id,
+                label: service_tier_label(wire_id),
             });
         }
     }
-    commands
+    if choices.len() == 1 {
+        return None;
+    }
+    let default_choice = item
+        .get("defaultServiceTier")
+        .and_then(Value::as_str)
+        .map(normalized_service_tier)
+        .filter(|id| seen.contains(*id))
+        .unwrap_or("default")
+        .to_owned();
+    Some(ModelOption {
+        id: "serviceTier".into(),
+        label: "Service Tier".into(),
+        choices,
+        default_choice,
+    })
+}
+
+/// Parse one `model/list` page. Unknown future reasoning levels are ignored
+/// independently instead of invalidating the complete catalog.
+fn parse_model_list_page(result: &Value) -> (Vec<(Model, bool)>, Option<String>) {
+    let mut models = Vec::new();
+    for item in result
+        .get("data")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        if item.get("hidden").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(id) = item
+            .get("model")
+            .and_then(Value::as_str)
+            .or_else(|| item.get("id").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        let label = item
+            .get("displayName")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .unwrap_or(id)
+            .to_owned();
+        let description = item
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+            .map(str::to_owned);
+        let reasoning_levels = item
+            .get("supportedReasoningEfforts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|effort| {
+                effort
+                    .get("reasoningEffort")
+                    .and_then(Value::as_str)
+                    .or_else(|| effort.as_str())
+                    .and_then(reasoning_level)
+            })
+            .collect();
+        let options = model_service_tier(item).into_iter().collect();
+        models.push((
+            Model {
+                id: id.to_owned(),
+                label,
+                description,
+                reasoning_levels,
+                options,
+            },
+            item.get("isDefault").and_then(Value::as_bool) == Some(true),
+        ));
+    }
+    let next_cursor = result
+        .get("nextCursor")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    (models, next_cursor)
 }
 
 #[async_trait]
@@ -296,28 +450,47 @@ impl Harness for CodexHarness {
         true
     }
 
-    /// The curated static catalog (see [`catalog`]); requires an installed CLI
-    /// so an absent binary surfaces as [`HarnessError::NotInstalled`] here.
-    /// This is the seam for live discovery: a short-lived `codex app-server`
-    /// paging `model/list` (experimentalApi) exactly as codex.ts does.
+    /// The account's live model catalog is authoritative. Discovery failures
+    /// must remain visible instead of substituting a curated snapshot.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        self.resolve_executable()?;
-        Ok(static_models())
+        self.discover_models().await
     }
 
-    /// Skills from a short-lived `skills/list` probe (see
-    /// [`Self::discover_commands`]); cached on success.
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        self.commands
-            .get_or_try_init(|| self.discover_commands())
-            .await
-            .cloned()
+        Err(HarnessError::Unsupported(
+            "Codex app-server skill invocation is not wired through the slash-command picker"
+                .into(),
+        ))
     }
 
     async fn run(
         &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.run_with_mode(request, controls, false).await
+    }
+
+    async fn run_title(
+        &self,
         mut request: RunRequest,
         controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        request.resume = None;
+        request.worktree = None;
+        request.attachments.clear();
+        request.model_options.clear();
+        request.auto_approve = false;
+        self.run_with_mode(request, controls, true).await
+    }
+}
+
+impl CodexHarness {
+    async fn run_with_mode(
+        &self,
+        mut request: RunRequest,
+        controls: RunControls,
+        title_only: bool,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
         // Yolo mode: danger-full-access + approvalPolicy "never" (set below) —
@@ -327,7 +500,11 @@ impl Harness for CodexHarness {
         // sidesteps codex ≤0.144.x's workspace-write bug where a linked
         // worktree on a slash-named branch derives a malformed mount that
         // kills every command.
-        request.sandbox = zeron_proto::SandboxLevel::DangerFullAccess;
+        request.sandbox = if title_only {
+            zeron_proto::SandboxLevel::ReadOnly
+        } else {
+            zeron_proto::SandboxLevel::DangerFullAccess
+        };
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
         crate::compose_child_path(&mut cmd, &exe);
@@ -369,6 +546,7 @@ impl Harness for CodexHarness {
         let (client, incoming) = RpcClient::new(stdin, stdout);
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
+            title_only,
             child,
             client,
             incoming,
@@ -392,6 +570,7 @@ impl Harness for CodexHarness {
 // ---------------------------------------------------------------------------
 
 struct Session {
+    title_only: bool,
     child: Child,
     client: RpcClient,
     incoming: mpsc::Receiver<Incoming>,
@@ -482,6 +661,7 @@ async fn start_turn(client: &RpcClient, params: Value) -> Result<String, Harness
 /// steering mailbox, the interrupt token, and consumer liveness.
 async fn run_session(session: Session) {
     let Session {
+        title_only,
         mut child,
         client,
         mut incoming,
@@ -520,6 +700,32 @@ async fn run_session(session: Session) {
 
     let start_params = {
         let mut p = serde_json::Map::new();
+        if title_only {
+            p.insert("baseInstructions".into(), crate::TITLE_INSTRUCTIONS.into());
+            p.insert(
+                "developerInstructions".into(),
+                crate::TITLE_INSTRUCTIONS.into(),
+            );
+            p.insert("ephemeral".into(), true.into());
+            p.insert(
+                "config".into(),
+                json!({
+                    "project_doc_max_bytes": 0,
+                    "web_search": "disabled",
+                    "features.shell_tool": false,
+                    "features.apply_patch_freeform": false,
+                    "features.multi_agent": false,
+                    "features.apps": false,
+                    "features.multi_agent_v2": false,
+                    "agents.enabled": false,
+                    "features.browser_use": false,
+                    "features.computer_use": false,
+                    "features.js_repl": false,
+                    "features.image_generation": false,
+                    "features.memories": false
+                }),
+            );
+        }
         p.insert("cwd".into(), Value::String(request.cwd.clone()));
         p.insert("approvalPolicy".into(), approval_policy.into());
         p.insert("sandbox".into(), sandbox_mode(request.sandbox).into());
@@ -549,6 +755,23 @@ async fn run_session(session: Session) {
             .await?;
         client.notify("initialized", None);
 
+        let mut start_params = start_params.clone();
+        if title_only {
+            // Disable each configured MCP server explicitly: an empty table
+            // would merge with user configuration and leave servers enabled.
+            let config = client
+                .request("config/read", json!({"includeLayers": false}))
+                .await?;
+            if let Some(servers) = config["config"]["mcp_servers"].as_object() {
+                let overrides = start_params
+                    .get_mut("config")
+                    .and_then(Value::as_object_mut)
+                    .unwrap();
+                for name in servers.keys() {
+                    overrides.insert(format!("mcp_servers.{name}.enabled"), false.into());
+                }
+            }
+        }
         let thread = if let Some(resume) = &request.resume {
             let mut p = start_params.clone();
             p.insert("threadId".into(), Value::String(resume.clone()));
@@ -571,9 +794,11 @@ async fn run_session(session: Session) {
                 .await?
         };
         let thread_id = thread["thread"]["id"].as_str().unwrap_or("").to_owned();
-        Ok::<String, HarnessError>(thread_id)
+        let mut children = subagents::Subagents::new(thread_id.clone());
+        children.restore(&thread["thread"]);
+        Ok::<_, HarnessError>((thread_id, children))
     };
-    let thread_id = tokio::select! {
+    let (thread_id, mut children) = tokio::select! {
         res = setup => match res {
             Ok(thread_id) => thread_id,
             Err(e) => {
@@ -648,11 +873,6 @@ async fn run_session(session: Session) {
     }
 
     let mut router = TurnRouter::default();
-    // Child app-server threads (multi-agent v2): child thread id → the
-    // parent-feed spawn call id its traffic is attributed to. Registered
-    // from `subAgentActivity` items on the parent thread and from a child
-    // `thread/started` carrying a spawn source.
-    let mut children: HashMap<String, String> = HashMap::new();
     match start_turn(&client, turn_params(&request.prompt)).await {
         Ok(id) => router.adopt_started(id),
         Err(e) => {
@@ -673,6 +893,7 @@ async fn run_session(session: Session) {
     // Deltas seen per agent-message item, so a model that never streams
     // (item/completed only) still emits its text exactly once.
     let mut streamed_text: HashSet<String> = HashSet::new();
+    let mut reasoning_streams: HashMap<String, ReasoningStream> = HashMap::new();
     // Token usage is held until the turn ends, emitted just before Done.
     let mut pending_usage: Option<AgentEvent> = None;
     // Steers whose `turn/steer` lost the turn-completed race; delivered as the
@@ -697,19 +918,6 @@ async fn run_session(session: Session) {
                     && !nthread.is_empty()
                     && nthread != thread_id
                 {
-                    // Registration path: a child thread/started with an
-                    // explicit spawn source. The spawn-call mapping from a
-                    // subAgentActivity item wins (that id IS the parent
-                    // chip); this only seeds a fallback.
-                    if method == "thread/started"
-                        && params
-                            .pointer("/thread/source/subAgent/thread_spawn")
-                            .is_some()
-                    {
-                        children
-                            .entry(nthread.clone())
-                            .or_insert_with(|| nthread.clone());
-                    }
                     match route_child_notification(&method) {
                         ChildRoute::Parent => {
                             // Unknown/parent-owned: fall through so a codex
@@ -718,121 +926,9 @@ async fn run_session(session: Session) {
                         }
                         ChildRoute::Consumed => continue,
                         ChildRoute::Subagent => {
-                            // Attributed child traffic — but only for a
-                            // REGISTERED child; pre-registration lifecycle
-                            // (captured ordering: a child's status change
-                            // can precede its registration) is dropped, not
-                            // passed to the parent path.
-                            if let Some(parent_call) = children.get(&nthread).cloned() {
-                                let events: Vec<AgentEvent> = match method.as_str() {
-                                    // The child settling its turn IS the
-                                    // subagent finishing its assignment —
-                                    // the chip's terminal state.
-                                    "turn/completed" => vec![AgentEvent::Done {
-                                        status: if turn_error_message(&params).is_some()
-                                            || params
-                                                .pointer("/turn/status")
-                                                .and_then(Value::as_str)
-                                                == Some("failed")
-                                        {
-                                            DoneStatus::Errored
-                                        } else {
-                                            DoneStatus::Completed
-                                        },
-                                        result: None,
-                                        error: None,
-                                        session_id: Some(nthread.clone()),
-                                    }],
-                                    "turn/failed" => vec![AgentEvent::Done {
-                                        status: DoneStatus::Errored,
-                                        result: None,
-                                        error: turn_error_message(&params),
-                                        session_id: Some(nthread.clone()),
-                                    }],
-                                    "turn/aborted" => vec![AgentEvent::Done {
-                                        status: DoneStatus::Interrupted,
-                                        result: None,
-                                        error: None,
-                                        session_id: Some(nthread.clone()),
-                                    }],
-                                    "item/agentMessage/delta" => delta_text(&params)
-                                        .map(|text| AgentEvent::TextDelta { text })
-                                        .into_iter()
-                                        .collect(),
-                                    "item/reasoning/textDelta"
-                                    | "item/reasoning/summaryTextDelta" => delta_text(&params)
-                                        .map(|text| AgentEvent::ReasoningDelta { text })
-                                        .into_iter()
-                                        .collect(),
-                                    "item/started" | "item/completed" => {
-                                        let phase = if method == "item/started" {
-                                            Phase::Started
-                                        } else {
-                                            Phase::Completed
-                                        };
-                                        let item =
-                                            params.get("item").cloned().unwrap_or(Value::Null);
-                                        // Same paragraphing as the parent:
-                                        // a child's completed message ends
-                                        // a paragraph in its transcript.
-                                        if phase == Phase::Completed
-                                            && matches!(
-                                                item_type(&item),
-                                                "agentMessage" | "agent_message"
-                                            )
-                                        {
-                                            vec![AgentEvent::TextDelta {
-                                                text: "\n\n".into(),
-                                            }]
-                                        } else if matches!(
-                                            item_type(&item),
-                                            "userMessage" | "user_message"
-                                        ) {
-                                            // A CHILD thread's user message
-                                            // is the parent steering it (the
-                                            // collab send_message path) —
-                                            // its own entry in the subagent
-                                            // doc. Completed only: both
-                                            // lifecycle events carry the
-                                            // full item.
-                                            if phase == Phase::Completed {
-                                                user_message_text(&item)
-                                                    .map(|text| AgentEvent::UserMessage { text })
-                                                    .into_iter()
-                                                    .collect()
-                                            } else {
-                                                Vec::new()
-                                            }
-                                        } else {
-                                            map_item(phase, &item)
-                                        }
-                                    }
-                                    "error" => vec![AgentEvent::Error {
-                                        message: params
-                                            .pointer("/error/message")
-                                            .and_then(Value::as_str)
-                                            .or_else(|| {
-                                                params.get("message").and_then(Value::as_str)
-                                            })
-                                            .unwrap_or("Codex subagent error")
-                                            .to_owned(),
-                                    }],
-                                    "thread/closed" => vec![AgentEvent::Done {
-                                        status: DoneStatus::Completed,
-                                        result: None,
-                                        error: None,
-                                        session_id: Some(nthread.clone()),
-                                    }],
-                                    _ => Vec::new(),
-                                };
-                                for ev in events {
-                                    let wrapped = AgentEvent::Subagent {
-                                        parent_tool_use_id: parent_call.clone(),
-                                        event: Box::new(ev),
-                                    };
-                                    if !send(&event_tx, wrapped).await {
-                                        break 'main;
-                                    }
+                            for event in children.notification(&nthread, &method, &params) {
+                                if !send(&event_tx, event).await {
+                                    break 'main;
                                 }
                             }
                             continue;
@@ -851,11 +947,14 @@ async fn run_session(session: Session) {
                         }
                     }
 
-                    "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
-                        if let Some(text) = delta_text(&params)
-                            && !send(&event_tx, AgentEvent::ReasoningDelta { text }).await
+                    "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta"
+                    | "item/reasoning/summaryPartAdded" => {
+                        for event in reasoning_streams.entry(thread_id.clone()).or_default()
+                            .map(&method, &params)
                         {
-                            break 'main;
+                            if !send(&event_tx, event).await {
+                                break 'main;
+                            }
                         }
                     }
 
@@ -865,42 +964,8 @@ async fn run_session(session: Session) {
                         } else {
                             Phase::Completed
                         };
-                        let item = params.get("item").cloned().unwrap_or(Value::Null);
-                        // A subAgentActivity item on the parent thread names a
-                        // child: register it (its call id = the parent chip
-                        // its traffic is attributed to). NEVER the root
-                        // thread itself — the wire emits subAgentActivity
-                        // about the root during collab runs, and registering
-                        // it would intercept every subsequent root
-                        // notification including turn/completed (the thread
-                        // would hang Working after the fleet finished).
-                        if matches!(
-                            item_type(&item),
-                            "subAgentActivity" | "sub_agent_activity"
-                        ) {
-                            let child = item
-                                .get("agentThreadId")
-                                .and_then(Value::as_str)
-                                .unwrap_or("");
-                            let path = item
-                                .get("agentPath")
-                                .and_then(Value::as_str)
-                                .unwrap_or("");
-                            let call = item.get("id").and_then(Value::as_str).unwrap_or("");
-                            if !child.is_empty()
-                                && child != thread_id
-                                && path != "/root"
-                                && path != "/"
-                                && !call.is_empty()
-                            {
-                                children.insert(child.to_owned(), call.to_owned());
-                            } else if child == thread_id || path == "/root" || path == "/" {
-                                // The root's own activity marker: no chip, no
-                                // registration — it is not a subagent.
-                                continue;
-                            }
-                        }
-                        if matches!(item_type(&item), "agentMessage" | "agent_message") {
+                        let item = params.get("item").unwrap_or(&Value::Null);
+                        if matches!(item_type(item), "agentMessage" | "agent_message") {
                             if phase == Phase::Completed {
                                 // Fallback for non-streamed messages only.
                                 let id = item.get("id").and_then(Value::as_str).unwrap_or("");
@@ -944,7 +1009,7 @@ async fn run_session(session: Session) {
                                 }
                             }
                         } else {
-                            for ev in map_item(phase, &item) {
+                            for ev in children.parent_item(phase, item) {
                                 if !send(&event_tx, ev).await {
                                     break 'main;
                                 }
@@ -953,6 +1018,8 @@ async fn run_session(session: Session) {
                     }
 
                     "thread/tokenUsage/updated" => {
+                        if let Some(usage) = normalize::context_usage_event(&params)
+                            && !send(&event_tx, usage).await { break 'main; }
                         if let Some(usage) = usage_event(&params) {
                             pending_usage = Some(usage);
                         }
@@ -1529,6 +1596,47 @@ mod tests {
             &json!({"command": ["git", "push", "--force"]}),
         );
         assert!(q.question.contains("git push --force"));
+    }
+
+    #[test]
+    fn model_page_skips_hidden_and_unknown_efforts() {
+        let page = json!({
+            "data": [
+                {
+                    "id": "hidden",
+                    "model": "hidden",
+                    "displayName": "Hidden",
+                    "hidden": true,
+                    "supportedReasoningEfforts": [{ "reasoningEffort": "high" }]
+                },
+                {
+                    "id": "gpt-6-astra",
+                    "model": "gpt-6-astra",
+                    "displayName": "GPT-6-Astra",
+                    "description": "  Most capable  ",
+                    "hidden": false,
+                    "supportedReasoningEfforts": [
+                        { "reasoningEffort": "high" },
+                        { "reasoningEffort": "future" }
+                    ],
+                    "serviceTiers": [{ "id": "priority", "name": "Fast" }],
+                    "additionalSpeedTiers": ["fast"],
+                    "defaultServiceTier": null,
+                    "isDefault": true
+                }
+            ],
+            "nextCursor": "next"
+        });
+        let (models, cursor) = parse_model_list_page(&page);
+        assert_eq!(cursor.as_deref(), Some("next"));
+        assert_eq!(models.len(), 1);
+        let (astra, is_default) = &models[0];
+        assert_eq!(astra.id, "gpt-6-astra");
+        assert_eq!(astra.description.as_deref(), Some("Most capable"));
+        assert_eq!(astra.reasoning_levels, vec![ReasoningLevel::High]);
+        assert!(*is_default);
+        assert_eq!(astra.options[0].choices.len(), 2);
+        assert_eq!(astra.options[0].choices[1].id, "fast");
     }
 
     #[test]

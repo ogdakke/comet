@@ -24,6 +24,7 @@ fn device(id: &str) -> Device {
         last_seen_at: Some(ts(1_000)),
         created_at: Some(ts(500)),
         version: Some("0.1.0".into()),
+        capabilities: Vec::new(),
     }
 }
 
@@ -113,6 +114,7 @@ async fn two_clients_converge_and_stream_live_updates() {
     {
         let mut doc = doc_a.lock().unwrap();
         doc.upsert_session(&Session {
+            last_completed_turn: None,
             chat_id: "chat-1".into(),
             device_id: "dev-a".into(),
             status: SessionStatus::Working,
@@ -421,6 +423,7 @@ async fn churn_stays_bounded_no_history_growth() {
         {
             let mut d = doc.lock().unwrap();
             d.upsert_session(&Session {
+                last_completed_turn: None,
                 chat_id: "chat-1".into(),
                 device_id: "dev-a".into(),
                 status: if i % 2 == 0 {

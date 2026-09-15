@@ -20,7 +20,8 @@ export default defineConfig({
         compatibilityDate: "2026-07-01",
         durableObjects: {
           TEST_LOG: { className: "TestLogRoom", useSQLite: true },
-          TEST_STUDIO: { className: "StudioRoom", useSQLite: true }
+          TEST_STUDIO: { className: "StudioRoom", useSQLite: true },
+          PREVIEW_ROOMS: { className: "PreviewRoom", useSQLite: true }
         }
       }
     })

@@ -92,6 +92,14 @@ impl Harness for MockHarness {
             "the mock harness has no slash-command parser".into(),
         ))
     }
+    async fn run_title(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.run(request, controls).await
+    }
+
     async fn run(
         &self,
         _request: RunRequest,

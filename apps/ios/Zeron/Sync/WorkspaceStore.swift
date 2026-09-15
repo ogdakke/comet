@@ -50,9 +50,10 @@ final class WorkspaceStore {
     @ObservationIgnored private var registryJoinedAt: Int64?
     private let config: AppConfig
 
-    init(config: AppConfig) {
+    init(config: AppConfig, doc: RegistryDoc? = nil) {
         self.config = config
-        self.doc = RegistryDoc(deviceId: config.deviceId)
+        self.doc = doc ?? RegistryDoc(deviceId: config.deviceId)
+        project()
     }
 
     func start() {
@@ -304,6 +305,10 @@ final class WorkspaceStore {
         return v >= min
     }
 
+    func deviceSupports(_ deviceId: String, _ capability: String) -> Bool {
+        devices.first(where: { $0.id == deviceId })?.supports(capability) ?? false
+    }
+
     // MARK: Projection (rows → typed entities)
 
     private func project() {
@@ -315,7 +320,9 @@ final class WorkspaceStore {
                              platform: f["platform"]?.stringValue ?? "",
                              lastSeenAt: f["lastSeenAt"]?.int64Value,
                              createdAt: f["createdAt"]?.int64Value,
-                             version: f["version"]?.stringValue)
+                             version: f["version"]?.stringValue,
+                             capabilities: (f["capabilities"]?.arrayValue ?? [])
+                                .compactMap(\.stringValue))
         }.sorted { $0.name < $1.name }
 
         spaces = doc.overlayRows(kind: "spaces").compactMap { row in
@@ -373,11 +380,11 @@ final class WorkspaceStore {
 
     // MARK: Derived views
 
-    /// state.rs `overview_chats`: every non-archived chat of a live space,
+    /// state.rs `overview_chats`: every non-archived projectless chat or chat of a live space,
     /// attention-sorted.
     var overviewChats: [Chat] {
         let liveSpaceIds = Set(spaces.map(\.id))
-        let live = chats.filter { !$0.archived && $0.spaceId.map(liveSpaceIds.contains) == true }
+        let live = chats.filter { !$0.archived && ($0.spaceId.map(liveSpaceIds.contains) ?? true) }
         return sortActive(live)
     }
 
@@ -554,6 +561,8 @@ final class WorkspaceStore {
             var name: String
             var installed: Bool?
             var enabled: Bool?
+            var supportsSteering: Bool?
+            var steeringMode: String?
         }
         let wire: [WireHarness]? = try? await relay(for: deviceId)
             .call(method: "ListHarnesses", params: [:])
@@ -563,23 +572,45 @@ final class WorkspaceStore {
                     && (h.installed ?? true)
                     && (h.enabled ?? ["claude-code", "codex"].contains(h.id))
             }
-            .map { HarnessInfo(id: $0.id, label: $0.name) }
+            .map { HarnessInfo(id: $0.id, label: $0.name,
+                               supportsSteering: $0.supportsSteering, steeringMode: $0.steeringMode) }
         }
     }
 
     func listModels(deviceId: String, harness: String) async -> [ModelInfo]? {
+        struct WireChoice: Decodable {
+            var id: String
+            var label: String
+        }
+        struct WireOption: Decodable {
+            var id: String
+            var label: String
+            var choices: [WireChoice]
+            var defaultChoice: String
+        }
         struct WireModel: Decodable {
             var id: String
             var label: String
             var description: String?
             var reasoningLevels: [String]?
+            var options: [WireOption]?
         }
         let wire: [WireModel]? = try? await relay(for: deviceId)
             .call(method: "ListModels", params: ["harness": harness])
         return wire.map { models in
             models.map {
                 ModelInfo(id: $0.id, label: $0.label, description: $0.description,
-                          reasoningLevels: $0.reasoningLevels ?? [])
+                          reasoningLevels: $0.reasoningLevels ?? [],
+                          options: ($0.options ?? []).map { option in
+                              ModelOptionInfo(
+                                  id: option.id,
+                                  label: option.label,
+                                  choices: option.choices.map {
+                                      ModelOptionChoiceInfo(id: $0.id, label: $0.label)
+                                  },
+                                  defaultChoice: option.defaultChoice
+                              )
+                          })
             }
         }
     }
@@ -620,18 +651,30 @@ final class WorkspaceStore {
     @discardableResult
     func createChat(space: Space, config chatConfig: ChatConfig,
                     branch: String? = nil, cwd: String? = nil) -> String {
+        createChat(deviceId: space.deviceId, spaceId: space.id, cwd: cwd ?? space.path,
+                   config: chatConfig, branch: branch)
+    }
+
+    /// Same local registry write and offline outbox as project sessions.
+    @discardableResult
+    func createProjectlessChat(deviceId: String, config: ChatConfig) -> String {
+        createChat(deviceId: deviceId, spaceId: nil, cwd: "~", config: config, branch: nil)
+    }
+
+    private func createChat(deviceId: String, spaceId: String?, cwd: String,
+                            config chatConfig: ChatConfig, branch: String?) -> String {
         let chatId = UUID().uuidString.lowercased()
         var set: [String: JSONValue] = [
             "id": .string(chatId),
-            "deviceId": .string(space.deviceId),
+            "deviceId": .string(deviceId),
             "archived": .bool(false),
-            "cwd": .string(cwd ?? space.path),
-            "spaceId": .string(space.id),
+            "cwd": .string(cwd),
             "createdAt": .int(nowMs()),
             // Born on chat2 (workspace_host.rs create_chat): a brand-new
             // chat has an empty doc — nothing to seed, no migration race.
             "roomGen": .int(2),
         ]
+        if let spaceId { set["spaceId"] = .string(spaceId) }
         if let branch {
             set["branch"] = .string(branch)
         }

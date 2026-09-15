@@ -1513,6 +1513,7 @@ impl StudioPage {
                 None
             } else {
                 Some(crate::composer::FlipMorph {
+                    spec: crate::motion::COLLAPSE,
                     from: self.prompt_last_height,
                     start_ms: now_ms,
                 })

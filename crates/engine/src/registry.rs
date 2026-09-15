@@ -37,6 +37,16 @@ pub struct HarnessDescriptor {
     pub enabled: Option<bool>,
 }
 
+impl HarnessDescriptor {
+    /// Whether this harness can accept a prompt inside the turn that is
+    /// currently running. Turn-boundary steering is still useful to the
+    /// automatic queue drain, but it is not the non-interrupting "Steer"
+    /// action exposed on an individual queued row.
+    pub fn steers_mid_turn(&self) -> bool {
+        self.supports_steering && self.steering_mode == SteeringMode::StepBoundary
+    }
+}
+
 fn default_installed() -> bool {
     true
 }
@@ -78,10 +88,21 @@ struct HarnessPrefsFile {
     /// so the file only records "no" — an agent installed later turns itself
     /// on without a trip to Settings.
     disabled: Vec<HarnessId>,
+    titles: TitleSettings,
     /// The allow-list written back when enablement was a fixed default set.
     /// Read once, folded into `disabled`, and never written again.
     #[serde(skip_serializing)]
     enabled: Option<Vec<HarnessId>>,
+}
+
+/// Per-device automatic session title preferences.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TitleSettings {
+    /// None follows the session harness, using a supported installed fallback.
+    pub harness: Option<HarnessId>,
+    /// None selects the cheapest model offered by the selected harness.
+    pub model: Option<String>,
 }
 
 type Factory = Box<dyn Fn() -> Result<Arc<dyn Harness>, HarnessError> + Send + Sync>;
@@ -245,6 +266,24 @@ impl HarnessRegistry {
         if let Err(err) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path)) {
             tracing::warn!(error = %err, "harness-prefs save failed");
         }
+    }
+
+    pub fn title_settings(&self) -> TitleSettings {
+        self.prefs().titles.clone()
+    }
+
+    pub fn set_title_settings(&self, mut settings: TitleSettings) -> Result<(), String> {
+        if let Some(id) = settings.harness {
+            if !zeron_harness::supports_titles(id) || !self.enabled_set().contains(&id) {
+                return Err("Choose an enabled harness that supports title generation".into());
+            }
+        } else if settings.model.is_some() {
+            return Err("Choose a title harness before choosing a model".into());
+        }
+        settings.model = settings.model.filter(|model| !model.trim().is_empty());
+        self.prefs().titles = settings;
+        self.persist_prefs();
+        Ok(())
     }
 
     pub fn register(&self, harness: Arc<dyn Harness>) {
@@ -435,6 +474,23 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::CursorHarness::new().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::CursorHarness::new()) as Arc<dyn Harness>)),
     );
+    // Devin over ACP (`devin acp`), same lazy pattern: the static descriptor
+    // mirrors AcpHarness::devin() exactly. No steering extension (turn
+    // boundaries) and no effort ladder — Devin bakes effort into the
+    // advertised model ids instead of a `thought_level` option.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Devin,
+            name: "Devin".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| zeron_harness::AcpHarness::devin().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::devin()) as Arc<dyn Harness>)),
+    );
     // Grok Build over ACP, same lazy pattern: the static descriptor mirrors
     // AcpHarness::grok() exactly. No `_session/steering` extension yet, so
     // steers deliver at turn boundaries; the effort ladder applies per
@@ -529,6 +585,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mid_turn_steering_requires_support_and_a_step_boundary() {
+        let mut descriptor = HarnessDescriptor {
+            id: HarnessId::Mock,
+            name: "Mock".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            enabled: Some(true),
+        };
+        assert!(descriptor.steers_mid_turn());
+
+        descriptor.steering_mode = SteeringMode::TurnBoundary;
+        assert!(!descriptor.steers_mid_turn());
+
+        descriptor.steering_mode = SteeringMode::StepBoundary;
+        descriptor.supports_steering = false;
+        assert!(!descriptor.steers_mid_turn());
+    }
+
+    #[test]
     fn lazy_slot_lists_without_resolving() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let registry = HarnessRegistry::new();
@@ -575,6 +652,7 @@ mod tests {
                 HarnessId::ClaudeCode,
                 HarnessId::Codex,
                 HarnessId::Cursor,
+                HarnessId::Devin,
                 HarnessId::Grok,
                 HarnessId::Hermes,
                 HarnessId::Pi,
@@ -601,12 +679,17 @@ mod tests {
                 ReasoningLevel::High
             ]
         );
-        // Cursor, Hermes and Pi mirror their specs the same way.
+        // Cursor, Devin, Hermes and Pi mirror their specs the same way.
         let cursor = registry.resolve(HarnessId::Cursor).unwrap();
         assert_eq!(cursor.id(), HarnessId::Cursor);
         assert_eq!(cursor.display_name(), "Cursor");
         assert_eq!(cursor.steering_mode(), SteeringMode::TurnBoundary);
         assert!(cursor.reasoning_levels().is_empty());
+        let devin = registry.resolve(HarnessId::Devin).unwrap();
+        assert_eq!(devin.id(), HarnessId::Devin);
+        assert_eq!(devin.display_name(), "Devin");
+        assert_eq!(devin.steering_mode(), SteeringMode::TurnBoundary);
+        assert!(devin.reasoning_levels().is_empty());
         let hermes = registry.resolve(HarnessId::Hermes).unwrap();
         assert_eq!(hermes.id(), HarnessId::Hermes);
         assert_eq!(hermes.display_name(), "Hermes");
@@ -886,5 +969,57 @@ mod tests {
         assert_eq!(before.supports_steering, after.supports_steering);
         assert_eq!(before.steering_mode, after.steering_mode);
         assert_eq!(before.reasoning_levels, after.reasoning_levels);
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::*;
+
+    #[test]
+    fn title_preferences_persist_and_validate_harness_model_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = HarnessRegistry::new();
+        registry.load_prefs(dir.path());
+        registry.register(Arc::new(
+            zeron_harness::ClaudeHarness::new().with_executable(std::env::current_exe().unwrap()),
+        ));
+        let settings = TitleSettings {
+            harness: Some(HarnessId::ClaudeCode),
+            model: Some("haiku-test".into()),
+        };
+        registry.set_title_settings(settings.clone()).unwrap();
+        let reloaded = HarnessRegistry::new();
+        reloaded.load_prefs(dir.path());
+        assert_eq!(reloaded.title_settings(), settings);
+        assert!(
+            registry
+                .set_title_settings(TitleSettings {
+                    harness: None,
+                    model: Some("orphan".into())
+                })
+                .is_err()
+        );
+        assert!(
+            registry
+                .set_title_settings(TitleSettings {
+                    harness: Some(HarnessId::Cursor),
+                    model: None
+                })
+                .is_err()
+        );
+        assert_eq!(registry.title_settings(), settings);
+        registry
+            .set_title_settings(TitleSettings::default())
+            .unwrap();
+        reloaded.load_prefs(dir.path());
+        assert_eq!(reloaded.title_settings(), TitleSettings::default());
+    }
+
+    #[test]
+    fn old_harness_preferences_default_to_automatic_titles() {
+        let prefs: HarnessPrefsFile = serde_json::from_str(r#"{"disabled":["codex"]}"#).unwrap();
+        assert_eq!(prefs.titles, TitleSettings::default());
+        assert_eq!(prefs.disabled, vec![HarnessId::Codex]);
     }
 }

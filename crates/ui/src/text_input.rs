@@ -2,7 +2,7 @@
 //! gestures (click, double-click selects the whole value, drag-select).
 //! Adapted from gpui's `examples/input.rs`.
 //!
-//! Dialogs, pickers, and the composer well all share this editor. Composer-
+//! Dialogs and Studio fields use this editor. Composer-
 //! only behavior (file-mention chips, prompt-history overflow) is opt-in; a
 //! default field is a plain editor that sizes to its text.
 
@@ -717,13 +717,17 @@ pub fn init(cx: &mut App) {
     // Dialogs / generic fields share the editor keys (enter submits, arrows
     // move the caret). Mention tab/escape stay on the composer context.
     cx.bind_keys(editor_bindings(Some("TextInput"), word_edit_prefix, false));
-    cx.bind_keys(editor_bindings(Some("Composer"), word_edit_prefix, true));
+    cx.bind_keys(editor_bindings(
+        Some("TextInputComposer"),
+        word_edit_prefix,
+        true,
+    ));
     // Palette-search context: TEXT-EDITING keys only. gpui dispatches matched
     // keybindings BEFORE raw key listeners (window.rs `dispatch_key_event`),
     // so anything bound here can never reach a palette's `on_key_down` —
     // navigation keys (up/down/left/right/enter) are deliberately unbound and
     // bubble to the palette frame instead.
-    let palette = Some("PaletteSearch");
+    let palette = Some("TextInputPaletteSearch");
     let mut palette_bindings = vec![
         KeyBinding::new("backspace", Backspace, palette),
         KeyBinding::new("delete", Delete, palette),
@@ -890,7 +894,7 @@ pub enum TextInputEvent {
 
 /// Multiline text field: content + selection + IME + measured wrap layout.
 pub struct TextInput {
-    /// Key context for the binding map ("Composer", or "PaletteSearch" for
+    /// Key context for the binding map ("TextInputComposer", or "TextInputPaletteSearch" for
     /// palette filters whose navigation keys must bubble).
     key_context: &'static str,
     focus_handle: FocusHandle,
@@ -984,7 +988,7 @@ impl TextInput {
 
     /// Composer / studio well: fills the parent-assigned height and scrolls.
     pub fn composer(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
-        let mut this = Self::with_context(placeholder, "Composer", cx);
+        let mut this = Self::with_context(placeholder, "TextInputComposer", cx);
         this.fill_parent = true;
         this
     }
@@ -992,10 +996,10 @@ impl TextInput {
     /// A picker/filter input whose bare navigation keys are owned by its
     /// surrounding menu rather than consumed as editor cursor movement.
     pub fn palette_search(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
-        Self::with_context(placeholder, "PaletteSearch", cx)
+        Self::with_context(placeholder, "TextInputPaletteSearch", cx)
     }
 
-    /// An input in a custom KEY context — palettes use `"PaletteSearch"`,
+    /// An input in a custom KEY context — palettes use `"TextInputPaletteSearch"`,
     /// whose keymap binds only text-editing keys so navigation keys bubble to
     /// the surrounding frame (see `init`).
     pub fn with_context(

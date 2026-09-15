@@ -1869,7 +1869,7 @@ impl Render for StudioPage {
         let tray_lightbox = self.tray_preview.clone().map(|preview| {
             let weak = cx.weak_entity();
             crate::attachments::lightbox(
-                window.viewport_size(),
+                window,
                 &preview,
                 &self.tray_preview_focus,
                 move |window, cx| {
@@ -1881,6 +1881,7 @@ impl Render for StudioPage {
                         window.focus(&focus, cx);
                     }
                 },
+                cx,
             )
         });
         div()

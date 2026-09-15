@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/theme",
     "crates/proto",
+    "crates/preview",
     "crates/doc",
     "crates/sync",
     "crates/harness",
@@ -16,13 +17,14 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.30"
+version = "0.2.65"
 edition = "2024"
 license = "MIT"
 publish = false
 
 [workspace.dependencies]
 zeron-proto = { path = "crates/proto" }
+zeron-preview = { path = "crates/preview" }
 zeron-doc = { path = "crates/doc" }
 zeron-sync = { path = "crates/sync" }
 zeron-harness = { path = "crates/harness" }
@@ -41,28 +43,18 @@ loro = "1.13"
 # frames, cross-checked by its js_snapshots tests).
 loro-protocol = "0.3"
 
-# gpui — comet's patched Zed fork, pinned for reproducible builds.
-# upstream f14fea9 + edge-fade / backdrop-blur / GPU-budget commits through
-# 5d1f83d (horizontal per-pixel EdgeFade for quads/images), then f6789b8
-# EffectQuad and 761f12d (denser flowing dot lattice;
-# Window::paint_effect_quad).
-# Rebase when bumping the upstream rev. Earlier notes on that line:
-# a6bf17c fixes BOTH wrap-rule copies (LineWrapper + line_layout's shaped-text
-# duplicate); 14baea0 adds the EdgeFade primitive (Window::with_edge_fade);
-# a6c1ad5 adds BackdropBlur + horizontal EdgeFade + glass fixes; 9b672fa
-# bounds renderer GPU memory; b687328 adds ImageSource::evict; ac135eb adds
-# device memory to the stats line; f596cde fixes destination alpha on
-# transparent windows (Porter-Duff OVER); 53518c0 merges the edge-fade line;
-# 8a8954c switches the macOS blurred view to UnderWindowBackground;
-# 041a391 adds EdgeFadeEase (Quadratic default, optional Exponential).
-gpui = { git = "https://github.com/ogdakke/zed", rev = "041a391d9149c37990e2a60f6481b3f780b688e5" }
-gpui_platform = { git = "https://github.com/ogdakke/zed", rev = "041a391d9149c37990e2a60f6481b3f780b688e5", features = [
+# GPUI follows upstream's extracted workspace. The patch below points every
+# extracted crate, including gpui-base's dependencies, at our Zed fork with
+# EffectQuad, Studio loading shaders, and EdgeFadeEase carried forward.
+gpui = { git = "https://github.com/zeronsh/zui", rev = "aa009411c2dbfb39556bff1b1febed0512fdf609" }
+gpui_platform = { git = "https://github.com/zeronsh/zui", rev = "aa009411c2dbfb39556bff1b1febed0512fdf609", features = [
     "wayland",
     "x11",
     "font-kit",
     "runtime_shaders",
 ] }
-gpui_tokio = { git = "https://github.com/ogdakke/zed", rev = "041a391d9149c37990e2a60f6481b3f780b688e5" }
+gpui_tokio = { git = "https://github.com/zeronsh/zui", rev = "aa009411c2dbfb39556bff1b1febed0512fdf609" }
+gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "94c1bbaf6311b9f36f5e7438aaf5aeadd38740da" }
 
 # diffs
 similar = "2"
@@ -108,6 +100,7 @@ portable-pty = "0.8"
 alacritty_terminal = "0.26"
 pulldown-cmark = "0.12"
 unicode-segmentation = "1"
+unicode-width = "0.2"
 fontdb = "0.23"
 ttf-parser = "0.25.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
@@ -126,3 +119,25 @@ opt-level = 0
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# Preserve the fork's shader and EdgeFade APIs across the upstream GPUI extraction.
+[patch."https://github.com/zeronsh/zui"]
+collections = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
+derive_refineable = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
+gpui = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
+gpui_linux = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
+gpui_macos = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
+gpui_macros = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
+gpui_platform = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
+gpui_shared_string = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
+gpui_tokio = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
+gpui_util = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
+gpui_web = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
+gpui_wgpu = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
+gpui_windows = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
+http_client = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
+media = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
+refineable = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
+scheduler = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
+sum_tree = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
+util_macros = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }

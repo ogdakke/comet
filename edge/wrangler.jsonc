@@ -21,6 +21,7 @@
     "bindings": [
       { "name": "SESSION_ROOMS", "class_name": "SessionRoom" },
       { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
+      { "name": "PREVIEW_ROOMS", "class_name": "PreviewRoom" },
       { "name": "REGISTRY_ROOMS", "class_name": "RegistryRoom" },
       { "name": "CHAT_ROOMS", "class_name": "ChatRoom" },
       { "name": "STUDIO_ROOMS", "class_name": "StudioRoom" }
@@ -48,7 +49,8 @@
       // remain content-addressed objects in R2, never SQLite values here.
       "tag": "v4",
       "new_sqlite_classes": ["StudioRoom"]
-    }
+    },
+    { "tag": "v5", "new_sqlite_classes": ["PreviewRoom"] }
   ],
   "r2_buckets": [
     {

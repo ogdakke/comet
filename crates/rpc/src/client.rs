@@ -249,7 +249,13 @@ impl Drop for RpcClient {
 async fn route_frame(shared: &Arc<Shared>, out: &mpsc::Sender<String>, frame: ServerFrame) {
     let id = frame.id;
     if let Some(err) = frame.err {
-        let error = wire_error(err);
+        let error = match frame.err_payload {
+            Some(payload) => RpcError::FailedStructured {
+                message: err,
+                payload,
+            },
+            None => wire_error(err),
+        };
         match shared.lock().remove(&id) {
             Some(Pending::Call(tx)) => {
                 let _ = tx.send(Err(error));

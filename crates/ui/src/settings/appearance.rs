@@ -5,8 +5,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    AnyElement, Context, Entity, FocusHandle, Focusable, Hsla, IntoElement, KeyDownEvent, Render,
-    SharedString, Subscription, Window, div, prelude::*, px,
+    AnyElement, Context, Entity, FocusHandle, Focusable, Hsla, IntoElement, KeyDownEvent,
+    ObjectFit, Render, SharedString, StyledImage as _, Subscription, Window, div, img, prelude::*,
+    px,
 };
 use zeron_theme::vscode::{ImportReport, SourceCompilation};
 use zeron_theme::{
@@ -36,11 +37,15 @@ struct ImportDialog {
 }
 
 pub struct AppearancePage {
+    scroll: crate::settings::widgets::PageScroll,
     selected_font: UiFontFamily,
     selected_size: UiFontSize,
     font_focus: FocusHandle,
     size_focus: FocusHandle,
     font_menu: Popup<()>,
+    /// Floating rail for the interface-font dropdown (the menu-scrollbar
+    /// treatment, on the menu's own scroll host).
+    font_list: widgets::PageScroll,
     size_menu: Popup<()>,
     font_menu_dismissed_at: Option<std::time::Instant>,
     size_menu_dismissed_at: Option<std::time::Instant>,
@@ -49,16 +54,19 @@ pub struct AppearancePage {
     import_dialog: Option<ImportDialog>,
     review_entry: Option<String>,
     library_error: Option<SharedString>,
+    background_error: Option<SharedString>,
 }
 
 impl AppearancePage {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
+            scroll: crate::settings::widgets::PageScroll::default(),
             selected_font: typography::effective(cx),
             selected_size: typography::font_size(cx),
             font_focus: cx.focus_handle(),
             size_focus: cx.focus_handle(),
             font_menu: Popup::default(),
+            font_list: widgets::PageScroll::default(),
             size_menu: Popup::default(),
             font_menu_dismissed_at: None,
             size_menu_dismissed_at: None,
@@ -67,6 +75,7 @@ impl AppearancePage {
             import_dialog: None,
             review_entry: None,
             library_error: None,
+            background_error: None,
         }
     }
 
@@ -118,6 +127,9 @@ impl AppearancePage {
             self.close_font_menu(cx);
         } else if !just_dismissed {
             self.selected_font = typography::effective(cx);
+            // Every open starts at the top, and the rail's baseline with it —
+            // no reopen flash from the previous session's offset.
+            self.font_list.reset();
             self.font_menu.open(());
         }
         cx.notify();
@@ -364,6 +376,40 @@ impl AppearancePage {
         .detach();
     }
 
+    fn choose_new_thread_background(&mut self, cx: &mut Context<Self>) {
+        self.background_error = None;
+        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose New Thread Composer Background".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let path = match receiver.await {
+                Ok(Ok(Some(mut paths))) => paths.pop(),
+                _ => None,
+            };
+            let Some(path) = path else {
+                return;
+            };
+            let _ = this.update(cx, |page, cx| {
+                page.background_error =
+                    crate::settings::install_new_thread_composer_background(&path, cx)
+                        .err()
+                        .map(SharedString::from);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn remove_new_thread_background(&mut self, cx: &mut Context<Self>) {
+        self.background_error = crate::settings::remove_new_thread_composer_background(cx)
+            .err()
+            .map(SharedString::from);
+        cx.notify();
+    }
+
     fn finish_import(&mut self, cx: &mut Context<Self>) {
         let Some(dialog) = self.import_dialog.as_mut() else {
             return;
@@ -385,6 +431,30 @@ impl AppearancePage {
             }
         }
         cx.notify();
+    }
+
+    fn on_scroll_hovered(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
+        if self.scroll.set_list_hovered(*hovered) {
+            cx.notify();
+        }
+    }
+
+    fn on_font_list_hover(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
+        if self.font_list.set_list_hovered(*hovered) {
+            cx.notify();
+        }
+    }
+}
+
+impl popover::ScrollRailHost for AppearancePage {
+    // The page's rail; the font dropdown's rail goes through [`widgets::rail`],
+    // which can serve a second scroll host on the same view.
+    fn rail_bar(&mut self) -> &mut popover::MenuScrollbarState {
+        self.scroll.rail_bar()
+    }
+
+    fn rail_scroll(&self) -> Option<gpui::ScrollHandle> {
+        self.scroll.rail_scroll()
     }
 }
 
@@ -542,6 +612,46 @@ fn surface_choice(
             control.hover(|style| style.bg(theme.surface_raised_hover))
         })
         .child(surface_label(surface))
+}
+
+fn background_effect_choice(
+    theme: &Theme,
+    effect: crate::settings::NewThreadBackgroundEffect,
+    selected: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(SharedString::from(format!(
+            "new-thread-background-effect-{}",
+            effect.label().to_lowercase()
+        )))
+        .h(px(28.0))
+        .px(px(9.0))
+        .rounded(px(7.0))
+        .border_1()
+        .border_color(if selected { theme.accent } else { theme.border })
+        .bg(if selected {
+            theme.accent_wash
+        } else {
+            theme.surface_raised.opacity(0.28)
+        })
+        .text_size(crate::typography::ui_rems(11.0))
+        .font_weight(if selected {
+            gpui::FontWeight::MEDIUM
+        } else {
+            gpui::FontWeight::NORMAL
+        })
+        .text_color(if selected {
+            theme.accent
+        } else {
+            theme.text_muted
+        })
+        .flex()
+        .items_center()
+        .cursor_pointer()
+        .when(!selected, |control| {
+            control.hover(|style| style.bg(theme.surface_raised_hover))
+        })
+        .child(effect.label())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1913,6 +2023,9 @@ impl Render for AppearancePage {
         let current_themes = appearance::themes(cx);
         let current_accent = appearance::accent(cx);
         let current_surface = appearance::surface(cx);
+        let ui_settings = crate::settings::current(cx);
+        let current_background = ui_settings.new_thread_composer_background;
+        let current_background_effect = ui_settings.new_thread_background_effect;
         let cards = AppearanceMode::ALL
             .into_iter()
             .map(|mode| {
@@ -2050,6 +2163,159 @@ impl Render for AppearancePage {
                 )
                 .into_any_element(),
         );
+        let background_available = current_background
+            .as_ref()
+            .is_some_and(|background| Path::new(&background.path).is_file());
+        let background_tile: AnyElement = if let Some(background) =
+            current_background.as_ref().filter(|_| background_available)
+        {
+            div()
+                .flex_none()
+                .size(px(36.0))
+                .rounded(px(10.0))
+                .overflow_hidden()
+                .border_1()
+                .border_color(crate::theme::hairline(0.10))
+                .child(
+                    img(PathBuf::from(background.path.clone()))
+                        .size(px(34.0))
+                        .rounded(px(9.0))
+                        .object_fit(ObjectFit::Cover),
+                )
+                .into_any_element()
+        } else {
+            widgets::row_tile(&theme, icons::FILE_IMAGE).into_any_element()
+        };
+        let background_meta = match current_background.as_ref() {
+            Some(background) if background_available => vec![
+                div()
+                    .child(SharedString::from(background.name.clone()))
+                    .into_any_element(),
+                div()
+                    .child("Softened automatically on frosted themes.")
+                    .into_any_element(),
+            ],
+            Some(_) => vec![
+                div().child("Image unavailable").into_any_element(),
+                div()
+                    .child("Choose a replacement or remove it.")
+                    .into_any_element(),
+            ],
+            None => vec![
+                div()
+                    .child("Add an image behind the composer on empty new threads.")
+                    .into_any_element(),
+            ],
+        };
+        settings_rows.push(
+            widgets::card_row(&theme, false)
+                .child(background_tile)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(widgets::row_title(&theme, "New thread composer background"))
+                        .child(widgets::meta_line(&theme, background_meta)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .ml(px(10.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .when(current_background.is_some(), |actions| {
+                            actions
+                                .child(
+                                    compact_action(
+                                        &theme,
+                                        "Replace image",
+                                        "new-thread-background-replace",
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| this.choose_new_thread_background(cx),
+                                    )),
+                                )
+                                .child(
+                                    compact_action(
+                                        &theme,
+                                        "Remove",
+                                        "new-thread-background-remove",
+                                    )
+                                    .text_color(theme.danger)
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| this.remove_new_thread_background(cx),
+                                    )),
+                                )
+                        })
+                        .when(current_background.is_none(), |actions| {
+                            actions.child(
+                                compact_action(
+                                    &theme,
+                                    "Choose image",
+                                    "new-thread-background-choose",
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| this.choose_new_thread_background(cx),
+                                )),
+                            )
+                        }),
+                )
+                .into_any_element(),
+        );
+        if background_available {
+            let effect_controls = crate::settings::NewThreadBackgroundEffect::ALL
+                .into_iter()
+                .map(|effect| {
+                    background_effect_choice(&theme, effect, effect == current_background_effect)
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            crate::settings::set_new_thread_background_effect(effect, cx);
+                            cx.notify();
+                        }))
+                })
+                .collect::<Vec<_>>();
+            settings_rows.push(
+                widgets::card_row(&theme, false)
+                    .child(widgets::row_tile(&theme, icons::TUNING))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(widgets::row_title(&theme, "Background effect"))
+                            .child(widgets::meta_line(
+                                &theme,
+                                vec![
+                                    div()
+                                        .child(current_background_effect.description())
+                                        .into_any_element(),
+                                ],
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .ml(px(10.0))
+                            .max_w(px(430.0))
+                            .flex()
+                            .flex_wrap()
+                            .justify_end()
+                            .gap(px(6.0))
+                            .children(effect_controls),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if let Some(error) = self.background_error.clone() {
+            settings_rows.push(
+                div()
+                    .px(px(20.0))
+                    .py(px(10.0))
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(widgets::error_strip(&theme, error))
+                    .into_any_element(),
+            );
+        }
         settings_rows.extend(self.render_theme_library_rows(&theme, cx));
         let library_warning = self
             .library_error
@@ -2096,17 +2362,37 @@ impl Render for AppearancePage {
             })
             .collect();
 
+        // Card-bleed scroll host (see [`popover::menu_scroll_host`]): the
+        // menu card carries nothing but this host, so the bleed runs
+        // vertically too and the rail mounts as a sibling of the scroller,
+        // above its clip.
+        let font_menu_scrollbar = widgets::rail(
+            &mut self.font_list,
+            "interface-font-scrollbar",
+            &theme,
+            cx,
+            |page| &mut page.font_list,
+        );
         let font_menu = popover::popover_card(&theme)
-            .id("interface-font-scroll")
+            .id("interface-font-card")
             .w(px(220.0))
             .font_family(fixed.clone())
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_font_menu(cx)))
-            .max_h(px(320.0))
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .children(font_rows)
+            .child(
+                popover::menu_scroll_host("interface-font-host")
+                    .my(px(-popover::CARD_INSET))
+                    .on_hover(cx.listener(Self::on_font_list_hover))
+                    .child(
+                        popover::menu_scroll_list("interface-font-scroll", &self.font_list.scroll)
+                            .max_h(px(320.0))
+                            .py(px(popover::CARD_INSET))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .children(font_rows),
+                    )
+                    .children(font_menu_scrollbar),
+            )
             .into_any_element();
 
         let font_trigger = div()
@@ -2240,95 +2526,108 @@ impl Render for AppearancePage {
                 ))
             });
 
+        let scrollbar = popover::rail(self, "appearance-page-scrollbar", &theme, cx);
         div()
-            .id("appearance-page")
+            .id("appearance-page-host")
+            .relative()
             .size_full()
-            .overflow_y_scroll()
+            .on_hover(cx.listener(Self::on_scroll_hovered))
             .child(
-                widgets::page_column()
-                    .child(widgets::page_header(&theme, "Appearance", None))
+                div()
+                    .id("appearance-page")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll.scroll)
                     .child(
-                        widgets::page_subtitle(
-                            &theme,
-                            "Choose how Zeron looks. These settings stay on this device.",
-                        )
-                        .max_w(px(512.0))
-                        .line_height(px(20.0)),
-                    )
-                    .child(
-                        div()
-                            .mt(px(32.0))
-                            .flex()
-                            .flex_col()
-                            .gap(px(12.0))
-                            .child(widgets::field_label(&theme, "Appearance"))
-                            .child(widgets::option_card_row().children(cards)),
-                    )
-                    .child(widgets::section_card(&theme).children(settings_rows))
-                    .child(
-                        div()
-                            .mt(px(36.0))
-                            .flex()
-                            .flex_col()
-                            .gap(px(10.0))
-                            .font_family(fixed.clone())
+                        widgets::page_column()
+                            .child(widgets::page_header(&theme, "Appearance", None))
+                            .child(
+                                widgets::page_subtitle(
+                                    &theme,
+                                    "Choose how Zeron looks. These settings stay on this device.",
+                                )
+                                .max_w(px(512.0))
+                                .line_height(px(20.0)),
+                            )
                             .child(
                                 div()
+                                    .mt(px(32.0))
                                     .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(px(24.0))
+                                    .flex_col()
+                                    .gap(px(12.0))
+                                    .child(widgets::field_label(&theme, "Appearance"))
+                                    .child(widgets::option_card_row().children(cards)),
+                            )
+                            .child(widgets::section_card(&theme).children(settings_rows))
+                            .child(
+                                div()
+                                    .mt(px(36.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(10.0))
+                                    .font_family(fixed.clone())
                                     .child(
                                         div()
-                                            .min_w_0()
-                                            .flex_1()
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(4.0))
-                                            .child(widgets::field_label(&theme, "Interface font"))
-                                            .child(
-                                                div()
-                                                    .max_w(px(520.0))
-                                                    .text_size(typography::ui_rems(12.0))
-                                                    .line_height(px(18.0))
-                                                    .text_color(theme.text_muted)
-                                                    .child(SharedString::from(
-                                                        "Used across the interface and conversations. Code, diffs, and terminal keep their current fonts and sizes.",
-                                                    )),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_none()
                                             .flex()
                                             .flex_row()
                                             .items_center()
-                                            .gap(px(8.0))
-                                            .child(font_trigger)
-                                            .child(size_trigger),
-                                    ),
-                            )
-                            .when(requested_font != effective_font, |section| {
-                                section.child(
-                                    widgets::error_strip(
-                                        &theme,
-                                        "This font could not be loaded. Comet is using Geist.",
+                                            .justify_between()
+                                            .gap(px(24.0))
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .flex_1()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap(px(4.0))
+                                                    .child(widgets::field_label(
+                                                        &theme,
+                                                        "Interface font",
+                                                    ))
+                                                    .child(
+                                                        div()
+                                                            .max_w(px(520.0))
+                                                            .text_size(typography::ui_rems(12.0))
+                                                            .line_height(px(18.0))
+                                                            .text_color(theme.text_muted)
+                                                            .child(SharedString::from(
+                                                                "Used across the interface and conversations. Code, diffs, and terminal keep their current fonts and sizes.",
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap(px(8.0))
+                                                    .child(font_trigger)
+                                                    .child(size_trigger),
+                                            ),
                                     )
-                                    .font_family(fixed.clone()),
+                                    .when(requested_font != effective_font, |section| {
+                                        section.child(
+                                            widgets::error_strip(
+                                                &theme,
+                                                "This font could not be loaded. Comet is using Geist.",
+                                            )
+                                            .font_family(fixed.clone()),
+                                        )
+                                    }),
+                            )
+                            .when_some(library_warning, |page, warning| {
+                                page.child(
+                                    div()
+                                        .mt(px(8.0))
+                                        .text_size(crate::typography::ui_rems(11.5))
+                                        .text_color(theme.warning)
+                                        .child(warning),
                                 )
                             }),
-                    )
-                    .when_some(library_warning, |page, warning| {
-                        page.child(
-                            div()
-                                .mt(px(8.0))
-                                .text_size(crate::typography::ui_rems(11.5))
-                                .text_color(theme.warning)
-                                .child(warning),
-                        )
-                    }),
+                    ),
             )
+            .children(scrollbar)
             .children(modal)
     }
 }

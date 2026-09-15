@@ -1236,3 +1236,10 @@ mod tests {
         assert!(!refresh_token_is_rejected(403));
     }
 }
+
+#[async_trait::async_trait]
+impl zeron_preview::signaling::TokenSource for Auth {
+    async fn token(&self) -> Option<String> {
+        self.access_token().await
+    }
+}

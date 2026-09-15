@@ -40,6 +40,9 @@ enum Command {
         #[command(subcommand)]
         command: StudioCommand,
     },
+    #[cfg(target_os = "linux")]
+    /// Trigger an Appshot in the running headed instance (desktop shortcut fallback).
+    Appshot,
     /// Manage `zeron headless` as a background service (launchd / systemd --user).
     Daemon {
         #[command(subcommand)]
@@ -221,6 +224,18 @@ fn main() -> anyhow::Result<()> {
         defaults::log_isolation(&config.data_dir, config.ipc_port);
     }
 
+    if long_running {
+        // Finder launches have no visible stderr. Mirror the panic location
+        // and backtrace into the same rotating log as engine diagnostics.
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            tracing::error!(panic = %info,
+                backtrace = %std::backtrace::Backtrace::force_capture(),
+                "application panic");
+            default_hook(info);
+        }));
+    }
+
     match cli.command {
         Some(Command::Headless) => {
             let runtime = tokio::runtime::Runtime::new()?;
@@ -252,6 +267,11 @@ fn main() -> anyhow::Result<()> {
                     runtime.block_on(studio_cli::import_local(engine_config_from_env(), source))
                 }
             }
+        }
+        #[cfg(target_os = "linux")]
+        Some(Command::Appshot) => {
+            zeron_ui::appshots::request_running_appshot(&engine_config_from_env().data_dir)
+                .map_err(anyhow::Error::msg)
         }
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;
@@ -322,6 +342,7 @@ fn harness_from_env() -> zeron_engine::HarnessId {
         Ok("mock") => zeron_engine::HarnessId::Mock,
         Ok("codex") => zeron_engine::HarnessId::Codex,
         Ok("cursor") => zeron_engine::HarnessId::Cursor,
+        Ok("devin") => zeron_engine::HarnessId::Devin,
         Ok("grok") => zeron_engine::HarnessId::Grok,
         Ok("hermes") => zeron_engine::HarnessId::Hermes,
         Ok("pi") => zeron_engine::HarnessId::Pi,

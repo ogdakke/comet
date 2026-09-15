@@ -2,7 +2,7 @@
 //! stdio, protocol v1) and maps its session updates onto [`AgentEvent`]s.
 //!
 //! KEPT ONLY for agents built ground-up on ACP: Grok ([`AcpHarness::grok`],
-//! `grok agent stdio`) and Hermes ([`AcpHarness::hermes`], `hermes acp`).
+//! `grok agent stdio`), Devin ([`AcpHarness::devin`], `devin acp`) and Hermes ([`AcpHarness::hermes`], `hermes acp`).
 //! Claude, Codex, Cursor, Pi, and OpenCode use native drivers. In particular,
 //! Pi must never pass through the community `pi-acp` adapter because it loses
 //! Pi's native settlement and steering semantics. Adapter-mediated ACP was
@@ -26,8 +26,10 @@
 //! - Interrupt: `session/cancel`, escalating SIGTERM → SIGKILL; the stream
 //!   always ends with `Done { status: Interrupted }`.
 
+mod devin_models;
 mod normalize;
 mod subagent;
+mod subagent_devin;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -52,6 +54,7 @@ use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
 use normalize::{map_update, parse_commands, preferred_allow_option};
 use subagent::SubagentTracker;
+use subagent_devin::DevinTracker;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -236,6 +239,77 @@ fn grok_spec() -> AcpAgentSpec {
     }
 }
 
+fn devin_install_paths() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        // The official installer's launcher symlink (the binary lives below
+        // ~/.local/share/devin/cli/_versions).
+        dirs.push(home.join(".local").join("bin").join("devin"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin/devin"));
+    dirs.push(PathBuf::from("/usr/local/bin/devin"));
+    dirs
+}
+
+fn devin_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::Devin,
+        display_name: "Devin",
+        executable: "devin",
+        env_override: "DEVIN_EXECUTABLE",
+        args: &["acp"],
+        // Native ACP server — no adapter package in between.
+        npm_package: None,
+        extra_paths: devin_install_paths,
+        cli_executable: "devin",
+        cli_extra_paths: devin_install_paths,
+        install_hint: "devin (searched PATH, the login shell's PATH, ~/.local/bin, \
+             /opt/homebrew/bin, and /usr/local/bin; install with \
+             `curl -fsSL https://cli.devin.ai/install.sh | bash` or \
+             `brew install --cask devin-cli`, then `devin auth login`; set \
+             DEVIN_EXECUTABLE to override)",
+        // Legacy metadata only: discovery uses `devin models list` because
+        // session/new starts with a stale catalog. Effort is baked into ids.
+        // These ids were live-verified with CLI 3000.6.14; `swe-1-7-medium`
+        // is the session default the server reports.
+        models: || {
+            vec![
+                Model {
+                    id: "swe-1-7-medium".into(),
+                    label: "SWE-1.7 Medium".into(),
+                    description: Some("Devin's default coding model".into()),
+                    reasoning_levels: Vec::new(),
+                    options: Vec::new(),
+                },
+                Model {
+                    id: "claude-fable-5-1-high".into(),
+                    label: "Claude Fable 5.1 High".into(),
+                    description: Some("Anthropic's frontier model through Devin".into()),
+                    reasoning_levels: Vec::new(),
+                    options: Vec::new(),
+                },
+                Model {
+                    id: "adaptive".into(),
+                    label: "Adaptive".into(),
+                    description: Some("Devin picks the model per request".into()),
+                    reasoning_levels: Vec::new(),
+                    options: Vec::new(),
+                },
+            ]
+        },
+        steering_mode: SteeringMode::TurnBoundary,
+        // Effort is encoded in Devin's advertised model ids, not a separate
+        // thought_level config option.
+        reasoning_levels: &[],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+        ladder_extras: &[],
+        prompt_complete_extension: false,
+        prompt_stall: None,
+        stall_hint: "The agent process is likely wedged.",
+    }
+}
+
 fn hermes_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -376,6 +450,7 @@ pub struct AcpHarness {
     /// Coalesce concurrent picker/title probes so a cold agent boot isn't
     /// paid more than once.
     models_probe: tokio::sync::Mutex<()>,
+    devin_models: devin_models::Catalog,
 }
 
 impl AcpHarness {
@@ -394,7 +469,13 @@ impl AcpHarness {
             commands: tokio::sync::OnceCell::new(),
             models_cache: tokio::sync::OnceCell::new(),
             models_probe: tokio::sync::Mutex::new(()),
+            devin_models: devin_models::Catalog::default(),
         }
+    }
+
+    /// Devin (`devin acp`) — Cognition's native ACP server.
+    pub fn devin() -> Self {
+        Self::with_spec(devin_spec())
     }
 
     /// Grok Build (`grok agent stdio`) — xAI's native ACP agent.
@@ -956,6 +1037,12 @@ impl Harness for AcpHarness {
     fn display_name(&self) -> &str {
         self.spec.display_name
     }
+    fn authoritative_prompt_end(&self) -> bool {
+        // ACP session/prompt owns the turn until its response. The engine's
+        // quiet watchdog must not park a still-pending model request either.
+        true
+    }
+
     fn supports_steering(&self) -> bool {
         true
     }
@@ -989,14 +1076,18 @@ impl Harness for AcpHarness {
         find_on_paths(self.spec.cli_executable, (self.spec.cli_extra_paths)()).is_some()
     }
 
-    /// ACP is the source of truth: a short-lived probe reads the agent's
-    /// advertised model list (cached on success). The spec's static catalog
-    /// answers when the agent advertises nothing. Most legacy ACP adapters also
-    /// use it when probing fails; OpenCode does not, because presenting two
-    /// static Zen models as a successful load permanently hides a slow or
-    /// failed plugin-backed catalog from the picker.
+    /// Devin refreshes through its native catalog command on each request.
+    /// Other ACP agents use a cached session probe, with the spec's static
+    /// catalog as fallback when they advertise nothing or probing fails.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_launch()?;
+        if self.spec.id == HarnessId::Devin {
+            let (exe, _) = self.resolve_program(false).await?;
+            return self
+                .devin_models
+                .refresh(&exe, self.model_discovery_timeout)
+                .await;
+        }
         if let Some(models) = self.models_cache.get() {
             return Ok(models.clone());
         }
@@ -1091,11 +1182,18 @@ struct Session {
     stderr_tail: crate::StderrTail,
 }
 
-fn initialize_params(_harness: HarnessId) -> Value {
-    let capabilities = json!({
+fn initialize_params(harness: HarnessId) -> Value {
+    let mut capabilities = json!({
         "fs": { "readTextFile": false, "writeTextFile": false },
         "terminal": false,
     });
+    if harness == HarnessId::Devin {
+        // Devin otherwise exposes only the parent's run_subagent call. This
+        // unlocks lifecycle tags plus every nested message, thought, and tool
+        // update, all of which DevinTracker can route. Do not advertise the
+        // separate subagentControl extension: Zeron has no matching UI yet.
+        capabilities["_meta"] = json!({ "cognition.ai/subagentSupport": true });
+    }
     json!({
         "protocolVersion": 1,
         "clientInfo": {
@@ -1321,9 +1419,9 @@ fn config_option_sets(
             // bypassPermissions / codex approvalPolicy never): pick the
             // no-prompts mode when the agent offers one. claude-agent-acp
             // calls it `bypassPermissions`, codex-acp `agent-full-access`
-            // (approvalPolicy "never" + danger-full-access sandbox).
-            // Cursor instead exposes agent/plan/ask — those arrive as a
-            // Traits "Mode" option and win when the run selected one.
+            // (approvalPolicy "never" + danger-full-access sandbox), Devin
+            // `bypass`. Cursor instead exposes agent/plan/ask — those arrive
+            // as a Traits "Mode" option and win when the run selected one.
             ("select", Some("mode")) => model_options
                 .get("mode")
                 .and_then(Value::as_str)
@@ -1333,6 +1431,7 @@ fn config_option_sets(
                     [
                         "bypassPermissions",
                         "bypass_permissions",
+                        "bypass",
                         "yolo",
                         "agent-full-access",
                         "danger-full-access",
@@ -1381,15 +1480,29 @@ fn config_option_sets(
     sets
 }
 
-/// The subagent correlator: grok's spawn-tool + disk-tail tracker (inert
-/// for agents that never emit `subagent_*` updates). It observes the raw
-/// updates ahead of [`map_update`]; its tagged events flow from its own
-/// tasks.
-struct SubagentObserver(SubagentTracker);
+/// Per-agent subagent correlation: Devin maps tagged ACP updates inline
+/// (`cognition.ai/subagent_*` lifecycle on ordinary `session/update`s),
+/// Grok tails child transcripts from disk (inert for agents that never
+/// emit its `subagent_*` extension). Both produce the same
+/// [`AgentEvent::Subagent`] contract.
+enum SubagentObserver {
+    Devin(DevinTracker),
+    Grok(SubagentTracker),
+}
 
 impl SubagentObserver {
     fn observe(&mut self, update: &Value) {
-        self.0.observe(update)
+        match self {
+            SubagentObserver::Devin(_) => {}
+            SubagentObserver::Grok(tracker) => tracker.observe(update),
+        }
+    }
+
+    fn finish_open(&mut self, status: DoneStatus) -> Vec<AgentEvent> {
+        match self {
+            SubagentObserver::Devin(tracker) => tracker.finish_open(status),
+            SubagentObserver::Grok(_) => Vec::new(),
+        }
     }
 }
 
@@ -1410,10 +1523,13 @@ fn session_update_events(
     }
     let update = params.get("update").unwrap_or(&Value::Null);
     match method {
-        "session/update" => {
-            subagents.observe(update);
-            map_update(update)
-        }
+        "session/update" => match subagents {
+            SubagentObserver::Devin(tracker) => tracker.map(update),
+            _ => {
+                subagents.observe(update);
+                map_update(update)
+            }
+        },
         "_x.ai/session_notification" => {
             subagents.observe(update);
             Vec::new()
@@ -1487,25 +1603,6 @@ fn prompt_turn(
     })
 }
 
-/// Hermes (and other agents without an authoritative turn-end
-/// notification) get a 30s quiet window; Grok does not — long silent
-/// reasoning / plan writes look finished and a false settle orphans the
-/// real `session/prompt` response. `ZERON_ACP_QUIET_SETTLE_MS` overrides
-/// (0 disables).
-fn quiet_settle_window(prompt_complete_extension: bool) -> Option<Duration> {
-    if prompt_complete_extension {
-        return None;
-    }
-    match std::env::var("ZERON_ACP_QUIET_SETTLE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        Some(0) => None,
-        Some(ms) => Some(Duration::from_millis(ms)),
-        None => Some(Duration::from_secs(30)),
-    }
-}
-
 /// Answer a server→client request. Permission requests are auto-accepted with
 /// the agent's preferred allow option — parity with the claude harness's
 /// bypassPermissions and the codex harness's approvalPolicy "never" (zeron
@@ -1575,7 +1672,6 @@ fn handle_server_request_live(
     method: &str,
     params: &Value,
     request_input: &std::sync::Arc<RequestInputFn>,
-    open_questions: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> Vec<AgentEvent> {
     if method != "session/request_permission" {
         return handle_server_request(client, id, method, params);
@@ -1611,10 +1707,6 @@ fn handle_server_request_live(
     };
     let client = client.clone();
     let request_input = std::sync::Arc::clone(request_input);
-    // Pending questions block the agent — the quiet-settle must not read
-    // that silence as a finished turn.
-    let open_questions = std::sync::Arc::clone(open_questions);
-    open_questions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     tokio::spawn(async move {
         let answers = (request_input)(vec![question.clone()])
             .await
@@ -1636,7 +1728,6 @@ fn handle_server_request_live(
             ),
             None => client.respond(&id, json!({ "outcome": { "outcome": "cancelled" } })),
         }
-        open_questions.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     });
     Vec::new()
 }
@@ -1651,15 +1742,35 @@ async fn request_draining(
     method: &'static str,
     params: Value,
 ) -> Result<Value, HarnessError> {
+    let loading_session = matches!(method, "session/new" | "session/load");
+    let requested_session = params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let mut config_updates = std::collections::HashMap::new();
+    let mut handle_incoming = |inc| match inc {
+        Incoming::Request { id, method, params } => {
+            handle_server_request(client, id, &method, &params);
+        }
+        Incoming::Notification { method, params }
+            if loading_session
+                && method == "session/update"
+                && params["update"]["sessionUpdate"] == "config_option_update" =>
+        {
+            if let Some(id) = params.get("sessionId").and_then(Value::as_str)
+                && params["update"]["configOptions"].is_array()
+            {
+                config_updates.insert(id.to_owned(), params["update"]["configOptions"].clone());
+            }
+        }
+        _ => {}
+    };
     let mut fut = prompt_like_request(client.clone(), method, params);
     let res = loop {
         tokio::select! {
             res = &mut fut => break res,
             inc = incoming.recv() => match inc {
-                Some(Incoming::Request { id, method, params }) => {
-                    handle_server_request(client, id, &method, &params);
-                }
-                Some(_) => {}
+                Some(inc) => handle_incoming(inc),
                 None => {
                     return Err(HarnessError::Protocol(format!(
                         "{method}: agent exited during setup"
@@ -1672,11 +1783,21 @@ async fn request_draining(
     // replay updates the reader forwarded BEFORE the response line may still
     // sit in the buffer — flush them now or they'd leak into the live turn.
     while let Ok(inc) = incoming.try_recv() {
-        if let Incoming::Request { id, method, params } = inc {
-            handle_server_request(client, id, &method, &params);
-        }
+        handle_incoming(inc);
     }
-    res
+    // Keep config refreshes even when they race the session response. They
+    // are session state, not replayed transcript, and dropping them can lose
+    // the only notification advertising a newly released Devin model.
+    res.map(|mut response| {
+        let id = response
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .or(requested_session.as_deref());
+        if let Some(options) = id.and_then(|id| config_updates.remove(id)) {
+            response["configOptions"] = options;
+        }
+        response
+    })
 }
 
 fn prompt_like_request(
@@ -1687,18 +1808,10 @@ fn prompt_like_request(
     Box::pin(async move { client.request(method, params).await })
 }
 
-/// Track the liveness signals the blanket quiet-settle keys on: content
-/// proves the turn produced something; an open tool call or a pending
-/// question proves silence is legitimate.
-fn track_turn_signals(
-    ev: &AgentEvent,
-    content_seen: &mut bool,
-    open_tools: &mut std::collections::HashSet<String>,
-) {
+/// Track tools to avoid prompting into an unowned self-continued turn.
+fn track_open_tools(ev: &AgentEvent, open_tools: &mut std::collections::HashSet<String>) {
     match ev {
-        AgentEvent::TextDelta { text } if !text.is_empty() => *content_seen = true,
         AgentEvent::ToolCall { id, .. } => {
-            *content_seen = true;
             open_tools.insert(id.clone());
         }
         AgentEvent::ToolResult { id, .. } => {
@@ -1763,7 +1876,7 @@ async fn run_session(session: Session) {
         let init_commands = scan_available_commands(&init);
 
         let session_params = json!({ "cwd": request.cwd, "mcpServers": [] });
-        let (session_id, session_response) = if let Some(resume) = &request.resume {
+        let (session_id, mut session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();
             load["sessionId"] = Value::String(resume.clone());
             match request_draining(&client, &mut incoming, "session/load", load).await {
@@ -1805,6 +1918,18 @@ async fn run_session(session: Session) {
             return Err(HarnessError::Protocol(
                 "session/new returned no sessionId".into(),
             ));
+        }
+        if harness == HarnessId::Devin
+            && let Some(model) = request.model.as_deref()
+        {
+            devin_models::wait_for_model(
+                &client,
+                &mut incoming,
+                &session_id,
+                &mut session_response,
+                model,
+            )
+            .await?;
         }
         // ACP has had two model-selection surfaces. Newer config-option agents
         // use category=model below; Grok Build currently advertises only the
@@ -1857,6 +1982,19 @@ async fn run_session(session: Session) {
             )
             .await
             {
+                if harness == HarnessId::Devin
+                    && options_snapshot["configOptions"]
+                        .as_array()
+                        .is_some_and(|options| {
+                            options
+                                .iter()
+                                .any(|o| o["id"] == config_id && o["category"] == "model")
+                        })
+                {
+                    return Err(HarnessError::Protocol(format!(
+                        "Devin rejected requested model {requested_model:?}: {e}"
+                    )));
+                }
                 tracing::debug!(
                     target: "zeron_harness::acp",
                     "session/set_config_option {config_id}={payload} rejected (agent default runs): {e}"
@@ -1965,13 +2103,18 @@ async fn run_session(session: Session) {
         return;
     }
 
-    // Subagent correlation + transcript tails: the grok tracker (inert for
-    // agents that never emit the `subagent_*` extension updates).
-    let mut subagents = SubagentObserver(SubagentTracker::new(
-        session_id.clone(),
-        event_tx.clone(),
-        sessions_root,
-    ));
+    // Subagent correlation + transcript tails: Devin carries nested updates
+    // on ACP itself; everything else gets the Grok tracker (inert without
+    // Grok's subagent lifecycle extension).
+    let mut subagents = if harness == HarnessId::Devin {
+        SubagentObserver::Devin(DevinTracker::default())
+    } else {
+        SubagentObserver::Grok(SubagentTracker::new(
+            session_id.clone(),
+            event_tx.clone(),
+            sessions_root,
+        ))
+    };
 
     // ---- main loop --------------------------------------------------------
     // Prompt-completion settlement state (the prompt-complete extension):
@@ -2033,39 +2176,12 @@ async fn run_session(session: Session) {
     // the queued steer is promoted to a fresh turn.
     const STARVE_GRACE: Duration = Duration::from_secs(2);
     let mut starve_deadline: Option<tokio::time::Instant> = None;
-    // BLANKET dropped-reply settle, adapter-agnostic: any ACP agent whose
-    // prompt response goes missing must not strand the turn. Signals that
-    // exist in core ACP stand in for the adapter-specific cost frame: once
-    // the turn has streamed content, every tool call it opened has resolved,
-    // no permission/question round-trip is pending, and the stream has been
-    // quiet past the window, the turn is settled through the same recovery
-    // arm. A false settle is only PARTLY recoverable: the engine folds any
-    // later output as a self-continued segment and re-arms Working, but the
-    // turn is orphaned — the real response resolves a closed channel, no
-    // Done ever comes, and the session strands Working until the engine's
-    // quiesce watchdog parks it.
-    //
-    // Grok is exempt: it advertises
-    // `_x.ai/session/prompt_complete` as the AUTHORITATIVE turn end, and a
-    // 30s think / long plan-file write looks identical to a dropped reply
-    // (Grok 2026-08-18: timestamp landed, then the session self-continued
-    // when more output arrived). Hermes uses this blanket window.
-    // (pi-acp was exempt too — long silent reasoning stretches — but the
-    // adapter is retired; the native PiHarness settles deterministically on
-    // pi's own agent_settled and never consults this window.)
-    // `ZERON_ACP_QUIET_SETTLE_MS` overrides; 0 disables.
-    let quiet_settle: Option<Duration> = quiet_settle_window(prompt_complete_extension);
+    // Silence is not a turn boundary: completed tools, text, and usage may
+    // all precede a slow model request. Keep the prompt future alive until
+    // its response (or an authoritative completion extension) arrives.
+    // ZERON_ACP_QUIET_SETTLE_MS is intentionally no longer honored (#296).
     let mut last_update_at = tokio::time::Instant::now();
-    let mut turn_content_seen = false;
-    // A steering injection makes the cost hint unsafe for the REST of the
-    // turn: the adapter emits a cost-bearing usage_update for the injected
-    // message itself, mid-turn, indistinguishable in shape from the
-    // terminal one (verified against 0.66.0 — premature Done exactly one
-    // grace after injection). Steered turns settle off their real response
-    // (healthy in every trace); the engine's quiesce watchdog backstops
-    // them (the quiet settle used to, before the Claude exemption above).
     let mut open_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let open_questions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // PREVENTION, ahead of all the recovery above: never send a
     // `session/prompt` into a session that is visibly mid SELF-CONTINUED
     // turn — that prompt's reply is what the adapter drops (the verified
@@ -2164,7 +2280,6 @@ async fn run_session(session: Session) {
                                 &method,
                                 &params,
                                 &request_input,
-                                &open_questions,
                             ) {
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
@@ -2235,7 +2350,6 @@ async fn run_session(session: Session) {
                         break 'main;
                     }
                     done_current = false;
-                    turn_content_seen = false;
                     open_tools.clear();
                     last_update_at = tokio::time::Instant::now();
                     prompt_seq += 1;
@@ -2324,7 +2438,7 @@ async fn run_session(session: Session) {
                     let events =
                         session_update_events(&method, &params, &session_id, &mut subagents);
                     for ev in events {
-                        track_turn_signals(&ev, &mut turn_content_seen, &mut open_tools);
+                        track_open_tools(&ev, &mut open_tools);
                         if !send(&event_tx, ev).await {
                             break 'main;
                         }
@@ -2338,7 +2452,6 @@ async fn run_session(session: Session) {
                         &method,
                         &params,
                         &request_input,
-                        &open_questions,
                     ) {
                         if !send(&event_tx, ev).await {
                             break 'main;
@@ -2420,8 +2533,8 @@ async fn run_session(session: Session) {
                     // eternal-timer bug. Post-turn: nothing left to do.
                     if turn.is_some() {
                         // The injection proves the turn is LIVE: any settle
-                        // deadline armed off a cost frame that raced this
-                        // response is invalid evidence.
+                        // deadline armed by an earlier noRunningTurn reply
+                        // is no longer valid.
                         starve_deadline = None;
                         // Pre-injection updates can still sit in `incoming`
                         // (responses bypass that queue): drain them into the
@@ -2448,7 +2561,6 @@ async fn run_session(session: Session) {
                                         &method,
                                         &params,
                                         &request_input,
-                                        &open_questions,
                                     ) {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
@@ -2519,7 +2631,6 @@ async fn run_session(session: Session) {
                         break 'main;
                     }
                     done_current = false;
-                    turn_content_seen = false;
                     open_tools.clear();
                     last_update_at = tokio::time::Instant::now();
                     prompt_seq += 1;
@@ -2569,7 +2680,6 @@ async fn run_session(session: Session) {
                         break 'main;
                     }
                     done_current = false;
-                    turn_content_seen = false;
                     open_tools.clear();
                     last_update_at = tokio::time::Instant::now();
                     prompt_seq += 1;
@@ -2589,40 +2699,10 @@ async fn run_session(session: Session) {
                 }
             },
 
-            // BLANKET quiet settle (see `quiet_settle` above), adapter-
-            // agnostic: content streamed, every tool resolved, no question
-            // pending, stream quiet past the window with the prompt still
-            // unsettled. Feeds the recovery arm below by expiring its
-            // deadline — one settle path for all three evidence sources.
-            _ = tokio::time::sleep_until(
-                last_update_at + quiet_settle.unwrap_or_default()
-            ), if quiet_settle.is_some()
-                && starve_deadline.is_none()
-                && turn.is_some()
-                && !interrupted
-                && turn_content_seen
-                && open_tools.is_empty()
-                && open_questions.load(std::sync::atomic::Ordering::SeqCst) == 0 =>
-            {
-                tracing::warn!(
-                    target: "zeron_harness::acp",
-                    quiet_ms = quiet_settle.unwrap_or_default().as_millis() as u64,
-                    "turn quiet past the settle window with completed output; \
-                     treating the prompt response as dropped"
-                );
-                starve_deadline = Some(tokio::time::Instant::now());
-            },
-
-            // Starved-turn recovery: the grace elapsed with the prompt still
-            // unsettled after turn-end evidence — the turn's terminal cost
-            // frame (COST_HINT_GRACE, ~immediate), a steering call answered
-            // noRunningTurn (STARVE_GRACE), or the blanket quiet settle
-            // above. Close the dead turn out
-            // with a Done — its output already streamed as session/updates
-            // and its text was delivered via the CLI's own queue — then
-            // promote any queued steer to a fresh prompt, which settles
-            // normally on a now-idle agent (verified against the real
-            // adapter).
+            // Explicit noRunningTurn from the steering extension proves
+            // the adapter has no running turn. After a grace for its racing
+            // response, recover the stranded prompt. Silence, tool results,
+            // and usage updates must never arm this recovery.
             _ = tokio::time::sleep_until(
                 starve_deadline.unwrap_or_else(tokio::time::Instant::now)
             ), if starve_deadline.is_some() && turn.is_some() && !interrupted => {
@@ -2672,7 +2752,6 @@ async fn run_session(session: Session) {
                         break 'main;
                     }
                     done_current = false;
-                    turn_content_seen = false;
                     open_tools.clear();
                     last_update_at = tokio::time::Instant::now();
                     prompt_seq += 1;
@@ -2709,14 +2788,6 @@ async fn run_session(session: Session) {
                         // Mid self-continued turn (see BUSY_RECENT above):
                         // cancel it rather than prompt into the starve.
                         //
-                        // Claude skips this branch ON PURPOSE and prompts
-                        // straight in — its NATIVE semantics: the CLI queues
-                        // the message and folds it into the running turn (no
-                        // work lost, verified from live session data). The
-                        // adapter drops that prompt's reply, and the
-                        // cost-frame settle reconstructs it ~1s after the
-                        // merged turn really ends. Only adapters with no
-                        // verified turn-end frame pay the cancel.
                         tracing::info!(
                             target: "zeron_harness::acp",
                             "steer into a self-continuing session; cancelling \
@@ -2744,7 +2815,6 @@ async fn run_session(session: Session) {
                             break 'main;
                         }
                         done_current = false;
-                        turn_content_seen = false;
                         open_tools.clear();
                         last_update_at = tokio::time::Instant::now();
                         prompt_seq += 1;
@@ -2845,6 +2915,19 @@ async fn run_session(session: Session) {
         }
     }
 
+    // A vanished Devin process cannot send subagent_completed. Settle every
+    // open nested transcript before the parent's terminal Done.
+    let subagent_status = if interrupted {
+        DoneStatus::Interrupted
+    } else {
+        DoneStatus::Errored
+    };
+    for event in subagents.finish_open(subagent_status) {
+        if !send(&event_tx, event).await {
+            break;
+        }
+    }
+
     // Terminal bookkeeping: never end the stream without a Done unless the
     // consumer already hung up.
     if !event_tx.is_closed() {
@@ -2883,6 +2966,17 @@ async fn run_session(session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn devin_initialize_enables_only_the_supported_subagent_stream() {
+        let devin = initialize_params(HarnessId::Devin);
+        let meta = &devin["clientCapabilities"]["_meta"];
+        assert_eq!(meta["cognition.ai/subagentSupport"], true);
+        assert!(meta.get("cognition.ai/subagentControl").is_none());
+
+        let grok = initialize_params(HarnessId::Grok);
+        assert!(grok["clientCapabilities"].get("_meta").is_none());
+    }
 
     #[test]
     fn steering_capability_reads_initialize_meta() {
@@ -3318,11 +3412,5 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].name, "compact");
         assert!(scan_available_commands(&json!({ "protocolVersion": 1 })).is_empty());
-    }
-
-    #[test]
-    fn grok_skips_the_quiet_settle_window() {
-        assert!(quiet_settle_window(true).is_none());
-        assert_eq!(quiet_settle_window(false), Some(Duration::from_secs(30)));
     }
 }

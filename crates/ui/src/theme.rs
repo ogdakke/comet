@@ -401,6 +401,12 @@ pub struct SyntaxPalette {
     pub tag: Hsla,
     pub attribute: Hsla,
     pub label: Hsla,
+    pub markup_heading: Hsla,
+    pub markup_raw: Hsla,
+    pub markup_link: Hsla,
+    pub markup_reference: Hsla,
+    pub markup_emphasis: Hsla,
+    pub markup_strong: Hsla,
     pub invalid: Hsla,
 }
 
@@ -430,6 +436,12 @@ impl SyntaxPalette {
             HighlightKind::Tag => self.tag,
             HighlightKind::Attribute => self.attribute,
             HighlightKind::Label => self.label,
+            HighlightKind::MarkupHeading => self.markup_heading,
+            HighlightKind::MarkupRaw => self.markup_raw,
+            HighlightKind::MarkupLink => self.markup_link,
+            HighlightKind::MarkupReference => self.markup_reference,
+            HighlightKind::MarkupEmphasis => self.markup_emphasis,
+            HighlightKind::MarkupStrong => self.markup_strong,
             HighlightKind::Invalid => self.invalid,
         }
     }
@@ -467,6 +479,12 @@ impl SyntaxPalette {
             tag: color("tag", fallback.tag),
             attribute: color("attribute", fallback.attribute),
             label: color("label", fallback.label),
+            markup_heading: color("markupHeading", fallback.markup_heading),
+            markup_raw: color("markupRaw", fallback.markup_raw),
+            markup_link: color("markupLink", fallback.markup_link),
+            markup_reference: color("markupReference", fallback.markup_reference),
+            markup_emphasis: color("markupEmphasis", fallback.markup_emphasis),
+            markup_strong: color("markupStrong", fallback.markup_strong),
             invalid: color("invalid", fallback.invalid),
         }
     }
@@ -502,6 +520,12 @@ impl SyntaxPalette {
             tag: pink,
             attribute: amber,
             label: amber,
+            markup_heading: indigo,
+            markup_raw: emerald,
+            markup_link: pink,
+            markup_reference: amber,
+            markup_emphasis: pink,
+            markup_strong: indigo,
             invalid: red,
         }
     }
@@ -537,6 +561,12 @@ impl SyntaxPalette {
             tag: pink,
             attribute: amber,
             label: amber,
+            markup_heading: indigo,
+            markup_raw: emerald,
+            markup_link: pink,
+            markup_reference: amber,
+            markup_emphasis: pink,
+            markup_strong: indigo,
             invalid: red,
         }
     }
@@ -771,8 +801,9 @@ impl Theme {
     /// rides [`Self::TITLEBAR_TOP_PAD`] lower than center so the air above
     /// matches the perceived gap to the inset card below (border + card body).
     pub const TITLEBAR_HEIGHT: f32 = 38.0;
-    /// Downward shift of titlebar content within the bar.
-    pub const TITLEBAR_TOP_PAD: f32 = 2.0;
+    /// Top-only padding moves the flex center by half this value. On macOS,
+    /// 38 / 2 + 4 / 2 = 21 matches the native traffic lights' center.
+    pub const TITLEBAR_TOP_PAD: f32 = 4.0;
     /// Reserved status strip under the content outlet (zeron `h-6`) — the
     /// WorkingIndicator row; reserving it keeps the composer from shifting.
     pub const STATUS_STRIP_HEIGHT: f32 = 24.0;
@@ -892,9 +923,42 @@ impl Theme {
     /// plane while still allowing the blurred backdrop to read through. The
     /// tint follows the appearance: near-black in dark mode, near-white in
     /// light mode.
+    /// Move toward the right pane tone while keeping the backdrop visible.
+    /// Solve the overlay in RGB: target = tint * alpha + canvas * (1 - alpha).
+    pub fn composer_sidebar_tint(&self) -> Hsla {
+        let target = if self.is_glass() {
+            flatten(self.bg.opacity(0.4), flatten(self.glass(), self.bg))
+        } else {
+            self.bg
+        };
+        // The transcript has no fill of its own: its canvas is the shell glass.
+        let canvas = flatten(self.glass(), self.bg);
+        let canvas = hsl_to_rgb(canvas.h, canvas.s, canvas.l);
+        let target = hsl_to_rgb(target.h, target.s, target.l);
+        let mut alpha: f32 = 0.60;
+        for (base, desired) in canvas.into_iter().zip(target) {
+            let needed = if desired > base {
+                (desired - base) / (1.0 - base).max(f32::EPSILON)
+            } else {
+                (base - desired) / base.max(f32::EPSILON)
+            };
+            alpha = alpha.max(needed);
+        }
+        let rgb = std::array::from_fn::<_, 3, _>(|i| {
+            ((target[i] - canvas[i] * (1.0 - alpha)) / alpha).clamp(0.0, 1.0)
+        });
+        let (h, s, l) = rgb_to_hsl(rgb[0], rgb[1], rgb[2]);
+        // Use the compensated hue, but leave 85% of the blurred backdrop visible.
+        hsla(h, s, l, 0.15)
+    }
+
+    /// Shared fill for the composer, queue tray, and input panels. Without
+    /// frost, composite the theme's input tint onto the page to preserve its
+    /// color while hiding the transcript and overlapping surfaces underneath.
+    /// Frosted surfaces retain their translucent, contrast-checked tint.
     pub fn input_glass_bg(&self) -> Hsla {
         if !self.is_frost() {
-            return self.input_bg;
+            return flatten(self.input_bg, self.bg);
         }
         let base = if matches!(self.appearance, Appearance::Light) {
             0.30
@@ -935,8 +999,16 @@ impl Theme {
     /// the re-apply in `appearance::apply` is what restores vibrancy when the
     /// user switches back to dark. See zed's `crates/zed/src/main.rs`, which
     /// runs the same loop on every settings change.
+    ///
+    /// Linux composites with alpha instead: the shell draws CSD chrome, and
+    /// rounded window corners (when floating) need the corner cutouts to be
+    /// genuinely transparent. The frost itself is opaque off macOS
+    /// ([`Self::GLASS_ALPHA`]), so nothing else shows through — only the
+    /// corners.
     pub fn window_background_appearance(&self) -> gpui::WindowBackgroundAppearance {
-        if self.is_glass() {
+        if cfg!(target_os = "linux") {
+            gpui::WindowBackgroundAppearance::Transparent
+        } else if self.is_glass() {
             gpui::WindowBackgroundAppearance::Blurred
         } else {
             gpui::WindowBackgroundAppearance::Opaque
@@ -1265,6 +1337,7 @@ impl Theme {
         set_current_appearance(appearance);
         let next = Self::for_preferences(appearance, accent)
             .with_font_sans(crate::typography::effective_family_name(cx));
+        sync_gpui_base_scrollbar(&next, cx);
         cx.set_global(next);
         // An accent-only swap leaves CURRENT_APPEARANCE unchanged, but cached
         // resolved colors still need to be discarded for the next frame.
@@ -1329,6 +1402,7 @@ impl Theme {
                 || theme.appearance != next.appearance
         });
         set_current_appearance(appearance);
+        sync_gpui_base_scrollbar(&next, cx);
         cx.set_global(next);
         if changed || force_generation {
             bump_style_generation();
@@ -1354,6 +1428,22 @@ impl Theme {
     pub fn wash(&self, alpha: f32) -> Hsla {
         wash_for(self.appearance, alpha)
     }
+}
+
+fn scrollbar_thumb_colors(theme: &Theme) -> (Hsla, Hsla, Hsla) {
+    (
+        theme.text.opacity(0.30),
+        theme.text.opacity(0.42),
+        theme.text.opacity(0.55),
+    )
+}
+
+fn sync_gpui_base_scrollbar(theme: &Theme, cx: &mut App) {
+    let (normal, hover, active) = scrollbar_thumb_colors(theme);
+    gpui_base::Theme::global_mut(cx).scrollbar.styles = gpui_base::ScrollbarStyles::default()
+        .thumb(|style| style.bg(normal))
+        .thumb_hover(|style| style.bg(hover))
+        .thumb_active(|style| style.bg(active));
 }
 
 impl Default for Theme {
@@ -1731,6 +1821,17 @@ mod tests {
         // oklch(0.145 0 0) is Tailwind neutral-950, zeron's app background.
         let rgb = srgb_u8(oklch_to_srgb(0.145, 0.0, 0.0));
         assert_eq!(rgb, [10, 10, 10]);
+    }
+
+    #[test]
+    fn scrollbar_thumbs_follow_the_active_appearance() {
+        let dark = scrollbar_thumb_colors(&Theme::dark());
+        let light = scrollbar_thumb_colors(&Theme::light());
+
+        assert!(dark.0.l > Theme::dark().bg.l);
+        assert!(light.0.l < Theme::light().bg.l);
+        assert_eq!([dark.0.a, dark.1.a, dark.2.a], [0.30, 0.42, 0.55]);
+        assert_eq!([light.0.a, light.1.a, light.2.a], [0.30, 0.42, 0.55]);
     }
 
     #[test]
@@ -2171,6 +2272,12 @@ mod tests {
             HighlightKind::Tag,
             HighlightKind::Attribute,
             HighlightKind::Label,
+            HighlightKind::MarkupHeading,
+            HighlightKind::MarkupRaw,
+            HighlightKind::MarkupLink,
+            HighlightKind::MarkupReference,
+            HighlightKind::MarkupEmphasis,
+            HighlightKind::MarkupStrong,
             HighlightKind::Embedded,
             HighlightKind::Invalid,
         ];
@@ -2551,6 +2658,36 @@ mod tests {
         assert!((mid.l - 0.5).abs() < 1e-6 && (mid.a - 0.5).abs() < 1e-6);
         // Out-of-range t clamps.
         assert_eq!(mix(a, b, 2.0), b);
+    }
+
+    #[test]
+    fn composer_tint_moves_toward_sidebar_without_hiding_backdrop() {
+        for mut theme in [Theme::dark(), Theme::light()] {
+            for (canvas, shell) in [
+                (theme.bg, theme.surface),
+                (hsla(0.58, 0.3, 0.12, 1.0), hsla(0.62, 0.25, 0.22, 1.0)),
+                (hsla(0.12, 0.2, 0.93, 1.0), hsla(0.08, 0.15, 0.82, 1.0)),
+            ] {
+                theme.bg = canvas;
+                theme.surface = shell;
+                let tint = theme.composer_sidebar_tint();
+                let expected = if theme.is_glass() {
+                    flatten(theme.bg.opacity(0.4), flatten(theme.glass(), theme.bg))
+                } else {
+                    theme.bg
+                };
+                let actual = flatten(tint, flatten(theme.glass(), theme.bg));
+                let base = flatten(theme.glass(), theme.bg);
+                let base_rgb = hsl_to_rgb(base.h, base.s, base.l);
+                let target_rgb = hsl_to_rgb(expected.h, expected.s, expected.l);
+                let actual_rgb = hsl_to_rgb(actual.h, actual.s, actual.l);
+                for i in 0..3 {
+                    assert!(actual_rgb[i] >= base_rgb[i].min(target_rgb[i]) - 0.0001);
+                    assert!(actual_rgb[i] <= base_rgb[i].max(target_rgb[i]) + 0.0001);
+                }
+                assert_eq!(tint.a, 0.15);
+            }
+        }
     }
 
     #[test]

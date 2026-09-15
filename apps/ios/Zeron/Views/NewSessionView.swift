@@ -1,7 +1,7 @@
 // New session — a real composer page, not a form. Mirrors the old mobile
 // app's canvas (faded mark + "What are we building?" + glass composer with
 // picker chips) and the desktop's new-session canvas (composer expanded with
-// in-pill pickers). The space already fixes device + folder; the composer
+// in-pill pickers). The destination fixes a project or execution host; the composer
 // carries the agent/model chip, and sending mints the chat, queues the first
 // run, and swaps straight into the live session.
 
@@ -10,7 +10,7 @@ import SwiftUI
 
 struct NewSessionView: View {
     @Environment(AppModel.self) private var model
-    let spaceId: String
+    let destination: NewSessionDestination
     @Binding var path: [Route]
 
     // Sticky run config (the old app persisted these to prefs.db).
@@ -19,19 +19,23 @@ struct NewSessionView: View {
     @AppStorage("newSessionReasoning") private var storedReasoning = ""
 
     @State private var draft = ""
+    @State private var selectedHostId: String?
+    @State private var showHostPicker = false
     @State private var showPicker = false
     @State private var showTraitPicker = false
+    @State private var showOptionPicker: ModelOptionInfo?
     @State private var showRefPicker = false
     @State private var showCheckoutPicker = false
     @State private var attachments: [StagedAttachment] = []
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var showPhotoPicker = false
     @State private var attachError: String?
-    /// Live harness list from the space's device (Settings → Agents gate);
+    /// Live harness list from the selected device (Settings → Agents gate);
     /// static pair until it loads.
     @State private var liveHarnesses: [HarnessInfo]?
-    /// Live per-harness catalogs from the space's device (static fallback).
+    /// Live per-harness catalogs from the selected device (static fallback).
     @State private var catalogs: [String: [ModelInfo]] = [:]
+    @State private var optionSelections: [String: String] = [:]
     @State private var refs: [RepoRef] = []
     @State private var selectedRef: String?
     @State private var checkoutKind: CheckoutKind = .local
@@ -41,8 +45,24 @@ struct NewSessionView: View {
     /// iOS 26 proposes leading toolbar items almost nothing).
     @State private var viewWidth: CGFloat = 0
 
-    private var space: Space? {
-        model.spaces.first { $0.id == spaceId }
+    private var effectiveDestination: NewSessionDestination {
+        if case .projectless = destination, let selectedHostId {
+            return .projectless(deviceId: selectedHostId)
+        }
+        return destination
+    }
+
+    private var space: Space? { effectiveDestination.space(in: model.spaces) }
+
+    private var deviceId: String? {
+        effectiveDestination.deviceId(spaces: model.spaces, devices: model.devices)
+    }
+
+    private var contextLabel: String {
+        switch effectiveDestination {
+        case .project: return space?.displayName ?? "Project unavailable"
+        case .projectless: return "No project"
+        }
     }
 
     private var harnesses: [HarnessInfo] {
@@ -63,6 +83,22 @@ struct NewSessionView: View {
         return HarnessCatalog.defaultReasoning(for: selectedModel)
     }
 
+    private func selectedChoice(for option: ModelOptionInfo) -> ModelOptionChoiceInfo {
+        HarnessCatalog.selectedChoice(for: option, selectedId: optionSelections[option.id])
+    }
+
+    /// Only non-default picks ride the run, matching the desktop picker.
+    private var resolvedModelOptions: [String: JSONValue] {
+        var result: [String: JSONValue] = [:]
+        for option in selectedModel.options {
+            let choice = selectedChoice(for: option)
+            if choice.id != option.defaultChoice {
+                result[option.id] = .string(choice.id)
+            }
+        }
+        return result
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             // Canvas — tap dismisses the keyboard, like the old app.
@@ -80,8 +116,22 @@ struct NewSessionView: View {
             .contentShape(Rectangle())
             .onTapGesture { focused = false }
 
-            if let space, !model.deviceOnline(space.deviceId), model.demo == nil {
-                offlineNotice(space: space)
+            if let deviceId, !model.deviceOnline(deviceId), model.demo == nil {
+                offlineNotice(deviceId: deviceId)
+            }
+
+            if case .projectless = destination {
+                Button {
+                    focused = false
+                    showHostPicker = true
+                } label: {
+                    Label(deviceId.map(model.deviceName) ?? "Select a device",
+                          systemImage: "desktopcomputer")
+                        .font(Theme.sans(13, weight: .medium))
+                }
+                .accessibilityIdentifier("session-host")
+                .disabled(busy)
+                .padding(.bottom, 8)
             }
 
             // Where-it-runs scope row (checkout + base ref), left-aligned
@@ -93,10 +143,12 @@ struct NewSessionView: View {
                             focused = false
                             showCheckoutPicker = true
                         }
+                        .accessibilityIdentifier("session-checkout")
                         chip(icon: .gitBranch, label: refLabel) {
                             focused = false
                             showRefPicker = true
                         }
+                        .accessibilityIdentifier("session-ref")
                     }
                     .padding(.horizontal, 16)
                 }
@@ -117,12 +169,15 @@ struct NewSessionView: View {
                     Text("New session")
                         .font(Theme.sans(13, weight: .medium))
                         .foregroundStyle(Theme.text)
-                    if let space {
-                        Text("\(space.displayName) · \(model.deviceName(space.deviceId))")
+                    if let deviceId {
+                        Text("\(contextLabel) · \(model.deviceName(deviceId))")
                             .font(Theme.sans(10.5))
                             .foregroundStyle(Theme.textMuted.opacity(0.6))
                             .lineLimit(1)
                             .truncationMode(.middle)
+                            .accessibilityIdentifier("new-session-context")
+                    } else {
+                        Text(contextLabel).font(Theme.sans(10.5))
                     }
                 }
                 // 170: enough slack that the bar never evicts the item into
@@ -131,6 +186,9 @@ struct NewSessionView: View {
             }
             // Bare text on the bar, not a glass capsule.
             .sharedBackgroundVisibility(.hidden)
+        }
+        .sheet(isPresented: $showHostPicker) {
+            SessionHostPickerSheet(selectedDeviceId: deviceId) { selectedHostId = $0 }
         }
         .sheet(isPresented: $showRefPicker) {
             RefPickerSheet(refs: refs, selected: selectedRef) { ref in
@@ -143,7 +201,7 @@ struct NewSessionView: View {
                 pickCheckout(kind)
             }
         }
-        .task(id: spaceId) {
+        .task(id: space?.id) {
             // Load refs for the branch chip (git spaces only).
             guard let space, space.gitDetected else { return }
             if let loaded = await model.listRefs(space: space) {
@@ -153,21 +211,26 @@ struct NewSessionView: View {
                 }
             }
         }
-        .task(id: spaceId) {
+        .task(id: deviceId) {
             // Live harness list + a model catalog per harness, all from the
             // device that will run the session (the picker shows one sectioned
             // list across harnesses, so it needs every catalog up front).
-            guard let space else { return }
-            let list = await model.listHarnesses(space: space)
+            liveHarnesses = nil
+            catalogs = [:]
+            optionSelections = [:]
+            guard let deviceId else { return }
+            let list = await model.listHarnesses(deviceId: deviceId)
+            guard !Task.isCancelled else { return }
             liveHarnesses = list
             if !list.contains(where: { $0.id == harness }), let first = list.first {
                 harness = first.id
             }
             await withTaskGroup(of: (String, [ModelInfo]).self) { group in
                 for h in list {
-                    group.addTask { (h.id, await model.listModels(space: space, harness: h.id)) }
+                    group.addTask { (h.id, await model.listModels(deviceId: deviceId, harness: h.id)) }
                 }
                 for await (id, catalog) in group {
+                    guard !Task.isCancelled else { return }
                     catalogs[id] = catalog
                 }
             }
@@ -186,6 +249,12 @@ struct NewSessionView: View {
                 get: { reasoning },
                 set: { storedReasoning = $0 ?? "" }
             ), levels: selectedModel.reasoningLevels)
+        }
+        .sheet(item: $showOptionPicker) { option in
+            ModelOptionPickerSheet(option: option, choiceId: Binding(
+                get: { selectedChoice(for: option).id },
+                set: { optionSelections[option.id] = $0 }
+            ))
         }
         .photosPicker(isPresented: $showPhotoPicker, selection: $pickerItems,
                       maxSelectionCount: 8, matching: .images)
@@ -221,7 +290,7 @@ struct NewSessionView: View {
             ComposerShell(
                 draft: $draft,
                 placeholder: "Do anything…",
-                sendEnabled: space != nil,
+                sendEnabled: deviceId != nil,
                 showStop: false,
                 busy: busy,
                 alwaysExpanded: true,
@@ -240,6 +309,12 @@ struct NewSessionView: View {
                     ComposerChip(label: HarnessCatalog.reasoningLabel(reasoning)) {
                         focused = false
                         showTraitPicker = true
+                    }
+                }
+                ForEach(selectedModel.options) { option in
+                    ComposerChip(label: selectedChoice(for: option).label) {
+                        focused = false
+                        showOptionPicker = option
                     }
                 }
             }
@@ -343,13 +418,13 @@ struct NewSessionView: View {
     }
 
     private var canSend: Bool {
-        guard !busy, space != nil else { return false }
+        guard !busy, deviceId != nil else { return false }
         return !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !attachments.isEmpty
     }
 
-    private func offlineNotice(space: Space) -> some View {
-        Text("\(model.deviceName(space.deviceId)) is offline — the run will start when it reconnects.")
+    private func offlineNotice(deviceId: String) -> some View {
+        Text("\(model.deviceName(deviceId)) is offline — the run will start when it reconnects.")
             .font(Theme.sans(12))
             .foregroundStyle(Theme.warning.opacity(0.9))
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -369,31 +444,33 @@ struct NewSessionView: View {
     /// CreateWorktree-before-send was the one new-chat path that could hang
     /// forever on a zombie link (the 2026-08-18 "Sending…" incident).
     private func send() {
-        guard let space, canSend else { return }
+        guard let deviceId, canSend else { return }
+        let space = space
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         busy = true
         let config = ChatConfig(harness: harness, model: selectedModel.id,
-                                reasoning: reasoning, sandbox: "workspace-write")
+                                reasoning: reasoning, modelOptions: resolvedModelOptions,
+                                sandbox: "workspace-write")
         Task { @MainActor in
             var cwd: String?
-            let branch = selectedRef
+            let branch = space == nil ? nil : selectedRef
             var worktree: WorktreeSpec?
-            switch checkoutKind {
-            case .newWorktree:
-                // Base defaults to HEAD (PR #165): a branch list that never
-                // loaded over a flapping relay must not silently drop
-                // isolation. cwd stays the space folder — the old-host
-                // degradation path (run in main checkout, never hung).
-                worktree = WorktreeSpec(repoPath: space.path, base: selectedRef ?? "HEAD")
-                cwd = space.path
-            case .local:
-                if let reused = selectedRefRow?.worktreePath {
-                    cwd = reused  // reuse the ref's existing checkout
+            if let space {
+                switch checkoutKind {
+                case .newWorktree:
+                    // The host materializes the worktree at drain time, so
+                    // an offline send never blocks on a relay RPC.
+                    worktree = WorktreeSpec(repoPath: space.path, base: selectedRef ?? "HEAD")
+                    cwd = space.path
+                case .local:
+                    if let reused = selectedRefRow?.worktreePath {
+                        cwd = reused
+                    }
                 }
             }
 
             let staged = attachments
-            let queued = model.hostSupportsQueuedAttachmentsOn(deviceId: space.deviceId)
+            let queued = model.hostSupportsQueuedAttachmentsOn(deviceId: deviceId)
 
             // Legacy hosts (< 0.2.12) stage attachments FIRST — before the
             // chat row or store exist — so an upload failure aborts with
@@ -408,9 +485,9 @@ struct NewSessionView: View {
                     for att in staged {
                         let uploadId = UUID().uuidString.lowercased()
                         let uploaded = try await workspace.uploadAttachment(
-                            deviceId: space.deviceId, name: att.name, data: att.data,
+                            deviceId: deviceId, name: att.name, data: att.data,
                             uploadId: uploadId)
-                        AttachmentImageCache.shared.seed(deviceId: space.deviceId, path: uploaded,
+                        AttachmentImageCache.shared.seed(deviceId: deviceId, path: uploaded,
                                                          name: att.name, data: att.data)
                         legacyPaths.append(uploaded)
                     }
@@ -421,8 +498,13 @@ struct NewSessionView: View {
                 }
             }
 
-            guard let chatId = model.createChat(space: space, config: config,
-                                                branch: branch, cwd: cwd),
+            let createdId: String?
+            if let space {
+                createdId = model.createChat(space: space, config: config, branch: branch, cwd: cwd)
+            } else {
+                createdId = model.createProjectlessChat(deviceId: deviceId, config: config)
+            }
+            guard let chatId = createdId,
                   let chat = model.chat(id: chatId),
                   let store = model.sessionStore(for: chat) else {
                 busy = false
@@ -455,7 +537,7 @@ struct NewSessionView: View {
             busy = false
             // Replace the canvas with the live session (in-place swap, no
             // back-through-canvas).
-            if path.last == .newSession(spaceId: spaceId) {
+            if path.last == .newSession(destination) {
                 path.removeLast()
             }
             path.append(.chat(chatId))
@@ -689,6 +771,61 @@ struct TraitPickerSheet: View {
         case "ultra": return "Highest Codex tier"
         case "ultracode": return "X-High plus the ultracode setting"
         case "ultrathink": return "Deep-thinking prompt mode"
+        default: return nil
+        }
+    }
+}
+
+// MARK: - Model option picker sheet
+
+/// Generic harness option picker. Codex uses it for Standard/Fast; decoding
+/// the wire shape keeps iOS ready for further server-advertised choices.
+struct ModelOptionPickerSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let option: ModelOptionInfo
+    @Binding var choiceId: String
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 4) {
+                    SheetLabel(option.label)
+                    ForEach(option.choices) { choice in
+                        PickRow(title: choice.label,
+                                subtitle: hint(for: choice),
+                                selected: choiceId == choice.id) {
+                            UISelectionFeedbackGenerator().selectionChanged()
+                            choiceId = choice.id
+                        }
+                    }
+                }
+                .padding(20)
+                .padding(.bottom, 12)
+            }
+            .background(SheetStyle.panel)
+            .navigationTitle(option.label)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 13, weight: .semibold))
+                    }
+                    .accessibilityLabel("Close")
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+        .presentationCornerRadius(32)
+        .preferredColorScheme(.dark)
+    }
+
+    private func hint(for choice: ModelOptionChoiceInfo) -> String? {
+        guard option.id == "serviceTier" else { return nil }
+        switch choice.id {
+        case "default": return "Standard response speed"
+        case "fast": return "Faster responses with increased usage"
         default: return nil
         }
     }

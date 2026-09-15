@@ -77,6 +77,15 @@ pub fn bound_document() -> Vec<(String, String)> {
     document().lock().unwrap().clone()
 }
 
+/// Selection state is process-global; tests that exercise its lifecycle must
+/// not race each other.
+#[cfg(test)]
+pub(crate) fn test_state_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Resolve the spans for a selection between `a` and `b`, each an
 /// `(element index, byte offset)` into `elements` (document-ordered
 /// `(key, text)` pairs). Handles either direction; empty slices are skipped.
@@ -113,7 +122,10 @@ pub fn resolve_span_ranges(
         let from = if ei == start.0 { start.1.start } else { 0 };
         let to = if ei == end.0 { end.1.end } else { text.len() };
         let (from, to) = (from.min(text.len()), to.min(text.len()));
-        if from < to {
+        // Keep empty elements strictly between the endpoints. Rendered code
+        // fences register one element per source line, so a blank line must
+        // contribute its newline when a selection crosses it.
+        if from < to || (ei > start.0 && ei < end.0) {
             spans.push(Span {
                 key: (*key).to_string(),
                 range: from..to,
@@ -179,6 +191,15 @@ pub fn drag_anchor(key: &str) -> Option<usize> {
 }
 
 /// Whether a drag is in flight (used to keep the edge-autoscroll loop alive).
+pub(crate) fn anchor_key() -> Option<String> {
+    state()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.anchor_key.clone())
+}
+
+/// Whether a markdown selection drag is currently in flight.
 pub fn is_dragging() -> bool {
     state()
         .lock()
@@ -346,7 +367,6 @@ pub fn selected_text() -> Option<String> {
 fn join_spans(spans: &[Span]) -> String {
     spans
         .iter()
-        .filter(|s| !s.range.is_empty())
         .map(|s| &s.text[s.range.clone()])
         .collect::<Vec<_>>()
         .join("\n")
@@ -447,7 +467,7 @@ mod tests {
 
     #[test]
     fn document_resolve_covers_unpainted_middles() {
-        let _state = state_lock();
+        let _state = test_state_lock();
         bind_document(vec![
             ("p1".into(), "first paragraph".into()),
             ("p2".into(), "second".into()),
@@ -468,7 +488,7 @@ mod tests {
 
     #[test]
     fn reversing_a_drag_keeps_the_original_anchor() {
-        let _state = state_lock();
+        let _state = test_state_lock();
         bind_document(vec![
             ("p1".into(), "first paragraph".into()),
             ("p2".into(), "second".into()),
@@ -495,15 +515,17 @@ mod tests {
     /// The drag tests below mutate the process-global selection state —
     /// serialize them, or the parallel test runner interleaves their
     /// begin/end_drag calls (long-standing flake).
-    fn state_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    #[test]
+    fn spans_across_empty_elements_preserve_blank_lines() {
+        let elements = [("line-1", "first"), ("line-2", ""), ("line-3", "third")];
+        let spans = resolve_spans(&elements, (0, 0), (2, 5));
+        assert_eq!(spans.len(), 3);
+        assert_eq!(join_spans(&spans), "first\n\nthird");
     }
 
     #[test]
     fn drag_lifecycle_and_copy_joins() {
-        let _state = state_lock();
+        let _state = test_state_lock();
         begin("p1", 6);
         assert_eq!(drag_anchor("p1"), Some(6));
         assert_eq!(drag_anchor("p2"), None);
@@ -523,7 +545,7 @@ mod tests {
 
     #[test]
     fn clear_drops_a_live_or_settled_selection() {
-        let _state = state_lock();
+        let _state = test_state_lock();
         begin("p1", 3);
         assert!(clear());
         assert_eq!(selected_text(), None);
@@ -532,8 +554,62 @@ mod tests {
     }
 
     #[test]
+    fn drag_survives_forward_virtualization() {
+        let _state = test_state_lock();
+        bind_document(
+            [
+                ("p1", "first paragraph"),
+                ("p2", "second"),
+                ("p3", "third one"),
+                ("p4", "fourth"),
+            ]
+            .into_iter()
+            .map(|(k, t)| (k.into(), t.into()))
+            .collect(),
+        );
+        begin("p1", 6);
+        assert!(update_drag(&elems(), (2, 5)));
+        let shifted = [("p2", "second"), ("p3", "third one"), ("p4", "fourth")];
+        assert!(update_drag(&shifted, (2, 4)));
+        assert_eq!(
+            selected_text().as_deref(),
+            Some("paragraph\nsecond\nthird one\nfour")
+        );
+        assert_eq!(
+            end_active_drag().as_deref(),
+            Some("paragraph\nsecond\nthird one\nfour")
+        );
+        assert_eq!(drag_anchor("p1"), None);
+        bind_document(Vec::new());
+    }
+
+    #[test]
+    fn drag_survives_backward_virtualization() {
+        let _state = test_state_lock();
+        bind_document(
+            [
+                ("p2", "second"),
+                ("p3", "third"),
+                ("p4", "fourth"),
+                ("p5", "fifth"),
+            ]
+            .into_iter()
+            .map(|(k, t)| (k.into(), t.into()))
+            .collect(),
+        );
+        begin("p5", 4);
+        let first = [("p3", "third"), ("p4", "fourth"), ("p5", "fifth")];
+        assert!(update_drag(&first, (0, 2)));
+        let shifted = [("p2", "second"), ("p3", "third"), ("p4", "fourth")];
+        assert!(update_drag(&shifted, (0, 3)));
+        assert_eq!(selected_text().as_deref(), Some("ond\nthird\nfourth\nfift"));
+        assert_eq!(end_drag("p5").as_deref(), Some("ond\nthird\nfourth\nfift"));
+        bind_document(Vec::new());
+    }
+
+    #[test]
     fn empty_click_clears_on_release() {
-        let _state = state_lock();
+        let _state = test_state_lock();
         begin("p1", 3);
         assert_eq!(end_drag("p1"), None);
         assert_eq!(selected_text(), None);
@@ -541,7 +617,7 @@ mod tests {
 
     #[test]
     fn double_click_span() {
-        let _state = state_lock();
+        let _state = test_state_lock();
         begin_with_span("p1", "hello world", 6..11);
         assert_eq!(wash_range("p1"), Some(6..11));
         assert_eq!(end_drag("p1").as_deref(), Some("world"));
@@ -585,4 +661,20 @@ mod tests {
         let u = "héllo wörld";
         assert_eq!(&u[word_range(u, 2)], "héllo");
     }
+}
+
+/// End a drag even when its anchor has scrolled out of the painted rows.
+pub fn end_active_drag() -> Option<String> {
+    end_any_drag()
+}
+
+/// Resolve the head against the complete catalog supplied by the document owner.
+pub fn update_drag(elements: &[(&str, &str)], head: (usize, usize)) -> bool {
+    let Some((_, _, granularity)) = drag_owner() else {
+        return false;
+    };
+    let Some((key, text)) = elements.get(head.0) else {
+        return false;
+    };
+    resolve_against_document(elements, key, snap_unit(text, head.1, granularity))
 }

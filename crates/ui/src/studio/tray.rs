@@ -532,6 +532,7 @@ impl StudioPage {
             return None;
         };
         Some(crate::attachments::PreviewImage {
+            viewer: Default::default(),
             name: SharedString::from("Reference image"),
             image,
         })

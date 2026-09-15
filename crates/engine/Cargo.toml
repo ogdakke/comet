@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+zeron-preview.workspace = true
 zeron-proto.workspace = true
 zeron-doc.workspace = true
 zeron-sync.workspace = true
@@ -42,8 +43,9 @@ thumbhash = "0.1"
 objc = "0.2"
 core-foundation = "0.10"
 
-[dev-dependencies]
 tempfile.workspace = true
+
+[dev-dependencies]
 tokio-tungstenite.workspace = true
 rusqlite.workspace = true
 # In-process registry server for the two-engine workspace integration tests.

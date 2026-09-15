@@ -245,6 +245,7 @@ fn device(id: &str, name: &str) -> Device {
         last_seen_at: Some(ts(1_000)),
         created_at: Some(ts(500)),
         version: Some("0.1.0".into()),
+        capabilities: Vec::new(),
     }
 }
 
@@ -291,6 +292,7 @@ fn space(id: &str, device_id: &str, path: &str) -> Space {
 
 fn session(chat_id: &str, device_id: &str, status: SessionStatus) -> Session {
     Session {
+        last_completed_turn: None,
         chat_id: chat_id.into(),
         device_id: device_id.into(),
         status,
@@ -344,13 +346,15 @@ fn server_round(
 #[test]
 fn rows_round_trip_and_upsert_refreshes() {
     let mut doc = RegistryDoc::new("dev-a");
-    doc.upsert_device(&device("dev-a", "laptop")).unwrap();
+    let mut device = device("dev-a", "laptop");
+    device.capabilities = vec![zeron_proto::capabilities::MESSAGE_QUEUE_V1.into()];
+    doc.upsert_device(&device).unwrap();
     doc.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
     doc.upsert_session(&session("chat-1", "dev-a", SessionStatus::Working))
         .unwrap();
 
     let state = doc.read_all().unwrap();
-    assert_eq!(state.devices, vec![device("dev-a", "laptop")]);
+    assert_eq!(state.devices, vec![device]);
     assert_eq!(state.chats, vec![chat("chat-1", "dev-a")]);
     assert_eq!(
         state.sessions,
@@ -895,4 +899,21 @@ fn migration_seeds_pending_upserts_that_lose_to_live_writes() {
         doc.chat("chat-1").unwrap().unwrap().title.as_deref(),
         Some("live rename")
     );
+}
+
+#[test]
+fn completion_marker_replicates_and_survives_next_turn() {
+    let mut source = RegistryDoc::new("dev-a");
+    let mut viewer = RegistryDoc::new("dev-b");
+    let mut server = HashMap::new();
+    let mut seq = 0;
+    let mut row = session("chat-1", "dev-a", SessionStatus::Idle);
+    row.last_completed_turn = Some("turn-one".into());
+    source.upsert_session(&row).unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut source, &mut viewer]);
+    assert_eq!(viewer.read_sessions().unwrap(), vec![row.clone()]);
+    row.status = SessionStatus::Working;
+    source.upsert_session(&row).unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut source, &mut viewer]);
+    assert_eq!(viewer.read_sessions().unwrap(), vec![row]);
 }
