@@ -38,12 +38,11 @@ ignore.workspace = true
 nucleo-matcher.workspace = true
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 thumbhash = "0.1"
+tempfile.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
 core-foundation = "0.10"
-
-tempfile.workspace = true
 
 [dev-dependencies]
 tokio-tungstenite.workspace = true

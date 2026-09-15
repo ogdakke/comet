@@ -122,22 +122,22 @@ opt-level = 2
 
 # Preserve the fork's shader and EdgeFade APIs across the upstream GPUI extraction.
 [patch."https://github.com/zeronsh/zui"]
-collections = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
-derive_refineable = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
-gpui = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
-gpui_linux = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
-gpui_macos = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
-gpui_macros = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
-gpui_platform = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
-gpui_shared_string = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
-gpui_tokio = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
-gpui_util = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
-gpui_web = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
-gpui_wgpu = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
-gpui_windows = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
-http_client = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
-media = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
-refineable = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
-scheduler = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
-sum_tree = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
-util_macros = { git = "https://github.com/ogdakke/zed", rev = "c596a04695feed092d468b5acb6181f69944de20" }
+collections = { git = "https://github.com/ogdakke/zed", rev = "f53b8aef51bbbfd5d17fc2c96618b6f3ff284c19" }
+derive_refineable = { git = "https://github.com/ogdakke/zed", rev = "f53b8aef51bbbfd5d17fc2c96618b6f3ff284c19" }
+gpui = { git = "https://github.com/ogdakke/zed", rev = "f53b8aef51bbbfd5d17fc2c96618b6f3ff284c19" }
+gpui_linux = { git = "https://github.com/ogdakke/zed", rev = "f53b8aef51bbbfd5d17fc2c96618b6f3ff284c19" }
+gpui_macos = { git = "https://github.com/ogdakke/zed", rev = "f53b8aef51bbbfd5d17fc2c96618b6f3ff284c19" }
+gpui_macros = { git = "https://github.com/ogdakke/zed", rev = "f53b8aef51bbbfd5d17fc2c96618b6f3ff284c19" }
+gpui_platform = { git = "https://github.com/ogdakke/zed", rev = "f53b8aef51bbbfd5d17fc2c96618b6f3ff284c19" }
+gpui_shared_string = { git = "https://github.com/ogdakke/zed", rev = "f53b8aef51bbbfd5d17fc2c96618b6f3ff284c19" }
+gpui_tokio = { git = "https://github.com/ogdakke/zed", rev = "f53b8aef51bbbfd5d17fc2c96618b6f3ff284c19" }
+gpui_util = { git = "https://github.com/ogdakke/zed", rev = "f53b8aef51bbbfd5d17fc2c96618b6f3ff284c19" }
+gpui_web = { git = "https://github.com/ogdakke/zed", rev = "f53b8aef51bbbfd5d17fc2c96618b6f3ff284c19" }
+gpui_wgpu = { git = "https://github.com/ogdakke/zed", rev = "f53b8aef51bbbfd5d17fc2c96618b6f3ff284c19" }
+gpui_windows = { git = "https://github.com/ogdakke/zed", rev = "f53b8aef51bbbfd5d17fc2c96618b6f3ff284c19" }
+http_client = { git = "https://github.com/ogdakke/zed", rev = "f53b8aef51bbbfd5d17fc2c96618b6f3ff284c19" }
+media = { git = "https://github.com/ogdakke/zed", rev = "f53b8aef51bbbfd5d17fc2c96618b6f3ff284c19" }
+refineable = { git = "https://github.com/ogdakke/zed", rev = "f53b8aef51bbbfd5d17fc2c96618b6f3ff284c19" }
+scheduler = { git = "https://github.com/ogdakke/zed", rev = "f53b8aef51bbbfd5d17fc2c96618b6f3ff284c19" }
+sum_tree = { git = "https://github.com/ogdakke/zed", rev = "f53b8aef51bbbfd5d17fc2c96618b6f3ff284c19" }
+util_macros = { git = "https://github.com/ogdakke/zed", rev = "f53b8aef51bbbfd5d17fc2c96618b6f3ff284c19" }
