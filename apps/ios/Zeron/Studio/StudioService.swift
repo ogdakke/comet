@@ -146,6 +146,18 @@ final class StudioService {
         let _: JSONValue? = try? await call(deviceId, "MarkStudioConversationSeen", ["conversationId": threadId])
     }
 
+    func renameStudioThread(deviceId: String, threadId: String, title: String) async throws {
+        let _: StudioThreadSummary = try await call(deviceId, "RenameStudioConversation", ["conversationId": threadId, "title": title])
+    }
+
+    func archiveStudioThread(deviceId: String, threadId: String, archived: Bool) async throws {
+        let _: StudioThreadSummary = try await call(deviceId, "ArchiveStudioConversation", ["conversationId": threadId, "archived": archived])
+    }
+
+    func deleteStudioThread(deviceId: String, threadId: String) async throws {
+        let _: JSONValue = try await call(deviceId, "DeleteStudioConversation", ["conversationId": threadId])
+    }
+
     func deleteStudioArtifact(deviceId: String, artifactId: String) async throws {
         struct Response: Decodable { let ok: Bool }
         let response: Response = try await call(deviceId, "DeleteStudioArtifact", ["artifactId": artifactId])

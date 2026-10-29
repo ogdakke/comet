@@ -109,10 +109,15 @@ final class StudioBrowserStore {
             )
             for try await response in stream {
                 guard !Task.isCancelled, selectedDeviceId == deviceId else { return }
-                threads = response.conversations.sorted {
-                    if $0.updatedDate != $1.updatedDate { return $0.updatedDate > $1.updatedDate }
-                    return $0.id < $1.id
-                }
+                // Each date parsed once, not twice per comparison.
+                let sorted = response.conversations.map { ($0.updatedDate, $0) }
+                    .sorted {
+                        if $0.0 != $1.0 { return $0.0 > $1.0 }
+                        return $0.1.id < $1.1.id
+                    }
+                    .map(\.1)
+                // Observation fires on every set: the list re-diffs otherwise.
+                if threads != sorted { threads = sorted }
                 threadsLoading = false
             }
             // The desktop closed the stream (its engine restarted): stop

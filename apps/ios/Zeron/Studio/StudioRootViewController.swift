@@ -21,7 +21,10 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
     private var watches: [Task<Void, Never>] = []
     /// Launch arguments for screenshots and profiling: `-studio-threads`
     /// (the Threads list), `-studio-thread` (open the newest thread),
-    /// `-studio-viewer` (open the newest creation). Each runs once.
+    /// `-studio-viewer` (open the newest creation). Each runs once. With
+    /// `-studio-thread`: `-studio-thread-match <text>` picks the thread by
+    /// title, and the thread screen's own steps (`-studio-thread-top`,
+    /// `-studio-thread-tile`, `-studio-thread-compose`) run on it.
     /// `-studio-bench` flings the gallery through the whole library and
     /// writes `Documents/studio-bench.json`.
     private var launchSteps = Set(["-studio-threads", "-studio-thread", "-studio-viewer", "-studio-bench"]
@@ -173,8 +176,14 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
     private func runLaunchSteps() {
         guard !launchSteps.isEmpty else { return }
         if launchSteps.remove("-studio-threads") != nil { mode = .threads }
+        // `-studio-thread-match <text>`: the first thread whose title has it
+        // (archived ones too), instead of the newest.
+        let arguments = ProcessInfo.processInfo.arguments
+        let match = arguments.firstIndex(of: "-studio-thread-match")
+            .flatMap { arguments.indices.contains($0 + 1) ? arguments[$0 + 1] : nil }
         if launchSteps.contains("-studio-thread"),
-           let thread = browser.threads.first(where: { !$0.archived }) {
+           let thread = match.map({ text in browser.threads.first { $0.title.localizedCaseInsensitiveContains(text) } })
+            ?? browser.threads.first(where: { !$0.archived }) {
             launchSteps.remove("-studio-thread")
             DispatchQueue.main.async { self.pushThread(thread.id) }
         }

@@ -69,11 +69,17 @@ struct StudioArtifact: Codable, Hashable, Identifiable {
 struct StudioRunModel: Codable, Hashable {
     var id: String
     var displayName: String
+    /// What it makes: a creating run's tiles say image or video.
+    var outputKind: StudioMediaKind?
+
+    var isVideo: Bool { outputKind == .video }
 
     private enum CodingKeys: String, CodingKey {
         case id
         case displayName
         case legacyDisplayName = "display_name"
+        case outputKind = "output_kind"
+        case camelOutputKind = "outputKind"
     }
 
     init(from decoder: Decoder) throws {
@@ -84,12 +90,16 @@ struct StudioRunModel: Codable, Hashable {
         } else {
             displayName = try container.decode(String.self, forKey: .legacyDisplayName)
         }
+        // Lenient: an unknown kind mustn't fail the whole thread's decode.
+        outputKind = (try? container.decodeIfPresent(StudioMediaKind.self, forKey: .outputKind))
+            ?? (try? container.decodeIfPresent(StudioMediaKind.self, forKey: .camelOutputKind))
     }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(id, forKey: .id)
         try container.encode(displayName, forKey: .displayName)
+        try container.encodeIfPresent(outputKind, forKey: .outputKind)
     }
 }
 
@@ -102,6 +112,15 @@ struct StudioRun: Codable, Hashable, Identifiable {
     var progress: Float?
     var error: String?
     var artifacts: [StudioArtifact]
+    /// How many it was asked for: a creating run shows that many tiles.
+    var outputCount: UInt32?
+    /// `[width, height]` the outputs are shaped to (the requested aspect).
+    var displayAspectRatio: [UInt32]?
+
+    var displayAspect: CGFloat? {
+        guard let ratio = displayAspectRatio, ratio.count == 2, ratio[0] > 0, ratio[1] > 0 else { return nil }
+        return CGFloat(ratio[0]) / CGFloat(ratio[1])
+    }
 }
 
 struct StudioTurn: Codable, Hashable, Identifiable {

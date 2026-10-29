@@ -731,7 +731,8 @@ final class StudioGalleryCell: UICollectionViewCell {
         requestActive = false
     }
 
-    private static func duration(_ seconds: Double?) -> String {
+    /// "0:05", "1:02:05"; "Video" when the length isn't known yet.
+    static func duration(_ seconds: Double?) -> String {
         guard let seconds, seconds.isFinite else { return "Video" }
         let total = max(0, Int(seconds.rounded()))
         let (hours, minutes) = (total / 3600, total / 60 % 60)

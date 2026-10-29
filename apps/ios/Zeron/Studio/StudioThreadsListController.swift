@@ -41,6 +41,9 @@ final class StudioThreadsListController: UIViewController, UICollectionViewDeleg
         config.backgroundColor = .clear
         // As the Sessions list: rows on the page, a rounded fill when pressed.
         config.showsSeparators = false
+        config.trailingSwipeActionsConfigurationProvider = { [weak self] indexPath in
+            self?.swipeActions(at: indexPath)
+        }
         collectionView = UICollectionView(frame: view.bounds, collectionViewLayout: UICollectionViewCompositionalLayout.list(using: config))
         collectionView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         collectionView.backgroundColor = .clear
@@ -76,6 +79,20 @@ final class StudioThreadsListController: UIViewController, UICollectionViewDeleg
         loadingView.frame = view.bounds
         loadingView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         view.addSubview(loadingView)
+    }
+
+    /// "3 minutes ago" went stale while a thread was on top.
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        reconfigureAll()
+    }
+
+    private func reconfigureAll() {
+        guard let dataSource else { return }
+        var snapshot = dataSource.snapshot()
+        guard !snapshot.itemIdentifiers.isEmpty else { return }
+        snapshot.reconfigureItems(snapshot.itemIdentifiers)
+        dataSource.apply(snapshot, animatingDifferences: false)
     }
 
     /// Tracks the store: reads here re-run this when they change.
@@ -139,6 +156,35 @@ final class StudioThreadsListController: UIViewController, UICollectionViewDeleg
         dataSource.apply(section, to: 0, animatingDifferences: true)
     }
 
+    // MARK: Thread actions
+
+    private func swipeActions(at indexPath: IndexPath) -> UISwipeActionsConfiguration? {
+        guard case let .thread(id)? = dataSource.itemIdentifier(for: indexPath),
+              let thread = rows[id]?.thread else { return nil }
+        let delete = UIContextualAction(style: .destructive, title: "Delete") { [weak self] _, _, done in
+            guard let self else { return done(false) }
+            StudioThreadActions.confirmDelete(thread, from: self, browser: self.browser, service: self.service) { done($0) }
+        }
+        delete.image = UIImage(systemName: "trash")
+        let archive = UIContextualAction(style: .normal, title: thread.archived ? "Unarchive" : "Archive") { [weak self] _, _, done in
+            guard let self else { return done(false) }
+            StudioThreadActions.setArchived(!thread.archived, thread, from: self, browser: self.browser, service: self.service)
+            done(true)
+        }
+        archive.image = UIImage(systemName: thread.archived ? "tray.and.arrow.up" : "archivebox")
+        archive.backgroundColor = Palette.secondary
+        return UISwipeActionsConfiguration(actions: [delete, archive])
+    }
+
+    func collectionView(_ collectionView: UICollectionView, contextMenuConfigurationForItemsAt indexPaths: [IndexPath], point: CGPoint) -> UIContextMenuConfiguration? {
+        guard indexPaths.count == 1, case let .thread(id)? = dataSource.itemIdentifier(for: indexPaths[0]),
+              let thread = rows[id]?.thread else { return nil }
+        return UIContextMenuConfiguration(actionProvider: { [weak self] _ in
+            guard let self else { return nil }
+            return UIMenu(children: StudioThreadActions.menuElements(for: thread, from: self, browser: self.browser, service: self.service))
+        })
+    }
+
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
         collectionView.deselectItem(at: indexPath, animated: true)
         switch dataSource.itemIdentifier(for: indexPath) {
@@ -188,12 +234,22 @@ private final class StudioThreadCell: UICollectionViewListCell {
         emptyPreview.addSubview(emptyGlyph)
         previewSlot.addSubview(emptyPreview)
 
-        titleLabel.font = Fonts.ui(.sansMedium, 14)
-        metaLabel.font = Fonts.ui(.sans, 11)
+        titleLabel.font = UIFontMetrics(forTextStyle: .body).scaledFont(for: Fonts.ui(.sansMedium, 14))
+        metaLabel.font = UIFontMetrics(forTextStyle: .footnote).scaledFont(for: Fonts.ui(.sans, 11))
         metaLabel.textColor = Palette.color(.textFaint)
         let text = UIStackView(arrangedSubviews: [titleLabel, metaLabel])
         text.axis = .vertical
         text.spacing = 4
+        // The text column takes the row's width; the status hugs the
+        // trailing edge (the labels inside both stacks decide this, not
+        // the stacks' own priorities).
+        for label in [titleLabel, metaLabel] {
+            label.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            label.adjustsFontForContentSizeCategory = true
+        }
+        statusLabel.setContentHuggingPriority(.required, for: .horizontal)
+        statusLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
         spinner.transform = CGAffineTransform(scaleX: 0.7, y: 0.7)
         spinner.color = Palette.secondary
@@ -273,5 +329,122 @@ private final class StudioThreadCell: UICollectionViewListCell {
         accessibilityValue = [metaLabel.text, status.isHidden ? nil : statusLabel.text, thread.archived ? "Archived" : nil]
             .compactMap { $0 }.joined(separator: ", ")
         accessibilityIdentifier = "studio-thread-\(thread.id)"
+    }
+}
+
+/// Rename, archive and delete for one thread: the list's swipes and menus,
+/// and the thread screen's ⋯ menu.
+@MainActor
+enum StudioThreadActions {
+    static func menuElements(
+        for thread: StudioThreadSummary,
+        from host: UIViewController,
+        browser: StudioBrowserStore,
+        service: StudioService,
+        deleted: (() -> Void)? = nil
+    ) -> [UIMenuElement] {
+        [
+            UIAction(title: "Rename", image: UIImage(systemName: "pencil")) { [weak host] _ in
+                guard let host else { return }
+                rename(thread, from: host, browser: browser, service: service)
+            },
+            UIAction(
+                title: thread.archived ? "Unarchive" : "Archive",
+                image: UIImage(systemName: thread.archived ? "tray.and.arrow.up" : "archivebox")
+            ) { [weak host] _ in
+                guard let host else { return }
+                setArchived(!thread.archived, thread, from: host, browser: browser, service: service)
+            },
+            UIMenu(options: .displayInline, children: [
+                UIAction(title: "Delete Thread", image: UIImage(systemName: "trash"), attributes: .destructive) { [weak host] _ in
+                    guard let host else { return }
+                    confirmDelete(thread, from: host, browser: browser, service: service) { if $0 { deleted?() } }
+                },
+            ]),
+        ]
+    }
+
+    static func rename(_ thread: StudioThreadSummary, from host: UIViewController, browser: StudioBrowserStore, service: StudioService) {
+        guard let deviceId = browser.selectedDeviceId else { return }
+        let alert = UIAlertController(title: "Rename Thread", message: nil, preferredStyle: .alert)
+        alert.addTextField { field in
+            field.text = thread.title
+            field.placeholder = "Title"
+            field.clearButtonMode = .whileEditing
+            field.autocapitalizationType = .sentences
+            field.returnKeyType = .done
+        }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        let save = UIAlertAction(title: "Rename", style: .default) { [weak host, weak alert] _ in
+            let title = alert?.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !title.isEmpty, title != thread.title else { return }
+            Task {
+                do {
+                    try await service.renameStudioThread(deviceId: deviceId, threadId: thread.id, title: String(title.prefix(200)))
+                } catch {
+                    showFailure(error, from: host)
+                }
+            }
+        }
+        alert.addAction(save)
+        alert.preferredAction = save
+        present(alert, from: host)
+    }
+
+    static func setArchived(_ archived: Bool, _ thread: StudioThreadSummary, from host: UIViewController, browser: StudioBrowserStore, service: StudioService) {
+        guard let deviceId = browser.selectedDeviceId else { return }
+        Task { [weak host] in
+            do {
+                try await service.archiveStudioThread(deviceId: deviceId, threadId: thread.id, archived: archived)
+            } catch {
+                showFailure(error, from: host)
+            }
+        }
+    }
+
+    /// `completion(true)` once it's gone from the desktop.
+    static func confirmDelete(
+        _ thread: StudioThreadSummary,
+        from host: UIViewController,
+        browser: StudioBrowserStore,
+        service: StudioService,
+        completion: @escaping (Bool) -> Void
+    ) {
+        guard let deviceId = browser.selectedDeviceId else { return completion(false) }
+        let desktop = service.hosts.first { $0.id == deviceId }?.name ?? "the desktop"
+        let title = thread.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sheet = UIAlertController(
+            title: title.isEmpty ? "Delete this thread?" : "Delete “\(title)”?",
+            message: "Its prompts and everything it made are removed from Studio on \(desktop). This can't be undone.",
+            preferredStyle: .alert
+        )
+        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in completion(false) })
+        sheet.addAction(UIAlertAction(title: "Delete", style: .destructive) { [weak host] _ in
+            Task {
+                do {
+                    try await service.deleteStudioThread(deviceId: deviceId, threadId: thread.id)
+                    completion(true)
+                } catch {
+                    completion(false)
+                    showFailure(error, from: host)
+                }
+            }
+        })
+        present(sheet, from: host)
+    }
+
+    private static func showFailure(_ error: Error, from host: UIViewController?) {
+        guard let host else { return }
+        let alert = UIAlertController(title: "Studio action failed", message: error.localizedDescription, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        present(alert, from: host)
+    }
+
+    /// Over whatever is already up from `host`.
+    private static func present(_ controller: UIViewController, from host: UIViewController) {
+        guard host.viewIfLoaded?.window != nil else { return }
+        var top = host
+        while let presented = top.presentedViewController { top = presented }
+        top.present(controller, animated: true)
     }
 }
