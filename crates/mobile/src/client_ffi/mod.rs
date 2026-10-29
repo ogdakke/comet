@@ -16,6 +16,8 @@ pub(crate) mod companions;
 mod providers;
 pub use providers::UsageWindowInfo;
 mod session;
+mod studio;
+pub use studio::*;
 mod voice;
 pub use voice::*;
 mod types;

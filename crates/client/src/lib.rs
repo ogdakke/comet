@@ -41,6 +41,7 @@ pub mod providers;
 pub mod rpc;
 pub mod runtime;
 pub mod session;
+pub mod studio;
 pub mod subagents;
 pub mod terminal;
 pub mod workspace;
@@ -60,6 +61,7 @@ pub use session::{
     QueueEditFinish, QueueEditLease, QueueEditStart, QueueGate, QueueItem, RoomState, SendOutcome,
     SendRequest, SessionHandle, SessionSnapshot, SnapshotDelta, SnapshotWatch,
 };
+pub use studio::{StudioSink, StudioWatch};
 pub use subagents::{SubagentInfo, SubagentSink, SubagentState, SubagentWatch};
 pub use terminal::{TerminalInfo, TerminalLink, TerminalReplies, TerminalSink, TerminalUpdate};
 pub use workspace::{

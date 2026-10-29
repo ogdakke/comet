@@ -180,6 +180,7 @@ fn gallery_items_use_camel_case_wire_shape() {
             source_artifact_id: None,
             duration_seconds: None,
         }],
+        next_cursor: None,
     };
     let json = serde_json::to_value(response).unwrap();
     assert!(json["artifacts"][0].get("conversationId").is_some());

@@ -1,10 +1,11 @@
 import UIKit
 
-/// Root on iPhone: the Sessions list, with a Liquid Glass bottom bar of
-/// native toolbar items — Settings, Search (the system's toolbar-integrated
-/// field), voice, and New session — instead of tabs. A plain container for
-/// the Sessions navigation stack: a hidden tab bar came back on device
-/// whenever a screen that hides the bottom bar was popped.
+/// Root on iPhone: the Sessions list, with Settings at the top left and a
+/// Liquid Glass bottom bar of native toolbar items — Studio, Search (the
+/// system's toolbar-integrated field), voice, and New session — instead of
+/// tabs. A plain container for the Sessions navigation stack: a hidden tab
+/// bar came back on device whenever a screen that hides the bottom bar was
+/// popped.
 final class MainTabController: UIViewController, AppRouter {
     private let app: AppModel
 
@@ -37,6 +38,7 @@ final class MainTabController: UIViewController, AppRouter {
 
     private func sessionsNav() -> UINavigationController {
         sessionsList.enableToolbarSearch()
+        sessionsList.navigationItem.leftBarButtonItem = settingsItem
         updateBottomBar()
         let nav = Self.nav(sessionsList)
         nav.isToolbarHidden = false
@@ -48,6 +50,13 @@ final class MainTabController: UIViewController, AppRouter {
         let item = UIBarButtonItem(image: UIImage(systemName: "gearshape"), primaryAction: UIAction { [weak self] _ in self?.showSettings() })
         item.accessibilityLabel = "Settings"
         item.accessibilityIdentifier = "bottom-settings"
+        return item
+    }()
+
+    private lazy var studioItem: UIBarButtonItem = {
+        let item = UIBarButtonItem(image: UIImage(systemName: "photo.stack"), primaryAction: UIAction { [weak self] _ in self?.showStudio() })
+        item.accessibilityLabel = "Studio"
+        item.accessibilityIdentifier = "bottom-studio"
         return item
     }()
 
@@ -70,7 +79,7 @@ final class MainTabController: UIViewController, AppRouter {
         return item
     }()
 
-    /// The bar: Settings · Search · voice (when a host can run it, or a call
+    /// The bar: Studio · Search · voice (when a host can run it, or a call
     /// is live) · New session. Rebuilt only when what it shows changes (the
     /// voice observer also fires for audio levels mid-call).
     private var shownBar: (live: Bool, voice: Bool)?
@@ -86,7 +95,7 @@ final class MainTabController: UIViewController, AppRouter {
         // Holding the live call must not offer to change its host.
         voiceItem.menu = state.live ? nil : voiceMenu(app: app)
         // Fixed spaces split the glass: each control its own shape.
-        var items: [UIBarButtonItem] = [settingsItem, .fixedSpace(0), sessionsList.navigationItem.searchBarPlacementBarButtonItem, .fixedSpace(0)]
+        var items: [UIBarButtonItem] = [studioItem, .fixedSpace(0), sessionsList.navigationItem.searchBarPlacementBarButtonItem, .fixedSpace(0)]
         if state.voice { items += [voiceItem, .fixedSpace(0)] }
         items.append(composeItem)
         // `viewIfLoaded`: loading the list outside its nav controller lays it
@@ -134,6 +143,21 @@ final class MainTabController: UIViewController, AppRouter {
         let more = MoreViewController(app: app)
         more.hidesBottomBarWhenPushed = true
         nav.pushViewController(more, animated: true)
+    }
+
+    /// Studio's library over the list (the bottom bar steps aside); back to
+    /// it as it was when it's already on the stack.
+    func showStudio() {
+        if presentedViewController != nil { dismiss(animated: false) }
+        if let studio = nav.viewControllers.first(where: { $0 is StudioRootViewController }) {
+            nav.popToViewController(studio, animated: true)
+            return
+        }
+        guard let client = app.client else { return }
+        nav.popToRootViewController(animated: false)
+        let studio = StudioRootViewController(app: app, service: StudioService(client: client))
+        studio.hidesBottomBarWhenPushed = true
+        nav.pushViewController(studio, animated: true)
     }
 
     func showSearch() {

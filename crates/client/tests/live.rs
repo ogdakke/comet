@@ -629,6 +629,18 @@ impl zeron_rpc::RpcService for HostService {
                 );
                 return Ok(RpcReply::Stream(Box::pin(stream)));
             }
+            m::LIST_STUDIO_MODELS => {
+                json!({ "providerId": params["providerId"], "models": [{ "id": "flux" }] })
+            }
+            m::WATCH_STUDIO_GALLERY => {
+                let page = |n: u64| json!({ "artifacts": [], "limit": n });
+                let limit = params["limit"].as_u64().unwrap_or(0);
+                let stream = futures::StreamExt::chain(
+                    futures::stream::iter([page(limit), page(limit + 1)]),
+                    futures::stream::pending(),
+                );
+                return Ok(RpcReply::Stream(Box::pin(stream)));
+            }
             other => return Err(zeron_rpc::RpcError::UnknownMethod(other.to_owned())),
         };
         Ok(RpcReply::Value(value))
@@ -1113,4 +1125,89 @@ async fn stalled_wakes_yield_delivery_capacity_to_later_chats() {
         "yielding must preserve the stalled obligation"
     );
     client.shutdown();
+}
+
+/// Studio calls and watches pass through to the host as JSON; anything
+/// outside Studio's methods is refused before it reaches the relay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn studio_rides_the_device_relay() {
+    let edge = MockEdge::start().await;
+    let _host = HostRegistry::start(&edge).await;
+    let _relay = zeron_rpc::HostRelay::spawn(
+        zeron_rpc::HostRelayConfig::new(
+            edge.edge_url(),
+            HOST,
+            Arc::new(zeron_rpc::StaticToken("t".into())),
+        ),
+        Arc::new(HostService::default()),
+        Arc::new(|_| true),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let client = phone(&edge, dir.path());
+    let start = Instant::now();
+    while !(edge.relay_host_connected(HOST)
+        && client.workspace().device(HOST).is_some_and(|d| d.online))
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "host never reachable"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let c = client.clone();
+    let reply = zeron_client::runtime::run(async move {
+        c.studio_call(HOST, "ListStudioModels", r#"{"providerId":"venice"}"#)
+            .await
+    })
+    .await
+    .unwrap();
+    let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(reply["providerId"], "venice");
+    assert_eq!(reply["models"][0]["id"], "flux");
+
+    let c = client.clone();
+    let refused =
+        zeron_client::runtime::run(async move { c.studio_call(HOST, "ListFolders", "{}").await })
+            .await;
+    assert!(
+        matches!(refused, Err(zeron_client::ClientError::InvalidArgument(_))),
+        "{refused:?}"
+    );
+    assert!(matches!(
+        client.watch_studio(HOST, "ListStudioModels", "{}", Arc::new(Items::default())),
+        Err(zeron_client::ClientError::InvalidArgument(_))
+    ));
+
+    let items = Arc::new(Items::default());
+    let watch = client
+        .watch_studio(HOST, "WatchStudioGallery", r#"{"limit":60}"#, items.clone())
+        .unwrap();
+    wait_for("both gallery pages", Duration::from_secs(10), || {
+        items.0.lock().unwrap().len() == 2
+    });
+    let limits: Vec<u64> = items
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|json| {
+            serde_json::from_str::<serde_json::Value>(json).unwrap()["limit"]
+                .as_u64()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(limits, [60, 61]);
+    drop(watch);
+}
+
+#[derive(Default)]
+struct Items(Mutex<Vec<String>>);
+
+impl zeron_client::StudioSink for Items {
+    fn item(&self, json: String) {
+        self.0.lock().unwrap().push(json);
+    }
+
+    fn ended(&self, _error: Option<String>) {}
 }

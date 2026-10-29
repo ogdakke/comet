@@ -1421,6 +1421,17 @@ public protocol CoreClientProtocol: AnyObject, Sendable {
     func setHarnessEnabled(deviceId: String, harness: String, enabled: Bool) async throws  -> [HarnessInfo]
     
     /**
+     * One Studio RPC on `device_id`'s engine. `params_json` is a JSON
+     * object; returns the reply's JSON.
+     */
+    func studioCall(deviceId: String, method: String, paramsJson: String) async throws  -> String
+    
+    /**
+     * Follow a `WatchStudio*` stream on `device_id`'s engine.
+     */
+    func studioWatch(deviceId: String, method: String, paramsJson: String, sink: StudioStreamSink) throws  -> StudioStream
+    
+    /**
      * Returns immediately. Callbacks are dispatched on the core runtime; the
      * platform must hop to its media/UI executor and call complete_media.
      */
@@ -2881,6 +2892,42 @@ open func setHarnessEnabled(deviceId: String, harness: String, enabled: Bool)asy
             liftFunc: FfiConverterSequenceTypeHarnessInfo.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
+}
+    
+    /**
+     * One Studio RPC on `device_id`'s engine. `params_json` is a JSON
+     * object; returns the reply's JSON.
+     */
+open func studioCall(deviceId: String, method: String, paramsJson: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_zeron_mobile_fn_method_coreclient_studio_call(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(deviceId),FfiConverterString.lower(method),FfiConverterString.lower(paramsJson)
+                )
+            },
+            pollFunc: ffi_zeron_mobile_rust_future_poll_rust_buffer,
+            completeFunc: ffi_zeron_mobile_rust_future_complete_rust_buffer,
+            freeFunc: ffi_zeron_mobile_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Follow a `WatchStudio*` stream on `device_id`'s engine.
+     */
+open func studioWatch(deviceId: String, method: String, paramsJson: String, sink: StudioStreamSink)throws  -> StudioStream  {
+    return try  FfiConverterTypeStudioStream_lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+        uniffiCallStatus in
+    uniffi_zeron_mobile_fn_method_coreclient_studio_watch(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(deviceId),
+        FfiConverterString.lower(method),
+        FfiConverterString.lower(paramsJson),
+        FfiConverterTypeStudioStreamSink_lower(sink),uniffiCallStatus
+    )
+})
 }
     
     /**
@@ -4419,6 +4466,379 @@ public func FfiConverterTypeSessionHandle_lift(_ handle: UInt64) throws -> Sessi
 #endif
 public func FfiConverterTypeSessionHandle_lower(_ value: SessionHandle) -> UInt64 {
     return FfiConverterTypeSessionHandle.lower(value)
+}
+
+
+
+
+
+
+/**
+ * A live Studio stream; `cancel()` (or dropping it) stops it.
+ */
+public protocol StudioStreamProtocol: AnyObject, Sendable {
+    
+    func cancel() 
+    
+}
+/**
+ * A live Studio stream; `cancel()` (or dropping it) stops it.
+ */
+open class StudioStream: StudioStreamProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_zeron_mobile_fn_clone_studiostream(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_zeron_mobile_fn_free_studiostream(handle, $0) }
+    }
+
+    
+
+    
+open func cancel()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_zeron_mobile_fn_method_studiostream_cancel(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeStudioStream: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = StudioStream
+
+    public static func lift(_ handle: UInt64) throws -> StudioStream {
+        return StudioStream(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: StudioStream) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StudioStream {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: StudioStream, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStudioStream_lift(_ handle: UInt64) throws -> StudioStream {
+    return try FfiConverterTypeStudioStream.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStudioStream_lower(_ value: StudioStream) -> UInt64 {
+    return FfiConverterTypeStudioStream.lower(value)
+}
+
+
+
+
+
+
+/**
+ * Receives one Studio stream. Called on a client thread.
+ */
+public protocol StudioStreamSink: AnyObject, Sendable {
+    
+    /**
+     * The next item, as JSON.
+     */
+    func onItem(json: String) 
+    
+    /**
+     * The stream ended: `None` when the host closed it, else why it failed.
+     */
+    func onEnd(error: String?) 
+    
+}
+/**
+ * Receives one Studio stream. Called on a client thread.
+ */
+open class StudioStreamSinkImpl: StudioStreamSink, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_zeron_mobile_fn_clone_studiostreamsink(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_zeron_mobile_fn_free_studiostreamsink(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * The next item, as JSON.
+     */
+open func onItem(json: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_zeron_mobile_fn_method_studiostreamsink_on_item(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(json),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * The stream ended: `None` when the host closed it, else why it failed.
+     */
+open func onEnd(error: String?)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_zeron_mobile_fn_method_studiostreamsink_on_end(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionString.lower(error),uniffiCallStatus
+    )
+}
+}
+    
+
+    
+}
+
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceStudioStreamSink {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceStudioStreamSink = UniffiVTableCallbackInterfaceStudioStreamSink(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterTypeStudioStreamSink.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface StudioStreamSink: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterTypeStudioStreamSink.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface StudioStreamSink: handle missing in uniffiClone")
+            }
+        },
+        onItem: { (
+            uniffiHandle: UInt64,
+            json: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStudioStreamSink.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onItem(
+                     json: try FfiConverterString.lift(json)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onEnd: { (
+            uniffiHandle: UInt64,
+            error: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeStudioStreamSink.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onEnd(
+                     error: try FfiConverterOptionString.lift(error)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        }
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    //
+    // `nonisolated(unsafe)` is needed under Swift 6 strict concurrency.
+    // This is safe because the pointee is initialized once during static init
+    // and never mutated by either side of the FFI.  Its fields are C function pointers.
+    nonisolated(unsafe) static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceStudioStreamSink> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceStudioStreamSink>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
+}
+
+private func uniffiCallbackInitStudioStreamSink() {
+    uniffi_zeron_mobile_fn_init_callback_vtable_studiostreamsink(UniffiCallbackInterfaceStudioStreamSink.vtablePtr)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeStudioStreamSink: FfiConverter {
+    fileprivate static let handleMap = UniffiHandleMap<StudioStreamSink>()
+
+    typealias FfiType = UInt64
+    typealias SwiftType = StudioStreamSink
+
+    public static func lift(_ handle: UInt64) throws -> StudioStreamSink {
+        if ((handle & 1) == 0) {
+            // Rust-generated handle, construct a new class that uses the handle to implement the
+            // interface
+            return StudioStreamSinkImpl(unsafeFromHandle: handle)
+        } else {
+            // Swift-generated handle, get the object from the handle map
+            return try handleMap.remove(handle: handle)
+        }
+    }
+
+    public static func lower(_ value: StudioStreamSink) -> UInt64 {
+         if let rustImpl = value as? StudioStreamSinkImpl {
+             // Rust-implemented object.  Clone the handle and return it
+            return rustImpl.uniffiCloneHandle()
+         } else {
+            // Swift object, generate a new vtable handle and return that.
+            return handleMap.insert(obj: value)
+         }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StudioStreamSink {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: StudioStreamSink, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStudioStreamSink_lift(_ handle: UInt64) throws -> StudioStreamSink {
+    return try FfiConverterTypeStudioStreamSink.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStudioStreamSink_lower(_ value: StudioStreamSink) -> UInt64 {
+    return FfiConverterTypeStudioStreamSink.lower(value)
 }
 
 
@@ -22123,6 +22543,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_zeron_mobile_checksum_method_coreclient_set_harness_enabled() != 59215) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_zeron_mobile_checksum_method_coreclient_studio_call() != 4244) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_coreclient_studio_watch() != 45837) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_zeron_mobile_checksum_method_coreclient_start_voice() != 62086) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -22196,6 +22622,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_sessionhandle_transcript_status() != 12910) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_studiostream_cancel() != 28260) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_studiostreamsink_on_item() != 18597) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_studiostreamsink_on_end() != 2345) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_voicecall_complete_media() != 130) {
@@ -22430,6 +22865,7 @@ private let initializationResult: InitializationResult = {
     uniffiCallbackInitClientListener()
     uniffiCallbackInitLayoutListener()
     uniffiCallbackInitPlatformMeasurer()
+    uniffiCallbackInitStudioStreamSink()
     uniffiCallbackInitTerminalListener()
     uniffiCallbackInitUploadProgress()
     uniffiCallbackInitVisualListener()

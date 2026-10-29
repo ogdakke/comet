@@ -6,6 +6,7 @@ protocol AppRouter: AnyObject {
     func openSession(_ chatId: String)
     func presentNewSession(prompt: String?)
     func showSettings()
+    func showStudio()
     func showSearch()
 }
 
@@ -179,6 +180,21 @@ final class SplitRootController: UISplitViewController, UISplitViewControllerDel
         present(nav, animated: true)
     }
 
+    /// Studio's library in the main column, in place of the session.
+    func showStudio() {
+        guard !isCollapsed else { return tabs.showStudio() }
+        if presentedViewController != nil { dismiss(animated: true) }
+        if detail.viewControllers.first is StudioRootViewController {
+            detail.popToRootViewController(animated: true)
+            return
+        }
+        guard let client = app.client else { return }
+        currentChatId = nil
+        sidebar.currentChatId = nil
+        hideCompanions()
+        detail.setViewControllers([StudioRootViewController(app: app, service: StudioService(client: client))], animated: false)
+    }
+
     func showSearch() {
         guard !isCollapsed else { return tabs.showSearch() }
         if displayMode == .secondaryOnly { show(.primary) }
@@ -350,8 +366,8 @@ final class SplitRootController: UISplitViewController, UISplitViewControllerDel
 
 /// The iPad sidebar: the phone's Sessions page in its own navigation stack
 /// (sections, folders, Archived push inside it), search in the bar, and
-/// the actions in a toolbar at the bottom: Settings and options on the
-/// left, new session on the right, within thumb reach.
+/// the actions in a toolbar at the bottom: Settings, options and Studio on
+/// the left, new session on the right, within thumb reach.
 final class SidebarViewController: UIViewController, UISearchResultsUpdating {
     private let app: AppModel
     private let list: SessionsViewController
@@ -411,6 +427,11 @@ final class SidebarViewController: UIViewController, UISearchResultsUpdating {
         settings.accessibilityIdentifier = "sidebar-settings"
         let options = UIBarButtonItem(image: UIImage(systemName: "ellipsis"), menu: list.optionsMenu())
         options.accessibilityLabel = "Options"
+        let studio = UIBarButtonItem(image: UIImage(systemName: "photo.stack"), primaryAction: UIAction { [weak self] _ in
+            self?.router?.showStudio()
+        })
+        studio.accessibilityLabel = "Studio"
+        studio.accessibilityIdentifier = "sidebar-studio"
         let compose = UIBarButtonItem(image: UIImage(systemName: "plus"), primaryAction: UIAction { [weak self] _ in
             self?.router?.presentNewSession(prompt: nil)
         })
@@ -424,14 +445,14 @@ final class SidebarViewController: UIViewController, UISearchResultsUpdating {
         probe.hidesSharedBackground = true
         probe.sharesBackground = false
         probe.isAccessibilityElement = false
-        list.toolbarItems = [settings, options, .flexibleSpace(), probe, compose]
+        list.toolbarItems = [settings, options, studio, .flexibleSpace(), probe, compose]
         nav.isToolbarHidden = false
         // Voice beside compose, once a host can run it.
         let voiceBar = VoiceBarItem(app: app, host: self)
         self.voiceBar = voiceBar
         let syncVoice = { [weak self, weak voiceBar] in
             guard let self, let voiceBar else { return }
-            let items = voiceBar.visible ? [settings, options, .flexibleSpace(), probe, voiceBar.item, compose] : [settings, options, .flexibleSpace(), probe, compose]
+            let items = voiceBar.visible ? [settings, options, studio, .flexibleSpace(), probe, voiceBar.item, compose] : [settings, options, studio, .flexibleSpace(), probe, compose]
             if self.list.toolbarItems?.count != items.count {
                 self.list.setToolbarItems(items, animated: self.view.window != nil)
             }

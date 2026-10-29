@@ -34,6 +34,10 @@ pub(crate) fn deadline(method: &str) -> Duration {
         methods::CREATE_WORKTREE => Duration::from_secs(120),
         methods::LIST_MODELS => Duration::from_secs(100),
         methods::UPLOAD_COMMIT => Duration::from_secs(150),
+        // The last slice hashes and commits the whole asset; a model list
+        // refresh asks the provider.
+        methods::IMPORT_STUDIO_ASSET => Duration::from_secs(150),
+        methods::LIST_STUDIO_MODELS => Duration::from_secs(100),
         _ => CALL_TIMEOUT,
     }
 }

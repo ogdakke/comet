@@ -49,11 +49,15 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         }
         if args.contains("-lab") {
             window.rootViewController = MainTabController.nav(TranscriptLabViewController())
+        } else if Self.studioViewerFixture {
+            #if DEBUG
+            window.rootViewController = StudioViewerFixtureHostController()
+            #endif
         } else {
             showRoot(animated: false)
         }
         window.makeKeyAndVisible()
-        if !args.contains("-lab") { shellShown() }
+        if !args.contains("-lab"), !Self.studioViewerFixture { shellShown() }
 
         #if DEBUG
         if args.contains("-voice-preview") {
@@ -73,6 +77,7 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
                 if route.hasPrefix("chat:") { router.openSession(String(route.dropFirst(5))) }
                 if route == "new" { router.presentNewSession(prompt: nil) }
                 if route == "more" { router.showSettings() }
+                if route == "studio" { router.showStudio() }
                 if route == "search" { router.showSearch() }
                 #if DEBUG
                 // Cloud screens straight away (screenshots, tests).
@@ -153,6 +158,16 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
     /// The signed-in shell is up: refresh this phone's notification
     /// registration and open a session a notification was tapped for.
+    /// `-studio-viewer-fixture`: the Studio viewer's profiling harness in
+    /// place of the app (debug builds).
+    private static var studioViewerFixture: Bool {
+        #if DEBUG
+        ProcessInfo.processInfo.arguments.contains("-studio-viewer-fixture")
+        #else
+        false
+        #endif
+    }
+
     private func shellShown() {
         guard app.isSignedIn else { return }
         if !app.isDemo { PushNotifications.shared.signedIn() }
