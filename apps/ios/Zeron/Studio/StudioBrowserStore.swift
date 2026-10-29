@@ -48,15 +48,23 @@ final class StudioBrowserStore {
             return
         }
         let remembered = UserDefaults.standard.string(forKey: "studioDeviceId")
-        selectedDeviceId = devices.first(where: { $0.id == remembered && online($0.id) })?.id
+        let pick = devices.first(where: { $0.id == remembered && online($0.id) })?.id
             ?? devices.first(where: { online($0.id) })?.id
             ?? devices.first?.id
+        // Picked for the user, not by them: not remembered.
+        if let pick { switchDevice(to: pick) }
     }
 
+    /// The user's pick: remembered for next time.
     func selectDevice(_ deviceId: String) {
+        UserDefaults.standard.set(deviceId, forKey: "studioDeviceId")
+        switchDevice(to: deviceId)
+    }
+
+    /// A new desktop: nothing of the old one's library or caches carries over.
+    private func switchDevice(to deviceId: String) {
         guard selectedDeviceId != deviceId else { return }
         selectedDeviceId = deviceId
-        UserDefaults.standard.set(deviceId, forKey: "studioDeviceId")
         threads = []
         gallery = []
         galleryCursor = nil
@@ -101,6 +109,11 @@ final class StudioBrowserStore {
                 }
                 threadsLoading = false
             }
+            // The desktop closed the stream (its engine restarted): stop
+            // waiting; an empty list shows why.
+            guard !Task.isCancelled, selectedDeviceId == deviceId else { return }
+            threadsLoading = false
+            if threads.isEmpty { threadsError = Self.streamClosed }
         } catch {
             guard !Task.isCancelled, selectedDeviceId == deviceId else { return }
             threadsLoading = false
@@ -135,12 +148,17 @@ final class StudioBrowserStore {
                 galleryCursor = response.nextCursor
                 galleryLoading = false
             }
+            guard !Task.isCancelled, selectedDeviceId == deviceId else { return }
+            galleryLoading = false
+            if gallery.isEmpty { galleryError = Self.streamClosed }
         } catch {
             guard !Task.isCancelled, selectedDeviceId == deviceId else { return }
             galleryLoading = false
             galleryError = error.localizedDescription
         }
     }
+
+    private static let streamClosed = "The desktop stopped sending updates."
 
     func loadMoreGallery(workspace: StudioService, deviceId: String) async {
         guard selectedDeviceId == deviceId,
@@ -326,6 +344,8 @@ final class StudioBrowserStore {
         deviceId: String,
         workspace: StudioService
     ) async -> UIImage? {
+        // A cached preview takes no hold, so there's none to release.
+        if let image = cachedPreview(artifactId: artifactId) { return image }
         let request = beginPreviewRequest(
             artifactId: artifactId,
             deviceId: deviceId,
