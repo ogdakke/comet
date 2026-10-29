@@ -61,6 +61,8 @@ final class StudioMediaPreviewView: UIView {
     /// The preview this view holds demand on, until it lands or is let go:
     /// a row scrolled away mustn't keep its relay read alive.
     private var requestedId: String?
+    /// The relayed preview is showing (not a thumbhash or the glyph).
+    private var loaded = false
 
     init(browser: StudioBrowserStore, service: StudioService) {
         self.browser = browser
@@ -100,11 +102,23 @@ final class StudioMediaPreviewView: UIView {
         transitionSource?.register(imageView, for: artifactId)
         self.transitionSource = transitionSource
         placeholder.image = UIImage(systemName: mediaKind == .video ? "film" : "photo")
-        guard self.artifactId != artifactId else { return }
+        let same = self.artifactId == artifactId
+        // The same artifact again: nothing to do unless its preview failed
+        // (retry) or it had nothing to show yet (a thumbhash may have come).
+        if same, loaded || requestedId != nil {
+            if imageView.image == nil { show(browser.thumbhashImage(thumbhash, aspectRatio: aspectRatio)) }
+            return
+        }
         self.artifactId = artifactId
-        endRequest()
-        if let cached = browser.cachedPreview(artifactId: artifactId) { return show(cached) }
-        show(browser.thumbhashImage(thumbhash, aspectRatio: aspectRatio))
+        if !same {
+            endRequest()
+            loaded = false
+        }
+        if let cached = browser.cachedPreview(artifactId: artifactId) {
+            loaded = true
+            return show(cached)
+        }
+        if !same || imageView.image == nil { show(browser.thumbhashImage(thumbhash, aspectRatio: aspectRatio)) }
         guard let deviceId = browser.selectedDeviceId else { return }
         // Not `browser.preview`: cancelling its caller leaves the read
         // running until it finishes on its own.
@@ -114,7 +128,9 @@ final class StudioMediaPreviewView: UIView {
             let image = await request.value
             guard !Task.isCancelled, let self, self.artifactId == artifactId else { return }
             self.endRequest()
-            if let image { self.show(image) }
+            guard let image else { return }
+            self.loaded = true
+            self.show(image)
         }
     }
 
@@ -123,6 +139,7 @@ final class StudioMediaPreviewView: UIView {
         endRequest()
         if let artifactId { transitionSource?.unregister(imageView, for: artifactId) }
         artifactId = nil
+        loaded = false
         show(nil)
     }
 

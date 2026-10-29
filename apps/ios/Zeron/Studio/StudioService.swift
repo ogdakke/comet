@@ -120,6 +120,13 @@ final class StudioService {
         return try await call(deviceId, "CreateStudioTurn", try Self.jsonObject(request))
     }
 
+    /// Run a failed run again; the host answers with the thread, the run
+    /// queued. `retryAnyway` for a run whose submission the host can't
+    /// confirm never reached the provider (it may bill twice).
+    func retryStudioRun(deviceId: String, runId: String, retryAnyway: Bool = false) async throws -> StudioThread {
+        try await call(deviceId, "RetryStudioRun", ["runId": runId, "retryAnyway": retryAnyway])
+    }
+
     func listStudioGalleryPage(
         deviceId: String,
         pageSize: Int,

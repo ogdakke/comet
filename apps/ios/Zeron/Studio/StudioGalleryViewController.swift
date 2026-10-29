@@ -59,7 +59,8 @@ final class StudioGalleryViewController: UIViewController,
             let columns = max(3, Int((width + Self.spacing) / 132))
             self?.columns = columns
             let side = floor((width - Self.spacing * CGFloat(columns - 1)) / CGFloat(columns))
-            let item = NSCollectionLayoutItem(layoutSize: .init(widthDimension: .fractionalWidth(1), heightDimension: .fractionalHeight(1)))
+            // The square itself: a full-width item would fill the row alone.
+            let item = NSCollectionLayoutItem(layoutSize: .init(widthDimension: .absolute(side), heightDimension: .absolute(side)))
             let group = NSCollectionLayoutGroup.horizontal(
                 layoutSize: .init(widthDimension: .fractionalWidth(1), heightDimension: .absolute(side)),
                 repeatingSubitem: item, count: columns

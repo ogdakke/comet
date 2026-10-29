@@ -27,6 +27,15 @@ private final class StudioThreadStore {
         thread = reply
     }
 
+    /// A retry's reply: the run queued again. Taken while what shows still
+    /// has it finished; once the watch shows it creating, the watch is newer.
+    func adoptRetry(_ reply: StudioThread, runId: String) {
+        guard reply.conversation.id == thread?.conversation.id,
+              let shown = thread?.turns.flatMap(\.runs).first(where: { $0.id == runId }),
+              !shown.state.isCreating else { return }
+        thread = reply
+    }
+
     func watch(service: StudioService, deviceId: String, threadId: String) async {
         loading = thread == nil
         var delay = Duration.seconds(1)
@@ -97,6 +106,8 @@ final class StudioThreadViewController: UIViewController, UICollectionViewDelega
     private var turns: [String: StudioTurn] = [:]
     private var runs: [String: (run: StudioRun, turn: StudioTurn)] = [:]
     private var artifacts: [String: (artifact: StudioArtifact, run: StudioRun, turn: StudioTurn)] = [:]
+    /// Runs whose retry is on its way: their row shows a spinner, not Retry.
+    private var retrying: Set<String> = []
 
     init(
         threadId: String,
@@ -287,6 +298,7 @@ final class StudioThreadViewController: UIViewController, UICollectionViewDelega
         if switched {
             store.reset()
             shown = nil
+            retrying = []
         }
         guard let deviceId else {
             store.loading = false
@@ -319,6 +331,8 @@ final class StudioThreadViewController: UIViewController, UICollectionViewDelega
             snapshot.appendItems([.prompt(turn.id)])
             for run in turn.runs.sorted(by: { $0.position < $1.position }) {
                 runs[run.id] = (run, turn)
+                // A retry is done once its run shows creating again.
+                if run.state.isCreating { retrying.remove(run.id) }
                 snapshot.appendSections([.run(run.id)])
                 snapshot.appendItems([.run(run.id)])
                 guard !run.artifacts.isEmpty else { continue }
@@ -434,8 +448,10 @@ final class StudioThreadViewController: UIViewController, UICollectionViewDelega
             cell.configure(prompt: self?.turns[turnId]?.prompt ?? "")
         }
         let runCells = UICollectionView.CellRegistration<StudioRunCell, String> { [weak self] cell, _, runId in
-            guard let run = self?.runs[runId]?.run else { return }
-            cell.configure(run)
+            guard let self, let run = self.runs[runId]?.run else { return }
+            cell.configure(run, retrying: self.retrying.contains(runId)) { [weak self] in
+                self?.retry(runId: runId)
+            }
         }
         let artifactCells = UICollectionView.CellRegistration<StudioArtifactCell, String> { [weak self] cell, _, artifactId in
             guard let self, let entry = self.artifacts[artifactId] else { return }
@@ -499,6 +515,74 @@ final class StudioThreadViewController: UIViewController, UICollectionViewDelega
                 UIPasteboard.general.string = prompt
             }])
         })
+    }
+
+    // MARK: Retry
+
+    /// Queues a failed or cancelled run again. The host refuses an uncertain
+    /// submission (interrupted mid-send: the provider may have the work)
+    /// until it's confirmed, since that can be charged twice.
+    private func retry(runId: String, anyway: Bool = false) {
+        guard !retrying.contains(runId), let deviceId = browser.selectedDeviceId else { return }
+        setRetrying(runId, true)
+        let service = service
+        Task { [weak self] in
+            do {
+                let thread = try await service.retryStudioRun(deviceId: deviceId, runId: runId, retryAnyway: anyway)
+                guard let self else { return }
+                self.store.adoptRetry(thread, runId: runId)
+                // Otherwise the row holds its spinner until the run shows
+                // creating (`apply`): no flash of Retry in between.
+                if self.store.thread?.turns.flatMap(\.runs).first(where: { $0.id == runId })?.state.isCreating != true {
+                    self.setRetrying(runId, false)
+                }
+            } catch {
+                guard let self else { return }
+                self.setRetrying(runId, false)
+                let message = error.localizedDescription
+                if !anyway, message.contains("explicit confirmation is required") {
+                    self.confirmUncertainRetry(runId: runId)
+                } else {
+                    self.showRetryFailure(message)
+                }
+            }
+        }
+    }
+
+    private func setRetrying(_ runId: String, _ on: Bool) {
+        guard (on ? retrying.insert(runId).inserted : retrying.remove(runId) != nil) else { return }
+        var snapshot = dataSource.snapshot()
+        guard snapshot.indexOfItem(.run(runId)) != nil else { return }
+        snapshot.reconfigureItems([.run(runId)])
+        dataSource.apply(snapshot, animatingDifferences: false)
+    }
+
+    private func confirmUncertainRetry(runId: String) {
+        let alert = UIAlertController(
+            title: "Retry anyway?",
+            message: "This run was interrupted while it was being sent, so the provider may already have it. Retrying could run it, and charge for it, twice.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Retry Anyway", style: .destructive) { [weak self] _ in
+            self?.retry(runId: runId, anyway: true)
+        })
+        presentOnTop(alert)
+    }
+
+    private func showRetryFailure(_ message: String) {
+        let alert = UIAlertController(title: "Couldn't retry", message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        presentOnTop(alert)
+    }
+
+    /// Over whatever is up (the viewer, a composer sheet); not at all once
+    /// this screen is gone.
+    private func presentOnTop(_ controller: UIViewController) {
+        guard viewIfLoaded?.window != nil || presentedViewController != nil else { return }
+        var host: UIViewController = self
+        while let presented = host.presentedViewController { host = presented }
+        host.present(controller, animated: true)
     }
 
     private func viewerArtifacts(in thread: StudioThread) -> [StudioArtifactDetail] {
@@ -644,6 +728,8 @@ private final class StudioRunCell: UICollectionViewCell {
     private let progress = UIProgressView(progressViewStyle: .default)
     private let error = UILabel()
     private let errorRow = UIStackView()
+    private let retryButton = UIButton(type: .system)
+    private var onRetry: (() -> Void)?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -654,7 +740,22 @@ private final class StudioRunCell: UICollectionViewCell {
         spinner.color = Palette.color(.textFaint)
         progress.progressTintColor = Palette.color(.textFaint)
         progress.widthAnchor.constraint(equalToConstant: 46).isActive = true
-        let status = UIStackView(arrangedSubviews: [progress, spinner, state])
+        var retry = UIButton.Configuration.filled()
+        retry.title = "Retry"
+        retry.image = UIImage(systemName: "arrow.clockwise", withConfiguration: UIImage.SymbolConfiguration(pointSize: 10, weight: .semibold))
+        retry.imagePadding = 4
+        retry.baseForegroundColor = Palette.text
+        retry.baseBackgroundColor = Palette.controlFill
+        retry.cornerStyle = .capsule
+        retry.contentInsets = NSDirectionalEdgeInsets(top: 7, leading: 12, bottom: 7, trailing: 13)
+        retry.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attrs in
+            var a = attrs
+            a.font = Fonts.ui(.sansMedium, 11.5)
+            return a
+        }
+        retryButton.configuration = retry
+        retryButton.addAction(UIAction { [weak self] _ in self?.onRetry?() }, for: .touchUpInside)
+        let status = UIStackView(arrangedSubviews: [progress, spinner, state, retryButton])
         status.spacing = 7
         status.alignment = .center
         status.setContentHuggingPriority(.required, for: .horizontal)
@@ -689,10 +790,21 @@ private final class StudioRunCell: UICollectionViewCell {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func configure(_ run: StudioRun) {
+    /// `retrying`: a retry is on its way; the row spins in its place.
+    func configure(_ run: StudioRun, retrying: Bool, onRetry: @escaping () -> Void) {
+        self.onRetry = onRetry
         model.text = run.model.displayName
         state.text = run.state.label
-        if run.state.isCreating {
+        let retryable = run.state == .failed || run.state == .cancelled
+        retryButton.isHidden = !retryable || retrying
+        if retrying {
+            state.font = Fonts.ui(.sans, 11)
+            state.textColor = Palette.color(.textFaint)
+            state.text = "Retrying"
+            progress.isHidden = true
+            spinner.isHidden = false
+            spinner.startAnimating()
+        } else if run.state.isCreating {
             state.font = Fonts.ui(.sans, 11)
             state.textColor = Palette.color(.textFaint)
             progress.isHidden = run.progress == nil
@@ -709,7 +821,14 @@ private final class StudioRunCell: UICollectionViewCell {
         let message = run.artifacts.isEmpty ? run.error.flatMap { $0.isEmpty ? nil : $0 } : nil
         error.text = message
         errorRow.isHidden = message == nil
-        accessibilityLabel = [run.model.displayName, run.state.label, message].compactMap(\.self).joined(separator: ", ")
+        accessibilityLabel = [run.model.displayName, state.text, message].compactMap(\.self).joined(separator: ", ")
+        // The row reads as one element, so its button is an action on it.
+        accessibilityCustomActions = retryable && !retrying
+            ? [UIAccessibilityCustomAction(name: "Retry") { [weak self] _ in
+                self?.onRetry?()
+                return true
+            }]
+            : nil
         accessibilityValue = run.state.isCreating ? run.progress.map { "\(Int(($0 * 100).rounded())) percent" } : nil
     }
 }
