@@ -5,12 +5,12 @@ import { isDeadToken, providerToken } from "./apns";
 describe("APNs provider token", () => {
   it("is an ES256 JWT with the key id and team, reused within its window", async () => {
     const { privateKey, publicKey } = await generateKeyPair("ES256", { extractable: true });
-    const cfg = { keyP8: await exportPKCS8(privateKey), keyId: "ABC123DEFG", teamId: "5XY3M483YQ", topic: "sh.zeron.ios" };
+    const cfg = { keyP8: await exportPKCS8(privateKey), keyId: "ABC123DEFG", teamId: "77Y4W75ZAJ", topic: "com.ogdakke.zeron" };
     const now = Date.now();
     const jwt = await providerToken(cfg, now);
     const { payload, protectedHeader } = await jwtVerify(jwt, publicKey);
     expect(protectedHeader).toMatchObject({ alg: "ES256", kid: "ABC123DEFG" });
-    expect(payload.iss).toBe("5XY3M483YQ");
+    expect(payload.iss).toBe("77Y4W75ZAJ");
     expect(await providerToken(cfg, now + 10 * 60 * 1000)).toBe(jwt);
     expect(await providerToken(cfg, now + 55 * 60 * 1000)).not.toBe(jwt);
   });

@@ -126,8 +126,8 @@ export const apnsConfig = (env: Env) =>
     ? {
         keyP8: env.APNS_KEY_P8,
         keyId: env.APNS_KEY_ID,
-        teamId: env.APNS_TEAM_ID ?? "5XY3M483YQ",
-        topic: env.APNS_TOPIC ?? "sh.zeron.ios"
+        teamId: env.APNS_TEAM_ID ?? "77Y4W75ZAJ",
+        topic: env.APNS_TOPIC ?? "com.ogdakke.zeron"
       }
     : undefined;
 

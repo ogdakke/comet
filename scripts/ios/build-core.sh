@@ -34,11 +34,12 @@ fi
 # Xcode exports SDKROOT/deployment vars for the *app* SDK; host build scripts
 # (proc macros, build.rs) must not see them, so cargo runs in a clean env.
 # Keep whichever cargo the caller's PATH finds, and rustup's homes: rustup
-# isn't always in ~/.cargo/bin (a CI runner image moved it).
+# isn't always in ~/.cargo/bin (a CI runner image moved it). DEVELOPER_DIR
+# keeps xcrun on the Xcode running this build, not whatever xcode-select says.
 CARGO_DIRS="$HOME/.cargo/bin"
 if FOUND="$(command -v cargo)"; then CARGO_DIRS="$(dirname "$FOUND"):$CARGO_DIRS"; fi
 KEEP=()
-for name in CARGO_HOME RUSTUP_HOME; do
+for name in CARGO_HOME RUSTUP_HOME DEVELOPER_DIR; do
   if [[ -n "${!name:-}" ]]; then KEEP+=("$name=${!name}"); fi
 done
 run_cargo() {

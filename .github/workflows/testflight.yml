@@ -81,10 +81,10 @@ jobs:
           }
 
           apps="$RUNNER_TEMP/apps.json"
-          api 'https://api.appstoreconnect.apple.com/v1/apps?filter[bundleId]=sh.zeron.ios&fields[apps]=name,bundleId&limit=10' > "$apps"
+          api 'https://api.appstoreconnect.apple.com/v1/apps?filter[bundleId]=com.ogdakke.zeron&fields[apps]=name,bundleId&limit=10' > "$apps"
           app_count="$(jq '.data | length' "$apps")"
           if [ "$app_count" -ne 1 ]; then
-            echo "Expected exactly one App Store Connect app for sh.zeron.ios; found $app_count." >&2
+            echo "Expected exactly one App Store Connect app for com.ogdakke.zeron; found $app_count." >&2
             exit 3
           fi
           app_id="$(jq -r '.data[0].id' "$apps")"
@@ -100,23 +100,23 @@ jobs:
           # fails with a clear provisioning error.
           asc() { curl --globoff --silent --show-error -o "$1" -w '%{http_code}' -H "Authorization: Bearer $token" -H 'Content-Type: application/json' "${@:2}"; }
           bundle_ids="$RUNNER_TEMP/bundle-ids.json"
-          status="$(asc "$bundle_ids" 'https://api.appstoreconnect.apple.com/v1/bundleIds?filter[identifier]=sh.zeron.ios')"
-          bundle_id="$(jq -r '[.data[]? | select(.attributes.identifier == "sh.zeron.ios")][0].id // empty' "$bundle_ids" 2>/dev/null || true)"
+          status="$(asc "$bundle_ids" 'https://api.appstoreconnect.apple.com/v1/bundleIds?filter[identifier]=com.ogdakke.zeron')"
+          bundle_id="$(jq -r '[.data[]? | select(.attributes.identifier == "com.ogdakke.zeron")][0].id // empty' "$bundle_ids" 2>/dev/null || true)"
           if [ "$status" != 200 ] || [ -z "$bundle_id" ]; then
-            echo "::warning::Couldn't look up the sh.zeron.ios App ID ($status): $(cat "$bundle_ids")"
+            echo "::warning::Couldn't look up the com.ogdakke.zeron App ID ($status): $(cat "$bundle_ids")"
           else
             caps="$RUNNER_TEMP/capabilities.json"
             status="$(asc "$caps" "https://api.appstoreconnect.apple.com/v1/bundleIds/$bundle_id/bundleIdCapabilities")"
             if [ "$status" != 200 ]; then
               echo "::warning::Couldn't read the App ID's capabilities ($status): $(cat "$caps")"
             elif jq -e '.data[] | select(.attributes.capabilityType == "PUSH_NOTIFICATIONS")' "$caps" > /dev/null; then
-              echo "Push Notifications already enabled on sh.zeron.ios."
+              echo "Push Notifications already enabled on com.ogdakke.zeron."
             else
               created="$RUNNER_TEMP/capability.json"
               status="$(asc "$created" -X POST 'https://api.appstoreconnect.apple.com/v1/bundleIdCapabilities' \
                 --data "$(jq -n --arg id "$bundle_id" '{data: {type: "bundleIdCapabilities", attributes: {capabilityType: "PUSH_NOTIFICATIONS"}, relationships: {bundleId: {data: {type: "bundleIds", id: $id}}}}}')")"
               if [ "$status" = 201 ]; then
-                echo "Enabled Push Notifications on sh.zeron.ios."
+                echo "Enabled Push Notifications on com.ogdakke.zeron."
               else
                 echo "::warning::Couldn't enable Push Notifications ($status): $(cat "$created")"
               fi
@@ -180,7 +180,7 @@ jobs:
           plutil -insert method -string app-store-connect "$options"
           plutil -insert destination -string upload "$options"
           plutil -insert signingStyle -string automatic "$options"
-          plutil -insert teamID -string 5XY3M483YQ "$options"
+          plutil -insert teamID -string 77Y4W75ZAJ "$options"
           plutil -insert manageAppVersionAndBuildNumber -bool false "$options"
           if [ "$AUDIENCE" = "internal" ]; then
             plutil -insert testFlightInternalTestingOnly -bool true "$options"
