@@ -14,6 +14,7 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
     private var mode = Mode.gallery
     private var appToken: AnyObject?
     private var hostIds: [String]?
+    private var onlineHostIds: Set<String> = []
     /// Whether each desktop has a Studio provider key (absent: not asked yet).
     private var providerHosts: [String: Bool] = [:]
     private var watchKey: String?
@@ -52,7 +53,7 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
             // Built as it opens: hosts come and go.
             UIDeferredMenuElement.uncached { [weak self] done in done(self?.machineActions() ?? []) },
         ]))
-        item.accessibilityLabel = "Studio machine"
+        item.accessibilityLabel = "Desktop"
         item.accessibilityIdentifier = "studio-machine"
         return item
     }()
@@ -72,6 +73,8 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = Palette.background
+        // Behind the switcher: names this page in the back button's menu.
+        title = "Studio"
         navigationItem.largeTitleDisplayMode = .never
         navigationItem.backButtonDisplayMode = .minimal
         navigationItem.titleView = switcher
@@ -84,19 +87,36 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
         syncHosts()
     }
 
-    /// Picks the desktop again only when the set of hosts changes.
+    /// Picks the desktop again only when the set of hosts changes; asks a
+    /// desktop about its keys again when it comes (back) online.
     private func syncHosts(force: Bool = false) {
-        let ids = service.hosts.map(\.id)
-        guard force || ids != hostIds else { return }
+        let hosts = service.hosts
+        let ids = hosts.map(\.id)
+        let online = Set(hosts.filter(\.online).map(\.id))
+        let cameOnline = online.subtracting(onlineHostIds)
+        onlineHostIds = online
+        guard force || ids != hostIds else {
+            if !cameOnline.isEmpty { refreshProviderHosts(cameOnline) }
+            return
+        }
         hostIds = ids
-        browser.resolveDevice(from: service.hosts, online: service.isOnline)
+        if let current = browser.selectedDeviceId, ids.contains(current) {
+            // Stays on its desktop, even offline: the page says so, and the
+            // menu picks another.
+        } else if browser.selectedDeviceId != nil {
+            // Its desktop is gone. `selectDevice` drops the old library
+            // (`resolveDevice` would keep it on screen under the new one).
+            if let next = hosts.first(where: \.online) ?? hosts.first { browser.selectDevice(next.id) }
+        } else {
+            browser.resolveDevice(from: hosts, online: service.isOnline)
+        }
         refreshProviderHosts()
     }
 
-    /// Ask each online desktop whether it has a provider key.
-    private func refreshProviderHosts() {
+    /// Ask each online desktop (or just `only`) whether it has a provider key.
+    private func refreshProviderHosts(_ only: Set<String>? = nil) {
         guard !app.isDemo else { return }
-        for host in service.hosts where service.isOnline(host.id) {
+        for host in service.hosts where service.isOnline(host.id) && only?.contains(host.id) != false {
             Task { [weak self, service] in
                 guard let providers = try? await service.listStudioProviders(deviceId: host.id), let self else { return }
                 self.providerHosts[host.id] = providers.contains(where: \.configured)
@@ -115,24 +135,29 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
     }
 
     /// Tracks the store: reads here re-run this when they change. Restarts
-    /// the threads and gallery watches when the desktop or a reload asks.
+    /// the threads and gallery watches when the desktop, its connection or
+    /// a reload asks: a watch ends with the connection, and nothing else
+    /// would start it again once the desktop is back.
     override func updateProperties() {
         super.updateProperties()
         let deviceId = browser.selectedDeviceId
-        let key = "\(deviceId ?? "none")-\(browser.reloadGeneration)"
+        let online = deviceId.map(service.isOnline) ?? false
+        let key = "\(deviceId ?? "none")-\(online)-\(browser.reloadGeneration)"
         if key != watchKey {
             watchKey = key
-            restartWatches(deviceId: deviceId)
+            restartWatches(deviceId: online ? deviceId : nil)
         }
         machineItem.accessibilityValue = deviceId.map(deviceName) ?? "None"
         switcher.selectedSegmentIndex = mode.rawValue
 
         if app.isDemo {
-            showUnavailable("Studio is not in the demo", "Connect to a desktop device to browse your Studio library.")
+            // Nothing to try again: the demo has no desktops.
+            showUnavailable("Studio is not in the demo", "Connect to a desktop device to browse your Studio library.", retry: false)
         } else if service.hosts.isEmpty {
             showUnavailable("Studio needs a desktop", "Open Zeron on a desktop device, then try again.")
-        } else if let deviceId, !service.isOnline(deviceId) {
-            showUnavailable("Desktop is offline", "Reconnect \(deviceName(deviceId)) to browse its Studio library.")
+        } else if let deviceId, !online {
+            let others = service.hosts.contains { $0.id != deviceId && service.isOnline($0.id) }
+            showUnavailable("Desktop is offline", "Reconnect \(deviceName(deviceId)) to browse its Studio library\(others ? ", or pick another desktop from the menu" : "").")
         } else {
             contentUnavailableConfiguration = nil
             show(mode == .gallery ? gallery as UIViewController : threads)
@@ -143,6 +168,10 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
         watches.forEach { $0.cancel() }
         watches = []
         guard !app.isDemo, let deviceId else { return }
+        // Loading from now, not from when the tasks first run: the pages
+        // would show "No creations yet" for a frame in between.
+        browser.threadsLoading = true
+        browser.galleryLoading = true
         watches = [
             Task { [browser, service] in await browser.watchThreads(workspace: service, deviceId: deviceId) },
             Task { [browser, service] in await browser.watchGallery(workspace: service, deviceId: deviceId) },
@@ -170,42 +199,46 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
         child.didMove(toParent: self)
     }
 
-    private func showUnavailable(_ title: String, _ message: String) {
+    private func showUnavailable(_ title: String, _ message: String, retry: Bool = true) {
         show(nil)
-        var config = StudioUnavailable.configuration(
-            title: title, message: message, symbol: "desktopcomputer.trianglebadge.exclamationmark"
+        contentUnavailableConfiguration = StudioUnavailable.configuration(
+            title: title, message: message, symbol: "desktopcomputer.trianglebadge.exclamationmark",
+            retry: retry ? { [weak self] in
+                self?.syncHosts(force: true)
+                self?.browser.reload()
+            } : nil
         )
-        var button = UIButton.Configuration.glass()
-        button.title = "Try again"
-        button.baseForegroundColor = Palette.text
-        config.button = button
-        config.buttonProperties.primaryAction = UIAction { [weak self] _ in
-            self?.syncHosts(force: true)
-            self?.browser.reload()
-        }
-        contentUnavailableConfiguration = config
     }
 
+    /// The desktops (a checkmark on the one shown, offline ones marked),
+    /// then the shown desktop's providers.
     private func machineActions() -> [UIMenuElement] {
         let hosts: [UIMenuElement] = service.hosts.map { device in
-            let selected = browser.selectedDeviceId == device.id
-            let symbol = selected ? "checkmark"
-                : service.isOnline(device.id) ? "desktopcomputer" : "desktopcomputer.trianglebadge.exclamationmark"
-            let action = UIAction(title: device.name, image: UIImage(systemName: symbol)) { [weak self] _ in
+            let online = service.isOnline(device.id)
+            let action = UIAction(
+                title: device.name,
+                image: UIImage(systemName: online ? "desktopcomputer" : "desktopcomputer.trianglebadge.exclamationmark")
+            ) { [weak self] _ in
                 self?.browser.selectDevice(device.id)
             }
-            if providerHosts[device.id] == false { action.subtitle = "No provider key" }
+            action.state = browser.selectedDeviceId == device.id ? .on : .off
+            if !online {
+                action.subtitle = "Offline"
+            } else if providerHosts[device.id] == false {
+                action.subtitle = "No provider key"
+            }
             return action
         }
-        guard let deviceId = browser.selectedDeviceId, service.isOnline(deviceId) else { return hosts }
+        let desktops = UIMenu(title: "Desktop", options: .displayInline, children: hosts)
+        guard let deviceId = browser.selectedDeviceId, service.isOnline(deviceId) else { return [desktops] }
         let providers = UIAction(title: "Providers…", image: UIImage(systemName: "key")) { [weak self] _ in
             guard let self else { return }
             self.presentStudioProviders(service: self.service, deviceId: deviceId) { [weak self] in
-                self?.refreshProviderHosts()
+                self?.refreshProviderHosts([deviceId])
             }
         }
         providers.accessibilityIdentifier = "studio-providers-open"
-        return [UIMenu(options: .displayInline, children: hosts), providers]
+        return [desktops, providers]
     }
 
     // MARK: Threads
@@ -275,9 +308,10 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
     }
 }
 
-/// Studio's empty and unavailable states, in the app's type.
+/// Studio's empty and unavailable states, in the app's type; `retry` adds
+/// a Try again button.
 enum StudioUnavailable {
-    static func configuration(title: String, message: String, symbol: String) -> UIContentUnavailableConfiguration {
+    static func configuration(title: String, message: String, symbol: String, retry: (() -> Void)? = nil) -> UIContentUnavailableConfiguration {
         var config = UIContentUnavailableConfiguration.empty()
         config.image = UIImage(systemName: symbol)
         config.imageProperties.tintColor = Palette.secondary
@@ -287,6 +321,13 @@ enum StudioUnavailable {
         config.secondaryText = message
         config.secondaryTextProperties.font = Fonts.ui(.sans, 15)
         config.secondaryTextProperties.color = Palette.secondary
+        if let retry {
+            var button = UIButton.Configuration.glass()
+            button.title = "Try again"
+            button.baseForegroundColor = Palette.text
+            config.button = button
+            config.buttonProperties.primaryAction = UIAction { _ in retry() }
+        }
         return config
     }
 }

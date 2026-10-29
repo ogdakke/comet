@@ -39,7 +39,8 @@ final class StudioThreadsListController: UIViewController, UICollectionViewDeleg
         view.backgroundColor = .clear
         var config = UICollectionLayoutListConfiguration(appearance: .plain)
         config.backgroundColor = .clear
-        config.separatorConfiguration.color = Palette.hairline
+        // As the Sessions list: rows on the page, a rounded fill when pressed.
+        config.showsSeparators = false
         collectionView = UICollectionView(frame: view.bounds, collectionViewLayout: UICollectionViewCompositionalLayout.list(using: config))
         collectionView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         collectionView.backgroundColor = .clear
@@ -54,13 +55,15 @@ final class StudioThreadsListController: UIViewController, UICollectionViewDeleg
         let archivedReg = UICollectionView.CellRegistration<UICollectionViewListCell, Item> { [weak self] cell, _, _ in
             var c = UIListContentConfiguration.cell()
             c.text = "Archived (\(self?.archivedCount ?? 0))"
-            c.textProperties.font = Fonts.ui(.sansMedium, 12)
+            c.textProperties.font = Fonts.ui(.sansMedium, 13)
             c.textProperties.color = Palette.secondary
             cell.contentConfiguration = c
             cell.accessories = [.outlineDisclosure(options: .init(style: .cell, tintColor: Palette.secondary)) {
                 self?.toggleArchived()
             }]
-            cell.backgroundConfiguration = .clear()
+            cell.configurationUpdateHandler = { cell, state in
+                cell.backgroundConfiguration = StudioThreadCell.background(for: state)
+            }
             cell.accessibilityIdentifier = "studio-archived"
         }
         dataSource = UICollectionViewDiffableDataSource(collectionView: collectionView) { cv, path, item in
@@ -86,11 +89,12 @@ final class StudioThreadsListController: UIViewController, UICollectionViewDeleg
             contentUnavailableConfiguration = nil
         } else if let error = browser.threadsError, threads.isEmpty {
             contentUnavailableConfiguration = StudioUnavailable.configuration(
-                title: "Threads unavailable", message: error, symbol: "exclamationmark.triangle"
+                title: "Threads unavailable", message: error, symbol: "exclamationmark.triangle",
+                retry: { [weak self] in self?.browser.reload() }
             )
         } else if threads.isEmpty {
             contentUnavailableConfiguration = StudioUnavailable.configuration(
-                title: "No threads yet", message: "New Studio threads will appear here.", symbol: "rectangle.stack"
+                title: "No threads yet", message: "Threads you start in Studio on this desktop will appear here.", symbol: "rectangle.stack"
             )
         } else {
             contentUnavailableConfiguration = nil
@@ -155,11 +159,21 @@ private final class StudioThreadCell: UICollectionViewListCell {
     private let metaLabel = UILabel()
     private let spinner = UIActivityIndicatorView(style: .medium)
     private let statusLabel = UILabel()
+    private let status = UIStackView()
     private let previewSlot = UIView()
+
+    /// The Sessions list's row fill: clear, rounded controlFill when pressed.
+    static func background(for state: UICellConfigurationState) -> UIBackgroundConfiguration {
+        var bg = UIBackgroundConfiguration.listCell().updated(for: state)
+        bg.backgroundColor = state.isHighlighted || state.isSelected ? Palette.controlFill : .clear
+        bg.cornerRadius = 16
+        bg.backgroundInsets = NSDirectionalEdgeInsets(top: 1, leading: 8, bottom: 1, trailing: 8)
+        return bg
+    }
 
     override init(frame: CGRect) {
         super.init(frame: frame)
-        backgroundConfiguration = .clear()
+        backgroundConfiguration = Self.background(for: configurationState)
 
         previewSlot.layer.cornerRadius = 9
         previewSlot.layer.cornerCurve = .continuous
@@ -183,7 +197,7 @@ private final class StudioThreadCell: UICollectionViewListCell {
 
         spinner.transform = CGAffineTransform(scaleX: 0.7, y: 0.7)
         spinner.color = Palette.secondary
-        let status = UIStackView(arrangedSubviews: [spinner, statusLabel])
+        for v in [spinner, statusLabel] { status.addArrangedSubview(v) }
         status.spacing = 6
         status.alignment = .center
         status.setContentHuggingPriority(.required, for: .horizontal)
@@ -203,11 +217,17 @@ private final class StudioThreadCell: UICollectionViewListCell {
             row.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 10),
             row.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -10),
         ])
-        // Separators start under the title, as list rows do.
-        separatorLayoutGuide.leadingAnchor.constraint(equalTo: text.leadingAnchor).isActive = true
+
+        // One element for VoiceOver: the title, then turns, time and state.
+        isAccessibilityElement = true
+        accessibilityTraits = .button
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    override func updateConfiguration(using state: UICellConfigurationState) {
+        backgroundConfiguration = Self.background(for: state)
+    }
 
     func configure(_ thread: StudioThreadSummary, preview item: StudioGalleryItem?, browser: StudioBrowserStore, service: StudioService) {
         if let item {
@@ -225,26 +245,33 @@ private final class StudioThreadCell: UICollectionViewListCell {
             preview?.isHidden = true
         }
 
-        titleLabel.text = thread.title
-        titleLabel.textColor = thread.archived ? Palette.secondary : Palette.text
+        let title = thread.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        titleLabel.text = title.isEmpty ? "Untitled thread" : title
+        titleLabel.textColor = thread.archived || title.isEmpty ? Palette.secondary : Palette.text
         let turns = "\(thread.turnCount) \(thread.turnCount == 1 ? "turn" : "turns")"
-        metaLabel.text = "\(turns) · \(thread.updatedDate.formatted(.relative(presentation: .named)))"
+        let updated = thread.updatedDate == .distantPast ? nil : thread.updatedDate.formatted(.relative(presentation: .named))
+        metaLabel.text = [turns, updated].compactMap { $0 }.joined(separator: " · ")
 
         if thread.creating {
             spinner.startAnimating()
             spinner.isHidden = false
-            statusLabel.isHidden = false
             statusLabel.text = "Creating"
             statusLabel.font = Fonts.ui(.sansMedium, 11)
             statusLabel.textColor = Palette.secondary
         } else {
             spinner.stopAnimating()
             spinner.isHidden = true
-            statusLabel.isHidden = !thread.done
             statusLabel.text = "Done"
             statusLabel.font = Fonts.ui(.sansSemibold, 11)
             statusLabel.textColor = Palette.success
         }
+        // Hidden whole when there's nothing to say, so the title takes the
+        // width (the stack's spacing after it goes with it).
+        status.isHidden = !thread.creating && !thread.done
+
+        accessibilityLabel = titleLabel.text
+        accessibilityValue = [metaLabel.text, status.isHidden ? nil : statusLabel.text, thread.archived ? "Archived" : nil]
+            .compactMap { $0 }.joined(separator: ", ")
         accessibilityIdentifier = "studio-thread-\(thread.id)"
     }
 }

@@ -37,7 +37,8 @@ final class StudioProvidersViewController: UIViewController, UICollectionViewDel
         config.headerMode = .supplementary
         config.footerMode = .supplementary
         config.trailingSwipeActionsConfigurationProvider = { [weak self] indexPath in
-            guard let self, let provider = self.dataSource.itemIdentifier(for: indexPath), provider.configured else { return nil }
+            guard let self, self.busy == nil,
+                  let provider = self.dataSource.itemIdentifier(for: indexPath), provider.configured else { return nil }
             let remove = UIContextualAction(style: .destructive, title: "Remove Key") { [weak self] _, _, done in
                 self?.remove(provider)
                 done(true)
@@ -63,11 +64,18 @@ final class StudioProvidersViewController: UIViewController, UICollectionViewDel
             c.image = UIImage(systemName: provider.configured ? "key.fill" : "key")
             c.imageProperties.tintColor = provider.configured ? Palette.text : Palette.secondary
             cell.contentConfiguration = c
+            // As Settings' rows.
+            var bg = UIBackgroundConfiguration.listGroupedCell()
+            bg.backgroundColor = Palette.elevated
+            cell.backgroundConfiguration = bg
+            cell.accessibilityIdentifier = "studio-provider-\(provider.providerId)"
             if self?.busy == provider.providerId {
                 let spinner = UIActivityIndicatorView(style: .medium)
                 spinner.startAnimating()
                 cell.accessories = [.customView(configuration: .init(customView: spinner, placement: .trailing()))]
+                cell.accessibilityValue = "Saving"
             } else {
+                cell.accessibilityValue = nil
                 cell.accessories = [.disclosureIndicator()]
             }
         }
@@ -103,7 +111,9 @@ final class StudioProvidersViewController: UIViewController, UICollectionViewDel
         }
     }
 
-    private func load() async {
+    /// `quietly`: after an action, keep the list as it was if the read fails
+    /// (the action's own error is what's shown).
+    private func load(quietly: Bool = false) async {
         do {
             providers = try await service.listStudioProviders(deviceId: deviceId)
             contentUnavailableConfiguration = providers.isEmpty
@@ -111,8 +121,13 @@ final class StudioProvidersViewController: UIViewController, UICollectionViewDel
                 : nil
             render()
         } catch {
+            guard !quietly else { return }
             contentUnavailableConfiguration = StudioUnavailable.configuration(
-                title: "Providers unavailable", message: error.localizedDescription, symbol: "exclamationmark.triangle"
+                title: "Providers unavailable", message: error.localizedDescription, symbol: "exclamationmark.triangle",
+                retry: { [weak self] in
+                    self?.contentUnavailableConfiguration = UIContentUnavailableConfiguration.loading()
+                    Task { await self?.load() }
+                }
             )
         }
     }
@@ -154,22 +169,29 @@ final class StudioProvidersViewController: UIViewController, UICollectionViewDel
             message: "Paste the API key. It's saved on \(deviceName) and checked with \(provider.displayLabel).",
             preferredStyle: .alert
         )
+        let save = UIAlertAction(title: "Save", style: .default) { [weak self, weak alert] _ in
+            let key = alert?.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !key.isEmpty else { return }
+            self?.save(provider, key: key)
+        }
+        // Nothing to save until there's a key.
+        save.isEnabled = false
         alert.addTextField { field in
             field.placeholder = "API key"
             field.isSecureTextEntry = true
             field.autocorrectionType = .no
             field.autocapitalizationType = .none
             field.textContentType = .password
+            field.addAction(UIAction { [weak field, weak save] _ in
+                save?.isEnabled = field?.text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            }, for: .editingChanged)
         }
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         if provider.configured {
             alert.addAction(UIAlertAction(title: "Remove Key", style: .destructive) { [weak self] _ in self?.remove(provider) })
         }
-        alert.addAction(UIAlertAction(title: "Save", style: .default) { [weak self, weak alert] _ in
-            let key = alert?.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            guard !key.isEmpty else { return }
-            self?.save(provider, key: key)
-        })
+        alert.addAction(save)
+        alert.preferredAction = save
         present(alert, animated: true)
     }
 
@@ -185,6 +207,10 @@ final class StudioProvidersViewController: UIViewController, UICollectionViewDel
                 replace(connection)
                 changed()
             } catch {
+                // The key may be stored even though checking it failed: show
+                // what the desktop has now, not the row as it was.
+                await load(quietly: true)
+                changed()
                 fail(error)
             }
         }
@@ -196,8 +222,14 @@ final class StudioProvidersViewController: UIViewController, UICollectionViewDel
             defer { setBusy(nil) }
             do {
                 try await service.removeStudioProviderCredential(deviceId: deviceId, providerId: provider.providerId)
-                await load()
+                if let index = providers.firstIndex(where: { $0.providerId == provider.providerId }) {
+                    providers[index].configured = false
+                    providers[index].validationState = nil
+                    providers[index].validationMessage = nil
+                }
+                render()
                 changed()
+                await load(quietly: true)
             } catch {
                 fail(error)
             }
@@ -205,6 +237,7 @@ final class StudioProvidersViewController: UIViewController, UICollectionViewDel
     }
 
     private func fail(_ error: Error) {
+        guard viewIfLoaded?.window != nil else { return }
         let alert = UIAlertController(title: "Couldn't update the provider", message: error.localizedDescription, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "OK", style: .default))
         present(alert, animated: true)

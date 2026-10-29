@@ -58,6 +58,9 @@ final class StudioMediaPreviewView: UIView {
     private var artifactId: String?
     private weak var transitionSource: StudioGalleryTransitionSource?
     private var load: Task<Void, Never>?
+    /// The preview this view holds demand on, until it lands or is let go:
+    /// a row scrolled away mustn't keep its relay read alive.
+    private var requestedId: String?
 
     init(browser: StudioBrowserStore, service: StudioService) {
         self.browser = browser
@@ -88,32 +91,46 @@ final class StudioMediaPreviewView: UIView {
         transitionSource: StudioGalleryTransitionSource? = nil
     ) {
         imageView.contentMode = contentMode
-        if self.artifactId != artifactId || self.transitionSource !== transitionSource {
-            if let previous = self.artifactId { self.transitionSource?.unregister(imageView, for: previous) }
-            transitionSource?.register(imageView, for: artifactId)
-            self.transitionSource = transitionSource
+        if self.artifactId != artifactId || self.transitionSource !== transitionSource,
+           let previous = self.artifactId {
+            self.transitionSource?.unregister(imageView, for: previous)
         }
+        // Every time: the source forgets a view it found off screen, and a
+        // row scrolled back must be found again.
+        transitionSource?.register(imageView, for: artifactId)
+        self.transitionSource = transitionSource
         placeholder.image = UIImage(systemName: mediaKind == .video ? "film" : "photo")
         guard self.artifactId != artifactId else { return }
         self.artifactId = artifactId
-        load?.cancel()
-        show(browser.cachedPreview(artifactId: artifactId)
-            ?? browser.thumbhashImage(thumbhash, aspectRatio: aspectRatio))
+        endRequest()
+        if let cached = browser.cachedPreview(artifactId: artifactId) { return show(cached) }
+        show(browser.thumbhashImage(thumbhash, aspectRatio: aspectRatio))
         guard let deviceId = browser.selectedDeviceId else { return }
-        load = Task { [weak self, browser, service] in
-            let image = await browser.preview(artifactId: artifactId, deviceId: deviceId, workspace: service)
-            guard !Task.isCancelled, let self, self.artifactId == artifactId, let image else { return }
-            self.show(image)
+        // Not `browser.preview`: cancelling its caller leaves the read
+        // running until it finishes on its own.
+        let request = browser.beginPreviewRequest(artifactId: artifactId, deviceId: deviceId, workspace: service)
+        requestedId = artifactId
+        load = Task { [weak self] in
+            let image = await request.value
+            guard !Task.isCancelled, let self, self.artifactId == artifactId else { return }
+            self.endRequest()
+            if let image { self.show(image) }
         }
     }
 
     /// Drop the artifact (cell reuse, removal).
     func reset() {
-        load?.cancel()
-        load = nil
+        endRequest()
         if let artifactId { transitionSource?.unregister(imageView, for: artifactId) }
         artifactId = nil
         show(nil)
+    }
+
+    private func endRequest() {
+        load?.cancel()
+        load = nil
+        if let requestedId { browser.endPreviewRequest(artifactId: requestedId) }
+        requestedId = nil
     }
 
     private func show(_ image: UIImage?) {
