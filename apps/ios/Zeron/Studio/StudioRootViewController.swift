@@ -19,6 +19,11 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
     private var providerHosts: [String: Bool] = [:]
     private var watchKey: String?
     private var watches: [Task<Void, Never>] = []
+    /// Launch arguments for screenshots and profiling: `-studio-threads`
+    /// (the Threads list), `-studio-thread` (open the newest thread),
+    /// `-studio-viewer` (open the newest creation). Each runs once.
+    private var launchSteps = Set(["-studio-threads", "-studio-thread", "-studio-viewer"]
+        .filter(ProcessInfo.processInfo.arguments.contains))
     private weak var viewer: StudioGalleryViewerController?
 
     private lazy var gallery = StudioGalleryViewController(
@@ -115,11 +120,12 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
 
     /// Ask each online desktop (or just `only`) whether it has a provider key.
     private func refreshProviderHosts(_ only: Set<String>? = nil) {
-        guard !app.isDemo else { return }
         for host in service.hosts where service.isOnline(host.id) && only?.contains(host.id) != false {
             Task { [weak self, service] in
-                guard let providers = try? await service.listStudioProviders(deviceId: host.id), let self else { return }
-                self.providerHosts[host.id] = providers.contains(where: \.configured)
+                let providers = try? await service.listStudioProviders(deviceId: host.id)
+                guard let self else { return }
+                // An engine without Studio (or that can't answer) can't create either.
+                self.providerHosts[host.id] = providers?.contains(where: \.configured) ?? false
                 self.preferProviderHost()
             }
         }
@@ -148,12 +154,10 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
             restartWatches(deviceId: online ? deviceId : nil)
         }
         machineItem.accessibilityValue = deviceId.map(deviceName) ?? "None"
+        runLaunchSteps()
         switcher.selectedSegmentIndex = mode.rawValue
 
-        if app.isDemo {
-            // Nothing to try again: the demo has no desktops.
-            showUnavailable("Studio is not in the demo", "Connect to a desktop device to browse your Studio library.", retry: false)
-        } else if service.hosts.isEmpty {
+        if service.hosts.isEmpty {
             showUnavailable("Studio needs a desktop", "Open Zeron on a desktop device, then try again.")
         } else if let deviceId, !online {
             let others = service.hosts.contains { $0.id != deviceId && service.isOnline($0.id) }
@@ -164,10 +168,31 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
         }
     }
 
+    private func runLaunchSteps() {
+        guard !launchSteps.isEmpty else { return }
+        if launchSteps.remove("-studio-threads") != nil { mode = .threads }
+        if launchSteps.contains("-studio-thread"),
+           let thread = browser.threads.first(where: { !$0.archived }) {
+            launchSteps.remove("-studio-thread")
+            DispatchQueue.main.async { self.pushThread(thread.id) }
+        }
+        if launchSteps.contains("-studio-viewer"), let newest = browser.gallery.last, view.window != nil {
+            launchSteps.remove("-studio-viewer")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self.openViewer(StudioViewerSession(
+                    artifacts: self.browser.gallery.map(StudioArtifactDetail.init(item:)),
+                    selectedId: newest.id,
+                    openedFromGallery: true,
+                    openingPreview: self.browser.cachedPreview(artifactId: newest.id)
+                ))
+            }
+        }
+    }
+
     private func restartWatches(deviceId: String?) {
         watches.forEach { $0.cancel() }
         watches = []
-        guard !app.isDemo, let deviceId else { return }
+        guard let deviceId else { return }
         // Loading from now, not from when the tasks first run: the pages
         // would show "No creations yet" for a frame in between.
         browser.threadsLoading = true

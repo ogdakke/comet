@@ -470,7 +470,9 @@ fn reply<T: Serialize>(value: &T) -> Result<Value, RpcError> {
 }
 
 impl DemoStudio {
-    pub(crate) fn new(cancel: CancellationToken, fast: bool) -> Arc<Self> {
+    /// `library`: extra gallery items in an archived thread (`-huge`: a
+    /// thousand-plus library, for scrolling and paging under load).
+    pub(crate) fn new(cancel: CancellationToken, fast: bool, library: usize) -> Arc<Self> {
         let now = now();
         let fetched_at = now - chrono::Duration::minutes(40);
         let mut state = State {
@@ -493,6 +495,7 @@ impl DemoStudio {
             variation: 0,
         };
         state.seed(now);
+        state.seed_library(now, library);
         let pending: Vec<StudioRunId> = state
             .threads
             .iter()
@@ -2180,6 +2183,87 @@ impl State {
             });
         }
     }
+
+    /// `count` images, four to a turn every 40 minutes back from a month
+    /// ago, in one archived thread behind the seeded ones.
+    fn seed_library(&mut self, now: DateTime<Utc>, count: usize) {
+        let Some(model) = self.catalog.iter().find(|m| m.id.as_str() == SD35).cloned() else {
+            return;
+        };
+        if count == 0 {
+            return;
+        }
+        let styles = [
+            png::STYLE_BLOBS,
+            png::STYLE_TILES,
+            png::STYLE_RINGS,
+            png::STYLE_LANDSCAPE,
+        ];
+        let aspects = [(1, 1), (2, 3), (3, 2), (9, 16), (16, 9), (4, 5)];
+        let turns_needed = count.div_ceil(4);
+        let newest = now - chrono::Duration::days(30);
+        let mut turns = Vec::with_capacity(turns_needed);
+        for index in 0..turns_needed {
+            let turn_at =
+                newest - chrono::Duration::minutes(40 * (turns_needed - 1 - index) as i64);
+            let aspect = aspects[index % aspects.len()];
+            let outputs = (count - index * 4).min(4) as u32;
+            let mut controls = BTreeMap::new();
+            controls.insert(
+                ControlId::from("aspect_ratio"),
+                ControlValue::AspectRatio {
+                    width: aspect.0,
+                    height: aspect.1,
+                },
+            );
+            let spec = StudioModelRunSpec {
+                provider_id: model.provider_id.clone(),
+                model_id: model.id.clone(),
+                operation: model.operation,
+                output_count: outputs,
+                controls: with_defaults(&model, controls),
+                inputs: Vec::new(),
+                manifest_version: model.manifest_version.clone(),
+                display_aspect_ratio: aspect,
+            };
+            let prompt = format!("Archive study #{}", index + 1);
+            let Ok(mut prepared) = self.prepare(&prompt, vec![spec], true) else {
+                continue;
+            };
+            let look = (
+                styles[index % styles.len()],
+                (index / styles.len()) as u32 % 8,
+            );
+            let mut view = self.new_run(0, prepared.remove(0), turn_at, look);
+            let settled = ms(turn_at + chrono::Duration::seconds(20));
+            let meta = self.runs[&view.id].clone();
+            view.artifacts = self.outputs(&meta, settled);
+            view.state = StudioRunState::Succeeded;
+            if let Some(meta) = self.runs.get_mut(&view.id) {
+                meta.updated_at = settled;
+            }
+            turns.push(StudioTurnView {
+                id: StudioTurnId::new(),
+                position: index as u32,
+                prompt,
+                source_turn_id: None,
+                batch_id: StudioBatchId::new(),
+                runs: vec![view],
+                created_at: ms(turn_at),
+            });
+        }
+        let first = newest - chrono::Duration::minutes(40 * turns_needed as i64);
+        self.threads.push(Thread {
+            id: StudioConversationId::new(),
+            title: "Archive".to_owned(),
+            created_at: ms(first),
+            updated_at: ms(newest),
+            archived: true,
+            forked_from_turn_id: None,
+            last_seen_at: Some(ms(newest)),
+            turns,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -2196,8 +2280,24 @@ mod tests {
     }
 
     #[test]
+    fn a_library_seeds_a_large_paged_gallery() {
+        let studio = DemoStudio::new(CancellationToken::new(), true, 1201);
+        let state = lock(&studio.state);
+        let (mut total, mut cursor) = (0, None);
+        loop {
+            let page = state.gallery_page(Some(200), cursor.as_ref());
+            total += page.artifacts.len();
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert!(total > 1201, "{total}");
+    }
+
+    #[test]
     fn seed_covers_the_screens() {
-        let studio = DemoStudio::new(CancellationToken::new(), true);
+        let studio = DemoStudio::new(CancellationToken::new(), true, 0);
         let state = lock(&studio.state);
         assert_eq!(state.threads.len(), THREADS.len());
         let page = state.gallery_page(None, None);

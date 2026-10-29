@@ -31,7 +31,7 @@ use zeron_proto::{FolderEntry, FolderListing, RepoRef, Session, SessionStatus};
 
 use crate::catalog::{self, HarnessInfo, ModelInfo};
 use crate::client::ClientInner;
-use crate::config::{DemoOptions, StreamSpeed};
+use crate::config::{DemoOptions, StreamSpeed, TranscriptScale};
 use crate::error::{ClientError, Result};
 use crate::rpc::ProgressFn;
 use crate::session::SessionCore;
@@ -122,7 +122,11 @@ impl DemoHost {
         let fast = self.options.stream_speed == StreamSpeed::Fast;
         Ok(self
             .studio
-            .get_or_init(|| studio::DemoStudio::new(self.cancel_token(), fast))
+            .get_or_init(|| studio::DemoStudio::new(
+                self.cancel_token(),
+                fast,
+                if self.options.transcript_scale == TranscriptScale::Huge { 1200 } else { 0 },
+            ))
             .clone())
     }
 
