@@ -27,6 +27,8 @@ const VIDEO_PROMPT_PLACEHOLDER: &str = "Describe the video you want to create";
 const COMPACT_ACTIONS_INSET: f32 = 205.0;
 const DURATION_DRAG_STEP_PX: f32 = 12.0;
 const MODEL_CHIPS_FADE: f32 = 24.0;
+/// Hover key and element id of the composer's model-picker chip.
+const MODEL_CHIP_ID: &str = "studio-model-picker-toggle";
 const DURATION_CHIP_MIN_GLYPHS: &str = "30s";
 
 /// Catalog rows visible in the Studio model picker after favorites, feature
@@ -1568,7 +1570,7 @@ impl StudioPage {
                     .h(px(32.0))
                     .flex()
                     .items_center()
-                    .gap(px(8.0))
+                    .gap(px(crate::composer::ACTION_PRIMARY_GAP))
                     .when(self.source_turn.is_some() && prompt_expanded, |row| {
                         row.child(
                             div()
@@ -1583,16 +1585,36 @@ impl StudioPage {
                             .relative()
                             .when_some(picker, |button, picker| button.child(picker))
                             .child(
+                                // The agent composer's model chip
+                                // (`pickers::trigger_chip`): a ghost pill with
+                                // a hover/open wash, no border.
                                 div()
-                                    .id("studio-model-picker-toggle")
-                                    .h(px(28.0))
-                                    .px(px(8.0))
+                                    .id(MODEL_CHIP_ID)
+                                    .h(px(32.0))
+                                    .min_w_0()
+                                    .px(px(6.0))
                                     .flex()
                                     .items_center()
                                     .gap(px(6.0))
-                                    .rounded(px(7.0))
+                                    .rounded(px(8.0))
+                                    .text_size(crate::typography::ui_rems(12.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(motion::hover_blend(
+                                        MODEL_CHIP_ID,
+                                        theme.text.opacity(0.9),
+                                        theme.text,
+                                    ))
+                                    .bg(if self.model_picker.is_open() {
+                                        theme.element_hover
+                                    } else {
+                                        motion::hover_blend(
+                                            MODEL_CHIP_ID,
+                                            gpui::transparent_black(),
+                                            theme.element_hover,
+                                        )
+                                    })
+                                    .on_hover(motion::hover_listener(MODEL_CHIP_ID))
                                     .cursor_pointer()
-                                    .hover(|style| style.bg(crate::theme::wash(0.08)))
                                     .on_mouse_down(
                                         gpui::MouseButton::Left,
                                         cx.listener(|page, _, _, _| {
@@ -1604,23 +1626,20 @@ impl StudioPage {
                                     }))
                                     .child(
                                         crate::icons::icon(crate::icons::PALETTE)
-                                            .size(px(13.0))
+                                            .size(px(16.0))
                                             .text_color(theme.text_muted),
                                     )
-                                    .child(
-                                        div()
-                                            .text_size(crate::typography::ui_rems(11.0))
-                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                            .child(SharedString::from(format!(
-                                                "{} model{}",
-                                                self.selected_models.len(),
-                                                if self.selected_models.len() == 1 {
-                                                    ""
-                                                } else {
-                                                    "s"
-                                                }
-                                            ))),
-                                    ),
+                                    .child(div().min_w_0().truncate().child(SharedString::from(
+                                        format!(
+                                            "{} model{}",
+                                            self.selected_models.len(),
+                                            if self.selected_models.len() == 1 {
+                                                ""
+                                            } else {
+                                                "s"
+                                            }
+                                        ),
+                                    ))),
                             ),
                     )
                     .when_some(batch_quote.as_ref(), |row, quote| {
@@ -1632,39 +1651,23 @@ impl StudioPage {
                         )
                     })
                     .child(
-                        div()
-                            .id("studio-generate")
-                            .size(px(28.0))
-                            .flex_none()
-                            .rounded_full()
-                            .bg(theme.text)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .when(blocked, |button| button.opacity(0.35))
+                        crate::composer::send_circle("studio-generate", blocked, theme)
                             .when(!blocked, |button| {
-                                button
-                                    .cursor_pointer()
-                                    .hover(|style| style.opacity(0.85))
-                                    .on_click(cx.listener(|page, _, _, cx| page.submit(cx)))
+                                button.on_click(cx.listener(|page, _, _, cx| page.submit(cx)))
                             })
-                            .child(
-                                crate::icons::icon(crate::icons::ARROW_UP)
-                                    .size(px(14.0))
-                                    .text_color(theme.bg),
-                            ),
+                            .tooltip(crate::settings::widgets::text_tooltip("Generate")),
                     ),
             );
         let composer = div()
             .relative()
             .w_full()
-            // Match the agent composer column (`max-w-3xl`).
-            .max_w(px(768.0))
+            // Match the agent composer column and surface.
+            .max_w(px(crate::composer::COMPOSER_MAX_WIDTH))
             .occlude()
-            .rounded(px(26.0))
+            .rounded(px(crate::composer::COMPOSER_RADIUS))
             .border_1()
-            .border_color(theme.border)
-            .bg(theme.input_glass_bg())
+            .border_color(theme.composer_surface_border())
+            .bg(theme.composer_surface_bg())
             .when(!theme.is_frost(), |composer| composer.shadow_lg())
             .on_drag_move::<ExternalPaths>(cx.listener(
                 |this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
@@ -1743,7 +1746,7 @@ impl StudioPage {
         // (it only shows when no conflict does).
         let composer_stack = div()
             .w_full()
-            .max_w(px(768.0))
+            .max_w(px(crate::composer::COMPOSER_MAX_WIDTH))
             .flex()
             .flex_col()
             .items_center()
@@ -1755,7 +1758,11 @@ impl StudioPage {
                     .then(|| self.render_generate_more_pill(theme, cx))
                     .flatten(),
             )
-            .child(crate::frost::frosted(26.0, 16.0, composer));
+            .child(crate::frost::frosted(
+                crate::composer::COMPOSER_RADIUS,
+                crate::frost::MENU_BLUR,
+                composer,
+            ));
 
         div()
             .absolute()
