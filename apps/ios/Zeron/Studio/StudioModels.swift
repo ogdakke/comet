@@ -59,9 +59,10 @@ struct StudioArtifact: Codable, Hashable, Identifiable {
     var thumbhash: String?
     var contentHash: String = ""
 
+    /// Reported dimensions, else the thumbhash's recorded shape (some
+    /// providers report none), else square.
     var aspectRatio: CGFloat {
-        guard let width, let height, height > 0 else { return 1 }
-        return CGFloat(width) / CGFloat(height)
+        studioAspectRatio(width: width, height: height, thumbhash: thumbhash)
     }
 }
 
@@ -138,9 +139,10 @@ struct StudioGalleryItem: Codable, Hashable, Identifiable {
     var durationSeconds: Double?
 
     var createdDate: Date { studioDate(createdAt) }
+    /// Reported dimensions, else the thumbhash's recorded shape (some
+    /// providers report none), else square.
     var aspectRatio: CGFloat {
-        guard let width, let height, height > 0 else { return 1 }
-        return CGFloat(width) / CGFloat(height)
+        studioAspectRatio(width: width, height: height, thumbhash: thumbhash)
     }
 }
 
@@ -189,9 +191,10 @@ struct StudioArtifactDetail: Hashable, Identifiable {
     }
 
     var createdDate: Date { studioDate(createdAt) }
+    /// Reported dimensions, else the thumbhash's recorded shape (some
+    /// providers report none), else square.
     var aspectRatio: CGFloat {
-        guard let width, let height, height > 0 else { return 1 }
-        return CGFloat(width) / CGFloat(height)
+        studioAspectRatio(width: width, height: height, thumbhash: thumbhash)
     }
 }
 
@@ -296,4 +299,9 @@ private nonisolated(unsafe) let studioWholeSecondDates = ISO8601DateFormatter()
 
 func studioDate(_ value: String) -> Date {
     studioFractionalDates.date(from: value) ?? studioWholeSecondDates.date(from: value) ?? .distantPast
+}
+
+func studioAspectRatio(width: UInt32?, height: UInt32?, thumbhash: String?) -> CGFloat {
+    if let width, let height, height > 0 { return CGFloat(width) / CGFloat(height) }
+    return StudioThumbHash.aspectRatio(base64: thumbhash) ?? 1
 }

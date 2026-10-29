@@ -1046,7 +1046,9 @@ fn bind_upscale_copies_source_run_aspect_when_artifact_has_no_pixels() {
             &[ProviderArtifact {
                 media_kind: MediaKind::Image,
                 mime_type: "image/png".into(),
-                bytes: rgb_png(32, 48),
+                // Unreadable past the signature: no decoded size either, so
+                // the run's aspect is all there is.
+                bytes: b"\x89PNG\r\n\x1a\nnot-an-image".to_vec(),
                 width: None,
                 height: None,
                 duration_seconds: None,
@@ -1077,6 +1079,35 @@ fn bind_upscale_copies_source_run_aspect_when_artifact_has_no_pixels() {
     };
     store.bind_generation_inputs(&mut request).unwrap();
     assert_eq!(request.display_aspect_ratio, (2, 3));
+}
+
+#[test]
+fn unreported_dimensions_come_from_the_decoded_image() {
+    let root = tempdir().unwrap();
+    let store = StudioStore::open(root.path(), 1024 * 1024).unwrap();
+    let conversation = store.create_conversation("sizes", None).unwrap();
+    let prepared = prepared_run(&image_model("fake"), "a comet");
+    let stored = store
+        .create_turn(conversation.id, "a comet", None, &[prepared], "device-a")
+        .unwrap();
+    store
+        .complete_run(
+            &stored[0],
+            &[ProviderArtifact {
+                media_kind: MediaKind::Image,
+                mime_type: "image/png".into(),
+                bytes: rgb_png(32, 48),
+                width: None,
+                height: None,
+                duration_seconds: None,
+                metadata: serde_json::json!({}),
+            }],
+        )
+        .unwrap();
+    let artifact = &store.conversation_view(conversation.id).unwrap().turns[0].runs[0].artifacts[0];
+    assert_eq!((artifact.width, artifact.height), (Some(32), Some(48)));
+    let gallery = store.list_gallery().unwrap();
+    assert_eq!((gallery[0].width, gallery[0].height), (Some(32), Some(48)));
 }
 
 fn i2v_model(provider_id: &str) -> MediaModel {

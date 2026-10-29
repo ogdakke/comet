@@ -37,6 +37,9 @@ pub fn preview_file_name(artifact_id: zeron_studio::StudioArtifactId) -> String 
 pub struct ArtifactPreview {
     pub bytes: Vec<u8>,
     pub thumbhash: String,
+    /// The source's decoded size, for providers that don't report one.
+    pub width: u32,
+    pub height: u32,
 }
 
 pub fn gallery_thumb_dimensions(width: u32, height: u32) -> (u32, u32) {
@@ -75,7 +78,8 @@ fn encode_video_poster(bytes: &[u8]) -> Result<ArtifactPreview, String> {
 }
 
 fn encode_image(image: DynamicImage) -> Result<ArtifactPreview, String> {
-    let (width, height) = gallery_thumb_dimensions(image.width(), image.height());
+    let (source_width, source_height) = (image.width(), image.height());
+    let (width, height) = gallery_thumb_dimensions(source_width, source_height);
     let thumb = image.resize_exact(width, height, image::imageops::FilterType::Triangle);
     let mut encoded = Cursor::new(Vec::new());
     thumb
@@ -84,6 +88,8 @@ fn encode_image(image: DynamicImage) -> Result<ArtifactPreview, String> {
     Ok(ArtifactPreview {
         bytes: encoded.into_inner(),
         thumbhash: encode_thumbhash(&thumb)?,
+        width: source_width,
+        height: source_height,
     })
 }
 
@@ -288,6 +294,8 @@ mod tests {
         let preview = derive_preview(&rgb_png(1200, 800)).unwrap();
         assert!(preview.bytes.len() < 1200 * 800);
         assert!(!preview.thumbhash.is_empty());
+        // The original's size, for providers that don't report one.
+        assert_eq!((preview.width, preview.height), (1200, 800));
         let decoded = image::load_from_memory(&preview.bytes).unwrap();
         assert_eq!(decoded.width(), 768);
         assert_eq!(decoded.height(), GALLERY_THUMB_SHORT_EDGE);

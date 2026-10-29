@@ -1382,10 +1382,10 @@ impl StudioStore {
                             metadata,
                             preview,
                         ) = published;
-                        let (preview_relative_path, thumbhash) = match preview {
-                            Some((path, hash)) => (Some(path.as_str()), Some(hash.as_str())),
-                            None => (None, None),
-                        };
+                        let preview_relative_path =
+                            preview.as_ref().map(|p| p.relative_path.as_str());
+                        let thumbhash = preview.as_ref().map(|p| p.thumbhash.as_str());
+                        let (width, height) = known_dimensions(*width, *height, preview.as_ref());
                         transaction.execute(
                             "INSERT INTO studio_artifacts (id, run_id, attempt_id, output_position, media_kind, relative_path, mime_type, size_bytes, content_hash, width, height, duration_seconds, metadata_json, preview_relative_path, thumbhash, created_at) VALUES (?1, ?2, ?3, ?4, 'image', ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12, ?13, ?14)",
                             rusqlite::params![
@@ -1762,16 +1762,23 @@ impl StudioStore {
             return Ok(());
         }
         let original = self.artifacts.read_all(artifact_id)?;
-        let Some((relative_path, thumbhash)) =
-            self.artifacts.persist_preview(artifact_id, &original)
-        else {
+        let Some(preview) = self.artifacts.persist_preview(artifact_id, &original) else {
             return Err(StudioStoreError::InvalidValue(
                 "could not derive a studio preview from the original".into(),
             ));
         };
+        // Dimensions a provider never reported come from the decoded original.
         self.connection()?.execute(
-            "UPDATE studio_artifacts SET preview_relative_path = ?2, thumbhash = ?3 WHERE id = ?1",
-            rusqlite::params![artifact_id.0.to_string(), relative_path, thumbhash],
+            "UPDATE studio_artifacts SET preview_relative_path = ?2, thumbhash = ?3,
+                 width = COALESCE(width, ?4), height = COALESCE(height, ?5)
+             WHERE id = ?1",
+            rusqlite::params![
+                artifact_id.0.to_string(),
+                preview.relative_path,
+                preview.thumbhash,
+                preview.width,
+                preview.height
+            ],
         )?;
         // A preview is durable gallery state too. Wake the debounced snapshot
         // publisher so a completed background thumbnail is not left local
@@ -2215,13 +2222,13 @@ impl StudioStore {
                     .and_then(|name| name.to_str())
                     .ok_or(StudioStoreError::InvalidArtifact)?;
                 let hash = format!("{:x}", Sha256::digest(&artifact.bytes));
-                let (preview_relative_path, thumbhash) = match preview {
-                    Some((path, hash)) => (Some(path.as_str()), Some(hash.as_str())),
-                    None => (None, None),
-                };
+                let preview_relative_path = preview.as_ref().map(|p| p.relative_path.as_str());
+                let thumbhash = preview.as_ref().map(|p| p.thumbhash.as_str());
+                let (width, height) =
+                    known_dimensions(artifact.width, artifact.height, preview.as_ref());
                 transaction.execute(
                     "INSERT INTO studio_artifacts (id, run_id, attempt_id, output_position, media_kind, relative_path, mime_type, size_bytes, content_hash, width, height, duration_seconds, metadata_json, preview_relative_path, thumbhash, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-                    rusqlite::params![id.0.to_string(), run.run_id.0.to_string(), run.attempt_id.0.to_string(), position as i64, media_kind_name(artifact.media_kind), relative_path, mime_type, artifact.bytes.len() as i64, hash, artifact.width, artifact.height, artifact.duration_seconds, artifact.metadata.to_string(), preview_relative_path, thumbhash, now],
+                    rusqlite::params![id.0.to_string(), run.run_id.0.to_string(), run.attempt_id.0.to_string(), position as i64, media_kind_name(artifact.media_kind), relative_path, mime_type, artifact.bytes.len() as i64, hash, width, height, artifact.duration_seconds, artifact.metadata.to_string(), preview_relative_path, thumbhash, now],
                 )?;
             }
             transaction.execute(
@@ -3743,11 +3750,16 @@ impl ArtifactStore {
         &self,
         artifact_id: StudioArtifactId,
         original: &[u8],
-    ) -> Option<(String, String)> {
+    ) -> Option<PersistedPreview> {
         let preview = crate::studio_preview::derive_preview(original).ok()?;
         let path = self.publish_preview(artifact_id, &preview.bytes).ok()?;
         let name = path.file_name()?.to_str()?.to_owned();
-        Some((name, preview.thumbhash))
+        Some(PersistedPreview {
+            relative_path: name,
+            thumbhash: preview.thumbhash,
+            width: preview.width,
+            height: preview.height,
+        })
     }
 
     fn publish_preview(
@@ -4031,5 +4043,26 @@ mod sync_snapshot_tests {
             })
             .expect("count source conversations");
         assert_eq!(source_count, 1);
+    }
+}
+
+/// A published gallery preview, and the size of the original it came from.
+pub struct PersistedPreview {
+    relative_path: String,
+    thumbhash: String,
+    width: u32,
+    height: u32,
+}
+
+/// The provider's dimensions when it reported both, else the decoded ones.
+fn known_dimensions(
+    width: Option<u32>,
+    height: Option<u32>,
+    preview: Option<&PersistedPreview>,
+) -> (Option<u32>, Option<u32>) {
+    match (width, height, preview) {
+        (Some(width), Some(height), _) => (Some(width), Some(height)),
+        (_, _, Some(preview)) => (Some(preview.width), Some(preview.height)),
+        _ => (width, height),
     }
 }

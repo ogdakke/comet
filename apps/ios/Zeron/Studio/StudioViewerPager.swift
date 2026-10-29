@@ -431,7 +431,8 @@ final class StudioViewerPageCell: UICollectionViewCell, UIScrollViewDelegate {
         } else if let image, image.size.height > 0 {
             ratio = image.size.width / image.size.height
         } else {
-            ratio = 1
+            // The thumbhash's recorded shape, so nothing reshapes from square.
+            ratio = artifact.aspectRatio
         }
         if abs(max(0.01, ratio) - mediaAspectRatio) > 0.001 {
             mediaAspectRatio = max(0.01, ratio)

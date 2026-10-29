@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import UIKit
 
 // ThumbHash decoder adapted from Evan Wallace's MIT-licensed reference
@@ -194,6 +195,24 @@ enum StudioThumbHash {
               ) else { return nil }
         return DecodedImage(image: UIImage(cgImage: cgImage))
     }
+
+    /// The source image's shape as the hash records it (coarse: the
+    /// encoder's component grid, e.g. 7:4 for 16:9), for artifacts whose
+    /// provider didn't report dimensions. Nil for an unreadable hash.
+    nonisolated static func aspectRatio(base64: String?) -> CGFloat? {
+        guard let base64 else { return nil }
+        if let known = aspectRatios.withLock({ $0[base64] }) { return known }
+        guard let hash = Data(base64Encoded: base64), hash.count >= 5 else { return nil }
+        let ratio = CGFloat(approximateAspectRatio([UInt8](hash)))
+        guard ratio.isFinite, ratio > 0 else { return nil }
+        aspectRatios.withLock { cache in
+            if cache.count > 8_000 { cache.removeAll(keepingCapacity: true) }
+            cache[base64] = ratio
+        }
+        return ratio
+    }
+
+    private nonisolated static let aspectRatios = Mutex<[String: CGFloat]>([:])
 
     private nonisolated static func approximateAspectRatio(_ hash: [UInt8]) -> Float32 {
         let header = hash[3]
