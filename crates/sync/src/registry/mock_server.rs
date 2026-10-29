@@ -129,6 +129,12 @@ async fn serve(
                     Some(Ok(WsMessage::Close(_))) | None | Some(Err(_)) => return,
                     Some(Ok(_)) => continue,
                 };
+                if text == "ping" {
+                    if sink.send(WsMessage::Text("pong".into())).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 let Ok(frame) = serde_json::from_str::<Value>(&text) else {
                     return;
                 };

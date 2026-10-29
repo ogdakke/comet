@@ -16,7 +16,7 @@ use zeron_harness::{AcpHarness, Harness, RunControls};
 use zeron_proto::{AgentEvent, RunRequest};
 
 #[tokio::test]
-#[ignore = "network + npm + codex CLI; installs the pinned adapter for real"]
+#[ignore = "network + npm; installs the pinned Grok CLI for real"]
 async fn managed_install_reaches_session_started() {
     let adapters = tempfile::tempdir().unwrap();
     // SAFETY: single-test binary — nothing else reads env concurrently.
@@ -29,11 +29,15 @@ async fn managed_install_reaches_session_started() {
     let (_steer_tx, steering) = mpsc::channel(1);
     let interrupt = CancellationToken::new();
     let controls = RunControls {
+        realtime: None,
+        execution_lease: None,
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
         steering,
         interrupt: interrupt.clone(),
+        turn: Default::default(),
     };
     let request = RunRequest {
+        mcp: None,
         prompt: "say the word ok and stop".into(),
         harness: None,
         model: None,
@@ -42,9 +46,12 @@ async fn managed_install_reaches_session_started() {
         cwd: std::env::temp_dir().display().to_string(),
         sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        access: Default::default(),
+        plan: false,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
+        env: Default::default(),
     };
 
     let mut stream = tokio::time::timeout(

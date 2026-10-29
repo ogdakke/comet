@@ -5,7 +5,7 @@
 //! 2. The chat's HOST is the sole writer of command outcomes; a composer may only set
 //!    `cancelled` on its own still-pending entries.
 //! 3. Evaluation (`evaluate_command`, pure): processed-id dedupe → Skip; expired TTL → Expired;
-//!    a newer command of the same kind supersedes steer/interrupt; an interrupt whose
+//!    a newer interrupt supersedes an older interrupt; user prompts never supersede each other; an interrupt whose
 //!    `based_on.turn_id` is already past → Superseded; otherwise Execute.
 
 use serde::{Deserialize, Serialize};
@@ -21,14 +21,6 @@ pub enum SessionCommandKind {
     Steer,
     Interrupt,
     RespondInput,
-    /// Queue a prompt for delivery after the current turn (composer tray).
-    /// Deliberately NOT in the supersede rule: queued prompts stack, one
-    /// command per tray row, delivered sequentially turn after turn.
-    Queue,
-    /// Remove a queued prompt from the tray (delete or edit-to-composer).
-    QueueRemove,
-    /// Promote a queued prompt to a mid-turn steer right now.
-    QueueSteerNow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,37 +47,12 @@ pub enum SessionCommandPayload {
     Steer {
         prompt: String,
         message_id: Option<String>,
-        /// "Send after the current turn" (composer Ctrl+Enter): the host
-        /// delivers the prompt as the NEXT turn instead of steering the
-        /// live one. Additive: an old host ignores the flag and steers —
-        /// degraded, never lost.
-        #[serde(default)]
-        follow_up: bool,
     },
     Interrupt {},
     #[serde(rename_all = "camelCase")]
     RespondInput {
         request_id: String,
         answers: Vec<UserInputAnswer>,
-    },
-    /// "Send after the current turn": the host parks the prompt in the
-    /// per-chat turn queue (a `queued` user entry in the doc) instead of
-    /// steering the live run; it is dispatched as the next turn when the
-    /// live one settles. Additive: an old host never sees this payload kind
-    /// (unknown kinds are skipped by the command reader's tolerant parse).
-    #[serde(rename_all = "camelCase")]
-    Queue {
-        prompt: String,
-        /// Client-minted id for the doc's queued user entry (dedup key).
-        message_id: String,
-    },
-    #[serde(rename_all = "camelCase")]
-    QueueRemove {
-        message_id: String,
-    },
-    #[serde(rename_all = "camelCase")]
-    QueueSteerNow {
-        message_id: String,
     },
 }
 
@@ -96,9 +63,6 @@ impl SessionCommandPayload {
             SessionCommandPayload::Steer { .. } => SessionCommandKind::Steer,
             SessionCommandPayload::Interrupt {} => SessionCommandKind::Interrupt,
             SessionCommandPayload::RespondInput { .. } => SessionCommandKind::RespondInput,
-            SessionCommandPayload::Queue { .. } => SessionCommandKind::Queue,
-            SessionCommandPayload::QueueRemove { .. } => SessionCommandKind::QueueRemove,
-            SessionCommandPayload::QueueSteerNow { .. } => SessionCommandKind::QueueSteerNow,
         }
     }
 }
@@ -181,12 +145,10 @@ pub fn evaluate_command(
     if cx.now_ms >= entry.effective_expiry() {
         return CommandDisposition::Expired;
     }
-    // A newer pending command of the same kind supersedes steer/interrupt.
+    // Interrupts are redundant control signals; steers are distinct user messages.
+    // Coalescing steers loses prompts when remote sync delivers a batch.
     let kind = entry.kind();
-    if matches!(
-        kind,
-        SessionCommandKind::Steer | SessionCommandKind::Interrupt
-    ) {
+    if kind == SessionCommandKind::Interrupt {
         let has_newer_same_kind = cx.entries.iter().any(|other| {
             other.id != entry.id
                 && other.kind() == kind
@@ -233,7 +195,6 @@ mod tests {
             SessionCommandPayload::Steer {
                 prompt: "go".into(),
                 message_id: None,
-                follow_up: false,
             },
             issued_at,
         )
@@ -275,16 +236,64 @@ mod tests {
     }
 
     #[test]
-    fn newer_steer_supersedes_older_pending_steer() {
+    fn newer_steer_preserves_older_pending_steer() {
         let older = steer("c1", 1_000);
         let newer = steer("c2", 2_000);
         let entries = vec![older.clone(), newer.clone()];
         let cx1 = cx(&entries, &NEVER, &NEVER, 3_000, None);
+        assert_eq!(evaluate_command(&older, &cx1), CommandDisposition::Execute);
+        assert_eq!(evaluate_command(&newer, &cx1), CommandDisposition::Execute);
+    }
+
+    #[test]
+    fn batched_remote_steers_all_execute_once_even_with_clock_skew() {
+        use std::collections::HashSet;
+        for count in [2, 20, 200] {
+            let entries: Vec<_> = (0..count)
+                .map(|i| {
+                    entry(
+                        &format!("c{i}"),
+                        SessionCommandPayload::Steer {
+                            prompt: format!("unique message {i}"),
+                            message_id: Some(format!("m{i}")),
+                        },
+                        1_000 + (i * 17 % 23),
+                    )
+                })
+                .collect();
+            let mut processed = HashSet::new();
+            for _ in 0..3 {
+                for entry in &entries {
+                    let expected = if processed.contains(&entry.id) {
+                        CommandDisposition::Skip
+                    } else {
+                        CommandDisposition::Execute
+                    };
+                    let seen = |id: &str| processed.contains(id);
+                    let context = cx(&entries, &seen, &NEVER, 2_000, None);
+                    assert_eq!(evaluate_command(entry, &context), expected);
+                    processed.insert(entry.id.clone());
+                }
+            }
+            assert_eq!(processed.len(), count as usize);
+        }
+    }
+
+    #[test]
+    fn newer_interrupt_still_supersedes_older_interrupt() {
+        let entries = vec![
+            entry("i1", SessionCommandPayload::Interrupt {}, 1_000),
+            entry("i2", SessionCommandPayload::Interrupt {}, 2_000),
+        ];
+        let context = cx(&entries, &NEVER, &NEVER, 3_000, None);
         assert_eq!(
-            evaluate_command(&older, &cx1),
+            evaluate_command(&entries[0], &context),
             CommandDisposition::Superseded
         );
-        assert_eq!(evaluate_command(&newer, &cx1), CommandDisposition::Execute);
+        assert_eq!(
+            evaluate_command(&entries[1], &context),
+            CommandDisposition::Execute
+        );
     }
 
     #[test]
@@ -305,7 +314,7 @@ mod tests {
 
     #[test]
     fn runs_are_not_superseded_by_newer_runs() {
-        // Two queued runs both execute (in order); supersession applies to steer/interrupt only.
+        // Two queued runs both execute (in order); supersession applies to interrupts only.
         let r1 = entry(
             "r1",
             SessionCommandPayload::Run {
@@ -340,6 +349,7 @@ mod tests {
 
     fn run_request() -> RunRequest {
         RunRequest {
+            mcp: None,
             prompt: "hello".into(),
             harness: None,
             model: None,
@@ -348,9 +358,12 @@ mod tests {
             cwd: "/tmp".into(),
             sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
             auto_approve: false,
+            access: Default::default(),
+            plan: false,
             attachments: Vec::new(),
             worktree: None,
             resume: None,
+            env: Default::default(),
         }
     }
 }

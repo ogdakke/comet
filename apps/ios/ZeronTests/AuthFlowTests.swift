@@ -19,11 +19,11 @@ final class AuthFlowTests: XCTestCase {
     }
 
     func testKeychainServicesAreIsolatedByDeployment() {
-        XCTAssertEqual(Keychain.serviceName(deployment: "staging"), "sh.zeron.ios.staging")
-        XCTAssertEqual(Keychain.serviceName(deployment: "production"), "sh.zeron.ios.production")
+        XCTAssertEqual(Endpoints.keychainService(deployment: "staging"), "sh.zeron.ios.staging")
+        XCTAssertEqual(Endpoints.keychainService(deployment: "production"), "sh.zeron.ios.production")
         XCTAssertNotEqual(
-            Keychain.serviceName(deployment: "staging"),
-            Keychain.serviceName(deployment: "production")
+            Endpoints.keychainService(deployment: "staging"),
+            Endpoints.keychainService(deployment: "production")
         )
     }
 }

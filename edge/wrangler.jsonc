@@ -1,6 +1,10 @@
 {
   // Copy this file to wrangler.personal.jsonc and fill in your private
   // deployment values. The real file is ignored by Git.
+  // Zeron edge: per-session + per-workspace Loro sync DOs, per-device
+  // relay DOs, R2 blobs, the absorbed WorkOS auth routes, and the Cloud
+  // control plane (CloudAccount/CloudIndex DOs, per-session lifecycle Workflows,
+  // usage metering; docs/design/cloud-device.md) in front of the vault.
   // Design: loro-sessions §2 (topology), §3 (persistence), §6.1 (diff
   // sidecar), §8 (device-room streams), §1.2 (R2 attachments), §3.3 (R2
   // backups); ARCHITECTURE.md §6.
@@ -21,9 +25,18 @@
     "bindings": [
       { "name": "SESSION_ROOMS", "class_name": "SessionRoom" },
       { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
+      { "name": "PREVIEW_ROOMS", "class_name": "PreviewRoom" },
       { "name": "REGISTRY_ROOMS", "class_name": "RegistryRoom" },
       { "name": "CHAT_ROOMS", "class_name": "ChatRoom" },
-      { "name": "STUDIO_ROOMS", "class_name": "StudioRoom" }
+      { "name": "STUDIO_ROOMS", "class_name": "StudioRoom" },
+      // Cloud control plane (docs/design/cloud-device.md):
+      // cloud1/{orgId}/{userId} — the account, its projects, and every
+      // session's machine (own sandbox, runner key, lifecycle), usage meter.
+      { "name": "CLOUD_ACCOUNTS", "class_name": "CloudAccount" },
+      // index1 — every user who ever had Cloud (billing walk list).
+      { "name": "CLOUD_INDEX", "class_name": "CloudIndex" },
+      // users1 — every WorkOS user's profile + join date (user-directory.ts).
+      { "name": "USER_DIRECTORY", "class_name": "UserDirectory" }
     ]
   },
   "migrations": [
@@ -48,8 +61,29 @@
       // remain content-addressed objects in R2, never SQLite values here.
       "tag": "v4",
       "new_sqlite_classes": ["StudioRoom"]
-    }
+    },
+    // Upstream's PreviewRoom/Cloud/UserDirectory classes follow Studio's tag:
+    // a deployment that already applied v4 (StudioRoom) must only append.
+    { "tag": "v5", "new_sqlite_classes": ["PreviewRoom"] },
+    { "tag": "v6", "new_sqlite_classes": ["CloudAccount", "CloudIndex"] },
+    { "tag": "v7", "new_sqlite_classes": ["UserDirectory"] }
   ],
+  // Cloud device lifecycle (src/cloud/workflows.ts). Workflow names are
+  // account-wide: the dev/test wrangler configs must never reuse them.
+  "workflows": [
+    { "name": "zeron-cloud-provision", "binding": "CLOUD_PROVISION", "class_name": "ProvisionWorkflow" },
+    { "name": "zeron-cloud-wake", "binding": "CLOUD_WAKE", "class_name": "WakeWorkflow" },
+    { "name": "zeron-cloud-sleep", "binding": "CLOUD_SLEEP", "class_name": "SleepWorkflow" },
+    // Explicit delete: stop → final usage read → DELETE (billing-exact).
+    { "name": "zeron-cloud-delete", "binding": "CLOUD_DELETE", "class_name": "DeleteWorkflow" }
+  ],
+  // The credential vault (edge/vault, deployed by its own job BEFORE this
+  // worker: a service binding to a missing worker fails the deploy). It has
+  // no routes; this binding is the only way in.
+  "services": [{ "binding": "VAULT", "service": "zeron-vault", "entrypoint": "VaultApi" }],
+  // Hourly: Cloud usage reconcile backstop + daily orphan scan (00:17 UTC) +
+  // closed-month exports to R2 usage/{YYYY-MM}.json (src/cloud/billing.ts).
+  "triggers": { "crons": ["17 * * * *"] },
   "r2_buckets": [
     {
       "binding": "BLOBS",
@@ -73,7 +107,63 @@
     }
   ],
   "vars": {
-    "AUTH_MODE": "workos"
+    // WORKOS_CLIENT_ID and WORKOS_API_KEY come from Secrets Store (bindings
+    // above). Set AUTH_MODE=dev locally to accept bearer==userId.
+    // Session push notifications (registry-room.ts) need two more secrets:
+    // `wrangler secret put APNS_KEY_P8` (the AuthKey_XXXX.p8 file's contents)
+    // and `wrangler secret put APNS_KEY_ID`. Unset ⇒ decided and logged on
+    // /registry/:org/stats, not sent.
+    //
+    // Cloud device secrets (unset ⇒ /cloud answers `available: false`):
+    //   BOAT_API_KEY            Boat provider API key. A scoped key needs:
+    //                           sandbox.create, sandbox.read, sandbox.update,
+    //                           sandbox.stop, sandbox.resume, sandbox.delete,
+    //                           exec, and usage read (GET /sandboxes/{id}/usage,
+    //                           also list for the orphan scan); account.read is
+    //                           not needed. A missing action surfaces as
+    //                           "Cloud isn't configured to … sandboxes".
+    //   RUNNER_JWT_PRIVATE_KEY  ES256 private JWK (JSON) that signs runner JWTs
+    //   RUNNER_JWT_PUBLIC_KEY   the matching public JWK (JSON); add a "kid" to
+    //                           rotate later
+    //   CLOUD_ACCESS            who Cloud is offered to: "everyone", or WorkOS
+    //                           user/org ids (comma or space separated). Unset ⇒
+    //                           nobody. A secret so it changes without a deploy.
+    //   ADMIN_TOKEN             operator bearer for GET /admin/cloud/usage and
+    //                           GET /admin/users (unset ⇒ those routes 404)
+    //   WORKOS_WEBHOOK_SECRET   signing secret of the WorkOS webhook endpoint
+    //                           https://<edge>/workos/webhook, subscribed to
+    //                           user.created, user.updated, user.deleted
+    //   STRIPE_SECRET_KEY       Stripe API key (billing; src/cloud/stripe.ts)
+    //   STRIPE_WEBHOOK_SECRET   signing secret of the webhook endpoint
+    //                           https://<edge>/stripe/webhook, subscribed to
+    //                           checkout.session.completed,
+    //                           checkout.session.async_payment_succeeded,
+    //                           customer.subscription.created/updated/deleted,
+    //                           invoice.paid
+    // Billing vars (Stripe Price ids): STRIPE_PRICE_BASE ($20/mo),
+    // STRIPE_PRICE_PRO ($50/mo), STRIPE_PRICE_MAX ($200/mo) — recurring
+    // monthly — and STRIPE_PRICE_CREDITS ($10, one-off: one 12,000-credit
+    // pack). Enable plan switching and cancellation in the Stripe customer
+    // portal settings. Billing reads as unavailable until all are set.
+    // CLOUD_CREDIT_SECONDS: provider billable seconds per credit (default
+    // 60) — what the provider bills for one minute of CLOUD_MACHINE.
+    // Optional var CLOUD_EDGE_URL overrides the origin session engines are
+    // pointed at (default: the origin of the request that created the session).
+    // Optional CLOUD_TEMPLATE names a provider snapshot (engine pre-installed,
+    // no identity) that session sandboxes start from; needs the key's
+    // snapshot.read. Unset ⇒ every session installs the engine (~30–60 s).
+    "AUTH_MODE": "workos",
+    // Cloud device tunables (inert unless the Cloud secrets above are set).
+    "SANDBOX_PROVIDER": "boat",
+    "CLOUD_TTL_SECONDS": "7200",
+    "CLOUD_IDLE_MINUTES": "10",
+    "CLOUD_MAX_AWAKE": "5",
+    "CLOUD_MACHINE": "default",
+    "BOAT_API_BASE": "https://boat.dev/api/v1",
+    "CLOUD_STARTING_CREDITS": "0"
+    // Set CLOUD_EDGE_URL, the STRIPE_PRICE_* ids and STRIPE_PORTAL_CONFIGURATION
+    // in the private config when enabling Cloud billing. Staging/other
+    // environments are separate private configs, not `env` blocks here.
   },
   "observability": {
     "enabled": true

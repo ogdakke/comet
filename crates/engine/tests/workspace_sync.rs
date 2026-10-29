@@ -145,6 +145,7 @@ where
 
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
+        mcp: None,
         prompt: prompt.into(),
         harness: None,
         model: None,
@@ -153,9 +154,12 @@ fn run_request(prompt: &str) -> RunRequest {
         cwd: "/tmp".into(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        access: Default::default(),
+        plan: false,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
+        env: Default::default(),
     }
 }
 
@@ -372,6 +376,56 @@ async fn claim_on_first_command_creates_the_chat_row() {
     b.shutdown().await;
 }
 
+#[tokio::test]
+async fn projectless_claim_syncs_after_offline_creation_and_survives_viewer_restart() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let a = assemble(dir_a.path(), "dev-a");
+    let b = assemble(dir_b.path(), "dev-b");
+    let mut request = run_request("projectless while offline");
+    request.cwd = "~".into();
+    a.doc_host
+        .queue_command(
+            "projectless-offline",
+            SessionCommandPayload::Run {
+                request,
+                message_id: "projectless-msg".into(),
+            },
+        )
+        .unwrap();
+    wait_for(
+        || a.workspace.chat("projectless-offline").unwrap().is_some(),
+        "offline claim",
+    )
+    .await;
+    let link = bridge(&a, &b).await;
+    wait_for(
+        || b.workspace.chat("projectless-offline").unwrap().is_some(),
+        "projectless sync",
+    )
+    .await;
+    let row = b.workspace.chat("projectless-offline").unwrap().unwrap();
+    assert_eq!(row.device_id, "dev-a");
+    assert_eq!(row.space_id, None);
+    // The claim gives the new chat its own scratch folder, not `~`.
+    assert!(zeron_proto::projectless::is_scratch_cwd(
+        row.cwd.as_deref().unwrap()
+    ));
+    assert!(a.workspace.read_spaces().unwrap().is_empty());
+    assert!(b.workspace.read_spaces().unwrap().is_empty());
+    b.shutdown().await;
+    drop(b);
+    let b = assemble(dir_b.path(), "dev-b");
+    let row = b.workspace.chat("projectless-offline").unwrap().unwrap();
+    assert_eq!(row.space_id, None);
+    assert_eq!(row.device_id, "dev-a");
+    assert_eq!(b.workspace.read_chats().unwrap().len(), 1);
+    assert!(b.workspace.read_spaces().unwrap().is_empty());
+    drop(link);
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
 /// A first command whose cwd is a linked WORKTREE must attribute the chat to
 /// the parent checkout's space — claiming at the worktree path minted a
 /// phantom sidebar space named after the worktree folder.
@@ -517,6 +571,8 @@ async fn chat_config_selects_the_run_harness() {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
+                access: Default::default(),
+                plan: false,
             }),
             None,
         )
@@ -632,6 +688,8 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 last_seen_at: Some(now),
                 created_at: Some(now),
                 version: Some("0.1.17".into()),
+                cursor_sdk_version: None,
+                capabilities: Vec::new(),
             })
             .unwrap();
         legacy
@@ -643,6 +701,8 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 git_detected: true,
                 git_checked_at: Some(now),
                 checkout_id: Some("co-1".into()),
+                repository_id: None,
+                github_repo: None,
                 created_at: now,
             })
             .unwrap();
@@ -662,13 +722,19 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 created_at: now,
                 harness_session_id: Some("hs-9".into()),
                 room_gen: None,
+                parent_chat_id: None,
                 harness_session_cwd: Some("/tmp/legacy".into()),
+                harness_session_harness: None,
                 space_id: Some("space-legacy".into()),
                 last_seen_at: Some(now),
             })
             .unwrap();
         legacy
             .upsert_session(&Session {
+                last_completed_turn: None,
+                last_turn_outcome: None,
+                terminal_activity: None,
+                running_subagents: 0,
                 chat_id: "chat-legacy".into(),
                 device_id: "dev-a".into(),
                 status: SessionStatus::Idle,
@@ -750,4 +816,113 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
             .is_some(),
         "legacy snapshot retained for rollback"
     );
+}
+
+#[tokio::test]
+async fn a_cloud_project_names_its_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = assemble(dir.path(), "dev-a");
+
+    // Only the logical Cloud device takes a repository at create.
+    assert!(
+        a.workspace
+            .create_cloud_space("space-x", "dev-a", "/home/user/app", None, "acme/app")
+            .is_err()
+    );
+    a.workspace
+        .create_cloud_space("space-c", "cloud-acct", "/home/user/app", None, "acme/app")
+        .expect("create Cloud project");
+    // The same repository on Cloud again is the same project.
+    a.workspace
+        .create_cloud_space(
+            "space-d",
+            "cloud-acct",
+            "/home/user/app-2",
+            None,
+            "Acme/App",
+        )
+        .expect("idempotent");
+    let spaces = a.workspace.read_spaces().expect("spaces");
+    let cloud: Vec<_> = spaces
+        .iter()
+        .filter(|s| s.device_id == "cloud-acct")
+        .collect();
+    assert_eq!(cloud.len(), 1);
+    assert_eq!(cloud[0].id, "space-c");
+    assert_eq!(cloud[0].github_repo.as_deref(), Some("acme/app"));
+    assert!(cloud[0].git_detected);
+    assert_eq!(
+        cloud[0].repository_id.as_deref(),
+        Some("github.com/acme/app")
+    );
+
+    a.shutdown().await;
+}
+
+/// A Cloud project and a full clone of the same repository are one project:
+/// the Cloud row takes the clone's commit identity, whether it was created
+/// before the clone was known (healed) or after (stamped).
+#[tokio::test]
+async fn cloud_projects_group_with_a_full_clone_of_their_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = assemble(dir.path(), "dev-a");
+    a.workspace
+        .create_cloud_space(
+            "cloud-early",
+            "cloud-acct",
+            "/home/user/app",
+            None,
+            "acme/app",
+        )
+        .expect("create Cloud project");
+    a.workspace
+        .create_space("local", "dev-a", "/src/app", None, true)
+        .expect("create local project");
+    a.workspace
+        .set_space_git("local", true, None, Some("commit:root1"), Some("Acme/App"))
+        .expect("stamp the clone");
+    let repo_of = |id: &str| {
+        a.workspace
+            .read_spaces()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == id)
+            .and_then(|s| s.repository_id)
+    };
+
+    // Healed: the clone's identity, never the other way round.
+    assert_eq!(
+        a.workspace
+            .align_cloud_spaces("acme/app", "commit:root1")
+            .unwrap(),
+        1
+    );
+    assert_eq!(repo_of("cloud-early").as_deref(), Some("commit:root1"));
+    assert_eq!(
+        a.workspace
+            .align_cloud_spaces("acme/app", "github.com/acme/app")
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        a.workspace
+            .align_cloud_spaces("acme/app", "commit:other")
+            .unwrap(),
+        0
+    );
+    assert_eq!(repo_of("cloud-early").as_deref(), Some("commit:root1"));
+
+    // Stamped: a Cloud project created once the clone is known.
+    a.workspace
+        .create_cloud_space(
+            "cloud-late",
+            "cloud-two",
+            "/home/user/app",
+            None,
+            "acme/app",
+        )
+        .expect("create on another Cloud device");
+    assert_eq!(repo_of("cloud-late").as_deref(), Some("commit:root1"));
+
+    a.shutdown().await;
 }

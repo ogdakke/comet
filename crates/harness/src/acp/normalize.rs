@@ -9,7 +9,7 @@
 //! statuses are snake_case).
 
 use serde_json::Value;
-use zeron_proto::{AgentEvent, SlashCommand, TodoItem, ToolCall, ToolDiff};
+use zeron_proto::{AgentEvent, SlashCommand, TodoItem, TodoStatus, ToolCall, ToolDiff};
 
 /// Byte cap applied to tool output text at the harness boundary. The doc-side
 /// fold applies its own (smaller) cap before anything persists; this one only
@@ -165,7 +165,7 @@ fn arg_from_title(title: &str) -> Option<String> {
 /// in how much structure they put in `rawInput`, so every arm has a fallback.
 /// Title is only used when it looks like a real arg — never a placeholder
 /// label or markdown-escaped summary.
-fn typed_call(update: &Value) -> ToolCall {
+pub(super) fn typed_call(update: &Value) -> ToolCall {
     let kind = update
         .get("kind")
         .and_then(Value::as_str)
@@ -276,6 +276,21 @@ fn typed_call(update: &Value) -> ToolCall {
                 .unwrap_or_else(|| "Agent".into()),
             input: raw.cloned(),
         },
+        // Devin's run_subagent tool uses a coarse ACP kind; its private meta
+        // field is the stable identity across pending/in-progress frames.
+        _ if update
+            .get("_meta")
+            .and_then(|m| m.get("cognition.ai/inferenceToolName"))
+            .and_then(Value::as_str)
+            == Some("run_subagent") =>
+        {
+            ToolCall::Unknown {
+                name: raw_str("title")
+                    .map(|d| format!("Agent: {d}"))
+                    .unwrap_or_else(|| "Agent".into()),
+                input: raw.cloned(),
+            }
+        }
         // opencode's subagent spawn (`task` tool — rawInput carries
         // description/prompt/subagent_type): same naming as grok's, so the
         // chip and its subagent tab say what the agent is doing.
@@ -388,9 +403,11 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
                 .map(|a| a.as_slice())
                 .unwrap_or_default()
                 .iter()
-                .map(|e| TodoItem {
-                    text: str_field(e, "content"),
-                    done: e.get("status").and_then(Value::as_str) == Some("completed"),
+                .map(|e| {
+                    TodoItem::new(
+                        str_field(e, "content"),
+                        TodoStatus::parse(e.get("status").and_then(Value::as_str).unwrap_or("")),
+                    )
                 })
                 .collect();
             // The plan has no wire id; a stable synthetic id makes every
@@ -412,12 +429,19 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
             let commands = parse_commands(update.get("availableCommands"));
             vec![AgentEvent::AvailableCommands { commands }]
         }
-        // Context-window gauge, not per-turn input/output tokens — zeron's
-        // Usage event feeds rate-limit probes, so a wrong mapping is worse
-        // than none. Mode/config/session-info updates carry nothing we render.
-        "usage_update" | "current_mode_update" | "config_option_update" | "session_info_update" => {
-            Vec::new()
+        "usage_update" => {
+            let tokens = update.get("used").and_then(Value::as_u64);
+            let window = ["max", "limit", "size", "contextWindow", "context_window"]
+                .iter()
+                .find_map(|key| update.get(*key).and_then(Value::as_u64))
+                .filter(|n| *n > 0);
+            if tokens.is_some() || window.is_some() {
+                vec![AgentEvent::ContextUsage { tokens, window }]
+            } else {
+                Vec::new()
+            }
         }
+        "current_mode_update" | "config_option_update" | "session_info_update" => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -637,14 +661,8 @@ mod tests {
                 id: zeron_proto::LIVE_PLAN_TOOL_ID.into(),
                 call: ToolCall::Todo {
                     items: vec![
-                        TodoItem {
-                            text: "read code".into(),
-                            done: true
-                        },
-                        TodoItem {
-                            text: "write fix".into(),
-                            done: false
-                        },
+                        TodoItem::new("read code", TodoStatus::Completed),
+                        TodoItem::new("write fix", TodoStatus::InProgress),
                     ]
                 },
             }
@@ -904,4 +922,16 @@ mod tests {
             ] if name == "Agent: Viz probe"
         ));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn empty_assistant_delta_does_not_open_a_segment() {
+    assert!(
+        map_update(&serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": ""},
+        }))
+        .is_empty()
+    );
 }

@@ -1,19 +1,39 @@
 //! zeron-proto — wire types shared by engine, UI, and RPC.
 //!
 //! Ported from zeron's `packages/control/src/wire.ts` + `packages/harness/src/types.ts`.
-//! Token-usage *display* types are excluded by design; the `Usage` agent event is kept as a
-//! harness-level passthrough (rate-limit meters), never persisted into docs.
+//! Context occupancy is replicated per chat; billing `Usage` remains a harness passthrough.
 
 pub mod agent;
+pub mod agent_messages;
+pub mod attachment_mentions;
+pub mod chat_mentions;
+pub mod change_request_assessment;
+pub mod cloud;
+pub mod device_paths;
 pub mod entities;
+pub mod annotation;
+pub mod file_mentions;
+pub mod invocation;
 pub mod motion;
 pub mod studio;
+pub mod plan_usage;
+pub mod preview;
+pub mod program_status;
+pub mod projectless;
+pub mod providers;
+pub mod run_errors;
+pub mod sidebar_pins;
 pub mod view;
+pub mod voice;
 pub mod workspace;
 
 pub use agent::*;
+pub use cloud::*;
 pub use entities::*;
 pub use studio::*;
+pub use preview::*;
+pub use program_status::*;
+pub use sidebar_pins::*;
 pub use workspace::*;
 
 /// Parse "0.2.12" (tolerating a `-suffix`/`+build` tail on the last part)

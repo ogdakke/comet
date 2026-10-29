@@ -289,7 +289,6 @@ impl ProvidersPage {
                                     "provider-remove-{}",
                                     remove_id.as_str()
                                 )))
-                                .hover(|style| widgets::ghost_hover(theme, style))
                                 .on_click(cx.listener(move |page, _, _, cx| {
                                     page.remove(remove_id.clone(), cx)
                                 }))
@@ -344,11 +343,15 @@ impl ProvidersPage {
                             )),
                     )
                     .child(
-                        widgets::toggle_switch(theme, safe_mode)
-                            .id(SharedString::from(format!(
-                                "provider-safe-mode-{}",
-                                toggle_id.as_str()
-                            )))
+                        widgets::toggle_switch(
+                            theme,
+                            safe_mode,
+                            format!("provider-safe-mode-{}", toggle_id.as_str()),
+                        )
+                        .id(SharedString::from(format!(
+                            "provider-safe-mode-{}",
+                            toggle_id.as_str()
+                        )))
                             .cursor_pointer()
                             .on_click(cx.listener(move |page, _, _, cx| {
                                 page.set_safe_mode(toggle_id.clone(), !safe_mode, cx)

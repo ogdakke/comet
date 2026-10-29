@@ -1512,10 +1512,10 @@ impl StudioPage {
             self.prompt_morph = if crate::motion::reduced_motion(cx) {
                 None
             } else {
-                Some(crate::composer::FlipMorph {
-                    from: self.prompt_last_height,
-                    start_ms: now_ms,
-                })
+                Some(crate::composer::FlipMorph::collapse(
+                    self.prompt_last_height,
+                    now_ms,
+                ))
             };
         }
         self.prompt_target_height = body_target;

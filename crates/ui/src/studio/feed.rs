@@ -36,6 +36,7 @@ use super::artifact::{
     run_error_message,
 };
 use super::page::StudioPage;
+use super::rail as tick_rail;
 
 /// Scroll runway below the final Studio turn. The composer floats 18px above
 /// the viewport and is 191px tall at its largest first-release configuration;
@@ -1269,16 +1270,6 @@ impl StudioPage {
         cx.notify();
     }
 
-    fn apply_selection_scroll(&mut self, delta: f32, cx: &mut Context<Self>) -> bool {
-        if !render::scroll_list_by(&self.feed_list, delta) {
-            return false;
-        }
-        self.sync_feed_visible_rows();
-        self.sync_feed_viewport_fulls();
-        self.request_visible_feed_images(cx);
-        cx.notify();
-        true
-    }
 
     fn feed_content_width(&self, window: &Window) -> f32 {
         let rail_gutter = if self.rail_should_show(self.feed_container_width(window)) {
@@ -1764,26 +1755,6 @@ impl StudioPage {
             self.stash_feed_cull_band();
             self.sync_feed_viewport_fulls();
             self.request_visible_feed_images(cx);
-            crate::markdown::selection::bind_document(
-                (0..self.feed_turn_count())
-                    .filter_map(|ix| self.feed_turn(ix))
-                    .filter(|turn| !turn.prompt.is_empty())
-                    .map(|turn| (format!("studio-prompt-{}", turn.id.0), turn.prompt.clone()))
-                    .collect(),
-            );
-            let vp = self.feed_list.viewport_bounds();
-            let top = f32::from(vp.top());
-            // Same as the transcript: measure from the window bottom, not the
-            // composer. The 220px reading inset is for rail ticks only.
-            let bottom = f32::from(vp.bottom());
-            let entity = cx.weak_entity();
-            render::bind_selection_scroll(top, bottom, move |delta, cx| {
-                entity
-                    .update(cx, |page: &mut StudioPage, cx| {
-                        page.apply_selection_scroll(delta, cx)
-                    })
-                    .unwrap_or(false)
-            });
         }
         let rail = self.render_studio_rail(window, theme, cx);
         let measure_entity = cx.weak_entity();
@@ -2269,20 +2240,20 @@ impl StudioPage {
         };
         let hover = self.rail_hover;
         let viewport_h = f32::from(self.feed_list.viewport_bounds().size.height);
-        let capacity = rail::rail_slots(if viewport_h > 0.0 { viewport_h } else { 600.0 });
-        let buckets = rail::tick_buckets(ticks.len(), capacity);
+        let capacity = tick_rail::rail_slots(if viewport_h > 0.0 { viewport_h } else { 600.0 });
+        let buckets = tick_rail::tick_buckets(ticks.len(), capacity);
         let bucket_n = buckets.len();
-        let active_bucket = active.and_then(|ix| rail::bucket_of(&buckets, ix));
+        let active_bucket = active.and_then(|ix| tick_rail::bucket_of(&buckets, ix));
         let now = Utc::now();
 
-        rail::rail_stack()
+        tick_rail::rail_stack()
             .children(buckets.into_iter().enumerate().map(|(ix, (start, end))| {
                 let rep = active.filter(|&a| a >= start && a < end).unwrap_or(start);
                 let tick = ticks[rep].clone();
                 let bucket_len = end - start;
                 let is_active = active_bucket == Some(ix);
                 let is_hovered = hover == Some(ix);
-                let prompt = rail::truncate_preview(&tick.prompt, rail::PREVIEW_PROMPT_CHARS);
+                let prompt = tick_rail::truncate_preview(&tick.prompt, tick_rail::PREVIEW_PROMPT_CHARS);
                 let models = format_studio_models(&tick.models);
                 let sent = format_studio_tick_time(tick.created_at, now, &chrono::Local);
                 let card: Option<AnyElement> = is_hovered.then(|| {
@@ -2331,16 +2302,16 @@ impl StudioPage {
                     crate::frost::frosted(12.0, crate::frost::MENU_BLUR, card).into_any_element()
                 });
                 let turn_ix = tick.turn_ix;
-                rail::rail_tick(
+                tick_rail::rail_tick(
                     ("studio-rail-tick", ix),
                     ix,
                     bucket_n,
-                    rail::rail_bar_width(is_hovered),
-                    rail::rail_bar_color(theme, is_active, is_hovered),
+                    tick_rail::rail_bar_width(is_hovered),
+                    tick_rail::rail_bar_color(theme, is_active, is_hovered),
                     card,
                 )
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                    rail::apply_rail_hover(&mut this.rail_hover, ix, *hovered);
+                    tick_rail::apply_rail_hover(&mut this.rail_hover, ix, *hovered);
                     cx.notify();
                 }))
                 .on_click(cx.listener(move |this, _, _, cx| {

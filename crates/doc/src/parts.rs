@@ -5,7 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use zeron_proto::{AgentEvent, SUBAGENT_INPUT_KEEP, ToolCall, ToolDiff, UserInputQuestion};
+use zeron_proto::{
+    AgentEvent, SUBAGENT_INPUT_KEEP, ToolCall, ToolDiff, UserInputAnswer, UserInputQuestion,
+};
 
 use crate::constants::MSG_INLINE_MAX;
 
@@ -108,12 +110,6 @@ pub enum MessageStatus {
     Streaming,
     Complete,
     Aborted,
-    /// A queued prompt ("send after the current turn") that has NOT been
-    /// delivered yet. The doc entry is the queue's durable representation:
-    /// the transcript hides it (it renders in the composer's queue tray
-    /// instead), and delivery flips it to `Complete`. Recovery treats a
-    /// `queued` user entry as pending work to re-dispatch.
-    Queued,
 }
 
 /// Lifecycle of a spawned subagent, carried on its spawn chip.
@@ -132,6 +128,21 @@ pub enum MessagePart {
     Text {
         id: String,
         text: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    Image {
+        id: String,
+        path: String,
+        name: String,
+        mime_type: String,
+    },
+    /// An agent-authored visual (`show_visual`): a Luau script stored on the
+    /// host at `path`, rendered natively. Old desktop builds' unknown-kind
+    /// fallback yields an empty text part (invisible); iOS drops unknown kinds.
+    Visual {
+        id: String,
+        path: String,
+        title: String,
     },
     /// Model thinking. Carries its body in a dedicated doc field (`reasoning`,
     /// never `text`) so pre-reasoning desktop builds — whose unknown-kind
@@ -198,10 +209,48 @@ pub enum MessagePart {
         questions: Vec<UserInputQuestion>,
         #[serde(default)]
         resolved: bool,
+        /// What the person answered, stamped by the host as the run received
+        /// it. Presence is the record, like a tool part's `isError`: `[]` when
+        /// the questions closed unanswered, absent while pending and on parts
+        /// written before answers were recorded (old readers ignore it).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answers: Option<Vec<UserInputAnswer>>,
     },
     Error {
         id: String,
         message: String,
+    },
+    /// The seam in a forked chat's transcript: everything above was copied
+    /// from `source_chat_id` when the fork was cut, everything below is this
+    /// chat's own. Written once by the fork RPC; renders as a labeled
+    /// divider. Old desktop builds' unknown-kind fallback yields an empty
+    /// text part (invisible); iOS drops unknown kinds.
+    #[serde(rename_all = "camelCase")]
+    Fork {
+        id: String,
+        source_chat_id: String,
+        /// The source's title as of the fork — the transcript reads it
+        /// without a registry lookup, and a later rename or delete of the
+        /// source does not rewrite history.
+        source_title: String,
+    },
+    /// The seam where a chat changed provider: the turns above ran on
+    /// `from`, the turns below run on `to`. Written by the host engine when
+    /// the first run after a harness change is dispatched. Labels are
+    /// display names ("Claude Code", "Codex"), frozen as of the switch.
+    /// `from_harness` / `to_harness` are the harness slugs (`claude-code`,
+    /// `codex`, ...) the UI draws provider logos from; absent on a seam written
+    /// without them. Old builds' unknown-kind fallback yields an invisible empty
+    /// text part.
+    #[serde(rename_all = "camelCase")]
+    Switch {
+        id: String,
+        from: String,
+        to: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_harness: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_harness: Option<String>,
     },
 }
 
@@ -209,10 +258,14 @@ impl MessagePart {
     pub fn id(&self) -> &str {
         match self {
             MessagePart::Text { id, .. }
+            | MessagePart::Image { id, .. }
+            | MessagePart::Visual { id, .. }
             | MessagePart::Reasoning { id, .. }
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
-            | MessagePart::Error { id, .. } => id,
+            | MessagePart::Error { id, .. }
+            | MessagePart::Fork { id, .. }
+            | MessagePart::Switch { id, .. } => id,
         }
     }
 
@@ -235,10 +288,28 @@ impl MessagePart {
                         .as_ref()
                         .map_or(0, |s| serde_json::to_vec(s).map_or(0, |v| v.len()))
             }
-            MessagePart::Input { questions, .. } => {
+            MessagePart::Input {
+                questions, answers, ..
+            } => {
                 serde_json::to_vec(questions).map_or(0, |v| v.len())
+                    + answers
+                        .as_ref()
+                        .map_or(0, |a| serde_json::to_vec(a).map_or(0, |v| v.len()))
             }
+            MessagePart::Image {
+                id,
+                path,
+                name,
+                mime_type,
+            } => id.len() + path.len() + name.len() + mime_type.len(),
+            MessagePart::Visual { id, path, title } => id.len() + path.len() + title.len(),
             MessagePart::Error { message, .. } => message.len(),
+            MessagePart::Fork {
+                source_chat_id,
+                source_title,
+                ..
+            } => source_chat_id.len() + source_title.len(),
+            MessagePart::Switch { from, to, .. } => from.len() + to.len(),
         }
     }
 }
@@ -254,7 +325,8 @@ impl MessagePart {
 ///   (a tool call in between breaks the text block).
 /// - `ToolCall` appends, or refreshes in place when the id already exists (SDK retry idempotence).
 /// - `ToolResult` marks the matching tool part resolved / errored in place.
-/// - `InputRequested` appends an input part; `InputResolved` marks it resolved.
+/// - `InputRequested` appends an input part; `InputResolved` marks it resolved and records the
+///   answers it carries.
 /// - `Error` and `Done{error}` become visible error parts.
 pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
     match event {
@@ -270,6 +342,36 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     id,
                     text: text.clone(),
                 });
+            }
+        }
+        AgentEvent::GeneratedImage {
+            id,
+            path,
+            name,
+            mime_type,
+        } => {
+            let image = MessagePart::Image {
+                id: id.clone(),
+                path: path.clone(),
+                name: name.clone(),
+                mime_type: mime_type.clone(),
+            };
+            if let Some(existing) = out.iter_mut().find(|p| p.id() == id) {
+                *existing = image;
+            } else {
+                out.push(image);
+            }
+        }
+        AgentEvent::Visual { id, path, title } => {
+            let visual = MessagePart::Visual {
+                id: id.clone(),
+                path: path.clone(),
+                title: title.clone(),
+            };
+            if let Some(existing) = out.iter_mut().find(|p| p.id() == id) {
+                *existing = visual;
+            } else {
+                out.push(visual);
             }
         }
         AgentEvent::ReasoningDelta { text } => {
@@ -361,19 +463,29 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     request_id: request_id.clone(),
                     questions: questions.clone(),
                     resolved: false,
+                    answers: None,
                 });
             }
         }
-        AgentEvent::InputResolved { request_id } => {
+        AgentEvent::InputResolved {
+            request_id,
+            answers,
+        } => {
             for p in out.iter_mut() {
                 if let MessagePart::Input {
                     request_id: rid,
                     resolved,
+                    answers: recorded,
                     ..
                 } = p
                     && rid == request_id
                 {
                     *resolved = true;
+                    // An event from before answers were recorded knows
+                    // nothing about them: leave the part's record alone.
+                    if let Some(answers) = answers {
+                        *recorded = Some(answers.clone());
+                    }
                 }
             }
         }
@@ -409,10 +521,11 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     zeron_proto::DoneStatus::Errored => SubagentStatus::Failed,
                     _ => SubagentStatus::Done,
                 }),
-                // A steer RESURRECTS a settled chip — it announces more work
-                // (claude: a queued SendMessage relaunches the agent), so
-                // this is the one event allowed past the no-regress guard.
-                AgentEvent::UserMessage { .. } => Some(SubagentStatus::Running),
+                // A new assignment reopens a settled chip. Providers may
+                // announce it with user text or a confirmed turn boundary.
+                AgentEvent::UserMessage { .. } | AgentEvent::Steered { .. } => {
+                    Some(SubagentStatus::Running)
+                }
                 _ => None,
             };
             for p in out.iter_mut() {
@@ -450,6 +563,8 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         // subagent sink writes it), never a part of the assistant message.
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
+        | AgentEvent::PlanUsage { .. }
+        | AgentEvent::ContextUsage { .. }
         | AgentEvent::AvailableCommands { .. }
         | AgentEvent::UserMessage { .. } => {}
     }
@@ -699,6 +814,71 @@ mod tests {
     }
 
     #[test]
+    fn input_resolution_records_what_the_run_received() {
+        let asked = |id: &str| AgentEvent::InputRequested {
+            request_id: id.into(),
+            questions: vec![],
+        };
+        let picked = vec![UserInputAnswer {
+            question_id: "q".into(),
+            labels: vec!["B".into()],
+        }];
+        let mut parts = Vec::new();
+        for id in ["answered", "closed", "legacy"] {
+            fold_event_into_parts(&mut parts, &asked(id));
+        }
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Input { answers: None, .. }
+        ));
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::InputResolved {
+                request_id: "answered".into(),
+                answers: Some(picked.clone()),
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::InputResolved {
+                request_id: "closed".into(),
+                answers: Some(vec![]),
+            },
+        );
+        // An event from before answers were recorded resolves the part but
+        // records nothing.
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::InputResolved {
+                request_id: "legacy".into(),
+                answers: None,
+            },
+        );
+        let recorded: Vec<_> = parts
+            .iter()
+            .map(|p| match p {
+                MessagePart::Input {
+                    resolved, answers, ..
+                } => (*resolved, answers.clone()),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![(true, Some(picked)), (true, Some(vec![])), (true, None)]
+        );
+        // The splitter counts answers toward the entry's byte budget.
+        let bare = MessagePart::Input {
+            id: "i".into(),
+            request_id: "i".into(),
+            questions: vec![],
+            resolved: true,
+            answers: None,
+        };
+        assert!(parts[0].byte_len() > bare.byte_len());
+    }
+
+    #[test]
     fn oversized_reasoning_splits_like_text() {
         let big = "x".repeat(MSG_INLINE_MAX + 10);
         let parts = vec![MessagePart::Reasoning {
@@ -714,6 +894,34 @@ mod tests {
         );
         assert!(flat.iter().all(|p| p.byte_len() <= MSG_INLINE_MAX));
         assert_eq!(flat[1].id(), "r0~1");
+    }
+
+    #[test]
+    fn generated_image_fold_is_ordered_atomic_and_idempotent() {
+        let mut parts = vec![];
+        fold_event_into_parts(&mut parts, &text_delta("before"));
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "i".into(),
+                call: ToolCall::Unknown {
+                    name: "Generate image".into(),
+                    input: None,
+                },
+            },
+        );
+        let event = AgentEvent::GeneratedImage {
+            id: "i:image".into(),
+            path: "/uploads/i.png".into(),
+            name: "generated.png".into(),
+            mime_type: "image/png".into(),
+        };
+        fold_event_into_parts(&mut parts, &event);
+        fold_event_into_parts(&mut parts, &text_delta("after"));
+        fold_event_into_parts(&mut parts, &event);
+        assert_eq!(parts.len(), 4);
+        assert!(matches!(&parts[2], MessagePart::Image { id, .. } if id == "i:image"));
+        assert_eq!(join_continuations(split_parts(&parts)), parts);
     }
 
     #[test]
@@ -1158,6 +1366,24 @@ mod tests {
             } => assert_eq!(*subagent_status, Some(SubagentStatus::Done)),
             other => panic!("{other:?}"),
         }
+        // A confirmed follow-up can reopen the same chip without user text.
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Subagent {
+                parent_tool_use_id: "toolu_sub".into(),
+                event: Box::new(AgentEvent::Steered {
+                    assistant_message_id: None,
+                    next_assistant_message_id: None,
+                }),
+            },
+        );
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Tool {
+                subagent_status: Some(SubagentStatus::Running),
+                ..
+            }
+        ));
         // Content never leaked into the parent parts.
         assert_eq!(parts.len(), 1);
     }

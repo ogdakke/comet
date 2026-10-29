@@ -3,14 +3,12 @@
 //! gpui has no built-in selection for plain text elements. Zed's markdown
 //! selects continuously because its whole document is ONE element over one
 //! text model; zeron renders a TREE of text elements inside a virtualized
-//! list, so this module rebuilds that continuity.
-//!
-//! The list owner binds a document-order catalog of *(key, text)* from its
-//! full row model each frame. Painted elements still register geometry for
-//! hit-testing; a drag's head is a visible key, then resolve walks the
-//! bound catalog so rows the virtualizer never painted stay in the
-//! selection. The wash paints per visible element from its span; copy
-//! joins every span in document order.
+//! list, so this module rebuilds that continuity: every frame the renderer
+//! registers each painted text element in paint order (= document order),
+//! and a drag anchored in one element resolves against that registry into
+//! per-element SPANS — partial in the anchor/head elements, whole for every
+//! element between. The wash paints per element from its span; copy joins
+//! the spans in order.
 //!
 //! This module is the pure state half (gpui-free, unit-tested); the
 //! registry, geometry and mouse listeners live in `render.rs`.
@@ -30,28 +28,21 @@ pub struct Span {
     pub text: String,
 }
 
-/// How a drag grows as the pointer moves.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Granularity {
-    /// Character caret (single click).
-    #[default]
-    Char,
-    /// Whole words (double-click, then drag).
-    Word,
-    /// Whole elements (triple-click, then drag).
-    Paragraph,
-}
-
 #[derive(Clone, Default)]
 struct MdSelection {
+    /// Painted surface (transcript) the selection lives in. Keys are only
+    /// unique within one: a side chat's forked history repeats its parent's.
+    surface: u64,
     /// Element that owns the drag (where the mouse went down).
     anchor_key: String,
-    /// The initial unit — a caret for char, the clicked word/block otherwise.
-    /// Always included in the selection, even when the head moves backward.
-    anchor_range: Range<usize>,
-    granularity: Granularity,
+    /// Byte offset of the anchor within its element.
+    anchor_ix: usize,
     dragging: bool,
-    /// Resolved spans over the bound document, not just the painted window.
+    /// Document direction established while the anchor is still painted.
+    /// Once virtualization moves it out of the registry, this tells us which
+    /// side of the accumulated spans to preserve while extending the head.
+    forward: Option<bool>,
+    /// Resolved spans, document order. Empty while a click hasn't moved.
     spans: Vec<Span>,
 }
 
@@ -60,60 +51,33 @@ fn state() -> &'static Mutex<Option<MdSelection>> {
     STATE.get_or_init(|| Mutex::new(None))
 }
 
-fn document() -> &'static Mutex<Vec<(String, String)>> {
-    static DOC: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
-    DOC.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// Replace the document-order catalog of selectable text. The list owner
-/// binds this every frame from its full row model (not the virtualized
-/// paint window) so a drag can cover rows that have never been on screen.
-pub fn bind_document(elements: Vec<(String, String)>) {
-    *document().lock().unwrap() = elements;
-}
-
-/// The bound document, for resolve / tests.
-pub fn bound_document() -> Vec<(String, String)> {
-    document().lock().unwrap().clone()
+/// Selection state is process-global; tests that exercise its lifecycle must
+/// not race each other.
+#[cfg(test)]
+pub(crate) fn test_state_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Resolve the spans for a selection between `a` and `b`, each an
 /// `(element index, byte offset)` into `elements` (document-ordered
 /// `(key, text)` pairs). Handles either direction; empty slices are skipped.
 pub fn resolve_spans(elements: &[(&str, &str)], a: (usize, usize), b: (usize, usize)) -> Vec<Span> {
-    resolve_span_ranges(elements, (a.0, a.1..a.1), (b.0, b.1..b.1))
-}
-
-/// Like [`resolve_spans`], but each end is a range so a double-clicked word
-/// stays selected when the head moves past it (the union of the two units).
-pub fn resolve_span_ranges(
-    elements: &[(&str, &str)],
-    a: (usize, Range<usize>),
-    b: (usize, Range<usize>),
-) -> Vec<Span> {
-    if elements.is_empty() {
-        return Vec::new();
-    }
-    if a.0 == b.0 {
-        let text = elements[a.0.min(elements.len() - 1)].1;
-        let from = a.1.start.min(b.1.start).min(text.len());
-        let to = a.1.end.max(b.1.end).min(text.len());
-        if from >= to {
-            return Vec::new();
-        }
-        return vec![Span {
-            key: elements[a.0].0.to_string(),
-            range: from..to,
-            text: text.to_string(),
-        }];
-    }
-    let (start, end) = if a.0 < b.0 { (a, b) } else { (b, a) };
+    let (start, end) = if (a.0, a.1) <= (b.0, b.1) {
+        (a, b)
+    } else {
+        (b, a)
+    };
     let mut spans = Vec::new();
     for (ei, (key, text)) in elements.iter().enumerate().take(end.0 + 1).skip(start.0) {
-        let from = if ei == start.0 { start.1.start } else { 0 };
-        let to = if ei == end.0 { end.1.end } else { text.len() };
+        let from = if ei == start.0 { start.1 } else { 0 };
+        let to = if ei == end.0 { end.1 } else { text.len() };
         let (from, to) = (from.min(text.len()), to.min(text.len()));
-        if from < to {
+        // Keep empty elements strictly between the endpoints. Rendered code
+        // fences register one element per source line, so a blank line must
+        // contribute its newline when a selection crosses it.
+        if from < to || (ei > start.0 && ei < end.0) {
             spans.push(Span {
                 key: (*key).to_string(),
                 range: from..to,
@@ -124,45 +88,36 @@ pub fn resolve_span_ranges(
     spans
 }
 
-/// Snap `ix` to the current granularity's unit.
-pub fn snap_unit(text: &str, ix: usize, granularity: Granularity) -> Range<usize> {
-    match granularity {
-        Granularity::Char => {
-            let ix = ix.min(text.len());
-            ix..ix
-        }
-        Granularity::Word => word_range(text, ix),
-        Granularity::Paragraph => 0..text.len(),
-    }
-}
-
 /// Begin a drag anchored at `(key, ix)`; claims the global selection.
 pub fn begin(key: &str, ix: usize) {
+    begin_in(0, key, ix);
+}
+
+/// `begin` on one of several surfaces painted in the same frame.
+pub(crate) fn begin_in(surface: u64, key: &str, ix: usize) {
     *state().lock().unwrap() = Some(MdSelection {
+        surface,
         anchor_key: key.to_string(),
-        anchor_range: ix..ix,
-        granularity: Granularity::Char,
+        anchor_ix: ix,
         dragging: true,
+        forward: None,
         spans: Vec::new(),
     });
 }
 
-/// Begin with an immediate span (double-click word / triple-click block).
+/// Begin with an immediate span (double/triple click inside one element).
 pub fn begin_with_span(key: &str, text: &str, range: Range<usize>) {
-    begin_granular(key, text, range, Granularity::Word);
+    begin_with_span_in(0, key, text, range);
 }
 
-/// Triple-click: the whole element, and a drag grows by whole elements.
-pub fn begin_paragraph(key: &str, text: &str) {
-    begin_granular(key, text, 0..text.len(), Granularity::Paragraph);
-}
-
-fn begin_granular(key: &str, text: &str, range: Range<usize>, granularity: Granularity) {
+/// `begin_with_span` on one of several surfaces painted in the same frame.
+pub(crate) fn begin_with_span_in(surface: u64, key: &str, text: &str, range: Range<usize>) {
     *state().lock().unwrap() = Some(MdSelection {
+        surface,
         anchor_key: key.to_string(),
-        anchor_range: range.clone(),
-        granularity,
+        anchor_ix: range.start,
         dragging: true,
+        forward: None,
         spans: vec![Span {
             key: key.to_string(),
             range,
@@ -175,82 +130,103 @@ fn begin_granular(key: &str, text: &str, range: Range<usize>, granularity: Granu
 pub fn drag_anchor(key: &str) -> Option<usize> {
     let guard = state().lock().unwrap();
     let sel = guard.as_ref()?;
-    (sel.dragging && sel.anchor_key == key).then_some(sel.anchor_range.start)
+    (sel.dragging && sel.anchor_key == key).then_some(sel.anchor_ix)
 }
 
-/// Whether a drag is in flight (used to keep the edge-autoscroll loop alive).
+pub(crate) fn anchor_key() -> Option<String> {
+    state()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.anchor_key.clone())
+}
+
+/// The surface the selection lives in (0 when there is none).
+pub(crate) fn anchor_surface() -> u64 {
+    state().lock().unwrap().as_ref().map_or(0, |s| s.surface)
+}
+
+/// Whether a markdown selection drag is currently in flight.
 pub fn is_dragging() -> bool {
     state()
         .lock()
         .unwrap()
         .as_ref()
-        .is_some_and(|sel| sel.dragging)
+        .is_some_and(|selection| selection.dragging)
 }
 
-/// The drag's owning element, initial unit, and granularity, if a drag is live.
-pub fn drag_owner() -> Option<(String, Range<usize>, Granularity)> {
-    let guard = state().lock().unwrap();
-    let sel = guard.as_ref()?;
-    sel.dragging.then(|| {
-        (
-            sel.anchor_key.clone(),
-            sel.anchor_range.clone(),
-            sel.granularity,
-        )
-    })
-}
-
-/// Resolve the live drag against the bound document (falling back to
-/// `visible` when the catalog is empty). The original anchor is never
-/// rewritten, so reversing a drag cannot invert the highlight.
-pub fn resolve_against_document(
-    visible: &[(&str, &str)],
-    head_key: &str,
-    head_range: Range<usize>,
-) -> bool {
-    let Some((anchor_key, anchor_range, _)) = drag_owner() else {
+/// Resolve a drag head against this frame's visible elements.
+///
+/// While the anchor is visible this is a normal replacement, which lets the
+/// user contract or reverse the selection. Once a virtualized list scrolls the
+/// anchor away, merge through an overlapping selected element instead. The
+/// overlap preserves text that is no longer painted while allowing newly
+/// visible elements at the drag edge to join the selection.
+pub fn update_drag(elements: &[(&str, &str)], head: (usize, usize)) -> bool {
+    let mut guard = state().lock().unwrap();
+    let Some(selection) = guard.as_mut().filter(|selection| selection.dragging) else {
         return false;
     };
-    let doc = document().lock().unwrap().clone();
-    let fallback: Vec<(String, String)> = visible
+    let spans = if let Some(anchor_ei) = elements
         .iter()
-        .map(|(k, t)| ((*k).to_string(), (*t).to_string()))
-        .collect();
-    let source = if doc.is_empty() { &fallback } else { &doc };
-    let elements: Vec<(&str, &str)> = source
-        .iter()
-        .map(|(k, t)| (k.as_str(), t.as_str()))
-        .collect();
-    let Some(anchor_ei) = elements.iter().position(|(k, _)| *k == anchor_key) else {
-        return false;
-    };
-    let Some(head_ei) = elements.iter().position(|(k, _)| *k == head_key) else {
-        return false;
-    };
-    update_spans(resolve_span_ranges(
-        &elements,
-        (anchor_ei, anchor_range),
-        (head_ei, head_range),
-    ))
-}
-
-/// Pixels to scroll this frame so a drag-select can grow past the viewport.
-/// Negative = toward earlier content. Zero when the pointer is inside the
-/// reading band; speed ramps as the pointer enters (or passes) the edge zone.
-pub fn autoscroll_delta(pointer_y: f32, band_top: f32, band_bottom: f32) -> f32 {
-    const ZONE: f32 = 72.0;
-    const MAX: f32 = 18.0;
-    if !pointer_y.is_finite() || band_bottom <= band_top + 1.0 {
-        return 0.0;
-    }
-    if pointer_y < band_top + ZONE {
-        let t = ((band_top + ZONE - pointer_y) / ZONE).clamp(0.0, 2.0);
-        -MAX * t
-    } else if pointer_y > band_bottom - ZONE {
-        let t = ((pointer_y - (band_bottom - ZONE)) / ZONE).clamp(0.0, 2.0);
-        MAX * t
+        .position(|(key, _)| *key == selection.anchor_key)
+    {
+        let anchor = (anchor_ei, selection.anchor_ix);
+        selection.forward = Some(anchor <= head);
+        resolve_spans(elements, anchor, head)
     } else {
-        0.0
+        let Some(forward) = selection.forward else {
+            return false;
+        };
+        let Some(spans) = extend_virtualized_drag(&selection.spans, elements, head, forward) else {
+            return false;
+        };
+        spans
+    };
+    if selection.spans == spans {
+        return false;
+    }
+    selection.spans = spans;
+    true
+}
+
+fn extend_virtualized_drag(
+    existing: &[Span],
+    elements: &[(&str, &str)],
+    head: (usize, usize),
+    forward: bool,
+) -> Option<Vec<Span>> {
+    if forward {
+        let (element_ix, span_ix) =
+            elements
+                .iter()
+                .enumerate()
+                .find_map(|(element_ix, (key, _))| {
+                    existing
+                        .iter()
+                        .position(|span| span.key == *key)
+                        .map(|span_ix| (element_ix, span_ix))
+                })?;
+        let start = existing[span_ix].range.start;
+        let mut merged = existing[..span_ix].to_vec();
+        merged.extend(resolve_spans(elements, (element_ix, start), head));
+        Some(merged)
+    } else {
+        let (element_ix, span_ix) =
+            elements
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(element_ix, (key, _))| {
+                    existing
+                        .iter()
+                        .position(|span| span.key == *key)
+                        .map(|span_ix| (element_ix, span_ix))
+                })?;
+        let end = existing[span_ix].range.end;
+        let mut merged = resolve_spans(elements, head, (element_ix, end));
+        merged.extend_from_slice(&existing[span_ix + 1..]);
+        Some(merged)
     }
 }
 
@@ -274,29 +250,40 @@ pub fn end_drag(key: &str) -> Option<String> {
     if sel.anchor_key != key || !sel.dragging {
         return None;
     }
-    finish_drag(&mut guard)
-}
-
-/// End whichever drag is live (window-level mouse-up).
-pub fn end_any_drag() -> Option<String> {
-    let mut guard = state().lock().unwrap();
-    let sel = guard.as_mut()?;
-    if !sel.dragging {
-        return None;
-    }
-    finish_drag(&mut guard)
-}
-
-fn finish_drag(guard: &mut Option<MdSelection>) -> Option<String> {
-    let Some(sel) = guard.as_mut() else {
-        return None;
-    };
     sel.dragging = false;
     if sel.spans.iter().all(|s| s.range.is_empty()) {
         *guard = None;
         return None;
     }
     Some(join_spans(&sel.spans))
+}
+
+/// End whichever drag is active, even when virtualization has removed the
+/// anchor element (and therefore its frame-scoped mouse-up listener).
+pub fn end_active_drag() -> Option<String> {
+    let mut guard = state().lock().unwrap();
+    let sel = guard.as_mut()?;
+    if !sel.dragging {
+        return None;
+    }
+    sel.dragging = false;
+    if sel.spans.iter().all(|span| span.range.is_empty()) {
+        *guard = None;
+        return None;
+    }
+    Some(join_spans(&sel.spans))
+}
+
+/// How a text-input drag grows as the pointer moves (TextInput primitive).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Granularity {
+    /// Character caret (single click).
+    #[default]
+    Char,
+    /// Whole words (double-click, then drag).
+    Word,
+    /// Whole lines (triple-click, then drag).
+    Paragraph,
 }
 
 /// Drop any live or settled selection. True if there was one.
@@ -323,10 +310,11 @@ pub fn clear_if_owner(key: &str) -> bool {
     false
 }
 
-/// The wash range for `key` this frame (empty ⇒ nothing to paint).
-pub fn wash_range(key: &str) -> Option<Range<usize>> {
+/// The wash range for `key` painted on `surface` this frame (empty ⇒ nothing
+/// to paint). Another surface showing the same key stays unwashed.
+pub fn wash_range(surface: u64, key: &str) -> Option<Range<usize>> {
     let guard = state().lock().unwrap();
-    let sel = guard.as_ref()?;
+    let sel = guard.as_ref().filter(|sel| sel.surface == surface)?;
     sel.spans
         .iter()
         .find(|s| s.key == key && !s.range.is_empty())
@@ -346,7 +334,6 @@ pub fn selected_text() -> Option<String> {
 fn join_spans(spans: &[Span]) -> String {
     spans
         .iter()
-        .filter(|s| !s.range.is_empty())
         .map(|s| &s.text[s.range.clone()])
         .collect::<Vec<_>>()
         .join("\n")
@@ -421,98 +408,25 @@ mod tests {
     }
 
     #[test]
-    fn word_drag_keeps_the_clicked_word_when_moving_left() {
-        let elems = vec![("p1", "hello world today")];
-        // Double-clicked "world" (6..11), dragged into "hello" (0..5).
-        let spans = resolve_span_ranges(&elems, (0, 6..11), (0, 0..5));
-        assert_eq!(spans.len(), 1);
-        assert_eq!(&spans[0].text[spans[0].range.clone()], "hello world");
-    }
-
-    #[test]
-    fn word_drag_extends_right_by_whole_words() {
-        let elems = vec![("p1", "hello world today")];
-        let spans = resolve_span_ranges(&elems, (0, 6..11), (0, 12..17));
-        assert_eq!(&spans[0].text[spans[0].range.clone()], "world today");
-    }
-
-    #[test]
-    fn word_drag_across_elements_unions_the_units() {
-        let spans = resolve_span_ranges(&elems(), (0, 6..15), (2, 0..5));
+    fn spans_across_empty_elements_preserve_blank_lines() {
+        let elements = [("line-1", "first"), ("line-2", ""), ("line-3", "third")];
+        let spans = resolve_spans(&elements, (0, 0), (2, 5));
         assert_eq!(spans.len(), 3);
-        assert_eq!(&spans[0].text[spans[0].range.clone()], "paragraph");
-        assert_eq!(&spans[1].text[spans[1].range.clone()], "second");
-        assert_eq!(&spans[2].text[spans[2].range.clone()], "third");
-    }
-
-    #[test]
-    fn document_resolve_covers_unpainted_middles() {
-        let _state = state_lock();
-        bind_document(vec![
-            ("p1".into(), "first paragraph".into()),
-            ("p2".into(), "second".into()),
-            ("p3".into(), "third one".into()),
-            ("p4".into(), "fourth".into()),
-        ]);
-        begin("p1", 6);
-        // Only p1 and p4 are "on screen" — p2/p3 were virtualized through.
-        let visible = [("p1", "first paragraph"), ("p4", "fourth")];
-        assert!(resolve_against_document(&visible, "p4", 6..6));
-        assert_eq!(
-            selected_text().as_deref(),
-            Some("paragraph\nsecond\nthird one\nfourth")
-        );
-        end_any_drag();
-        bind_document(Vec::new());
-    }
-
-    #[test]
-    fn reversing_a_drag_keeps_the_original_anchor() {
-        let _state = state_lock();
-        bind_document(vec![
-            ("p1".into(), "first paragraph".into()),
-            ("p2".into(), "second".into()),
-            ("p3".into(), "third one".into()),
-        ]);
-        begin("p3", 9);
-        let visible = [
-            ("p1", "first paragraph"),
-            ("p2", "second"),
-            ("p3", "third one"),
-        ];
-        assert!(resolve_against_document(&visible, "p1", 0..0));
-        assert_eq!(
-            selected_text().as_deref(),
-            Some("first paragraph\nsecond\nthird one")
-        );
-        // Drag back toward the anchor: must shrink from the top, not flip.
-        assert!(resolve_against_document(&visible, "p2", 0..0));
-        assert_eq!(selected_text().as_deref(), Some("second\nthird one"));
-        end_any_drag();
-        bind_document(Vec::new());
-    }
-
-    /// The drag tests below mutate the process-global selection state —
-    /// serialize them, or the parallel test runner interleaves their
-    /// begin/end_drag calls (long-standing flake).
-    fn state_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        assert_eq!(join_spans(&spans), "first\n\nthird");
     }
 
     #[test]
     fn drag_lifecycle_and_copy_joins() {
-        let _state = state_lock();
+        let _state = test_state_lock();
         begin("p1", 6);
         assert_eq!(drag_anchor("p1"), Some(6));
         assert_eq!(drag_anchor("p2"), None);
         let spans = resolve_spans(&elems(), (0, 6), (1, 6));
         assert!(update_spans(spans.clone()));
         assert!(!update_spans(spans)); // unchanged ⇒ no repaint
-        assert_eq!(wash_range("p1"), Some(6..15));
-        assert_eq!(wash_range("p2"), Some(0..6));
-        assert_eq!(wash_range("p3"), None);
+        assert_eq!(wash_range(0, "p1"), Some(6..15));
+        assert_eq!(wash_range(0, "p2"), Some(0..6));
+        assert_eq!(wash_range(0, "p3"), None);
         assert_eq!(end_drag("p1").as_deref(), Some("paragraph\nsecond"));
         assert_eq!(selected_text().as_deref(), Some("paragraph\nsecond"));
         // Settled: a down elsewhere clears via the owner's listener.
@@ -522,18 +436,38 @@ mod tests {
     }
 
     #[test]
-    fn clear_drops_a_live_or_settled_selection() {
-        let _state = state_lock();
-        begin("p1", 3);
-        assert!(clear());
-        assert_eq!(selected_text(), None);
-        assert!(!is_dragging());
-        assert!(!clear());
+    fn drag_survives_forward_virtualization() {
+        let _state = test_state_lock();
+        begin("p1", 6);
+        assert!(update_drag(&elems(), (2, 5)));
+        let shifted = [("p2", "second"), ("p3", "third one"), ("p4", "fourth")];
+        assert!(update_drag(&shifted, (2, 4)));
+        assert_eq!(
+            selected_text().as_deref(),
+            Some("paragraph\nsecond\nthird one\nfour")
+        );
+        assert_eq!(
+            end_active_drag().as_deref(),
+            Some("paragraph\nsecond\nthird one\nfour")
+        );
+        assert_eq!(drag_anchor("p1"), None);
+    }
+
+    #[test]
+    fn drag_survives_backward_virtualization() {
+        let _state = test_state_lock();
+        begin("p5", 4);
+        let first = [("p3", "third"), ("p4", "fourth"), ("p5", "fifth")];
+        assert!(update_drag(&first, (0, 2)));
+        let shifted = [("p2", "second"), ("p3", "third"), ("p4", "fourth")];
+        assert!(update_drag(&shifted, (0, 3)));
+        assert_eq!(selected_text().as_deref(), Some("ond\nthird\nfourth\nfift"));
+        assert_eq!(end_drag("p5").as_deref(), Some("ond\nthird\nfourth\nfift"));
     }
 
     #[test]
     fn empty_click_clears_on_release() {
-        let _state = state_lock();
+        let _state = test_state_lock();
         begin("p1", 3);
         assert_eq!(end_drag("p1"), None);
         assert_eq!(selected_text(), None);
@@ -541,35 +475,10 @@ mod tests {
 
     #[test]
     fn double_click_span() {
-        let _state = state_lock();
+        let _state = test_state_lock();
         begin_with_span("p1", "hello world", 6..11);
-        assert_eq!(wash_range("p1"), Some(6..11));
+        assert_eq!(wash_range(0, "p1"), Some(6..11));
         assert_eq!(end_drag("p1").as_deref(), Some("world"));
-    }
-
-    #[test]
-    fn autoscroll_delta_is_zero_inside_the_band() {
-        assert_eq!(autoscroll_delta(200.0, 100.0, 500.0), 0.0);
-        assert_eq!(autoscroll_delta(172.0, 100.0, 500.0), 0.0);
-        assert_eq!(autoscroll_delta(428.0, 100.0, 500.0), 0.0);
-    }
-
-    #[test]
-    fn autoscroll_delta_ramps_at_the_edges() {
-        // Mid-zone above the top: half speed upward.
-        let up = autoscroll_delta(136.0, 100.0, 500.0);
-        assert!((up - (-9.0)).abs() < 0.01, "{up}");
-        // Mid-zone below the bottom: half speed downward.
-        let down = autoscroll_delta(464.0, 100.0, 500.0);
-        assert!((down - 9.0).abs() < 0.01, "{down}");
-        // Past the band edge: still capped at 2×.
-        assert!((autoscroll_delta(0.0, 100.0, 500.0) - (-36.0)).abs() < 0.01);
-        assert!((autoscroll_delta(600.0, 100.0, 500.0) - 36.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn autoscroll_delta_rejects_a_collapsed_band() {
-        assert_eq!(autoscroll_delta(10.0, 100.0, 100.0), 0.0);
     }
 
     #[test]

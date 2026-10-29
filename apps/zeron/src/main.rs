@@ -2,6 +2,8 @@
 //! local-only without credentials. `zeron login` and `zeron logout` select the
 //! profile used by the next engine start without mutating a live runtime.
 
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod auth_cli;
 mod daemon;
 mod defaults;
@@ -9,23 +11,36 @@ mod studio_cli;
 mod update_cli;
 
 use clap::{Parser, Subcommand};
-
 const PRIVATE_ENV_KEYS: [&str; 2] = ["ZERON_EDGE_URL", "ZERON_WORKOS_CLIENT_ID"];
 
+use zeron_app::{edge_url_from_env, engine_config_from_env, paths, workos_client_id_from_env};
+
 #[derive(Parser)]
-#[command(name = "zeron", about = "Multi-device controller for coding agents")]
+#[command(
+    name = "zeron",
+    version,
+    about = "Multi-device controller for coding agents"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
     /// Open a Zeron conversation URL.
     #[arg(value_name = "URL")]
     open_url: Option<String>,
+    #[cfg(windows)]
+    #[arg(long, hide = true)]
+    wait_for_exit: Option<u32>,
 }
 
 #[derive(Subcommand)]
 enum Command {
     /// Run the engine without a UI (local-only unless a saved session enables sync).
     Headless,
+    /// The desktop app's background engine (`zeron-engine` where it ships
+    /// separately): started by the app, it keeps sessions running with the
+    /// app closed.
+    #[command(hide = true)]
+    Engine,
     /// Sign in and enable sync on the next engine start.
     Login,
     /// Remove the saved session and return to local-only on the next start.
@@ -40,6 +55,18 @@ enum Command {
         #[command(subcommand)]
         command: StudioCommand,
     },
+    /// Cloud sleep handshake: ask the running engine to start no new work.
+    /// Exits 0 when quiesced, 75 when busy (a turn in flight, a message
+    /// waiting) — the edge then keeps the machine awake.
+    #[command(hide = true)]
+    Quiesce,
+    #[cfg(target_os = "linux")]
+    /// Trigger an Appshot in the running headed instance (desktop shortcut fallback).
+    Appshot,
+    /// Serve the Zeron MCP (Model Context Protocol) server on stdin/stdout,
+    /// proxying to the running engine's IPC. Agents use it to create, read,
+    /// and message chats. Logs go to stderr; stdout is the protocol.
+    Mcp,
     /// Manage `zeron headless` as a background service (launchd / systemd --user).
     Daemon {
         #[command(subcommand)]
@@ -79,34 +106,6 @@ enum DaemonCommand {
     Status,
 }
 
-fn edge_url_from_env() -> String {
-    std::env::var("ZERON_EDGE_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_default()
-}
-
-/// WorkOS requires an explicit client id. An explicit development bearer still
-/// enables the local development edge flow; no configuration remains local-only.
-fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
-    match std::env::var("ZERON_WORKOS_CLIENT_ID") {
-        Ok(v) if v.trim().is_empty() => None,
-        Ok(v) => Some(v),
-        Err(_) if edge_token.is_some() => None,
-        Err(_) => None,
-    }
-}
-
-/// mimalloc, macOS only: libmalloc never returns the streaming churn's
-/// high-water pages, so transient allocation became permanent RSS
-/// (docs/memory-plan.md §1). Pinned to mimalloc v2 in the workspace manifest —
-/// the crate's default v3 has the same pathology (churn retained as permanent
-/// RSS, ~6x glibc's growth on identical workloads, no idle recovery). Linux
-/// measured flat on glibc, so it keeps the system allocator.
-#[cfg(target_os = "macos")]
-#[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 fn load_private_deployment_env() {
     let path = private_deployment_env_path();
     let Ok(contents) = std::fs::read_to_string(path) else {
@@ -127,11 +126,7 @@ fn load_private_deployment_env() {
 /// WorkOS application (`~/.zeron`). An explicit `ZERON_DATA_DIR` gets the same
 /// behavior, which makes private test deployments self-contained.
 fn private_deployment_env_path() -> std::path::PathBuf {
-    private_deployment_env_path_for(
-        std::env::var_os("ZERON_DATA_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(defaults::data_dir),
-    )
+    private_deployment_env_path_for(paths::data_dir())
 }
 
 fn private_deployment_env_path_for(data_dir: std::path::PathBuf) -> std::path::PathBuf {
@@ -165,59 +160,40 @@ fn parse_private_env(contents: &str) -> Vec<(&'static str, String)> {
 
 fn main() -> anyhow::Result<()> {
     load_private_deployment_env();
-    let cli = Cli::parse();
-    // Long-running modes log at info, one-shot CLI commands at warn (RUST_LOG
-    // overrides either).
-    // loro's internal block-encode diagnostics log at info and flood
-    // journald on every snapshot export — enough to fill a disk on a
-    // long-running headless host. Quiet them by default (RUST_LOG still
-    // overrides the whole filter).
-    let long_running = matches!(&cli.command, None | Some(Command::Headless));
-    let default_filter = if long_running {
-        "info,loro_internal=warn,loro=warn"
-    } else {
-        "warn"
-    };
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| default_filter.into());
-    // Long-running modes mirror stdout logging to {data_dir}/logs — a headed
-    // app launched from Finder has no visible stdout, which left every sync
-    // wedge report ("stale until restart") with zero diagnostics even though
-    // the engine logs the exact failure line. One file per launch, previous
-    // launch kept as `.old`.
-    let runtime_defaults = if long_running {
-        Some(engine_config_from_env())
-    } else {
-        None
-    };
-    let log_file = if long_running {
-        let mode = if cli.command.is_some() {
-            "headless"
-        } else {
-            "headed"
-        };
-        open_log_file(mode)
-    } else {
-        None
-    };
-    {
-        use tracing_subscriber::layer::SubscriberExt;
-        use tracing_subscriber::util::SubscriberInitExt;
-        let registry = tracing_subscriber::registry()
-            .with(filter)
-            .with(tracing_subscriber::fmt::layer());
-        match log_file {
-            Some(file) => registry
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .with_ansi(false)
-                        .with_writer(std::sync::Arc::new(file)),
-                )
-                .init(),
-            None => registry.init(),
-        }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--noop-browser")) {
+        return Ok(());
     }
-    if let Some(config) = &runtime_defaults {
+    #[cfg(windows)]
+    attach_parent_console();
+    let cli = Cli::parse();
+    #[cfg(windows)]
+    if let Some(pid) = cli.wait_for_exit {
+        zeron_update::windows::wait_for_exit(pid)?;
+    } else if matches!(
+        &cli.command,
+        None | Some(Command::Headless) | Some(Command::Engine)
+    ) {
+        zeron_update::windows::cleanup_previous_image();
+    }
+    let long_running = matches!(&cli.command, None | Some(Command::Headless));
+    let mode = if cli.command.is_some() {
+        "headless"
+    } else {
+        "headed"
+    };
+    // `zeron mcp` owns stdout for the protocol: a single log line on it
+    // would corrupt the JSON-RPC stream, so its diagnostics go to stderr.
+    // The background engine logs on its own (`zeron_app::background`).
+    if !matches!(&cli.command, Some(Command::Engine)) {
+        zeron_app::init_logging(
+            long_running,
+            mode,
+            matches!(&cli.command, Some(Command::Mcp)),
+        );
+    }
+    if long_running {
+        zeron_app::long_running_setup();
+        let config = engine_config_from_env();
         defaults::log_isolation(&config.data_dir, config.ipc_port);
     }
 
@@ -243,7 +219,8 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Command::Sync) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(sync_cli(engine_config_from_env().ipc_port))
+            let config = engine_config_from_env();
+            runtime.block_on(sync_cli(config.ipc_port, &config.data_dir))
         }
         Some(Command::Studio { command }) => {
             let runtime = tokio::runtime::Runtime::new()?;
@@ -252,6 +229,18 @@ fn main() -> anyhow::Result<()> {
                     runtime.block_on(studio_cli::import_local(engine_config_from_env(), source))
                 }
             }
+        }
+        Some(Command::Quiesce) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            let config = engine_config_from_env();
+            runtime.block_on(quiesce_cli(config.ipc_port, &config.data_dir))
+        }
+        Some(Command::Mcp) => zeron_app::run_mcp(),
+        Some(Command::Engine) => zeron_app::background::run(),
+        #[cfg(target_os = "linux")]
+        Some(Command::Appshot) => {
+            zeron_ui::appshots::request_running_appshot(&engine_config_from_env().data_dir)
+                .map_err(anyhow::Error::msg)
         }
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;
@@ -270,9 +259,7 @@ fn main() -> anyhow::Result<()> {
             // Headed: the UI probes ZERON_IPC_PORT and connects to a running
             // daemon, or embeds the engine in-process (ARCHITECTURE §1).
             zeron_ui::run_app(zeron_ui::UiConfig {
-                data_dir: std::env::var_os("ZERON_DATA_DIR")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(defaults::data_dir),
+                data_dir: paths::data_dir(),
                 ipc_port: std::env::var("ZERON_IPC_PORT")
                     .ok()
                     .and_then(|p| p.parse().ok())
@@ -289,78 +276,59 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// The env-resolved engine configuration shared by `headless`, `login`,
-/// `logout`, and `status` — one resolution so the CLI auth commands always
-/// operate on the exact session the daemon will load.
-fn engine_config_from_env() -> zeron_engine::EngineConfig {
-    // Dev-mode bearer (no WorkOS): an explicit token enables sync.
-    let edge_token = std::env::var("ZERON_EDGE_TOKEN").ok();
-    zeron_engine::EngineConfig {
-        data_dir: std::env::var_os("ZERON_DATA_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(defaults::data_dir),
-        edge_url: edge_url_from_env(),
-        ipc_port: std::env::var("ZERON_IPC_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or_else(defaults::ipc_port),
-        default_harness: harness_from_env(),
-        // WorkOS mode: the signed-in session's org wins; ZERON_ORG_ID (dev
-        // default "dev-org") scopes the workspace room otherwise.
-        org_id: std::env::var("ZERON_ORG_ID").ok(),
-        // Real auth against production by default; see
-        // `workos_client_id_from_env` for the dev-mode escape hatches.
-        workos_client_id: workos_client_id_from_env(&edge_token),
-        edge_token,
-    }
-}
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE, SetStdHandle,
+    };
 
-/// `ZERON_HARNESS` (kebab-case id) picks the default harness for chats without a
-/// config row — `mock` powers the e2e smoke; default `claude-code`.
-fn harness_from_env() -> zeron_engine::HarnessId {
-    match std::env::var("ZERON_HARNESS").as_deref().map(str::trim) {
-        Ok("mock") => zeron_engine::HarnessId::Mock,
-        Ok("codex") => zeron_engine::HarnessId::Codex,
-        Ok("cursor") => zeron_engine::HarnessId::Cursor,
-        Ok("grok") => zeron_engine::HarnessId::Grok,
-        Ok("hermes") => zeron_engine::HarnessId::Hermes,
-        Ok("pi") => zeron_engine::HarnessId::Pi,
-        _ => zeron_engine::HarnessId::ClaudeCode,
-    }
-}
-
-#[cfg(test)]
-mod private_env_tests {
-    use super::{parse_private_env, private_deployment_env_path_for};
-
-    #[test]
-    fn parses_only_private_deployment_values() {
-        let values = parse_private_env(
-            "# personal deployment\nZERON_EDGE_URL=https://edge.example\nZERON_WORKOS_CLIENT_ID=\"client_test\"\nZERON_EDGE_TOKEN=must-not-load\n",
-        );
-        assert_eq!(
-            values,
-            vec![
-                ("ZERON_EDGE_URL", "https://edge.example".into()),
-                ("ZERON_WORKOS_CLIENT_ID", "client_test".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn private_env_follows_the_active_data_directory() {
-        assert_eq!(
-            private_deployment_env_path_for(std::path::PathBuf::from("/tmp/zeron-isolated")),
-            std::path::PathBuf::from("/tmp/zeron-isolated/env")
-        );
+    // The GUI subsystem prevents Explorer from creating a console at startup.
+    // Reuse an existing parent's console for CLI output and cargo run, without
+    // allocating one. Attach before Clap so help and argument errors work too.
+    // Preserve redirected pipes/files: attaching may replace standard handles.
+    unsafe {
+        let saved = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+            .map(|id| (id, GetStdHandle(id)));
+        if AttachConsole(ATTACH_PARENT_PROCESS) != 0 {
+            for (id, handle) in saved {
+                if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                    SetStdHandle(id, handle);
+                }
+            }
+        }
     }
 }
 
 /// `zeron sync`: dial the running engine's IPC and print per-room sync state.
 /// The introspection surface every 2026-08 incident was missing — "is this
 /// device's workspace room actually receiving?" as a one-liner.
-async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
-    let client = zeron_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"))
+/// `zeron quiesce`'s exit status when the engine is busy (EX_TEMPFAIL); the
+/// edge's sleep workflow reads it (`QUIESCE_BUSY_EXIT`).
+const QUIESCE_BUSY_EXIT: i32 = 75;
+
+async fn quiesce_cli(ipc_port: u16, data_dir: &std::path::Path) -> anyhow::Result<()> {
+    let client = zeron_rpc::connect_ipc(ipc_port, Some(data_dir))
+        .await
+        .map_err(|e| anyhow::anyhow!("no engine listening on 127.0.0.1:{ipc_port} ({e})"))?;
+    let reply = client
+        .call(zeron_rpc::methods::QUIESCE_FOR_SLEEP, serde_json::json!({}))
+        .await
+        .map_err(|e| anyhow::anyhow!("QuiesceForSleep failed: {e}"))?;
+    if reply["quiesced"].as_bool() == Some(true) {
+        println!("quiesced");
+        return Ok(());
+    }
+    eprintln!(
+        "busy: {}",
+        reply["busy"].as_str().unwrap_or("the engine is busy")
+    );
+    std::process::exit(QUIESCE_BUSY_EXIT);
+}
+
+async fn sync_cli(ipc_port: u16, data_dir: &std::path::Path) -> anyhow::Result<()> {
+    let client = zeron_rpc::connect_ipc(ipc_port, Some(data_dir))
         .await
         .map_err(|e| {
             anyhow::anyhow!("no engine listening on 127.0.0.1:{ipc_port} ({e}) — is zeron running?")
@@ -479,131 +447,29 @@ async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `{data_dir}/logs/zeron-{mode}.log`, previous launch preserved as `.old`.
-/// Headed and headless are separate files so an embedded-engine app and a
-/// daemon on the same machine never interleave writes.
-///
-/// The returned file holds an exclusive `flock` for the process lifetime:
-/// rotate-on-launch is only safe when nothing is still WRITING the current
-/// file. On 2026-08-04 a dev build launched twice next to the running
-/// installed app — the first rename put the daemon's live log at `.old`, the
-/// second unlinked it entirely, and the daemon spent the rest of the incident
-/// logging to an orphaned inode (an entire day of sync diagnostics gone at
-/// the exact moment they were needed). A launch that finds the canonical file
-/// locked logs to `zeron-{mode}.{pid}.log` instead; the next lock-holding
-/// launch sweeps pid-suffixed files older than a week.
-fn open_log_file(mode: &str) -> Option<std::fs::File> {
-    let dir = std::env::var_os("ZERON_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(defaults::data_dir)
-        .join("logs");
-    open_log_file_in(&dir, mode)
-}
-
-/// Dir-parameterized body of [`open_log_file`] (unit-testable without env).
-fn open_log_file_in(dir: &std::path::Path, mode: &str) -> Option<std::fs::File> {
-    std::fs::create_dir_all(dir).ok()?;
-    let path = dir.join(format!("zeron-{mode}.log"));
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        // Probe the CURRENT inode for a live writer before touching it.
-        let preexisting = path.exists();
-        let existing = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .ok()?;
-        let rc = unsafe { libc::flock(existing.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            // A live process owns the canonical log — leave it alone.
-            return std::fs::File::create(
-                dir.join(format!("zeron-{mode}.{}.log", std::process::id())),
-            )
-            .ok();
-        }
-        // No live writer: rotate, create fresh, and lock it as ours. (The
-        // probe's flock dies with `existing`; a first-ever launch has nothing
-        // to rotate — the probe itself created the empty file.)
-        drop(existing);
-        if preexisting {
-            let _ = std::fs::rename(&path, dir.join(format!("zeron-{mode}.log.old")));
-        }
-        let file = std::fs::File::create(&path).ok()?;
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        sweep_stale_pid_logs(dir, mode);
-        Some(file)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = std::fs::rename(&path, dir.join(format!("zeron-{mode}.log.old")));
-        std::fs::File::create(&path).ok()
-    }
-}
-
-#[cfg(all(test, unix))]
-mod log_file_tests {
-    use super::open_log_file_in;
+#[cfg(test)]
+mod private_env_tests {
+    use super::{parse_private_env, private_deployment_env_path_for};
 
     #[test]
-    fn second_launch_never_rotates_a_live_processes_log() {
-        let dir = tempfile::tempdir().unwrap();
-        let dir = dir.path();
-        // First launch owns the canonical file and keeps writing.
-        let first = open_log_file_in(dir, "headed").expect("first log");
-        assert!(dir.join("zeron-headed.log").is_file());
-        // Second launch while the first is alive: canonical file untouched,
-        // pid-suffixed overflow file instead (the 2026-08-04 clobber).
-        let second = open_log_file_in(dir, "headed").expect("second log");
-        let pid_path = dir.join(format!("zeron-headed.{}.log", std::process::id()));
-        assert!(pid_path.is_file(), "expected pid-suffixed overflow log");
-        assert!(
-            !dir.join("zeron-headed.log.old").exists(),
-            "live canonical log must not be rotated away"
+    fn parses_only_private_deployment_values() {
+        let values = parse_private_env(
+            "# personal deployment\nZERON_EDGE_URL=https://edge.example\nZERON_WORKOS_CLIENT_ID=\"client_test\"\nZERON_EDGE_TOKEN=must-not-load\n",
         );
-        drop(second);
-        // After the owner exits, a fresh launch rotates normally.
-        drop(first);
-        let third = open_log_file_in(dir, "headed").expect("third log");
-        assert!(
-            dir.join("zeron-headed.log.old").is_file(),
-            "rotation resumes"
+        assert_eq!(
+            values,
+            vec![
+                ("ZERON_EDGE_URL", "https://edge.example".into()),
+                ("ZERON_WORKOS_CLIENT_ID", "client_test".into()),
+            ]
         );
-        drop(third);
     }
-}
 
-/// Delete `zeron-{mode}.{pid}.log` overflow files older than a week — they
-/// only exist when a second instance raced a live one for the canonical log.
-#[cfg(unix)]
-fn sweep_stale_pid_logs(dir: &std::path::Path, mode: &str) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let prefix = format!("zeron-{mode}.");
-    let week = std::time::Duration::from_secs(7 * 24 * 60 * 60);
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Some(middle) = name
-            .strip_prefix(&prefix)
-            .and_then(|rest| rest.strip_suffix(".log"))
-        else {
-            continue;
-        };
-        if !middle.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        let stale = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age > week);
-        if stale {
-            let _ = std::fs::remove_file(entry.path());
-        }
+    #[test]
+    fn private_env_follows_the_active_data_directory() {
+        assert_eq!(
+            private_deployment_env_path_for(std::path::PathBuf::from("/tmp/zeron-isolated")),
+            std::path::PathBuf::from("/tmp/zeron-isolated/env")
+        );
     }
 }

@@ -11,17 +11,18 @@
 pub mod commands;
 pub mod constants;
 pub mod parts;
-pub mod prompt_refs;
+pub mod queue;
 pub mod rebuild;
 pub mod registry;
 pub mod schema;
 pub mod transcript_delta;
+pub mod voice;
 pub mod workspace;
 
 pub use commands::*;
 pub use constants::*;
 pub use parts::*;
-pub use prompt_refs::*;
+pub use queue::*;
 pub use rebuild::*;
 pub use registry::*;
 pub use schema::*;

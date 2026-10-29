@@ -3,6 +3,8 @@ name: release
 # Build release artifacts and publish them:
 #   - Linux headless tarballs (x86_64 + aarch64) via scripts/package-linux.sh
 #   - macOS dmg (Apple silicon) via scripts/package-macos.sh
+#   - Windows per-user installer, portable zip, and updater exe (x86_64) via
+#     scripts/package-windows.ps1
 # then create a GitHub Release and, when the private Cloudflare secrets are
 # configured, upload everything to that deployment's release bucket.
 #
@@ -19,6 +21,9 @@ permissions:
   contents: write
 
 jobs:
+  cursor-compatibility:
+    uses: ./.github/workflows/cursor-compatibility.yml
+
   linux:
     strategy:
       fail-fast: false
@@ -28,7 +33,7 @@ jobs:
           - runner: ubuntu-24.04-arm # aarch64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: gpui system deps
         run: |
           sudo apt-get update -qq
@@ -36,21 +41,19 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-dev libxcb1-dev libx11-xcb-dev \
             libfontconfig1-dev libfreetype-dev libasound2-dev \
-            libvulkan-dev pkg-config cmake
+            libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: package
         run: scripts/package-linux.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-${{ runner.arch }}
           path: target/package/*.tar.gz
           if-no-files-found: error
 
-  # Heads-up: the macOS cfg paths (Keychain in agent_accounts.rs) have never
-  # been type-checked against the Apple SDK — this job may surface errors on
-  # its first runs. continue-on-error keeps the Linux release shippable.
+  # Every platform must build before publishing the release and updater manifest.
   #
   # Signing/notarization (both optional — absent secrets fall back to an
   # ad-hoc-signed build):
@@ -61,7 +64,6 @@ jobs:
   #     script notarizes and staples the app + dmg (no Gatekeeper warning).
   macos:
     runs-on: macos-latest # Apple silicon
-    continue-on-error: true
     env:
       MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
       MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -69,10 +71,10 @@ jobs:
       AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
       AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: import Developer ID certificate
         if: env.MACOS_CERT_P12 != ''
         run: |
@@ -104,7 +106,7 @@ jobs:
           } >>"$GITHUB_ENV"
       - name: package dmg
         run: scripts/package-macos.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: macos-${{ runner.arch }}
           path: |
@@ -112,9 +114,36 @@ jobs:
             target/package/*.tar.gz
           if-no-files-found: error
 
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Locate Windows SDK shader compiler
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/fxc.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: package installer and portable app
+        run: ./scripts/package-windows.ps1 -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-${{ runner.arch }}
+          path: |
+            target/package/*.zip
+            target/package/*.exe
+          if-no-files-found: error
+
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux, macos]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [cursor-compatibility, linux, macos, windows]
     runs-on: ubuntu-latest
     env:
       # `secrets` is not a valid context in step `if:` expressions — surface
@@ -123,7 +152,7 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_RELEASES_BUCKET: ${{ secrets.CLOUDFLARE_RELEASES_BUCKET }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
@@ -131,12 +160,27 @@ jobs:
         run: |
           ver="${GITHUB_REF_NAME#v}"
           ls dist/
-          ls dist/ | grep -q "zeron-$ver-" \
-            || { echo "tag v$ver does not match built artifact versions — bump Cargo.toml [workspace.package] version"; exit 1; }
+          for platform in linux-x86_64.tar.gz linux-aarch64.tar.gz \
+              macos-arm64.dmg macos-arm64-app.tar.gz \
+              windows-x86_64.zip windows-x86_64.exe windows-x86_64-setup.exe; do
+            test -f "dist/zeron-$ver-$platform" \
+              || { echo "missing artifact for tag v$ver: $platform — check builds and Cargo.toml version"; exit 1; }
+          done
           echo "VERSION=$ver" >> "$GITHUB_ENV"
-      - uses: softprops/action-gh-release@v2
+      - name: updater manifest
+        run: |
+          manifest=$(jq -n --arg version "$VERSION" '{version: $version, files: {}}')
+          for f in dist/*; do
+            sha=$(sha256sum "$f" | cut -d' ' -f1)
+            manifest=$(jq --arg name "$(basename "$f")" --arg sha "$sha" \
+              '.files[$name] = {sha256: $sha}' <<<"$manifest")
+          done
+          printf '%s' "$manifest" > manifest.json
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          files: dist/*
+          files: |
+            dist/*
+            manifest.json
           generate_release_notes: true
       - name: upload to private R2 release bucket
         if: env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != '' && env.CLOUDFLARE_RELEASES_BUCKET != ''
@@ -148,13 +192,6 @@ jobs:
           # manifest.json: version + per-artifact sha256 — the auto-updater
           # (crates/update) verifies downloads against it. Published before
           # latest.txt so no client ever sees a version without its checksums.
-          manifest=$(jq -n --arg version "$VERSION" '{version: $version, files: {}}')
-          for f in dist/*; do
-            sha=$(sha256sum "$f" | cut -d' ' -f1)
-            manifest=$(jq --arg name "$(basename "$f")" --arg sha "$sha" \
-              '.files[$name] = {sha256: $sha}' <<<"$manifest")
-          done
-          printf '%s' "$manifest" > manifest.json
           npx wrangler@4 r2 object put "$CLOUDFLARE_RELEASES_BUCKET/manifest.json" \
             --file manifest.json --remote
           printf '%s' "$VERSION" > latest.txt

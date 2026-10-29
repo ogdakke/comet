@@ -531,10 +531,10 @@ impl StudioPage {
         } else {
             return None;
         };
-        Some(crate::attachments::PreviewImage {
-            name: SharedString::from("Reference image"),
+        Some(crate::attachments::PreviewImage::new(
+            SharedString::from("Reference image"),
             image,
-        })
+        ))
     }
 
     pub(super) fn render_prompt_budget(&self, theme: &Theme) -> Option<gpui::Stateful<gpui::Div>> {

@@ -23,7 +23,11 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
-    match zeron_update::detect_install() {
+    let install = zeron_update::detect_install();
+    if let Some(blocker) = install.desktop_update_blocker() {
+        bail!("{blocker}");
+    }
+    match install {
         InstallKind::Managed { app_root } => {
             println!(
                 "downloading {}…",
@@ -49,9 +53,7 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
                 "downloading {}…",
                 zeron_update::mac_app_artifact(&manifest.version)
             );
-            let data_dir = std::env::var_os("ZERON_DATA_DIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(super::defaults::data_dir);
+            let data_dir = super::paths::data_dir();
             let staged = zeron_update::stage_mac_app(edge_url, &manifest, &data_dir).await?;
             zeron_update::apply_mac_app(&staged, &bundle)?;
             println!("updated {} — relaunch Zeron to finish.", bundle.display());
@@ -63,11 +65,23 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
                  Replace ~/.local/bin/zeron yourself, or install the managed Linux release."
             )
         }
+        #[cfg(windows)]
+        InstallKind::WindowsPortable { directory } => {
+            let staged = zeron_update::windows::stage(edge_url, &manifest, &directory).await?;
+            zeron_update::windows::apply(&staged, &directory, false)?;
+            println!(
+                "updated to {} — relaunch Zeron to finish.",
+                manifest.version
+            );
+            Ok(())
+        }
         InstallKind::Unmanaged => {
             bail!(
                 "this binary is not update-managed (source build or hand-copied).\n\
-                 Linux: curl -fsSL https://zeron.sh/install.sh | sh\n\
-                 macOS: download the new Zeron.app dmg, or rebuild from source."
+                 Linux: curl -fsSL https://zeron.sh/install.sh | sh, or run install.sh from the release tarball\n\
+                 macOS: download the new Zeron.app dmg, or rebuild from source.\n\
+                 Windows: install with the Zeron setup .exe from {}, or rebuild from source.",
+                zeron_update::LATEST_RELEASE_PAGE
             )
         }
     }

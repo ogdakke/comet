@@ -52,6 +52,7 @@ pub enum LanguageId {
     Php,
     Sql,
     Lua,
+    Luau,
     Dockerfile,
     Nix,
     Make,
@@ -82,6 +83,12 @@ pub enum HighlightKind {
     Tag,
     Attribute,
     Label,
+    MarkupHeading,
+    MarkupRaw,
+    MarkupLink,
+    MarkupReference,
+    MarkupEmphasis,
+    MarkupStrong,
     Embedded,
     Invalid,
 }
@@ -100,6 +107,15 @@ impl HighlightKind {
             Self::Comment | Self::Keyword | Self::String | Self::Number | Self::Boolean => 60,
             Self::Variable | Self::Operator => 50,
             Self::Punctuation | Self::Embedded => 40,
+            // Markdown block captures can wrap more specific inline captures,
+            // and fenced-code captures can wrap an injected language. Keep
+            // markup below programming-language tokens while preserving the
+            // nesting order among Markdown roles.
+            Self::MarkupHeading => 30,
+            Self::MarkupEmphasis => 31,
+            Self::MarkupStrong => 32,
+            Self::MarkupLink | Self::MarkupReference => 33,
+            Self::MarkupRaw => 34,
         }
     }
 }
@@ -123,7 +139,7 @@ pub struct HighlightRequest<'a> {
     pub fence_tag: Option<&'a str>,
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum HighlightError {
     #[error("the source language is not registered")]
     UnknownLanguage,
@@ -310,32 +326,28 @@ pub fn highlight_with_limits(
         return Err(HighlightError::GrammarUnavailable(language));
     }
 
-    let mut primary_configuration = configuration(language)?;
-    primary_configuration.configure(CAPTURE_NAMES);
-    let injected = if matches!(language, LanguageId::Html | LanguageId::Markdown) {
-        injected_languages(language)
-            .into_iter()
-            .filter_map(|language| {
-                let mut config = configuration(language).ok()?;
-                config.configure(CAPTURE_NAMES);
-                Some((language, config))
-            })
-            .collect::<Vec<_>>()
+    let primary_configuration = cached_configuration(language)?;
+    let injected = injected_languages(language);
+    let markdown_inline = if language == LanguageId::Markdown {
+        Some(cached_markdown_inline_configuration()?)
     } else {
-        Vec::new()
+        None
     };
     let mut highlighter = Highlighter::new();
     let events = highlighter
         .highlight(
-            &primary_configuration,
+            primary_configuration,
             request.source.as_bytes(),
             cancellation_flag,
             |name| {
+                if name == "markdown_inline" {
+                    return markdown_inline;
+                }
                 let language = language_for_alias(name)?;
-                injected
-                    .iter()
-                    .find(|(candidate, _)| *candidate == language)
-                    .map(|(_, config)| config)
+                if !injected.contains(&language) {
+                    return None;
+                }
+                cached_configuration(language).ok()
             },
         )
         .map_err(|error| HighlightError::Parser(error.to_string()))?;
@@ -370,10 +382,56 @@ fn injected_languages(parent: LanguageId) -> Vec<LanguageId> {
         Html => vec![JavaScript, Css, Json],
         Markdown => vec![
             Rust, JavaScript, Jsx, TypeScript, Tsx, Python, Go, Json, Jsonc, Bash, Toml, Html, Css,
-            Yaml, C, Cpp, CSharp, Java, Kotlin, Swift, Ruby, Php, Sql, Lua, Dockerfile, Nix, Make,
+            Yaml, C, Cpp, CSharp, Java, Kotlin, Swift, Ruby, Php, Sql, Lua, Luau, Dockerfile, Nix,
+            Make,
         ],
+        Dockerfile => vec![Bash, Json, Yaml, Toml],
         _ => Vec::new(),
     }
+}
+
+/// Compiled queries contain no document/theme state and are immutable after
+/// capture configuration. Keep one per used grammar instead of recompiling
+/// for every fence or eagerly compiling all 28 Markdown injection targets.
+/// Each grammar has its own cell: concurrent requests compile it only once,
+/// while unrelated languages never wait on a global compilation lock.
+fn cached_configuration(
+    language: LanguageId,
+) -> Result<&'static HighlightConfiguration, HighlightError> {
+    macro_rules! registry {
+        ($($variant:ident),+ $(,)?) => {
+            match language {
+                $(LanguageId::$variant => {
+                    static CONFIG: std::sync::OnceLock<Result<HighlightConfiguration, HighlightError>> =
+                        std::sync::OnceLock::new();
+                    CONFIG.get_or_init(|| {
+                        let mut config = configuration(language)?;
+                        config.configure(CAPTURE_NAMES);
+                        Ok(config)
+                    }).as_ref().map_err(Clone::clone)
+                }),+
+            }
+        };
+    }
+    registry!(
+        Rust, JavaScript, Jsx, TypeScript, Tsx, Python, Go, Json, Jsonc, Bash, Toml, Markdown,
+        Html, Css, Yaml, C, Cpp, CSharp, Java, Kotlin, Swift, Ruby, Php, Sql, Lua, Luau,
+        Dockerfile, Nix, Make,
+    )
+}
+
+fn cached_markdown_inline_configuration() -> Result<&'static HighlightConfiguration, HighlightError>
+{
+    static CONFIG: std::sync::OnceLock<Result<HighlightConfiguration, HighlightError>> =
+        std::sync::OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let mut config = markdown_inline_configuration()?;
+            config.configure(CAPTURE_NAMES);
+            Ok(config)
+        })
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 fn rust_configuration() -> Result<HighlightConfiguration, HighlightError> {
@@ -402,6 +460,77 @@ fn rust_configuration() -> Result<HighlightConfiguration, HighlightError> {
     .map_err(|error| HighlightError::Parser(error.to_string()))
 }
 
+/// The upstream Luau query is written for Neovim, and several of its patterns
+/// misfire under tree-sitter-highlight. Each rewrite names the exact upstream
+/// text, so a grammar bump that changes it fails the Luau tests instead of
+/// silently highlighting differently.
+const LUAU_QUERY_REWRITES: &[(&str, &str)] = &[
+    // `#lua-match?` takes Lua patterns and the Rust runtime doesn't evaluate
+    // it: every identifier would match the type and constant patterns. The
+    // patterns are regexes already, but for Lua's `%s` class.
+    ("#lua-match?", "#match?"),
+    (r#""^[-][-](%s?)@""#, r#""^[-][-](\\s?)@""#),
+    // A second capture Zeron doesn't map takes the comment's highlight.
+    ("(comment) @comment @spell", "(comment) @comment"),
+    // `type` is a supertype whose subtypes include `identifier`, so this
+    // matches every identifier. A bare type name sits after an annotation's
+    // `:`, a cast's `::` or an alias's `=`, or inside a composite type.
+    (
+        "(type\n  (identifier) @type)",
+        "(parameter \":\" . (identifier) @type)\n\
+         (variable_list \":\" . (identifier) @type)\n\
+         (function_declaration \":\" . (identifier) @type)\n\
+         (function_definition \":\" . (identifier) @type)\n\
+         (object_type \":\" . (identifier) @type)\n\
+         (cast_expression \"::\" . (identifier) @type)\n\
+         (type_definition \"=\" . (identifier) @type)\n\
+         ([(generic_type) (generic_type_list) (union_type) (intersection_type) (optional_type)\n\
+           (variadic_type) (tuple_type) (field_type) (function_type)] (identifier) @type)",
+    ),
+    // Only a name before a `:` is a table type's key; the rest are types.
+    (
+        "(object_type\n  (identifier) @variable.member)",
+        "(object_type (identifier) @variable.member . \":\")",
+    ),
+    // The grammar doesn't parse named parameters in function types, so
+    // every identifier there is a type, not a parameter.
+    ("(function_type\n  (identifier) @variable.parameter)", ""),
+];
+
+fn luau_highlights() -> String {
+    LUAU_QUERY_REWRITES.iter().fold(
+        tree_sitter_luau::HIGHLIGHTS_QUERY.to_owned(),
+        |query, (from, to)| query.replace(from, to),
+    )
+}
+
+fn markdown_configuration() -> Result<HighlightConfiguration, HighlightError> {
+    // tree-sitter-highlight excludes child ranges from injections by default.
+    // The Markdown block grammar's `inline` node owns anonymous children that
+    // cover its source, so the upstream query otherwise injects an empty range.
+    let injections = tree_sitter_md::INJECTION_QUERY_BLOCK.replace(
+        "((inline) @injection.content\n  (#set! injection.language \"markdown_inline\"))",
+        "((inline) @injection.content\n  (#set! injection.language \"markdown_inline\")\n  (#set! injection.include-children))",
+    );
+    make_configuration(
+        tree_sitter_md::LANGUAGE.into(),
+        "markdown",
+        tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
+        &injections,
+        "",
+    )
+}
+
+fn markdown_inline_configuration() -> Result<HighlightConfiguration, HighlightError> {
+    make_configuration(
+        tree_sitter_md::INLINE_LANGUAGE.into(),
+        "markdown_inline",
+        tree_sitter_md::HIGHLIGHT_QUERY_INLINE,
+        tree_sitter_md::INJECTION_QUERY_INLINE,
+        "",
+    )
+}
+
 fn make_configuration(
     language: tree_sitter::Language,
     name: &str,
@@ -413,42 +542,70 @@ fn make_configuration(
         .map_err(|error| HighlightError::Parser(error.to_string()))
 }
 
+fn javascript_family_highlights(language: LanguageId) -> String {
+    use LanguageId::*;
+
+    let queries = match language {
+        JavaScript => &[tree_sitter_javascript::HIGHLIGHT_QUERY][..],
+        Jsx => &[
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
+        ][..],
+        TypeScript => &[
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            tree_sitter_typescript::HIGHLIGHTS_QUERY,
+        ][..],
+        Tsx => &[
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
+            tree_sitter_typescript::HIGHLIGHTS_QUERY,
+        ][..],
+        _ => unreachable!("JavaScript query composition requires a JavaScript-family language"),
+    };
+    queries.join("\n")
+}
+
+fn javascript_family_configuration(
+    language: LanguageId,
+) -> Result<HighlightConfiguration, HighlightError> {
+    use LanguageId::*;
+
+    let highlights = javascript_family_highlights(language);
+    let (grammar, name, injections, locals) = match language {
+        JavaScript => (
+            tree_sitter_javascript::LANGUAGE.into(),
+            "javascript",
+            tree_sitter_javascript::INJECTIONS_QUERY,
+            tree_sitter_javascript::LOCALS_QUERY,
+        ),
+        Jsx => (
+            tree_sitter_javascript::LANGUAGE.into(),
+            "jsx",
+            tree_sitter_javascript::INJECTIONS_QUERY,
+            tree_sitter_javascript::LOCALS_QUERY,
+        ),
+        TypeScript => (
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "typescript",
+            "",
+            tree_sitter_typescript::LOCALS_QUERY,
+        ),
+        Tsx => (
+            tree_sitter_typescript::LANGUAGE_TSX.into(),
+            "tsx",
+            "",
+            tree_sitter_typescript::LOCALS_QUERY,
+        ),
+        _ => unreachable!("JavaScript configuration requires a JavaScript-family language"),
+    };
+    make_configuration(grammar, name, &highlights, injections, locals)
+}
+
 fn configuration(language: LanguageId) -> Result<HighlightConfiguration, HighlightError> {
     use LanguageId::*;
     match language {
         Rust => rust_configuration(),
-        JavaScript => make_configuration(
-            tree_sitter_javascript::LANGUAGE.into(),
-            "javascript",
-            tree_sitter_javascript::HIGHLIGHT_QUERY,
-            tree_sitter_javascript::INJECTIONS_QUERY,
-            tree_sitter_javascript::LOCALS_QUERY,
-        ),
-        Jsx => make_configuration(
-            tree_sitter_javascript::LANGUAGE.into(),
-            "jsx",
-            &format!(
-                "{}\n{}",
-                tree_sitter_javascript::HIGHLIGHT_QUERY,
-                tree_sitter_javascript::JSX_HIGHLIGHT_QUERY
-            ),
-            tree_sitter_javascript::INJECTIONS_QUERY,
-            tree_sitter_javascript::LOCALS_QUERY,
-        ),
-        TypeScript => make_configuration(
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            "typescript",
-            tree_sitter_typescript::HIGHLIGHTS_QUERY,
-            "",
-            tree_sitter_typescript::LOCALS_QUERY,
-        ),
-        Tsx => make_configuration(
-            tree_sitter_typescript::LANGUAGE_TSX.into(),
-            "tsx",
-            tree_sitter_typescript::HIGHLIGHTS_QUERY,
-            "",
-            tree_sitter_typescript::LOCALS_QUERY,
-        ),
+        JavaScript | Jsx | TypeScript | Tsx => javascript_family_configuration(language),
         Python => make_configuration(
             tree_sitter_python::LANGUAGE.into(),
             "python",
@@ -484,13 +641,7 @@ fn configuration(language: LanguageId) -> Result<HighlightConfiguration, Highlig
             "",
             "",
         ),
-        Markdown => make_configuration(
-            tree_sitter_md::LANGUAGE.into(),
-            "markdown",
-            tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
-            tree_sitter_md::INJECTION_QUERY_BLOCK,
-            "",
-        ),
+        Markdown => markdown_configuration(),
         Html => make_configuration(
             tree_sitter_html::LANGUAGE.into(),
             "html",
@@ -547,7 +698,7 @@ fn configuration(language: LanguageId) -> Result<HighlightConfiguration, Highlig
         Kotlin => make_configuration(
             tree_sitter_kotlin_ng::LANGUAGE.into(),
             "kotlin",
-            "[(line_comment) (block_comment)] @comment [(string_literal) (multiline_string_literal)] @string [(number_literal) (float_literal)] @number",
+            include_str!("../queries/kotlin/highlights.scm"),
             "",
             "",
         ),
@@ -586,6 +737,15 @@ fn configuration(language: LanguageId) -> Result<HighlightConfiguration, Highlig
             "",
             tree_sitter_lua::LOCALS_QUERY,
         ),
+        // Its locals query names definitions `local.definition.var` and the
+        // like, which tree-sitter-highlight doesn't resolve: no locals.
+        Luau => make_configuration(
+            tree_sitter_luau::LANGUAGE.into(),
+            "luau",
+            &luau_highlights(),
+            "",
+            "",
+        ),
         Nix => make_configuration(
             tree_sitter_nix::LANGUAGE.into(),
             "nix",
@@ -604,7 +764,7 @@ fn configuration(language: LanguageId) -> Result<HighlightConfiguration, Highlig
             tree_sitter_containerfile::LANGUAGE.into(),
             "dockerfile",
             tree_sitter_containerfile::HIGHLIGHTS_QUERY,
-            "",
+            tree_sitter_containerfile::INJECTIONS_QUERY,
             "",
         ),
     }
@@ -636,6 +796,12 @@ const CAPTURE_NAMES: &[&str] = &[
     "tag",
     "attribute",
     "label",
+    "text.title",
+    "text.literal",
+    "text.uri",
+    "text.reference",
+    "text.emphasis",
+    "text.strong",
     "embedded",
     "error",
 ];
@@ -664,6 +830,12 @@ const CAPTURE_KINDS: &[HighlightKind] = &[
     HighlightKind::Tag,
     HighlightKind::Attribute,
     HighlightKind::Label,
+    HighlightKind::MarkupHeading,
+    HighlightKind::MarkupRaw,
+    HighlightKind::MarkupLink,
+    HighlightKind::MarkupReference,
+    HighlightKind::MarkupEmphasis,
+    HighlightKind::MarkupStrong,
     HighlightKind::Embedded,
     HighlightKind::Invalid,
 ];
@@ -711,6 +883,7 @@ pub fn language_for_alias(alias: &str) -> Option<LanguageId> {
         "php" => LanguageId::Php,
         "sql" => LanguageId::Sql,
         "lua" => LanguageId::Lua,
+        "luau" => LanguageId::Luau,
         "dockerfile" | "docker" => LanguageId::Dockerfile,
         "nix" => LanguageId::Nix,
         "make" | "makefile" => LanguageId::Make,
@@ -750,6 +923,28 @@ fn language_for_shebang(line: &str) -> Option<LanguageId> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compiled_queries_are_shared_across_concurrent_documents() {
+        let config = super::cached_configuration(super::LanguageId::Rust).unwrap();
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                scope.spawn(move || {
+                    let shared = super::cached_configuration(super::LanguageId::Rust).unwrap();
+                    assert!(std::ptr::eq(config, shared));
+                    let source = format!("fn example_{i}() {{ let value = {i}; }}");
+                    let document = super::highlight(super::HighlightRequest {
+                        source: &source,
+                        path: None,
+                        fence_tag: Some("rust"),
+                    })
+                    .unwrap();
+                    assert_eq!(document.language, super::LanguageId::Rust);
+                    assert!(document.lines.iter().flatten().next().is_some());
+                });
+            }
+        });
+    }
+
     use super::*;
 
     #[test]
@@ -903,9 +1098,13 @@ mod tests {
     }
 
     fn highlighted_fragments(source: &str) -> Vec<(&str, HighlightKind)> {
+        highlighted_fragments_at("src/lib.rs", source)
+    }
+
+    fn highlighted_fragments_at<'a>(path: &str, source: &'a str) -> Vec<(&'a str, HighlightKind)> {
         let document = highlight(HighlightRequest {
             source,
-            path: Some("src/lib.rs"),
+            path: Some(path),
             fence_tag: None,
         })
         .unwrap();
@@ -940,6 +1139,74 @@ fn build(value: usize) -> Widget {
                 "missing {text:?} as {expected:?}: {fragments:?}"
             );
         }
+    }
+
+    #[test]
+    fn luau_highlighting_covers_its_syntax_beyond_lua() {
+        let source = r#"--!strict
+export type Point<T> = { x: T, y: T? }
+local MAX_COUNT = 10
+local function add(a: Point<number>, b: Point<number>): Point<number>
+    return { x = a.x + b.x, y = a.y + b.y }
+end
+local total = 0
+for i = 1, MAX_COUNT do
+    if i % 2 == 0 then continue end
+    total += i
+end
+local label = if total > 10 then `big {total}` else "small"
+local Players = game:GetService("Players")
+local item = value :: Item
+print(typeof(label), self)"#;
+        let fragments = highlighted_fragments_at("app.luau", source);
+        for (text, expected) in [
+            ("--!strict", HighlightKind::Comment),
+            ("export", HighlightKind::Keyword),
+            ("type", HighlightKind::Keyword),
+            ("number", HighlightKind::TypeBuiltin),
+            ("Item", HighlightKind::Type),
+            ("x", HighlightKind::Variable),
+            ("a", HighlightKind::Parameter),
+            ("MAX_COUNT", HighlightKind::Constant),
+            ("add", HighlightKind::Function),
+            ("GetService", HighlightKind::Function),
+            ("continue", HighlightKind::Keyword),
+            ("+=", HighlightKind::Operator),
+            ("`big {total}`", HighlightKind::String),
+            ("typeof", HighlightKind::FunctionBuiltin),
+            ("self", HighlightKind::VariableSpecial),
+        ] {
+            assert!(
+                fragments.contains(&(text, expected)),
+                "missing {text:?} as {expected:?}: {fragments:?}"
+            );
+        }
+        // Upstream, every identifier matched the type patterns.
+        for text in ["total", "i", "label", "item", "value", "a"] {
+            assert!(
+                !fragments.contains(&(text, HighlightKind::Type)),
+                "{text:?} highlighted as a type: {fragments:?}"
+            );
+        }
+        assert!(fragments.contains(&("Point", HighlightKind::Type)));
+        assert!(fragments.contains(&("T", HighlightKind::Type)));
+    }
+
+    #[test]
+    fn luau_query_rewrites_still_apply_to_the_pinned_grammar() {
+        for (from, _) in LUAU_QUERY_REWRITES {
+            assert!(
+                tree_sitter_luau::HIGHLIGHTS_QUERY.contains(from),
+                "the upstream Luau query no longer contains {from:?}"
+            );
+        }
+        let query = luau_highlights();
+        assert!(!query.contains("lua-match") && !query.contains("@spell"));
+        assert_eq!(
+            language_for_path("src/Main.client.luau"),
+            Some(LanguageId::Luau)
+        );
+        assert_eq!(language_for_alias("luau"), Some(LanguageId::Luau));
     }
 
     #[test]
@@ -1011,7 +1278,7 @@ fn build(value: usize) -> Widget {
     }
 
     #[test]
-    fn every_registered_grammar_loads_and_highlights_a_fixture() {
+    fn every_registered_grammar_and_query_loads_for_the_bundled_abi() {
         let fixtures = [
             (LanguageId::JavaScript, "app.js", "const value = call(42);"),
             (
@@ -1057,6 +1324,7 @@ fn build(value: usize) -> Widget {
             ),
             (LanguageId::Sql, "query.sql", "SELECT name FROM users;"),
             (LanguageId::Lua, "app.lua", "local value = 1"),
+            (LanguageId::Luau, "app.luau", "local value: number = 1"),
             (LanguageId::Nix, "flake.nix", "{ pkgs }: pkgs.hello"),
             (LanguageId::Make, "Makefile", "all:\n\techo hello"),
             (
@@ -1082,6 +1350,23 @@ fn build(value: usize) -> Widget {
             assert!(
                 document.lines.iter().flatten().next().is_some(),
                 "{language:?} fixture has no structural spans"
+            );
+        }
+    }
+
+    #[test]
+    fn affected_composed_and_project_queries_load_for_pinned_grammars() {
+        for language in [
+            LanguageId::TypeScript,
+            LanguageId::Tsx,
+            LanguageId::Kotlin,
+            LanguageId::Dockerfile,
+        ] {
+            let configuration = configuration(language)
+                .unwrap_or_else(|error| panic!("{language:?} query failed to load: {error}"));
+            assert!(
+                !configuration.names().is_empty(),
+                "{language:?} query has no captures"
             );
         }
     }
@@ -1137,6 +1422,37 @@ fn build(value: usize) -> Widget {
         })
         .unwrap();
         assert_eq!(document.language, LanguageId::Markdown);
+    }
+
+    #[test]
+    fn markdown_highlights_block_and_inline_semantics() {
+        let source = "# Heading with *emphasis* and **strong**\n\nUse `inline code` and [reference](https://example.com).\n";
+        let document = highlight(HighlightRequest {
+            source,
+            path: Some("README.md"),
+            fence_tag: None,
+        })
+        .unwrap();
+
+        let assert_kind = |line_index: usize, needle: &str, expected: HighlightKind| {
+            let line = source.lines().nth(line_index).unwrap();
+            let start = line.find(needle).unwrap();
+            let end = start + needle.len();
+            assert!(
+                document.lines[line_index].iter().any(|span| {
+                    span.kind == expected && span.range.start <= start && span.range.end >= end
+                }),
+                "missing {needle:?} as {expected:?}: {:?}",
+                document.lines[line_index]
+            );
+        };
+
+        assert_kind(0, "Heading", HighlightKind::MarkupHeading);
+        assert_kind(0, "emphasis", HighlightKind::MarkupEmphasis);
+        assert_kind(0, "strong", HighlightKind::MarkupStrong);
+        assert_kind(2, "inline code", HighlightKind::MarkupRaw);
+        assert_kind(2, "reference", HighlightKind::MarkupReference);
+        assert_kind(2, "https://example.com", HighlightKind::MarkupLink);
     }
 
     #[test]

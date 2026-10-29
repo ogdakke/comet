@@ -5,7 +5,7 @@
  * {@link MSG_INLINE_MAX}. Free, invisible — renderers stitch continuations
  * back onto their parent by `continuationOf`.
  */
-import type { UserInputQuestion } from "./control-types";
+import type { UserInputAnswer, UserInputQuestion } from "./control-types";
 import { MSG_INLINE_MAX } from "./constants";
 import type { RenderToolCall, SessionMessagePart } from "./render-parts";
 
@@ -21,9 +21,12 @@ export type SessionMessageRole = "user" | "assistant" | "system";
  */
 export interface DocMessagePart {
   readonly id: string;
-  readonly kind: "text" | "reasoning" | "tool" | "input" | "error";
+  readonly kind: "text" | "reasoning" | "tool" | "input" | "error" | "image";
   /** kind === "text" — LoroText in the doc, string in mirror state. */
   readonly text?: string;
+  readonly path?: string;
+  readonly name?: string;
+  readonly mimeType?: string;
   /** kind === "reasoning" — LoroText in the doc. Deliberately NOT `text`:
    * old readers' unknown-kind fallback renders `text` as prose, so reasoning
    * on this field degrades to an invisible empty part instead of leaking
@@ -35,6 +38,7 @@ export interface DocMessagePart {
   /** kind === "input" — the part id doubles as the requestId. */
   readonly questions?: ReadonlyArray<UserInputQuestion>;
   readonly resolved?: boolean;
+  readonly answers?: ReadonlyArray<UserInputAnswer>;
   /** kind === "error". */
   readonly message?: string;
 }
@@ -45,6 +49,8 @@ export const toDocParts = (
 ): ReadonlyArray<DocMessagePart> =>
   parts.map((p): DocMessagePart => {
     switch (p.kind) {
+      case "image":
+        return { id: p.id, kind: "image", path: p.path, name: p.name, mimeType: p.mimeType };
       case "text":
         return { id: p.id, kind: "text", text: p.text };
       case "reasoning":
@@ -61,7 +67,8 @@ export const toDocParts = (
           id: p.requestId,
           kind: "input",
           questions: p.questions,
-          ...(typeof p.resolved === "boolean" ? { resolved: p.resolved } : {})
+          ...(typeof p.resolved === "boolean" ? { resolved: p.resolved } : {}),
+          ...(p.answers ? { answers: p.answers } : {})
         };
       case "error":
         return { id: p.id, kind: "error", message: p.message };
@@ -75,6 +82,10 @@ export const fromDocParts = (
 ): ReadonlyArray<SessionMessagePart> =>
   parts.map((p): SessionMessagePart => {
     switch (p.kind) {
+      case "image":
+        return typeof p.path === "string" && p.path.length > 0 && typeof p.name === "string" && p.name.length > 0 && ["image/png", "image/jpeg", "image/webp", "image/gif"].includes(p.mimeType ?? "")
+          ? { kind: "image", id: p.id, path: p.path, name: p.name, mimeType: p.mimeType! }
+          : { kind: "error", id: p.id, message: "Generated image unavailable" };
       case "tool":
         return p.call
           ? {
@@ -89,7 +100,8 @@ export const fromDocParts = (
           kind: "input",
           requestId: p.id,
           questions: (p.questions ?? []) as never,
-          ...(typeof p.resolved === "boolean" ? { resolved: p.resolved } : {})
+          ...(typeof p.resolved === "boolean" ? { resolved: p.resolved } : {}),
+          ...(Array.isArray(p.answers) ? { answers: p.answers } : {})
         };
       case "error":
         return { kind: "error", id: p.id, message: p.message ?? "" };

@@ -400,7 +400,10 @@ impl StudioSync {
     }
 
     async fn bearer(&self) -> Result<String, StudioSyncError> {
-        self.edge.bearer().await.ok_or(StudioSyncError::SignedOut)
+        self.edge.bearer().await.map_err(|error| match error {
+            zeron_rpc::TokenError::SignedOut => StudioSyncError::SignedOut,
+            other => StudioSyncError::Protocol(other.to_string()),
+        })
     }
 
     async fn fetch_manifest(&self) -> Result<ManifestEnvelope, StudioSyncError> {

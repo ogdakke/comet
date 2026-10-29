@@ -15,8 +15,13 @@
 //! is captured by the command host and is never rewritten from this watcher;
 //! otherwise one checkout change would relabel every chat sharing that folder.
 //!
-//! Fast recursive `notify` watchers (debounced [`WATCH_DEBOUNCE`]) are backed by a
-//! slow 2-minute repair tick because native watchers may coalesce or drop events.
+//! Archived chats are ignored: they get no entry, no watcher, and no captures
+//! (an entry whose every chat was archived is dropped on the next reconcile;
+//! unarchiving re-adds it).
+//!
+//! Fast recursive watches on the process-wide [`FsWatchHub`] (one watcher thread
+//! for every checkout; debounced [`WATCH_DEBOUNCE`]) are backed by a slow
+//! 2-minute repair tick because native watchers may coalesce or drop events.
 //! Snapshots carry a sha256 checksum; an unchanged checksum publishes nothing.
 //!
 //! Reconcile is deliberately damped, because it runs on *every* workspace chat
@@ -31,25 +36,35 @@
 //! `GetCheckoutDiff` captures for the Changes pane's scopes: *branch changes*
 //! (vs `merge-base(baseRef, HEAD)`, same capture path with the base overridden)
 //! and *latest turn* (vs a temp-index `write-tree` snapshot taken when a turn
-//! dispatches — see [`CheckoutDiffSync::note_turn_start`]).
+//! dispatches — see [`CheckoutDiffSync::note_turn_start`]). Those snapshots
+//! live in Zeron's own object store, never the checkout's — see
+//! [`turn_snapshot`].
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use zeron_proto::{Chat, CheckoutDiff, DiffFileSummary};
 
 use crate::EngineError;
 use crate::doc_host::EdgeConfig;
+use crate::fs_watch::{FsWatch, FsWatchHub};
 use crate::repos::{CheckoutIdentity, Repos};
 use crate::workspace_host::WorkspaceHost;
+
+mod git_status;
+mod turn_snapshot;
+
+pub use turn_snapshot::{TreeSnapshot, snapshot_tree};
 
 /// Hard cap on the unified patch (plus untracked hunks) — "Partial snapshot".
 pub const MAX_PATCH_BYTES: usize = 3 * 1024 * 1024;
@@ -58,6 +73,10 @@ pub const MAX_DIFF_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
 /// Slow repair pass: re-reconcile + re-sync every checkout.
 const REPAIR_INTERVAL: Duration = Duration::from_secs(120);
+/// How long an archived chat stays tracked after its last viewer leaves —
+/// flicking between chats must not tear down and rebuild (full capture) its
+/// checkout every time.
+const INTEREST_LINGER: Duration = Duration::from_secs(30);
 /// Max subdirectories a checkout may have before we skip its live recursive
 /// watch (one OS watch per dir; past this the watcher thread's own bookkeeping
 /// costs more than instant diffs are worth). A normal source tree is well
@@ -91,6 +110,7 @@ pub struct DiffSidecar {
 /// One bounded atomic snapshot of a checkout's working tree.
 #[derive(Debug, Clone)]
 pub struct DiffSnapshot {
+    pub git_status: Option<(Vec<zeron_proto::GitFileStatus>, bool)>,
     pub branch: String,
     pub head_sha: Option<String>,
     pub patch: String,
@@ -123,13 +143,16 @@ struct CheckoutEntry {
     /// of CPU on a big checkout, so a single flapping chat-watch emission or
     /// transient identity failure must never destroy a live entry.
     orphaned_since: Mutex<Option<std::time::Instant>>,
+    /// A kick arrived while orphaned and was skipped — a chat-less checkout
+    /// is not worth a capture. Reconcile re-kicks if chats come back.
+    skipped_while_orphaned: AtomicBool,
     /// Kick channel into the entry's debounce/sync task.
     kick_tx: mpsc::UnboundedSender<()>,
-    /// Keeps the recursive fs watchers alive; dropped on entry close. Filled
-    /// asynchronously — watcher setup (budget walk + FSEvents registration) can
-    /// block for seconds, so [`add_entry`] does it off the runtime and attaches
-    /// the result here once ready.
-    watchers: Mutex<Vec<notify::RecommendedWatcher>>,
+    /// Keeps the recursive fs watches alive on the shared [`FsWatchHub`];
+    /// dropped on entry close. Filled asynchronously — watcher setup (budget
+    /// walk + FSEvents registration) can block for seconds, so [`add_entry`]
+    /// does it off the runtime and attaches the result here once ready.
+    watchers: Mutex<Vec<FsWatch>>,
 }
 
 /// Working-tree snapshot recorded when a chat's turn dispatches — the diff
@@ -139,8 +162,9 @@ struct CheckoutEntry {
 pub struct TurnSnapshot {
     /// Canonical checkout root the tree was captured in.
     pub root: PathBuf,
-    /// `git write-tree` sha of the tracked + untracked (unignored) tree.
-    pub tree: String,
+    /// The tracked + untracked (unignored) tree, with the object store that
+    /// holds it. Replacing or dropping the snapshot deletes that store.
+    pub tree: TreeSnapshot,
     pub at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -161,12 +185,91 @@ struct DiffSyncInner {
     /// How long an entry may sit chat-less before reconcile removes it.
     orphan_grace: Duration,
     diffs_tx: watch::Sender<Vec<CheckoutDiff>>,
+    statuses_tx: watch::Sender<Vec<zeron_proto::CheckoutGitStatus>>,
     /// chat_id → turn-start tree (see [`TurnSnapshot`]).
     turn_trees: Mutex<HashMap<String, TurnSnapshot>>,
     /// The tasks hold `Weak` refs, but an in-flight iteration holds an
     /// upgraded Arc — the token cuts it so no sidecar HTTP outlives shutdown.
     cancel: CancellationToken,
     supervisor: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// chat_id → viewer interest; see [`CheckoutDiffSync::retain_chat`].
+    interest: Mutex<HashMap<String, Interest>>,
+    /// How long released interest keeps an archived chat tracked.
+    interest_linger: Duration,
+    /// Wakes the supervisor to reconcile when an archived chat's interest
+    /// starts or lapses.
+    interest_changed: Arc<Notify>,
+    /// Serializes discards, whether or not their checkout has an entry: an
+    /// entry can appear between the lookup and the lock, and two discards of
+    /// one root must never interleave. File-system watchers and read-only
+    /// captures may still run concurrently.
+    discard_lock: tokio::sync::Mutex<()>,
+}
+
+#[derive(Default)]
+struct Interest {
+    holders: usize,
+    /// When `holders` last fell to zero; interest lingers `interest_linger`.
+    released_at: Option<Instant>,
+}
+
+/// Keeps a chat tracked by diff sync while alive, even if archived. See
+/// [`CheckoutDiffSync::retain_chat`].
+pub struct ChatInterest {
+    inner: Weak<DiffSyncInner>,
+    chat_id: String,
+}
+
+impl Drop for ChatInterest {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        {
+            let mut interest = lock(&inner.interest);
+            let Some(state) = interest.get_mut(&self.chat_id) else {
+                return;
+            };
+            state.holders = state.holders.saturating_sub(1);
+            if state.holders > 0 {
+                return;
+            }
+            state.released_at = Some(Instant::now());
+        }
+        // Only an archived chat's entry depends on interest; reconcile once the
+        // linger runs out so its checkout is released.
+        if is_archived_here(&inner, &self.chat_id)
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let notify = inner.interest_changed.clone();
+            let linger = inner.interest_linger;
+            runtime.spawn(async move {
+                tokio::time::sleep(linger + Duration::from_millis(50)).await;
+                notify.notify_one();
+            });
+        }
+    }
+}
+
+fn is_archived_here(inner: &DiffSyncInner, chat_id: &str) -> bool {
+    inner
+        .workspace
+        .watch_chats()
+        .borrow()
+        .iter()
+        .any(|chat| chat.id == chat_id && chat.archived && chat.device_id == inner.device_id)
+}
+
+/// Chats with live or lingering interest; prunes lapsed records.
+fn interested_chats(inner: &DiffSyncInner) -> HashSet<String> {
+    let mut interest = lock(&inner.interest);
+    interest.retain(|_, state| {
+        state.holders > 0
+            || state
+                .released_at
+                .is_some_and(|at| at.elapsed() < inner.interest_linger)
+    });
+    interest.keys().cloned().collect()
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -202,7 +305,31 @@ impl CheckoutDiffSync {
         edge: Option<EdgeConfig>,
         orphan_grace: Duration,
     ) -> Self {
+        Self::start_with_timings(
+            repos,
+            workspace,
+            device_id,
+            edge,
+            orphan_grace,
+            INTEREST_LINGER,
+        )
+    }
+
+    /// [`CheckoutDiffSync::start_with_orphan_grace`] plus an explicit interest
+    /// linger — test hook for archived-chat interest release.
+    #[doc(hidden)]
+    pub fn start_with_timings(
+        repos: Repos,
+        workspace: WorkspaceHost,
+        device_id: &str,
+        edge: Option<EdgeConfig>,
+        orphan_grace: Duration,
+        interest_linger: Duration,
+    ) -> Self {
         let (diffs_tx, _) = watch::channel(Vec::new());
+        // Turn snapshots are in-memory state: whatever an earlier run left on
+        // disk is unreachable now.
+        turn_snapshot::sweep_stale_stores(repos.data_dir());
         let sync = Self {
             inner: Arc::new(DiffSyncInner {
                 repos,
@@ -215,14 +342,20 @@ impl CheckoutDiffSync {
                 identities: Mutex::new(HashMap::new()),
                 orphan_grace,
                 diffs_tx,
+                statuses_tx: watch::channel(Vec::new()).0,
                 turn_trees: Mutex::new(HashMap::new()),
                 cancel: CancellationToken::new(),
                 supervisor: Mutex::new(None),
+                interest: Mutex::new(HashMap::new()),
+                interest_linger,
+                interest_changed: Arc::new(Notify::new()),
+                discard_lock: tokio::sync::Mutex::new(()),
             }),
         };
         let task = tokio::spawn(diff_sync_task(
             Arc::downgrade(&sync.inner),
             workspace.watch_chats(),
+            sync.inner.interest_changed.clone(),
             sync.inner.cancel.clone(),
         ));
         *lock(&sync.inner.supervisor) = Some(task);
@@ -246,6 +379,11 @@ impl CheckoutDiffSync {
         self.inner.diffs_tx.subscribe()
     }
 
+    /// Consumers filter this shared cache; subscribing never starts another Git scan.
+    pub fn watch_git_statuses(&self) -> watch::Receiver<Vec<zeron_proto::CheckoutGitStatus>> {
+        self.inner.statuses_tx.subscribe()
+    }
+
     /// Regroup this device's chats by checkout identity, then (re)build watchers.
     /// Public for tests (the background task calls it on every chat change).
     pub async fn reconcile_now(&self) {
@@ -260,6 +398,48 @@ impl CheckoutDiffSync {
         let chats = self.inner.workspace.watch_chats().borrow().clone();
         reconcile(&self.inner, chats, true).await;
         self.sync_all();
+    }
+
+    /// Tracked checkout roots, each with its count of live fs watches — test
+    /// hook (watches attach asynchronously after an entry is added).
+    #[doc(hidden)]
+    pub fn tracked_checkouts(&self) -> Vec<(PathBuf, usize)> {
+        let mut tracked: Vec<(PathBuf, usize)> = lock(&self.inner.entries)
+            .values()
+            .map(|entry| {
+                let live = lock(&entry.watchers).iter().filter(|w| w.is_live()).count();
+                (entry.identity.root.clone(), live)
+            })
+            .collect();
+        tracked.sort();
+        tracked
+    }
+
+    /// Keep `chat_id` tracked while the returned guard lives — even when the
+    /// chat is archived. Archived chats otherwise cost nothing (no entry,
+    /// watch, capture or sidecar), but an archived chat someone has open must
+    /// still show its checkout's live diff, accept a discard, and get its
+    /// `checkoutId` stamped. The engine holds one guard per open transcript
+    /// stream; released interest lingers [`INTEREST_LINGER`].
+    pub fn retain_chat(&self, chat_id: &str) -> ChatInterest {
+        let first = {
+            let mut interest = lock(&self.inner.interest);
+            let state = interest.entry(chat_id.to_string()).or_default();
+            state.holders += 1;
+            let lapsed = state
+                .released_at
+                .take()
+                .is_none_or(|at| at.elapsed() >= self.inner.interest_linger);
+            state.holders == 1 && lapsed
+        };
+        // Non-archived chats are tracked anyway — no reconcile needed.
+        if first && is_archived_here(&self.inner, chat_id) {
+            self.inner.interest_changed.notify_one();
+        }
+        ChatInterest {
+            inner: Arc::downgrade(&self.inner),
+            chat_id: chat_id.to_string(),
+        }
     }
 
     /// Kick an immediate sync of every tracked checkout (repair-tick path).
@@ -280,9 +460,13 @@ impl CheckoutDiffSync {
             let Some(inner) = inner.upgrade() else { return };
             let identity = match inner.repos.checkout_identity(&cwd).await {
                 Ok(identity) => identity,
-                Err(_) => return, // not a checkout
+                Err(_) => {
+                    // Not a checkout: no turn to diff, not the previous one.
+                    lock(&inner.turn_trees).remove(&chat_id);
+                    return;
+                }
             };
-            match snapshot_tree(&identity.root).await {
+            match snapshot_tree(&inner.repos, &identity.root).await {
                 Ok(tree) => {
                     lock(&inner.turn_trees).insert(
                         chat_id,
@@ -294,6 +478,8 @@ impl CheckoutDiffSync {
                     );
                 }
                 Err(err) => {
+                    // Keeping the previous base would silently diff two turns.
+                    lock(&inner.turn_trees).remove(&chat_id);
                     tracing::debug!(chat = %chat_id, error = %err,
                         "diff-sync: turn snapshot failed");
                 }
@@ -305,6 +491,47 @@ impl CheckoutDiffSync {
     /// since boot.
     pub fn turn_snapshot(&self, chat_id: &str) -> Option<TurnSnapshot> {
         lock(&self.inner.turn_trees).get(chat_id).cloned()
+    }
+
+    /// Discard the complete uncommitted state of a checkout after verifying
+    /// that the UI acted on the latest full snapshot. A checkout without an
+    /// entry (e.g. only archived chats, interest not yet reconciled) is
+    /// discarded directly; there is just no live diff to republish.
+    pub async fn discard_working_tree(
+        &self,
+        identity: &CheckoutIdentity,
+        expected_checksum: &str,
+    ) -> Result<DiffSnapshot, EngineError> {
+        let entry = lock(&self.inner.entries).get(&identity.id).cloned();
+        let inner = self.inner.clone();
+        let expected_checksum = expected_checksum.to_owned();
+        let Some(entry) = entry else {
+            let root = identity.root.clone();
+            return tokio::spawn(async move {
+                let _guard = inner.discard_lock.lock().await;
+                discard_working_tree(&inner.repos, &root, &expected_checksum).await
+            })
+            .await
+            .map_err(|error| EngineError::Other(format!("discard task failed: {error}")))?;
+        };
+        // Own task: a started discard always runs to completion even if the
+        // RPC caller goes away, and the nested git captures start from a fresh
+        // worker stack instead of stacking on the RPC dispatcher's frames
+        // (which overflowed the 2 MiB worker stack in debug builds).
+        tokio::spawn(async move {
+            let _guard = inner.discard_lock.lock().await;
+            let result =
+                discard_working_tree(&inner.repos, &entry.identity.root, &expected_checksum).await;
+
+            // Publish immediately instead of waiting for the watcher debounce.
+            // The watcher kick remains useful if an external writer races this
+            // operation after the final capture.
+            sync_entry(&inner, &entry).await;
+            let _ = entry.kick_tx.send(());
+            result
+        })
+        .await
+        .map_err(|error| EngineError::Other(format!("discard task failed: {error}")))?
     }
 }
 
@@ -366,8 +593,17 @@ async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>, fresh: bool) {
     let mut groups: HashMap<String, (CheckoutIdentity, Vec<Chat>)> = HashMap::new();
     // Dedupe resolution within this pass — many chats share one checkout.
     let mut resolved: HashMap<String, Option<CheckoutIdentity>> = HashMap::new();
+    // This device's archived chats nobody has open: never grouped (no entry,
+    // watcher, capture or sidecar), and an entry left holding only these is
+    // dropped below. An archived chat with a viewer is grouped like any other.
+    let interested = interested_chats(inner);
+    let mut archived: HashSet<String> = HashSet::new();
     for chat in chats {
         if chat.device_id != inner.device_id {
+            continue;
+        }
+        if chat.archived && !interested.contains(&chat.id) {
+            archived.insert(chat.id);
             continue;
         }
         let Some(cwd) = chat.cwd.clone() else {
@@ -396,18 +632,43 @@ async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>, fresh: bool) {
             .1
             .push(chat);
     }
+    // A turn snapshot holds an object store on disk: keep it only for chats
+    // that can still show "Latest turn". Judged on the current rows, not this
+    // pass's (possibly older) list, so a chat created meanwhile keeps its own.
+    {
+        let current = inner.workspace.watch_chats();
+        let current = current.borrow();
+        let live: HashSet<&str> = current
+            .iter()
+            .filter(|chat| !chat.archived || interested.contains(&chat.id))
+            .map(|chat| chat.id.as_str())
+            .collect();
+        lock(&inner.turn_trees).retain(|chat_id, _| live.contains(chat_id.as_str()));
+    }
 
     // Close entries whose checkout has had no chats for a full grace period;
     // drop their published diff. A single pass that misses a checkout only
     // *marks* it — teardown is expensive to undo (re-add kicks a capture), so
-    // absence must be sustained before we act on it.
+    // absence must be sustained before we act on it. Archiving is not a flap:
+    // an entry whose every chat is now an archived row goes immediately.
     let removed: Vec<String> = {
         let now = std::time::Instant::now();
         let mut entries = lock(&inner.entries);
         let mut removed = Vec::new();
         for (id, entry) in entries.iter() {
             if groups.contains_key(id) {
-                *lock(&entry.orphaned_since) = None;
+                let was_orphaned = lock(&entry.orphaned_since).take().is_some();
+                if was_orphaned && entry.skipped_while_orphaned.swap(false, Ordering::AcqRel) {
+                    let _ = entry.kick_tx.send(()); // catch up on what we skipped
+                }
+                continue;
+            }
+            let archived_away = {
+                let held = lock(&entry.chats);
+                !held.is_empty() && held.iter().all(|chat| archived.contains(&chat.id))
+            };
+            if archived_away {
+                removed.push(id.clone());
                 continue;
             }
             let mut orphaned = lock(&entry.orphaned_since);
@@ -520,6 +781,7 @@ fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<
         chats: Mutex::new(chats),
         checksum: Mutex::new(None),
         orphaned_since: Mutex::new(None),
+        skipped_while_orphaned: AtomicBool::new(false),
         kick_tx: kick_tx.clone(),
         watchers: Mutex::new(Vec::new()),
     });
@@ -537,50 +799,49 @@ fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<
     // for seconds when fseventsd is contended. Doing it inline starved the whole
     // runtime (workspace watches, presence) whenever entries were (re)built, so
     // it runs on the blocking pool and attaches to the entry when ready. Events
-    // occurring before attachment are covered by the initial sync; one extra
-    // kick after attachment closes the capture→attach gap.
+    // occurring before attachment are covered by the initial sync; the hub's
+    // rescan when each watch goes live closes the capture→attach gap.
     let weak = Arc::downgrade(&entry);
     tokio::task::spawn_blocking(move || {
         let Some(entry) = weak.upgrade() else {
             return; // entry removed before watchers were ready
         };
-        let watchers = build_watchers(&entry.identity, &kick_tx);
+        let watchers = build_watchers(&FsWatchHub::global(), &entry.identity, &kick_tx);
         *lock(&entry.watchers) = watchers;
-        let _ = kick_tx.send(());
     });
 }
 
-/// Recursive watchers on the worktree root (budget permitting) and the git
-/// dir — HEAD/index churn and file edits both land here. Failures are fine:
-/// the initial + repair sync still keep the snapshot correct. Blocking — call
-/// from the blocking pool.
+/// Recursive watches on the worktree root (budget permitting) and the git
+/// dir — HEAD/index churn and file edits both land here. Registered on the
+/// shared [`FsWatchHub`], so a checkout costs OS watches but no thread of its
+/// own; the hub's rescan signals (watch went live, events possibly lost) kick
+/// like any change. Failures are fine: the initial + repair sync still keep
+/// the snapshot correct. Blocking (budget walk) — call from the blocking pool.
 fn build_watchers(
+    hub: &Arc<FsWatchHub>,
     identity: &CheckoutIdentity,
     kick_tx: &mpsc::UnboundedSender<()>,
-) -> Vec<notify::RecommendedWatcher> {
+) -> Vec<FsWatch> {
     let mut watchers = Vec::new();
     for target in watch_targets(identity) {
         let tx = kick_tx.clone();
-        let watcher =
-            notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
-                if event.is_ok() {
+        watchers.push(
+            hub.watch(&target, notify::RecursiveMode::Recursive, move |event| {
+                if is_checkout_change(event) {
                     let _ = tx.send(());
                 }
-            });
-        match watcher {
-            Ok(mut watcher) => {
-                use notify::Watcher as _;
-                match watcher.watch(&target, notify::RecursiveMode::Recursive) {
-                    Ok(()) => watchers.push(watcher),
-                    Err(err) => {
-                        tracing::debug!(path = %target.display(), error = %err, "diff-sync: watch failed")
-                    }
-                }
-            }
-            Err(err) => tracing::debug!(error = %err, "diff-sync: watcher create failed"),
-        }
+            }),
+        );
     }
     watchers
+}
+
+/// Whether a watch event can change the checkout's diff. Opens and reads are
+/// not changes — and the sync's own git runs open files under both watched
+/// roots, so kicking on them would re-sync every checkout forever. A write
+/// still arrives as a modify event before its close.
+fn is_checkout_change(event: &notify::Event) -> bool {
+    !matches!(event.kind, notify::EventKind::Access(_))
 }
 
 /// Per-checkout task: trailing-debounce fs kicks, then compute + publish. Runs
@@ -603,6 +864,13 @@ async fn entry_task(
         let (Some(inner), Some(entry)) = (inner.upgrade(), entry.upgrade()) else {
             return;
         };
+        // No chats (deleted / moved away; teardown pending the orphan grace):
+        // nobody consumes this checkout's diff, so skip the capture — repair
+        // ticks and fs churn included. Reconcile re-kicks if chats return.
+        if lock(&entry.orphaned_since).is_some() {
+            entry.skipped_while_orphaned.store(true, Ordering::Release);
+            continue;
+        }
         // The upgraded Arc would let a sync outlive shutdown — race the token
         // so an in-flight sidecar POST is dropped, not completed.
         tokio::select! {
@@ -622,10 +890,14 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
         Err(err) => {
             tracing::debug!(checkout = %entry.identity.root.display(), error = %err,
                 "diff-sync: capture failed");
+            git_status::publish(inner, entry, Vec::new(), false);
             return;
         }
     };
 
+    if let Some((files, complete)) = &snapshot.git_status {
+        git_status::publish(inner, entry, files.clone(), *complete);
+    }
     if lock(&entry.checksum).as_deref() == Some(snapshot.checksum.as_str()) {
         return; // unchanged — publish nothing
     }
@@ -653,7 +925,13 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
 
     // Latest-only sidecar to every syncing chat's session DO slot.
     let chats = lock(&entry.chats).clone();
-    if let Some(edge) = &inner.edge {
+    // The legacy s2 sidecar route is closed to Cloud runner tokens (and no
+    // current client reads it), so a Cloud machine doesn't post it.
+    if let Some(edge) = inner
+        .edge
+        .as_ref()
+        .filter(|_| !crate::runner::is_cloud_platform())
+    {
         for chat in &chats {
             let sidecar = DiffSidecar {
                 chat_id: chat.id.clone(),
@@ -670,8 +948,8 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
             };
             let url = format!("{}/diff/{}", edge.url.trim_end_matches('/'), chat.id);
             // Fresh bearer per request — never the boot-time snapshot.
-            let Some(bearer) = edge.bearer().await else {
-                tracing::debug!(chat = %chat.id, "diff-sync: sidecar skipped (signed out)");
+            let Ok(bearer) = edge.bearer().await else {
+                tracing::debug!(chat = %chat.id, "diff-sync: sidecar skipped (token unavailable)");
                 continue;
             };
             let result = inner
@@ -716,6 +994,12 @@ fn publish_watch_with(inner: &Arc<DiffSyncInner>, updated: Option<CheckoutDiff>)
 
 fn publish_watch(inner: &Arc<DiffSyncInner>) {
     publish_watch_with(inner, None);
+    let live: HashSet<String> = lock(&inner.entries).keys().cloned().collect();
+    inner.statuses_tx.send_if_modified(|statuses| {
+        let before = statuses.len();
+        statuses.retain(|status| live.contains(&status.checkout_id));
+        before != statuses.len()
+    });
 }
 
 /// Chat-watch follower + repair tick. Holds only weak handles so dropping the
@@ -723,6 +1007,7 @@ fn publish_watch(inner: &Arc<DiffSyncInner>) {
 async fn diff_sync_task(
     inner: Weak<DiffSyncInner>,
     mut chats_rx: watch::Receiver<Vec<Chat>>,
+    interest_changed: Arc<Notify>,
     cancel: CancellationToken,
 ) {
     let mut repair = tokio::time::interval(REPAIR_INTERVAL);
@@ -739,6 +1024,12 @@ async fn diff_sync_task(
                 let chats = chats_rx.borrow_and_update().clone();
                 // Memoized identities only: chat rows change constantly (the
                 // sync itself writes them) and must never fan out into git.
+                reconcile(&inner, chats, false).await;
+            }
+            // An archived chat gained its first viewer or its interest lapsed.
+            _ = interest_changed.notified() => {
+                let Some(inner) = inner.upgrade() else { break };
+                let chats = chats_rx.borrow().clone();
                 reconcile(&inner, chats, false).await;
             }
             _ = repair.tick() => {
@@ -765,9 +1056,38 @@ struct Capture {
 
 /// Run git capturing stdout under a hard byte ceiling — the child is killed once
 /// the cap is hit, so an arbitrarily large repository diff never buffers fully.
-async fn capture_git(cwd: &Path, args: &[&str], max_bytes: usize) -> Result<Capture, EngineError> {
+///
+/// Not an `async fn`: a wrapping future would add a poll frame, and a copy of
+/// the 64 KiB read buffer, to every capture on the RPC worker's stack.
+fn capture_git<'a, S: AsRef<OsStr>>(
+    cwd: &'a Path,
+    args: &'a [S],
+    max_bytes: usize,
+) -> impl Future<Output = Result<Capture, EngineError>> + 'a {
+    capture_git_in(cwd, args, max_bytes, None)
+}
+
+/// [`capture_git`] that can also see a turn snapshot's objects, which exist
+/// only in that snapshot's store.
+async fn capture_git_in<S: AsRef<OsStr>>(
+    cwd: &Path,
+    args: &[S],
+    max_bytes: usize,
+    snapshot: Option<&TreeSnapshot>,
+) -> Result<Capture, EngineError> {
     let mut cmd = tokio::process::Command::new("git");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.as_std_mut().creation_flags(0x08000000);
+    }
     cmd.arg("-C").arg(cwd).args(args);
+    if let Some(snapshot) = snapshot {
+        snapshot.apply_to(&mut cmd);
+    }
+    // Read-only commands: a caller that gives up (a timed-out snapshot, a
+    // dropped request) takes its git child down with it.
+    cmd.kill_on_drop(true);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -779,7 +1099,9 @@ async fn capture_git(cwd: &Path, args: &[&str], max_bytes: usize) -> Result<Capt
         .take()
         .ok_or_else(|| EngineError::Other("git stdout unavailable".into()))?;
     let mut out: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 64 * 1024];
+    // Keep the read buffer out of nested async state: inline storage grows
+    // every caller's future and can overflow a standard RPC worker's stack.
+    let mut buf = vec![0u8; 64 * 1024];
     let mut truncated = false;
     loop {
         let n = stdout
@@ -823,6 +1145,35 @@ fn split_z(value: &[u8]) -> Vec<String> {
         .filter(|part| !part.is_empty())
         .map(|part| String::from_utf8_lossy(part).to_string())
         .collect()
+}
+
+/// Git paths are arbitrary bytes on Unix, while the diff protocol exposes
+/// paths as UTF-8 strings. Treat an unrepresentable path as a partial snapshot
+/// so destructive actions cannot operate on a file the UI could not faithfully
+/// display or checksum.
+fn has_non_utf8_status_path(value: &[u8]) -> bool {
+    let records: Vec<&[u8]> = value
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .collect();
+    let mut i = 0usize;
+    while i < records.len() {
+        let record = records[i];
+        i += 1;
+        if record.len() < 3 || record[2] != b' ' {
+            continue;
+        }
+        if std::str::from_utf8(&record[3..]).is_err() {
+            return true;
+        }
+        if (record.starts_with(b"R") || record.starts_with(b"C")) && i < records.len() {
+            if std::str::from_utf8(records[i]).is_err() {
+                return true;
+            }
+            i += 1;
+        }
+    }
+    false
 }
 
 fn parse_name_status(value: &[u8]) -> Vec<DiffFileSummary> {
@@ -990,9 +1341,20 @@ async fn read_worktree_source(root: &Path, path: &Path) -> Result<Capture, Engin
     })
 }
 
-async fn read_git_source(root: &Path, revision: &str, path: &Path) -> Result<Capture, EngineError> {
+async fn read_git_source(
+    root: &Path,
+    revision: &str,
+    snapshot: Option<&TreeSnapshot>,
+    path: &Path,
+) -> Result<Capture, EngineError> {
     let spec = format!("{revision}:{}", path.to_string_lossy());
-    capture_git(root, &["cat-file", "blob", &spec], MAX_DIFF_SOURCE_BYTES).await
+    capture_git_in(
+        root,
+        &["cat-file", "blob", &spec],
+        MAX_DIFF_SOURCE_BYTES,
+        snapshot,
+    )
+    .await
 }
 
 /// Read the exact old/new documents for one file in a previously captured diff.
@@ -1003,15 +1365,18 @@ pub async fn read_diff_file_text(
     base: &str,
     file: &DiffFileSummary,
 ) -> Result<DiffFileTextPair, EngineError> {
-    read_diff_file_text_at(root, base, None, file).await
+    read_diff_file_text_at(root, base, None, None, file).await
 }
 
 /// Read the exact old/new documents for one file in a diff between `base` and
 /// an optional committed target. Without a target, the new source is the live
-/// working tree; with one, both sources are immutable Git blobs.
+/// working tree; with one, both sources are immutable Git blobs. A `base` that
+/// is a turn snapshot's tree needs that snapshot as `base_snapshot`: its
+/// objects are not in the checkout.
 pub(crate) async fn read_diff_file_text_at(
     root: &Path,
     base: &str,
+    base_snapshot: Option<&TreeSnapshot>,
     target: Option<&str>,
     file: &DiffFileSummary,
 ) -> Result<DiffFileTextPair, EngineError> {
@@ -1021,12 +1386,12 @@ pub(crate) async fn read_diff_file_text_at(
     let old = if file.status == "added" {
         None
     } else {
-        Some(read_git_source(root, base, old_path).await?)
+        Some(read_git_source(root, base, base_snapshot, old_path).await?)
     };
     let new = if file.status == "deleted" {
         None
     } else if let Some(target) = target {
-        Some(read_git_source(root, target, new_path).await?)
+        Some(read_git_source(root, target, None, new_path).await?)
     } else {
         Some(read_worktree_source(root, new_path).await?)
     };
@@ -1150,7 +1515,13 @@ pub async fn capture_diff_against(
     // read-only (a status-triggered index refresh would re-kick our own watcher).
     let status = capture_git(
         root,
-        &["--no-optional-locks", "status", "--porcelain", "-z"],
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ],
         2 * 1024 * 1024,
     )
     .await?;
@@ -1159,6 +1530,9 @@ pub async fn capture_diff_against(
     apply_numstat(&mut files, &nums.stdout);
     let mut patch = String::from_utf8_lossy(&tracked.stdout).to_string();
     let mut truncated = tracked.truncated || names.truncated || nums.truncated || status.truncated;
+    if has_non_utf8_status_path(&status.stdout) {
+        truncated = true;
+    }
 
     if tracked.truncated {
         let boundary = patch.rfind('\n').unwrap_or(0);
@@ -1186,20 +1560,54 @@ pub async fn capture_diff_against(
     }
     untracked.sort();
 
+    // Status now enumerates new directories as individual paths. Keep content
+    // work bounded even when thousands of those files are binary or too large
+    // to fit in the patch; their Git statuses remain complete independently.
+    let mut untracked_budget = MAX_PATCH_BYTES;
     for path in untracked {
+        if untracked_budget == 0 {
+            truncated = true;
+            break;
+        }
         let full = root.join(&path);
         let binary;
         let mut additions = 0u32;
-        let size = tokio::fs::metadata(&full)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        if size > MAX_PATCH_BYTES as u64 {
+        let Ok(metadata) = tokio::fs::symlink_metadata(&full).await else {
+            continue;
+        };
+        let size = metadata.len();
+        if metadata.is_dir() {
+            // Git keeps nested repositories atomic even with
+            // `--untracked-files=all`. Surface the directory in the snapshot,
+            // but never read through or clean it recursively.
+            binary = true;
+        } else if size > MAX_PATCH_BYTES as u64 {
             binary = true;
             truncated = true;
         } else {
-            match tokio::fs::read(&full).await {
+            let content = if metadata.file_type().is_symlink() {
+                // A Git symlink's content is its target path, never the target file.
+                tokio::fs::read_link(&full)
+                    .await
+                    .map(|path| path.to_string_lossy().into_owned().into_bytes())
+            } else {
+                async {
+                    let file = tokio::fs::File::open(&full).await?;
+                    let mut bytes = Vec::new();
+                    file.take(untracked_budget as u64 + 1)
+                        .read_to_end(&mut bytes)
+                        .await?;
+                    Ok::<_, std::io::Error>(bytes)
+                }
+                .await
+            };
+            match content {
                 Ok(bytes) => {
+                    if bytes.len() > untracked_budget {
+                        truncated = true;
+                        break;
+                    }
+                    untracked_budget = untracked_budget.saturating_sub(bytes.len().max(1));
                     binary = bytes.contains(&0);
                     if !binary {
                         let text = String::from_utf8_lossy(&bytes).to_string();
@@ -1248,6 +1656,7 @@ pub async fn capture_diff_against(
     let checksum = crate::repos::hex(&hasher.finalize());
 
     Ok(DiffSnapshot {
+        git_status: Some(git_status::parse(&status.stdout, status.truncated)),
         branch,
         head_sha: (!head.is_empty()).then_some(head),
         patch,
@@ -1257,6 +1666,221 @@ pub async fn capture_diff_against(
         truncated,
         checksum,
     })
+}
+
+fn status_paths(status: &[u8]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let records: Vec<&[u8]> = status
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .collect();
+    let mut tracked = Vec::new();
+    let mut untracked = Vec::new();
+    let mut i = 0usize;
+    while i < records.len() {
+        let record = records[i];
+        i += 1;
+        if record.len() < 4 || record[2] != b' ' {
+            continue;
+        }
+        let code = &record[..2];
+        let path = record[3..].to_vec();
+        if code == b"??" {
+            untracked.push(path);
+            continue;
+        }
+        if code == b"!!" {
+            continue;
+        }
+        tracked.push(path);
+        if (code.contains(&b'R') || code.contains(&b'C')) && i < records.len() {
+            tracked.push(records[i].to_vec());
+            i += 1;
+        }
+    }
+    tracked.sort();
+    tracked.dedup();
+    untracked.sort();
+    untracked.dedup();
+    (tracked, untracked)
+}
+
+#[cfg(unix)]
+fn path_argument(path: &[u8]) -> OsString {
+    use std::os::unix::ffi::OsStringExt as _;
+    OsString::from_vec(path.to_vec())
+}
+
+#[cfg(not(unix))]
+fn path_argument(path: &[u8]) -> OsString {
+    OsString::from(String::from_utf8_lossy(path).into_owned())
+}
+
+/// Path bytes per git invocation. Windows caps a whole command line at 32,767
+/// UTF-16 units (macOS/Linux at 1-2 MiB including the environment); a change
+/// set past that must not fail to spawn halfway through a discard.
+const MAX_PATH_ARGUMENT_BYTES: usize = 16 * 1024;
+
+/// Split `paths` into consecutive batches of at most `budget` bytes (one NUL
+/// per path included). A single path over budget still forms its own batch.
+fn path_batches(paths: &[Vec<u8>], budget: usize) -> Vec<&[Vec<u8>]> {
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = 0usize;
+    for (index, path) in paths.iter().enumerate() {
+        let cost = path.len() + 1;
+        if index > start && bytes + cost > budget {
+            batches.push(&paths[start..index]);
+            start = index;
+            bytes = 0;
+        }
+        bytes += cost;
+    }
+    if start < paths.len() {
+        batches.push(&paths[start..]);
+    }
+    batches
+}
+
+async fn run_git_for_paths(
+    root: &Path,
+    fixed_args: &[OsString],
+    paths: &[Vec<u8>],
+) -> Result<(), EngineError> {
+    for batch in path_batches(paths, MAX_PATH_ARGUMENT_BYTES) {
+        run_git_for_path_batch(root, fixed_args, batch).await?;
+    }
+    Ok(())
+}
+
+async fn run_git_for_path_batch(
+    root: &Path,
+    fixed_args: &[OsString],
+    paths: &[Vec<u8>],
+) -> Result<(), EngineError> {
+    let mut command = tokio::process::Command::new("git");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.as_std_mut().creation_flags(0x08000000);
+    }
+    command
+        .arg("-C")
+        .arg(root)
+        .arg("--literal-pathspecs")
+        .args(fixed_args)
+        .arg("--");
+    for path in paths {
+        command.arg(path_argument(path));
+    }
+    command.stdin(std::process::Stdio::null());
+    let output = command
+        .output()
+        .await
+        .map_err(|error| EngineError::Other(format!("git spawn failed: {error}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let message = stderr.trim();
+    Err(EngineError::Other(if message.is_empty() {
+        format!("git discard failed ({})", output.status)
+    } else {
+        format!("git: {message}")
+    }))
+}
+
+/// Restore staged and unstaged tracked paths to the snapshot's HEAD, then ask
+/// Git to remove only the exact untracked paths it reported. Ignored files are
+/// excluded by porcelain status and `git clean` intentionally omits `-x`;
+/// nested repositories and submodule contents are never recursively cleaned.
+pub async fn discard_working_tree(
+    repos: &Repos,
+    root: &Path,
+    expected_checksum: &str,
+) -> Result<DiffSnapshot, EngineError> {
+    let snapshot = capture_diff(repos, root).await?;
+    let head = snapshot.head_sha.as_deref().ok_or_else(|| {
+        EngineError::Other("cannot discard changes before the first commit".into())
+    })?;
+    if snapshot.truncated {
+        return Err(EngineError::Other(
+            "cannot safely discard a partial diff snapshot".into(),
+        ));
+    }
+    if snapshot.checksum != expected_checksum {
+        return Err(EngineError::Other(
+            "working tree changed since the confirmation was opened".into(),
+        ));
+    }
+
+    let status = capture_git(
+        root,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ],
+        2 * 1024 * 1024,
+    )
+    .await?;
+    if status.truncated {
+        return Err(EngineError::Other(
+            "cannot safely discard a truncated working-tree status".into(),
+        ));
+    }
+    let (tracked, untracked) = status_paths(&status.stdout);
+    let is_directory = |path: &Vec<u8>| {
+        std::fs::symlink_metadata(root.join(PathBuf::from(path_argument(path))))
+            .is_ok_and(|metadata| metadata.is_dir())
+    };
+    if untracked.iter().any(is_directory) {
+        return Err(EngineError::Other(
+            "cannot discard an untracked nested repository safely".into(),
+        ));
+    }
+    // Git tracks files and symlinks, so a tracked path that is a directory on
+    // disk is a submodule or a file replaced by a directory. `git restore`
+    // leaves submodule contents in place (the final check would then fail
+    // after everything else was already discarded) and removes a replacing
+    // directory wholesale, ignored files included. Refuse before mutating.
+    if tracked.iter().any(is_directory) {
+        return Err(EngineError::Other(
+            "cannot discard submodule or directory changes safely".into(),
+        ));
+    }
+
+    let restore_args = [
+        OsString::from("restore"),
+        OsString::from(format!("--source={head}")),
+        OsString::from("--staged"),
+        OsString::from("--worktree"),
+    ];
+    run_git_for_paths(root, &restore_args, &tracked).await?;
+    let clean_args = [OsString::from("clean"), OsString::from("-fd")];
+    run_git_for_paths(root, &clean_args, &untracked).await?;
+    // `--untracked-files=all` gives exact files, so `git clean` can leave
+    // their now-empty parent directories behind. Remove only empty ancestors;
+    // ignored files or any concurrent writer make `remove_dir` stop safely.
+    for path in &untracked {
+        let full = root.join(PathBuf::from(path_argument(path)));
+        let mut parent = full.parent();
+        while let Some(directory) = parent {
+            if directory == root || std::fs::remove_dir(directory).is_err() {
+                break;
+            }
+            parent = directory.parent();
+        }
+    }
+
+    let final_snapshot = capture_diff(repos, root).await?;
+    if !final_snapshot.files.is_empty() || !final_snapshot.patch.trim().is_empty() {
+        return Err(EngineError::Other(
+            "some changes could not be discarded safely".into(),
+        ));
+    }
+    Ok(final_snapshot)
 }
 
 /// Snapshot of one COMMIT's changes: first-parent (or the empty tree for a
@@ -1342,6 +1966,7 @@ pub async fn capture_commit_diff(
     Ok(DiffSnapshot {
         branch,
         head_sha: Some(sha.to_string()),
+        git_status: None,
         patch,
         files,
         additions,
@@ -1362,60 +1987,22 @@ pub async fn merge_base(root: &Path, base_ref: &str) -> Result<String, EngineErr
     Ok(sha)
 }
 
-/// Write the checkout's current tracked + untracked (unignored) tree into the
-/// object db via a throwaway index: `git add -A` under `GIT_INDEX_FILE`, then
-/// `git write-tree`. The real index is never touched. Costs one full hash pass
-/// over the working tree (no stat cache in a fresh index) — run once per turn
-/// dispatch, that is the same cost class as the untracked-file reads the watch
-/// capture already does.
-pub async fn snapshot_tree(root: &Path) -> Result<String, EngineError> {
-    let index = std::env::temp_dir().join(format!(
-        "zeron-turn-index-{}-{}",
-        std::process::id(),
-        chrono::Utc::now().timestamp_micros()
-    ));
-    let run = |args: &[&str]| {
-        let mut cmd = tokio::process::Command::new("git");
-        cmd.arg("-C").arg(root).args(args);
-        cmd.env("GIT_INDEX_FILE", &index);
-        cmd.stdin(std::process::Stdio::null());
-        cmd.output()
-    };
-    let added = run(&["add", "-A", "--ignore-errors", "."])
-        .await
-        .map_err(|e| EngineError::Other(format!("git add failed: {e}")))?;
-    if !added.status.success() {
-        let _ = tokio::fs::remove_file(&index).await;
-        return Err(EngineError::Other(format!(
-            "git add: {}",
-            String::from_utf8_lossy(&added.stderr).trim()
-        )));
-    }
-    let written = run(&["write-tree"])
-        .await
-        .map_err(|e| EngineError::Other(format!("git write-tree failed: {e}")));
-    let _ = tokio::fs::remove_file(&index).await;
-    let written = written?;
-    if !written.status.success() {
-        return Err(EngineError::Other(format!(
-            "git write-tree: {}",
-            String::from_utf8_lossy(&written.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&written.stdout).trim().to_string())
-}
-
 /// "Latest turn" capture: tree-to-tree diff from the turn-start snapshot to a
 /// fresh [`snapshot_tree`] of the current state. Both trees carry untracked
 /// (unignored) files, so no synthesis is needed and a file that was already
 /// untracked at turn start diffs correctly (the watch capture's synthesis
 /// would misreport it as entirely new).
+///
+/// The fresh snapshot is layered on the turn's store, so it only writes the
+/// files that changed since, and it is deleted again when this returns.
 pub async fn capture_turn_diff(
     repos: &Repos,
     root: &Path,
-    turn_tree: &str,
+    turn: &TreeSnapshot,
 ) -> Result<DiffSnapshot, EngineError> {
-    let current = snapshot_tree(root).await?;
+    let current = turn_snapshot::snapshot_tree_onto(repos, root, Some(turn)).await?;
+    let turn_tree = turn.tree();
+    let current_tree = current.tree();
     let head = capture_git(root, &["rev-parse", "--verify", "HEAD"], 256)
         .await
         .map(|c| String::from_utf8_lossy(&c.stdout).trim().to_string())
@@ -1425,7 +2012,7 @@ pub async fn capture_turn_diff(
         .await
         .unwrap_or_else(|_| "HEAD".into());
 
-    let names = capture_git(
+    let names = capture_git_in(
         root,
         &[
             "diff",
@@ -1433,13 +2020,14 @@ pub async fn capture_turn_diff(
             "-z",
             "--find-renames",
             turn_tree,
-            &current,
+            current_tree,
             "--",
         ],
         2 * 1024 * 1024,
+        Some(&current),
     )
     .await?;
-    let nums = capture_git(
+    let nums = capture_git_in(
         root,
         &[
             "diff",
@@ -1447,13 +2035,14 @@ pub async fn capture_turn_diff(
             "-z",
             "--find-renames",
             turn_tree,
-            &current,
+            current_tree,
             "--",
         ],
         2 * 1024 * 1024,
+        Some(&current),
     )
     .await?;
-    let tracked = capture_git(
+    let tracked = capture_git_in(
         root,
         &[
             "diff",
@@ -1462,10 +2051,11 @@ pub async fn capture_turn_diff(
             "--find-renames",
             "--unified=3",
             turn_tree,
-            &current,
+            current_tree,
             "--",
         ],
         MAX_PATCH_BYTES,
+        Some(&current),
     )
     .await?;
 
@@ -1497,6 +2087,7 @@ pub async fn capture_turn_diff(
     Ok(DiffSnapshot {
         branch,
         head_sha: (!head.is_empty()).then_some(head),
+        git_status: None,
         patch,
         files,
         additions,
@@ -1508,7 +2099,84 @@ pub async fn capture_turn_diff(
 
 #[cfg(test)]
 mod watch_budget_tests {
-    use super::{CheckoutIdentity, MAX_WATCH_DIRS, exceeds_watch_budget, watch_targets};
+    use super::{
+        CheckoutIdentity, MAX_WATCH_DIRS, exceeds_watch_budget, has_non_utf8_status_path,
+        is_checkout_change, path_batches, watch_targets,
+    };
+
+    /// End to end through a real watcher: opening a file under a watched
+    /// checkout raises access events on Linux, and before the filter each one
+    /// kicked a sync whose own git reads raised more. A read must stay quiet;
+    /// a write must still kick.
+    #[tokio::test]
+    async fn watcher_stays_quiet_on_reads_and_kicks_on_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub = crate::fs_watch::FsWatchHub::new();
+        let watchers = super::build_watchers(&hub, &identity(&root, &root.join(".git")), &tx);
+        // Install now (the batch worker would within ~100 ms) and expect the
+        // attach rescan's kick; then let registration settle and drop
+        // anything it raised.
+        hub.apply();
+        assert!(watchers.iter().all(super::FsWatch::is_live));
+        rx.try_recv().expect("going live kicks a sync");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        while rx.try_recv().is_ok() {}
+
+        let _ = std::fs::read(root.join("a.txt")).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(rx.try_recv().is_err(), "a read must not kick a sync");
+
+        std::fs::write(root.join("a.txt"), "two\n").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a write kicks a sync")
+            .expect("kick channel open");
+    }
+
+    #[test]
+    fn reads_do_not_kick_a_sync_but_writes_do() {
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, DataChange, EventKind, ModifyKind, RemoveKind,
+        };
+        for kind in [
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+        ] {
+            assert!(!is_checkout_change(&notify::Event::new(kind)), "{kind:?}");
+        }
+        for kind in [
+            EventKind::Create(CreateKind::File),
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Any,
+        ] {
+            assert!(is_checkout_change(&notify::Event::new(kind)), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn path_batches_split_on_budget_and_keep_every_path() {
+        let paths: Vec<Vec<u8>> = ["aaa", "bbb", "cc", "dddddddddd", "e"]
+            .iter()
+            .map(|path| path.as_bytes().to_vec())
+            .collect();
+        let batches = path_batches(&paths, 8);
+        let sizes: Vec<usize> = batches.iter().map(|batch| batch.len()).collect();
+        // "aaa\0bbb\0" fills 8; "cc\0" alone; the oversized path stands alone.
+        assert_eq!(sizes, vec![2, 1, 1, 1]);
+        assert_eq!(batches.concat(), paths);
+        assert!(path_batches(&[], 8).is_empty());
+    }
+
+    #[test]
+    fn non_utf8_status_paths_are_marked_unsafe_for_destructive_actions() {
+        assert!(has_non_utf8_status_path(b"?? invalid-\xff.txt\0"));
+        assert!(!has_non_utf8_status_path(b"?? valid.txt\0"));
+    }
 
     #[test]
     fn small_tree_is_watchable() {

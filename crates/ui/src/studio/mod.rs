@@ -28,6 +28,7 @@ mod lineage;
 mod page;
 mod paint;
 mod providers;
+mod rail;
 mod tray;
 mod upscale;
 mod video;

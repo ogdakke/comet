@@ -21,8 +21,10 @@ async fn cli_on_login_shell_path_only_is_resolved() {
     let dir = tempfile::tempdir().unwrap();
     let shell_bin = dir.path().join("shell-bin");
     std::fs::create_dir(&shell_bin).unwrap();
+    write_executable(&shell_bin.join("devin"), "#!/bin/sh\nexit 0\n");
     write_executable(&shell_bin.join("hermes"), "#!/bin/sh\nexit 0\n");
-    write_executable(&shell_bin.join("pi"), "#!/bin/sh\nexit 0\n");
+    // Native discovery prefers the newest installed version; outrank any real CLI.
+    write_executable(&shell_bin.join("pi"), "#!/bin/sh\necho 9999.0.0\n");
     write_executable(&shell_bin.join("claude"), "#!/bin/sh\nexit 0\n");
 
     // A $SHELL whose init shapes PATH — the shape resolution must survive.
@@ -46,6 +48,7 @@ async fn cli_on_login_shell_path_only_is_resolved() {
         std::env::set_var("SHELL", &fake_shell);
         std::env::set_var("HOME", dir.path());
         std::env::set_var("PATH", "/usr/bin:/bin");
+        std::env::remove_var("DEVIN_EXECUTABLE");
         std::env::remove_var("HERMES_EXECUTABLE");
         std::env::remove_var("PI_EXECUTABLE");
         std::env::remove_var("CLAUDE_CODE_EXECUTABLE");
@@ -67,14 +70,16 @@ async fn cli_on_login_shell_path_only_is_resolved() {
         zeron_harness::ClaudeHarness::new().installed(),
         "claude resolves via login-shell PATH"
     );
+    let devin = AcpHarness::devin()
+        .launch_program()
+        .expect("devin resolves via login-shell PATH");
+    assert_eq!(devin, shell_bin.join("devin"), "{devin:?}");
     let hermes = AcpHarness::hermes()
         .launch_program()
         .expect("hermes resolves via login-shell PATH");
     assert_eq!(hermes, shell_bin.join("hermes"), "{hermes:?}");
-    // The native pi driver resolves the `pi` CLI itself through the same
-    // snapshot (installed() is a pure resolution probe).
-    assert!(
-        zeron_harness::PiHarness::new().installed(),
-        "pi resolves via login-shell PATH"
-    );
+    let pi = zeron_harness::PiHarness::new()
+        .resolve_executable()
+        .expect("pi resolves via login-shell PATH");
+    assert_eq!(pi, shell_bin.join("pi"), "{pi:?}");
 }

@@ -1,283 +1,276 @@
-//! pi harness: spawns the installed `pi` CLI as `pi --mode rpc` and speaks
-//! its JSONL command/response protocol directly — no adapter process in
-//! between. Replaces the `pi-acp` ACP adapter path (decision record:
-//! docs/research/harness.md), same motivation as the codex/claude native
-//! drivers: the adapter held its own turn queue and re-derived done-status
-//! from pi's events, while steering (pi's native strength) never crossed
-//! the ACP boundary at all.
-//!
-//! VERSION PIN: validated against pi `@earendil-works/pi-coding-agent`
-//! (docs/rpc.md of that version). The RPC surface is additive-friendly —
-//! unknown events are tolerated by design — but revalidate the command
-//! shapes (`prompt`/`steer`/`abort`/`set_model`/`set_thinking_level`) and
-//! `agent_settled` semantics when bumping.
-//!
-//! - `pi --mode rpc [--session <id>]`: newline-framed JSONL over stdio.
-//!   Commands carry an id; responses resolve by id; agent events (`message_
-//!   update`, `tool_execution_*`, …) stream bare (see [`wire`]). Extension
-//!   UI dialogs (`extension_ui_request` select/confirm/input/editor) block
-//!   the agent until answered — with no dialog surface to route them to,
-//!   they are auto-cancelled so a run can never wedge on one.
-//! - SETUP: `get_state` (session id + model for SessionStarted), optional
-//!   `set_model` (`provider/id` catalog ids split on the slash) and
-//!   `set_thinking_level`, then `prompt`. The prompt RESPONSE means
-//!   accepted, never done — the turn settles on `agent_settled` (pi drains
-//!   retries, compaction, and queued follow-ups before emitting it).
-//! - STEERING: native `steer` command — delivered by pi after the current
-//!   internal turn's tool calls, before the next LLM call: StepBoundary
-//!   semantics, the same class as codex `turn/steer`. A steer rejected with
-//!   "not streaming" lost the settle race; it is redelivered as the next
-//!   `prompt` on the same persistent session (the codex expectedTurnId
-//!   fallback, pi-shaped). Steers after a settled turn start new turns
-//!   directly — the engine's done→wake handling already folds multi-Done
-//!   runs.
-//! - INTERRUPT: `abort`, then SIGTERM → SIGKILL escalation; the stream ends
-//!   with `Done { status: Interrupted }`.
-//! - DONE-STATUS: `agent_settled` completes the turn; a final assistant
-//!   `message_end` with `stopReason: "error"` (after pi's own retries are
-//!   exhausted) maps to Errored. `agent_settled` fires per settled run, so
-//!   every turn shape ends deterministically — no quiesce watchdog needed.
-//! - IMAGES: `RunRequest::attachments` are inlined as base64 image blocks
-//!   on the prompt (pi's `ImageContent` format).
+//! Native Pi JSONL RPC driver. See PROTOCOL.md for the legacy ACK barrier.
+mod catalog;
+mod mcp;
+mod normalize;
+mod rpc;
+mod sessions;
+mod ui;
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::process::Stdio;
-use std::time::Duration;
-
-use async_trait::async_trait;
-use futures::StreamExt;
-use futures::stream::BoxStream;
-use serde_json::{Value, json};
-use tokio::process::{Child, Command};
-use tokio::sync::mpsc;
-
-use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
-use wire::PiClient;
-use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
-    SteeringMode, ToolCall, ToolDiff,
+use crate::{
+    Harness, HarnessError, RunControls,
+    process::{Command, Stdio, owned::Child},
 };
+use async_trait::async_trait;
+use futures::{StreamExt, stream::BoxStream};
+use normalize::{Normalizer, string};
+use serde_json::{Value, json};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    path::{Path, PathBuf},
+    time::Duration,
+};
+use tokio::sync::mpsc;
+use zeron_proto::{AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode};
 
-mod wire;
+/// Bound on a state query (`get_state`, `get_entries`) a turn's end waits on.
+/// Pi answers them at once even mid-run; silence past this is a wedged
+/// process, which fails the run instead of leaving it Working forever.
+const STATE_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Bound on applying a mid-session model or thinking change (several
+/// queries, one of which lists the available models).
+const CONFIGURE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long an idle Pi may hold queued input before the turn settles as it
+/// stands. Pi starts queued input at once; input it leaves queued while idle
+/// has no settle event coming, so the barrier is re-polled until this bound.
+const IDLE_QUEUE_TIMEOUT: Duration = Duration::from_secs(15);
+const IDLE_QUEUE_POLL: Duration = Duration::from_millis(250);
 
-/// pi's thinking ladder maps 1:1 onto zeron's (pi's extra "off" tier has no
-/// zeron equivalent and is left to the agent default; the Claude-style
-/// prompt-prefix levels have no pi meaning).
-pub(crate) const REASONING_LEVELS: &[ReasoningLevel] = &[
-    ReasoningLevel::Minimal,
-    ReasoningLevel::Low,
-    ReasoningLevel::Medium,
-    ReasoningLevel::High,
-    ReasoningLevel::XHigh,
-    ReasoningLevel::Max,
-];
-
-fn to_pi_thinking_level(level: ReasoningLevel) -> Option<&'static str> {
-    Some(match level {
-        ReasoningLevel::Minimal => "minimal",
-        ReasoningLevel::Low => "low",
-        ReasoningLevel::Medium => "medium",
-        ReasoningLevel::High => "high",
-        ReasoningLevel::XHigh => "xhigh",
-        ReasoningLevel::Max => "max",
-        // Ultra/Ultracode/Ultrathink are harness-specific elsewhere; pi has
-        // no equivalent — leave the agent default in place.
-        _ => return None,
-    })
-}
-
-/// Locate the installed pi CLI: `PI_EXECUTABLE`, then our own PATH, then
-/// the login-shell PATH snapshot (GUI launches never see the shell init
-/// that shapes PATH — see [`crate::shell_env`]), then the node version
-/// manager / global bin dirs (pi installs via npm).
-fn resolve_pi_executable() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("PI_EXECUTABLE")
-        && !p.is_empty()
-    {
-        return Some(PathBuf::from(p));
-    }
-    let exe = if cfg!(windows) { "pi.exe" } else { "pi" };
-    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(shell_path) = crate::shell_env::login_shell_path() {
-        candidates.extend(
-            std::env::split_paths(shell_path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe)),
-        );
-    }
-    candidates.extend(
-        crate::node_version_manager_bins()
-            .into_iter()
-            .map(|d| d.join(exe)),
-    );
-    candidates.into_iter().find(|p| p.exists())
-}
-
-/// The pi harness. Construct with [`PiHarness::new`]; tests point it at a
-/// fake CLI with [`PiHarness::with_executable`].
 pub struct PiHarness {
+    models_cache: crate::catalog::Catalog,
+    workspace_commands: crate::skills::CommandDiscovery,
+    session_store: Option<PathBuf>,
+    agent_dir: Option<PathBuf>,
     executable: Option<PathBuf>,
-    /// Grace between the `abort` command and SIGTERM.
     interrupt_grace: Duration,
-    /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
-    /// Slash-command cache behind `commands()` — one `get_commands` probe
-    /// per harness instance (the ACP pattern). Project-level commands
-    /// (`./.pi/agent/`) are cwd-dependent; the probe inherits zeron's
-    /// process cwd, so those are only right for the home project — the
-    /// same limitation the ACP discovery probe has.
-    commands_cache: tokio::sync::OnceCell<Vec<SlashCommand>>,
+    idle_queue_timeout: Duration,
 }
-
 impl Default for PiHarness {
     fn default() -> Self {
         Self {
             executable: None,
+            session_store: None,
+            agent_dir: None,
+            models_cache: Default::default(),
+            workspace_commands: Default::default(),
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
-            commands_cache: tokio::sync::OnceCell::new(),
+            idle_queue_timeout: IDLE_QUEUE_TIMEOUT,
         }
     }
 }
-
 impl PiHarness {
     pub fn new() -> Self {
         Self::default()
     }
-
-    /// Point at a specific binary (tests: `tests/fixtures/fake-pi.sh`).
-    pub fn with_executable(mut self, path: PathBuf) -> Self {
-        self.executable = Some(path);
+    pub fn with_executable(mut self, path: impl Into<PathBuf>) -> Self {
+        self.executable = Some(path.into());
         self
     }
-
-    /// Tune the interrupt→SIGTERM→SIGKILL escalation timing.
-    pub fn with_graces(mut self, interrupt_grace: Duration, kill_grace: Duration) -> Self {
-        self.interrupt_grace = interrupt_grace;
-        self.kill_grace = kill_grace;
+    pub fn with_session_store(mut self, path: impl Into<PathBuf>) -> Self {
+        self.session_store = Some(path.into());
         self
     }
-
-    fn resolve_executable(&self) -> Result<PathBuf, HarnessError> {
-        if let Some(p) = &self.executable {
-            return Ok(p.clone());
+    /// Pi's settings/credentials directory (`PI_CODING_AGENT_DIR`) for the
+    /// child and for Zeron's own reads of it; defaults to the inherited one.
+    pub fn with_agent_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.agent_dir = Some(path.into());
+        self
+    }
+    pub fn with_graces(mut self, interrupt: Duration, kill: Duration) -> Self {
+        self.interrupt_grace = interrupt;
+        self.kill_grace = kill;
+        self
+    }
+    /// Tune the idle-with-queued-input bound (tests shrink it; default 15s).
+    #[doc(hidden)]
+    pub fn with_idle_queue_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_queue_timeout = timeout;
+        self
+    }
+    pub fn resolve_executable(&self) -> Result<PathBuf, HarnessError> {
+        if let Some(path) = self
+            .executable
+            .clone()
+            .or_else(|| std::env::var_os("PI_EXECUTABLE").map(PathBuf::from))
+        {
+            return crate::executable::validate_native_override(&path);
         }
-        resolve_pi_executable().ok_or_else(|| {
+        let home = crate::executable::home_or_current_dir();
+        crate::executable::find_on_paths(
+            "pi",
+            vec![
+                home.join(".local/bin/pi"),
+                home.join(".npm-global/bin/pi"),
+                PathBuf::from("/opt/homebrew/bin/pi"),
+                PathBuf::from("/usr/local/bin/pi"),
+            ],
+        )
+        .ok_or_else(|| {
             HarnessError::NotInstalled(
-                "pi (searched PATH, the login shell's PATH, and fnm/nvm/volta/pnpm/bun \
-                 install dirs; install with `npm install -g --ignore-scripts \
-                 @earendil-works/pi-coding-agent`; set PI_EXECUTABLE to override)"
-                    .into(),
+                "Pi CLI: install Pi or set PI_EXECUTABLE (the pi-acp adapter is not used)".into(),
             )
         })
     }
-
-    /// Short-lived `pi --mode rpc --no-session` answering ONE command
-    /// (model and slash-command discovery). Bounded so a wedged pi can't
-    /// hang the pickers; the child is always shut down before returning.
-    async fn rpc_probe(&self, command: Value, timeout_error: &str) -> Result<Value, HarnessError> {
+    async fn probe(&self, cwd: &Path, models: bool) -> Result<Value, HarnessError> {
+        let mut process = self.spawn(cwd, &["--no-session".into()], None, &Default::default())?;
+        let (mut tx, rx) = tokio::sync::oneshot::channel();
+        let grace = self.kill_grace;
+        tokio::spawn(async move {
+            let result = tokio::select! {
+                result=tokio::time::timeout(Duration::from_secs(60),async {
+                    if models {Ok(serde_json::to_value(catalog::models(&mut process).await?).unwrap())}
+                    else {process.query(json!({"type":"get_commands"}),&mut vec![]).await}
+                })=>result.unwrap_or_else(|_|Err(HarnessError::Protocol("Pi discovery timed out".into()))),
+                _=tx.closed()=>Err(HarnessError::Protocol("Pi discovery cancelled".into())),
+            };
+            process.shutdown(grace).await;
+            let _ = tx.send(result);
+        });
+        rx.await
+            .map_err(|_| HarnessError::Protocol("Pi discovery task failed".into()))?
+    }
+    fn spawn(
+        &self,
+        cwd: &Path,
+        args: &[String],
+        mcp: Option<&zeron_proto::McpServer>,
+        run_env: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Process, HarnessError> {
         let exe = self.resolve_executable()?;
-        let mut cmd = Command::new(&exe);
-        cmd.args(["--mode", "rpc", "--no-session"]);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(exe.display().to_string())
-            } else {
-                HarnessError::Io(e)
-            }
-        })?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| HarnessError::Protocol("pi child has no stdin".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| HarnessError::Protocol("pi child has no stdout".into()))?;
-        let (client, mut events) = PiClient::new(stdin, stdout);
-
-        // Catalog/extension loading can take a beat on first run; bounded
-        // so a wedged pi can't hang the picker.
-        let data = tokio::select! {
-            res = client.request(command) => match res {
-                Ok(data) => data,
-                Err(e) => {
-                    shutdown_child(&mut child, Duration::from_secs(2)).await;
-                    return Err(e);
+        if self.executable.is_none() {
+            if let Some(version) = crate::executable::binary_version(&exe) {
+                if version < semver::Version::new(0, 85, 1) {
+                    return Err(HarnessError::Protocol(format!(
+                        "Pi {version} is unsupported; update Pi to 0.85.1 or newer"
+                    )));
                 }
-            },
-            _ = tokio::time::sleep(Duration::from_secs(20)) => {
-                shutdown_child(&mut child, Duration::from_secs(2)).await;
-                return Err(HarnessError::Protocol(timeout_error.into()));
             }
-        };
-        shutdown_child(&mut child, Duration::from_secs(2)).await;
-        // Drain the event channel so the reader task exits.
-        while events.try_recv().is_ok() {}
-        Ok(data)
-    }
-
-    /// pi's `get_commands` (extension commands, prompt templates, skills —
-    /// skills ride as `skill:name`, invoked with `/skill:name`) mapped onto
-    /// the composer's slash list. `input_hint` has no pi equivalent.
-    async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        let data = self
-            .rpc_probe(json!({"type": "get_commands"}), "pi get_commands timed out")
-            .await?;
-        let empty = Vec::new();
-        let commands = data
-            .get("commands")
-            .and_then(Value::as_array)
-            .map(|a| a.as_slice())
-            .unwrap_or(&empty);
-        Ok(commands
-            .iter()
-            .filter_map(|c| {
-                let name = c.get("name").and_then(Value::as_str)?;
-                let description = c
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                Some(SlashCommand {
-                    name: name.to_owned(),
-                    description,
-                    input_hint: None,
-                })
-            })
-            .collect())
-    }
-
-    /// Build the `pi --mode rpc` command for one run.
-    fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
-        let mut cmd = Command::new(exe);
-        cmd.arg("--mode").arg("rpc");
-        if let Some(resume) = &request.resume {
-            cmd.arg("--session").arg(resume);
         }
-        if !request.cwd.is_empty() {
-            cmd.current_dir(&request.cwd);
+        let mut cmd = Command::new(&exe);
+        // Process group plus the same env scrubbing the ACP launch applied.
+        crate::process::owned::configure(&mut cmd);
+        crate::compose_child_path(&mut cmd, &exe);
+        if let Some(dir) = &self.agent_dir {
+            cmd.env("PI_CODING_AGENT_DIR", dir);
         }
-        cmd.stdin(Stdio::piped())
+        crate::apply_run_env(&mut cmd, run_env);
+        cmd.args(["--mode", "rpc", "--no-themes"])
+            .args(args)
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        cmd
+        let scratch = mcp
+            .map(|config| self::mcp::configure(&mut cmd, config))
+            .transpose()?;
+        let child = cmd.spawn().map_err(|e| {
+            crate::executable::spawn_error(e, Some(cwd), || crate::executable::binary_hint(&exe))
+        })?;
+        let mut child = Child::new(child);
+        let tail = crate::StderrTail::default();
+        let mut lines = crate::lossy_lines::lossy_lines(child.stderr.take().expect("piped stderr"));
+        let stderr = tail.clone();
+        let stderr_task = tokio::spawn(async move {
+            while let Ok(Some(line)) = lines.next_line().await {
+                stderr.push(&line);
+            }
+            stderr.close();
+        });
+        let transport = rpc::Transport::new(
+            child.stdin.take().expect("piped stdin"),
+            child.stdout.take().expect("piped stdout"),
+        );
+        Ok(Process {
+            child,
+            _scratch: scratch,
+            transport,
+            tail,
+            stderr_task,
+            dialogs: Default::default(),
+            exit_deadline: None,
+        })
     }
 }
-
+struct Process {
+    child: Child,
+    _scratch: Option<crate::scratch::ScratchDir>,
+    transport: rpc::Transport,
+    tail: crate::StderrTail,
+    stderr_task: tokio::task::JoinHandle<()>,
+    dialogs: ui::Dialogs,
+    exit_deadline: Option<tokio::time::Instant>,
+}
+impl Drop for Process {
+    fn drop(&mut self) {
+        self.stderr_task.abort();
+    }
+}
+impl Process {
+    async fn next(&mut self) -> Result<Value, HarnessError> {
+        loop {
+            tokio::select! {
+                // Drain buffered output before reporting process death. A descendant
+                // may retain stdout, so EOF alone cannot govern liveness.
+                biased;
+                _ = async {
+                    match self.exit_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => return Err(HarnessError::Protocol("Pi exited".into())),
+                status = self.child.wait(), if self.exit_deadline.is_none() => {
+                    status?;
+                    self.exit_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(100));
+                }
+                frame = self.transport.incoming.recv() => return frame.unwrap_or_else(|| Err(HarnessError::Protocol("Pi disconnected".into()))),
+            }
+        }
+    }
+    async fn query(
+        &mut self,
+        command: Value,
+        backlog: &mut Vec<Value>,
+    ) -> Result<Value, HarnessError> {
+        let id = self.transport.client.request(command)?;
+        loop {
+            let frame = self.next().await?;
+            if frame["type"] == "response" && frame["id"] == id {
+                return response_data(frame);
+            }
+            if frame["type"] == "extension_ui_request" {
+                self.dialogs.request(self.transport.client.clone(), &frame);
+            } else {
+                backlog.push(frame);
+            }
+        }
+    }
+    async fn shutdown(&mut self, grace: Duration) {
+        self.dialogs.cancel(&self.transport.client);
+        self.transport.close_input_for_teardown();
+        self.child.shutdown(grace).await;
+    }
+}
+/// Whether `request` picks a thinking level (an effort, or thinking off).
+fn thinking_selected(request: &RunRequest) -> bool {
+    request.reasoning.is_some()
+        || request
+            .model_options
+            .get("pi_thinking")
+            .is_some_and(|v| v == "off")
+}
+fn response_data(frame: Value) -> Result<Value, HarnessError> {
+    if frame["success"] == true {
+        Ok(frame["data"].clone())
+    } else {
+        Err(HarnessError::Protocol(format!(
+            "Pi {}: {}",
+            string(&frame, "command"),
+            frame["error"].as_str().unwrap_or("command failed")
+        )))
+    }
+}
 #[async_trait]
 impl Harness for PiHarness {
     fn id(&self) -> HarnessId {
@@ -289,1040 +282,970 @@ impl Harness for PiHarness {
     fn supports_steering(&self) -> bool {
         true
     }
-    /// Native `steer` injects after the current internal turn's tool calls,
-    /// before the next LLM call; a steer that misses the settle boundary
-    /// becomes the next `prompt` on the same session.
     fn steering_mode(&self) -> SteeringMode {
         SteeringMode::StepBoundary
     }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
-        REASONING_LEVELS
+        &[]
     }
     fn installed(&self) -> bool {
-        self.executable.is_some() || resolve_pi_executable().is_some()
+        self.resolve_executable().is_ok()
     }
-    /// Done is pi's own `agent_settled`, for steered follow-up turns too.
+    fn executable_path(&self) -> Option<PathBuf> {
+        self.resolve_executable().ok()
+    }
     fn deterministic_turn_end(&self) -> bool {
         true
     }
-
-    /// Live discovery: a short-lived `pi --mode rpc --no-session` answering
-    /// `get_available_models`. Model ids ride the catalog as `provider/id`
-    /// so [`run`] can split them back into `set_model`'s provider/modelId
-    /// pair. Models without reasoning support advertise an empty ladder.
+    /// `set_model` and `set_thinking_level` change the live process. Clearing
+    /// either back to the default cannot be expressed that way.
+    fn reconfigures_in_place(&self, live: &RunRequest, next: &RunRequest) -> bool {
+        let model = |r: &RunRequest| r.model.as_deref().filter(|m| *m != "default").is_some();
+        live.cwd == next.cwd
+            && (model(next) || !model(live))
+            && (thinking_selected(next) || !thinking_selected(live))
+    }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        let data = self
-            .rpc_probe(
-                json!({"type": "get_available_models"}),
-                "pi get_available_models timed out",
+        Ok(self.model_catalog(false).await?.models)
+    }
+    fn model_context(&self) -> Result<Option<crate::ModelContext>, HarnessError> {
+        let root = sessions::agent_dir(self.agent_dir.clone());
+        crate::model_context::context(
+            HarnessId::Pi,
+            &self.resolve_executable()?,
+            &[root.join("models.json"), root.join("settings.json")],
+        )
+        .map(Some)
+    }
+    async fn model_catalog(&self, force: bool) -> Result<crate::ModelCatalog, HarnessError> {
+        self.models_cache
+            .get_with_timeout(
+                force,
+                Duration::from_secs(65),
+                || Ok(self.model_context()?.expect("Pi model context").key()),
+                || async {
+                    let value = self.probe(&std::env::current_dir()?, true).await?;
+                    serde_json::from_value(value).map_err(|e| HarnessError::Protocol(e.to_string()))
+                },
             )
-            .await?;
-
-        let empty = Vec::new();
-        let models = data
-            .get("models")
-            .and_then(Value::as_array)
-            .map(|a| a.as_slice())
-            .unwrap_or(&empty);
-        Ok(models
-            .iter()
-            .filter_map(|m| {
-                let id = m.get("id").and_then(Value::as_str)?;
-                let provider = m.get("provider").and_then(Value::as_str)?;
-                let name = m.get("name").and_then(Value::as_str).unwrap_or(id);
-                let reasoning = m.get("reasoning").and_then(Value::as_bool).unwrap_or(false);
-                let context = m
-                    .get("contextWindow")
-                    .and_then(Value::as_u64)
-                    .map(|c| format!("{}k context window", c / 1000));
-                Some(Model {
-                    id: format!("{provider}/{id}"),
-                    label: name.to_owned(),
-                    description: context,
-                    reasoning_levels: if reasoning {
-                        REASONING_LEVELS.to_vec()
-                    } else {
-                        Vec::new()
-                    },
-                    options: Vec::new(),
-                })
-            })
-            .collect())
-    }
-
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        self.commands_cache
-            .get_or_try_init(|| self.discover_commands())
             .await
-            .cloned()
     }
-
+    async fn commands(&self) -> Result<Vec<zeron_proto::SlashCommand>, HarnessError> {
+        self.commands_for(&std::env::current_dir()?).await
+    }
+    async fn commands_for(
+        &self,
+        cwd: &Path,
+    ) -> Result<Vec<zeron_proto::SlashCommand>, HarnessError> {
+        self.workspace_commands
+            .get(cwd, async {
+                Ok(catalog::commands(&self.probe(cwd, false).await?))
+            })
+            .await
+    }
+    async fn skills(
+        &self,
+        cwd: &Path,
+    ) -> Result<Option<Vec<zeron_proto::invocation::Skill>>, HarnessError> {
+        let mut skills = crate::skills::discover(HarnessId::Pi, cwd).await?;
+        let commands = self.commands_for(cwd).await?;
+        crate::skills::attach_advertised_commands(HarnessId::Pi, &mut skills, &commands);
+        Ok(Some(skills))
+    }
+    fn fallback_models(&self) -> Vec<Model> {
+        vec![Model {
+            id: "default".into(),
+            label: "Pi default".into(),
+            description: Some("Model configured in Pi".into()),
+            reasoning_levels: vec![],
+            options: vec![],
+        }]
+    }
     async fn run(
         &self,
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        let exe = self.resolve_executable()?;
-        let mut cmd = self.build_command(&exe, &request);
-        let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(exe.display().to_string())
-            } else {
-                HarnessError::Io(e)
-            }
-        })?;
-
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| HarnessError::Protocol("pi child has no stdin".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| HarnessError::Protocol("pi child has no stdout".into()))?;
-        let stderr_tail = crate::StderrTail::default();
-        if let Some(stderr) = child.stderr.take() {
-            use tokio::io::AsyncBufReadExt as _;
-            let tail = stderr_tail.clone();
-            tokio::spawn(async move {
-                let mut lines = tokio::io::BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "zeron_harness::pi", "stderr: {line}");
-                    tail.push(&line);
+        let mut request = request;
+        let store = sessions::Store::new(self.session_store.clone(), self.agent_dir.clone());
+        let mut lost_context = None;
+        let args = match &request.resume {
+            Some(id) => match store.resume_args(id, Path::new(&request.cwd)) {
+                Ok(args) => args,
+                // Like every other harness, a session that can no longer be
+                // reopened starts fresh with a visible notice. Failing instead
+                // would strand the chat: the engine resumes the same id forever.
+                Err(error) => {
+                    lost_context = Some(format!(
+                        "Pi could not restore session {id}; starting a new session without the previous context: {error}"
+                    ));
+                    vec![]
                 }
-            });
+            },
+            None => vec![],
+        };
+        if lost_context.is_some() {
+            request.resume = None;
         }
-
-        let (client, events) = PiClient::new(stdin, stdout);
-        let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
-        tokio::spawn(run_session(Session {
-            child,
-            client,
-            events,
-            event_tx,
-            controls,
-            request,
-            interrupt_grace: self.interrupt_grace,
-            kill_grace: self.kill_grace,
-            stderr_tail,
-        }));
-
-        Ok(futures::stream::unfold(event_rx, |mut rx| async move {
-            rx.recv().await.map(|ev| (ev, rx))
-        })
-        .boxed())
+        let process = self.spawn(
+            Path::new(&request.cwd),
+            &args,
+            request.mcp.as_ref(),
+            &request.env,
+        )?;
+        let (tx, rx) = mpsc::channel(256);
+        let kill_grace = self.kill_grace;
+        let interrupt_grace = self.interrupt_grace;
+        let idle_queue_timeout = self.idle_queue_timeout;
+        tokio::spawn(async move {
+            let mut runner = Runner {
+                store,
+                interrupted: false,
+                extension_commands: HashSet::new(),
+                auto_compaction: true,
+                initial_pending: true,
+                deliveries: VecDeque::new(),
+                native_queue: Vec::new(),
+                queued: VecDeque::new(),
+                process,
+                tx,
+                request,
+                norm: Normalizer::default(),
+                active: true,
+                epoch: 0,
+                pending: HashMap::new(),
+                session: String::new(),
+                assistant: uuid::Uuid::new_v4().to_string(),
+                lost_context,
+                recheck_state: false,
+                state_deadline: None,
+                idle_queue_timeout,
+                idle_queue_deadline: None,
+                idle_poll: None,
+            };
+            // The lease lives through shutdown even if the consumer drops its stream.
+            let RunControls {
+                realtime: _,
+                execution_lease: _lease,
+                request_input,
+                mut steering,
+                interrupt,
+                turn: _,
+            } = controls;
+            runner.process.dialogs.input = Some(std::sync::Arc::from(request_input));
+            let consumer = runner.tx.clone();
+            let result = tokio::select! {
+                result=runner.run(&mut steering)=>result,
+                _=interrupt.cancelled()=>{ runner.interrupt(interrupt_grace).await; Ok(()) },
+                _=consumer.closed()=>Ok(()),
+            };
+            if let Err(error) = result {
+                // The first symptom of a crash is usually the pipe's ("Pi
+                // stdout closed", EPIPE), racing the exit itself: give the exit
+                // and the stderr tail a moment so the message names the crash.
+                let status =
+                    tokio::time::timeout(Duration::from_millis(250), runner.process.child.wait())
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
+                if status.is_some() {
+                    runner.process.tail.wait_closed().await;
+                }
+                runner.norm.error = Some(if status.is_some() {
+                    crate::crash_message("Pi", status, &runner.process.tail)
+                } else {
+                    error.to_string()
+                });
+            }
+            runner.process.shutdown(kill_grace).await;
+            let _ = runner.finish().await;
+        });
+        Ok(
+            futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|v| (v, rx)) })
+                .boxed(),
+        )
     }
 }
-
-struct Session {
-    child: Child,
-    client: PiClient,
-    events: mpsc::Receiver<Value>,
-    event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
-    controls: RunControls,
+#[derive(Clone)]
+enum Pending {
+    Prompt(u64),
+    Barrier(u64),
+    Command(u64),
+    EmptyEntries(u64, String),
+    EmptyState(u64, String, bool),
+}
+struct Delivery {
+    epoch: u64,
+    // Queue acceptance permits sending the next steer, but is not consumption.
+    queued: bool,
+    // Sent while no turn ran: it starts its own turn rather than joining one.
+    opens_turn: bool,
+}
+struct Runner {
+    extension_commands: HashSet<String>,
+    auto_compaction: bool,
+    interrupted: bool,
+    initial_pending: bool,
+    deliveries: VecDeque<Delivery>,
+    native_queue: Vec<String>,
+    queued: VecDeque<crate::SteerMessage>,
+    store: sessions::Store,
+    process: Process,
+    tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     request: RunRequest,
-    interrupt_grace: Duration,
-    kill_grace: Duration,
-    stderr_tail: crate::StderrTail,
+    norm: Normalizer,
+    active: bool,
+    epoch: u64,
+    pending: HashMap<String, Pending>,
+    session: String,
+    assistant: String,
+    lost_context: Option<String>,
+    /// The last state barrier found Pi busy (streaming, compacting, queued
+    /// input) with no settle event guaranteed to follow: re-check at the end
+    /// of compaction or of an automatic retry.
+    recheck_state: bool,
+    /// When an outstanding state query gives up (see STATE_QUERY_TIMEOUT).
+    state_deadline: Option<tokio::time::Instant>,
+    idle_queue_timeout: Duration,
+    /// Since the barrier first found Pi idle with input queued: past it the
+    /// turn settles as it stands (see IDLE_QUEUE_TIMEOUT).
+    idle_queue_deadline: Option<tokio::time::Instant>,
+    /// The next re-poll of that idle state.
+    idle_poll: Option<tokio::time::Instant>,
+}
+impl Runner {
+    async fn emit(&self, event: AgentEvent) -> Result<(), HarnessError> {
+        self.tx
+            .send(Ok(event))
+            .await
+            .map_err(|_| HarnessError::Protocol("Pi event consumer closed".into()))
+    }
+    async fn started(&self, model: String) -> Result<(), HarnessError> {
+        self.emit(AgentEvent::SessionStarted {
+            harness: HarnessId::Pi,
+            model,
+            tools: vec![],
+            cwd: self.request.cwd.clone(),
+            session_id: self.session.clone(),
+            assistant_message_id: self.assistant.clone(),
+        })
+        .await
+    }
+    async fn finish(&mut self) -> Result<(), HarnessError> {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        self.idle_queue_deadline = None;
+        self.idle_poll = None;
+        self.process.dialogs.cancel(&self.process.transport.client);
+        self.emit(AgentEvent::Done {
+            status: if self.interrupted {
+                zeron_proto::DoneStatus::Interrupted
+            } else {
+                self.norm.status()
+            },
+            result: None,
+            error: self.norm.error.clone(),
+            session_id: (!self.session.is_empty()).then(|| self.session.clone()),
+        })
+        .await
+    }
+    fn control_command(&self, text: &str) -> Option<Value> {
+        let name = text
+            .trim()
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('/');
+        if self.extension_commands.contains(name) {
+            None
+        } else {
+            catalog::builtin(text, self.auto_compaction)
+        }
+    }
+    fn submit(&mut self, text: String, images: Value, steer: bool) -> Result<(), HarnessError> {
+        self.store.mark_submitted(&self.session)?;
+        let control = self.control_command(&text);
+        let command=control.clone().unwrap_or_else(||json!({"type":"prompt","message":text,"images":images,"streamingBehavior":if steer {"steer"}else{"followUp"}}));
+        let id = self.process.transport.client.request(command)?;
+        self.pending.insert(
+            id,
+            if control.is_some() {
+                Pending::Command(self.epoch)
+            } else {
+                Pending::Prompt(self.epoch)
+            },
+        );
+        Ok(())
+    }
+    fn prompt(&mut self, text: String, images: Value) -> Result<(), HarnessError> {
+        self.epoch += 1;
+        self.active = true;
+        self.norm.reset();
+        self.submit(text, images, false)
+    }
+    async fn bootstrap(&mut self, backlog: &mut Vec<Value>) -> Result<Value, HarnessError> {
+        // Pi defaults to one-at-a-time. Zeron's pending steers belong together
+        // at the next model step. Pi persists this in its global settings, so
+        // select it only while no mode is configured: an explicit choice (the
+        // user's, or `/steering` in a chat) is never overwritten.
+        if !self
+            .store
+            .steering_mode_configured(Path::new(&self.request.cwd))
+        {
+            self.process
+                .query(json!({"type":"set_steering_mode","mode":"all"}), backlog)
+                .await?;
+        }
+        let request = self.request.clone();
+        self.configure(&request, backlog).await?;
+        let commands = self
+            .process
+            .query(json!({"type":"get_commands"}), backlog)
+            .await?;
+        self.extension_commands = commands["commands"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|c| c["source"] == "extension")
+            .map(|c| string(c, "name").to_owned())
+            .collect();
+        self.emit(AgentEvent::AvailableCommands {
+            commands: catalog::commands(&commands),
+        })
+        .await?;
+        self.process
+            .query(json!({"type":"get_state"}), backlog)
+            .await
+    }
+    /// Select `request`'s model and thinking level on the live process.
+    async fn configure(
+        &mut self,
+        request: &RunRequest,
+        backlog: &mut Vec<Value>,
+    ) -> Result<(), HarnessError> {
+        if let Some(model) = request.model.as_deref().filter(|s| *s != "default") {
+            let models = self
+                .process
+                .query(json!({"type":"get_available_models"}), backlog)
+                .await?;
+            let options = models["models"]
+                .as_array()
+                .ok_or_else(|| HarnessError::Protocol("Pi returned no models".into()))?;
+            let found = options
+                .iter()
+                .find(|m| format!("{}/{}", string(m, "provider"), string(m, "id")) == model)
+                .or_else(|| {
+                    let mut matches = options.iter().filter(|m| string(m, "id") == model);
+                    let first = matches.next()?;
+                    matches.next().is_none().then_some(first)
+                })
+                .ok_or_else(|| {
+                    HarnessError::Protocol(format!("Pi model is not available: {model}"))
+                })?;
+            self.process
+                .query(
+                    json!({"type":"set_model","provider":found["provider"],"modelId":found["id"]}),
+                    backlog,
+                )
+                .await?;
+        }
+        if thinking_selected(request) {
+            let supported = self
+                .process
+                .query(json!({"type":"get_available_thinking_levels"}), backlog)
+                .await?;
+            let levels = supported["levels"].as_array().cloned().unwrap_or_default();
+            let desired = if request
+                .model_options
+                .get("pi_thinking")
+                .is_some_and(|v| v == "off")
+            {
+                "off".to_string()
+            } else {
+                serde_json::to_value(request.reasoning)
+                    .unwrap()
+                    .as_str()
+                    .unwrap_or("medium")
+                    .to_owned()
+            };
+            let order = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+            let rank = order
+                .iter()
+                .position(|s| *s == desired)
+                .unwrap_or(order.len() - 1);
+            let effective = order[..=rank]
+                .iter()
+                .rev()
+                .find(|s| levels.iter().any(|v| v == **s))
+                .ok_or_else(|| {
+                    HarnessError::Protocol("Pi returned no supported thinking level".into())
+                })?;
+            self.process
+                .query(
+                    json!({"type":"set_thinking_level","level":effective}),
+                    backlog,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+    async fn run(
+        &mut self,
+        steering: &mut mpsc::Receiver<crate::SteerMessage>,
+    ) -> Result<(), HarnessError> {
+        let mut backlog = vec![];
+        // Same budget the ACP handshake gave Pi: extensions can start cold.
+        let state = tokio::time::timeout(Duration::from_secs(120), self.bootstrap(&mut backlog))
+            .await
+            .map_err(|_| HarnessError::Protocol("Pi startup timed out".into()))??;
+        self.session = string(&state, "sessionId").into();
+        if self.session.is_empty() {
+            return Err(HarnessError::Protocol(
+                "Pi get_state omitted sessionId".into(),
+            ));
+        }
+        if self
+            .request
+            .resume
+            .as_ref()
+            .is_some_and(|id| id != &self.session)
+        {
+            return Err(HarnessError::Protocol(
+                "Pi resumed a different session".into(),
+            ));
+        }
+        if let Some(file) = state["sessionFile"].as_str() {
+            self.store.remember(&self.session, Path::new(file))?;
+        }
+        self.auto_compaction = state["autoCompactionEnabled"].as_bool().unwrap_or(true);
+        self.norm.window = state["model"]["contextWindow"].as_u64();
+        self.started(state["model"]["id"].as_str().unwrap_or("default").into())
+            .await?;
+        if let Some(message) = self.lost_context.take() {
+            self.emit(AgentEvent::Error { message }).await?;
+        }
+        for frame in backlog {
+            self.frame(frame).await?;
+        }
+        let images = load_images(&self.request.attachments).await;
+        self.prompt(self.request.prompt.clone(), images)?;
+        let mut open = true;
+        loop {
+            if self.deliveries.iter().all(|delivery| delivery.queued)
+                && !self.initial_pending
+                && !self.pending.values().any(|p| {
+                    matches!(
+                        p,
+                        Pending::Prompt(_)
+                            | Pending::Barrier(_)
+                            | Pending::Command(_)
+                            | Pending::EmptyEntries(..)
+                            | Pending::EmptyState(..)
+                    )
+                })
+            {
+                if !self.queued.front().is_some_and(|s| {
+                    (self.active && self.control_command(&s.prompt).is_some())
+                        || (!self.deliveries.is_empty()
+                            && s.prompt.strip_prefix('/').is_some_and(|command| {
+                                self.extension_commands
+                                    .contains(command.split_whitespace().next().unwrap_or(""))
+                            }))
+                }) {
+                    if let Some(steer) = self.queued.pop_front() {
+                        // A changed model or thinking level applies on the
+                        // live process before the message it was sent with.
+                        if let Some(next) = &steer.config {
+                            let mut backlog = vec![];
+                            tokio::time::timeout(
+                                CONFIGURE_TIMEOUT,
+                                self.configure(next, &mut backlog),
+                            )
+                            .await
+                            .map_err(|_| {
+                                HarnessError::Protocol(format!(
+                                    "Pi did not apply the model change within {}s",
+                                    CONFIGURE_TIMEOUT.as_secs()
+                                ))
+                            })??;
+                            self.request.model = next.model.clone();
+                            self.request.reasoning = next.reasoning;
+                            self.request.model_options = next.model_options.clone();
+                            for frame in backlog {
+                                self.frame(frame).await?;
+                            }
+                        }
+                        let opens_turn = !self.active;
+                        if opens_turn {
+                            self.norm.reset();
+                        }
+                        self.epoch += 1;
+                        self.active = true;
+                        // Atomic Pi operation: queue at a step boundary if busy, start if idle.
+                        // A separate get_state + steer pair would strand an input on the idle race.
+                        let images = load_images(&steer.attachments).await;
+                        self.submit(steer.prompt.clone(), images, true)?;
+                        self.deliveries.push_back(Delivery {
+                            epoch: self.epoch,
+                            queued: false,
+                            opens_turn,
+                        });
+                    }
+                }
+            }
+            if !self.active && !open && self.queued.is_empty() {
+                return Ok(());
+            }
+            if !self.pending.values().any(|p| {
+                matches!(
+                    p,
+                    Pending::Barrier(_) | Pending::EmptyEntries(..) | Pending::EmptyState(..)
+                )
+            }) {
+                self.state_deadline = None;
+            }
+            let state_deadline = self.state_deadline;
+            let idle_poll = self.idle_poll;
+            tokio::select! {
+                incoming=self.process.next()=>self.frame(incoming?).await?,
+                steer=steering.recv(),if open=>match steer {Some(steer)=>self.queued.push_back(steer),None=>open=false},
+                _ = tokio::time::sleep_until(state_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                    if state_deadline.is_some() =>
+                {
+                    return Err(HarnessError::Protocol(format!(
+                        "Pi did not answer a state query within {}s",
+                        STATE_QUERY_TIMEOUT.as_secs()
+                    )));
+                }
+                _ = tokio::time::sleep_until(idle_poll.unwrap_or_else(tokio::time::Instant::now)),
+                    if idle_poll.is_some() =>
+                {
+                    self.idle_poll = None;
+                    if self.active {
+                        self.query_state(json!({"type":"get_state"}), Pending::Barrier(self.epoch))?;
+                    }
+                }
+            }
+        }
+    }
+    async fn confirm_delivery(&mut self) -> Result<(), HarnessError> {
+        if self.deliveries.pop_front().is_some() {
+            let old = std::mem::replace(&mut self.assistant, uuid::Uuid::new_v4().to_string());
+            self.emit(AgentEvent::Steered {
+                assistant_message_id: Some(old),
+                next_assistant_message_id: Some(self.assistant.clone()),
+            })
+            .await?;
+        }
+        Ok(())
+    }
+    async fn interrupt(&mut self, grace: Duration) {
+        self.interrupted = true;
+        self.process.dialogs.cancel(&self.process.transport.client);
+        self.queued.clear();
+        self.deliveries.clear();
+        if !self.active {
+            return;
+        }
+        let _ = self
+            .process
+            .transport
+            .client
+            .request(json!({"type":"clear_queue"}));
+        let Ok(abort) = self
+            .process
+            .transport
+            .client
+            .request(json!({"type":"abort"}))
+        else {
+            return;
+        };
+        let _ = tokio::time::timeout(grace, async {
+            while let Ok(frame) = self.process.next().await {
+                if frame["id"] == abort && frame["success"] == true {
+                    break;
+                }
+                if self.frame(frame).await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await;
+    }
+    /// Send a state query the turn's end depends on, under STATE_QUERY_TIMEOUT.
+    fn query_state(&mut self, command: Value, pending: Pending) -> Result<(), HarnessError> {
+        let id = self.process.transport.client.request(command)?;
+        self.pending.insert(id, pending);
+        self.state_deadline = Some(tokio::time::Instant::now() + STATE_QUERY_TIMEOUT);
+        self.idle_poll = None;
+        Ok(())
+    }
+    /// Pi refused a submission: a steer it would not take, a failed command.
+    /// That fails the input, not the run. A turn the input joined goes on; a
+    /// turn it opened settles Errored through the usual state barrier.
+    async fn rejected(&mut self, epoch: u64, error: HarnessError) -> Result<(), HarnessError> {
+        let message = error.to_string();
+        let opened = match self.deliveries.iter().position(|d| d.epoch == epoch) {
+            Some(0) if self.deliveries[0].opens_turn => {
+                // Its own segment, as if consumed, so the error lands there.
+                self.confirm_delivery().await?;
+                true
+            }
+            Some(index) => {
+                // It will never see a consumption event.
+                self.deliveries.remove(index);
+                false
+            }
+            None => std::mem::take(&mut self.initial_pending),
+        };
+        if opened {
+            self.norm.error = Some(message.clone());
+        }
+        self.emit(AgentEvent::Error { message }).await?;
+        if epoch == self.epoch && self.active {
+            self.query_state(json!({"type":"get_state"}), Pending::Barrier(epoch))?;
+        }
+        Ok(())
+    }
+    async fn state(&mut self, data: Value, empty_proof: Option<bool>) -> Result<(), HarnessError> {
+        let session = data["sessionId"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| HarnessError::Protocol("Pi get_state omitted sessionId".into()))?;
+        let changed = self.session != session;
+        self.session = session.into();
+        let file = data["sessionFile"].as_str().map(Path::new);
+        if let Some(file) = file {
+            self.store.remember(&self.session, file)?;
+        }
+        if changed {
+            self.started(data["model"]["id"].as_str().unwrap_or("default").into())
+                .await?;
+        }
+        self.auto_compaction = data["autoCompactionEnabled"]
+            .as_bool()
+            .unwrap_or(self.auto_compaction);
+        self.norm.window = data["model"]["contextWindow"].as_u64().or(self.norm.window);
+        if self.pending.values().any(|p| {
+            matches!(
+                p,
+                Pending::Prompt(_)
+                    | Pending::Command(_)
+                    | Pending::EmptyEntries(..)
+                    | Pending::EmptyState(..)
+            )
+        }) {
+            return Ok(());
+        }
+        // Busy: the next agent_settled normally re-checks. Compaction and
+        // automatic retries can end without one, so remember to re-check
+        // when they end (see `frame`).
+        let busy = data["isStreaming"] != false || data["isCompacting"] != false;
+        let queued = data["pendingMessageCount"].as_u64().unwrap_or(0);
+        if busy {
+            self.idle_queue_deadline = None;
+            self.recheck_state = true;
+            return Ok(());
+        }
+        if queued > 0 {
+            // Idle, yet input queued: Pi normally starts it at once, and that
+            // run settles. Input it leaves queued has no event coming, so poll
+            // the barrier, and past the bound settle as the turn stands.
+            let now = tokio::time::Instant::now();
+            let deadline = *self
+                .idle_queue_deadline
+                .get_or_insert(now + self.idle_queue_timeout);
+            if now < deadline {
+                self.recheck_state = true;
+                self.idle_poll = Some(now + IDLE_QUEUE_POLL);
+                return Ok(());
+            }
+            tracing::warn!(
+                queued,
+                "Pi stayed idle with input queued for {:?}; settling the turn",
+                self.idle_queue_timeout
+            );
+        }
+        self.recheck_state = false;
+        if file.is_some_and(|p| {
+            p.metadata()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        }) && data["messageCount"] == 0
+            && !self.interrupted
+        {
+            if let Some(clean) = empty_proof {
+                if clean {
+                    self.store
+                        .remember_empty(&data, Path::new(&self.request.cwd))?;
+                }
+            } else {
+                let pending = Pending::EmptyEntries(self.epoch, self.session.clone());
+                self.query_state(json!({"type":"get_entries"}), pending)?;
+                return Ok(());
+            }
+        }
+        self.initial_pending = false;
+        if !self.interrupted {
+            // Only an unqueued input may have been handled without a model run.
+            // Never turn an accepted-but-unconsumed queued steer into a receipt.
+            if self.deliveries.iter().any(|delivery| delivery.queued) {
+                return Err(HarnessError::Protocol(
+                    "Pi settled with unconsumed steering messages".into(),
+                ));
+            }
+            while !self.deliveries.is_empty() {
+                self.confirm_delivery().await?;
+            }
+        }
+        self.finish().await
+    }
+    async fn frame(&mut self, frame: Value) -> Result<(), HarnessError> {
+        if frame["type"] == "queue_update" {
+            let queue: Vec<String> = frame["steering"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|text| text.as_str().map(str::to_owned))
+                .collect();
+            // Preflight requests stay serialized through their ordered state
+            // barrier. An appended queue entry therefore belongs to the one
+            // submission in flight, including Pi's input/template expansions.
+            if queue.len() > self.native_queue.len()
+                && queue.starts_with(&self.native_queue)
+                && let Some(delivery) = self.deliveries.back_mut()
+                && self.pending.values().any(
+                    |pending| matches!(pending, Pending::Prompt(epoch) if *epoch == delivery.epoch),
+                )
+            {
+                delivery.queued = true;
+            }
+            self.native_queue = queue;
+            return Ok(());
+        }
+        if frame["type"] == "extension_ui_request" {
+            if !self.active {
+                // A background notification must not reopen a completed engine turn.
+                // No foreground run can own a dialog here, so cancel it explicitly.
+                ui::Dialogs::default().request(self.process.transport.client.clone(), &frame);
+                tracing::debug!(method = %string(&frame, "method"), "Pi UI request outside a run");
+                return Ok(());
+            }
+            self.process
+                .dialogs
+                .request(self.process.transport.client.clone(), &frame);
+            if frame["method"] == "notify" {
+                self.emit(AgentEvent::TextDelta {
+                    text: format!("\n{}\n", string(&frame, "message")),
+                })
+                .await?;
+            }
+            return Ok(());
+        }
+        if frame["type"] == "response" {
+            let Some(pending) = self.pending.remove(string(&frame, "id")) else {
+                return Ok(());
+            };
+            let data = match (response_data(frame), &pending) {
+                (Ok(data), _) => data,
+                (Err(error), Pending::Prompt(epoch) | Pending::Command(epoch)) => {
+                    return self.rejected(*epoch, error).await;
+                }
+                (Err(error), _) => return Err(error),
+            };
+            if let Pending::Command(epoch) = pending {
+                if epoch == self.epoch {
+                    self.initial_pending = false;
+                    self.confirm_delivery().await?;
+                    let text = if data.is_null() {
+                        "Pi command completed.".into()
+                    } else {
+                        serde_json::to_string_pretty(&data).unwrap()
+                    };
+                    self.emit(AgentEvent::TextDelta { text }).await?;
+                    self.query_state(json!({"type":"get_state"}), Pending::Barrier(epoch))?;
+                }
+                return Ok(());
+            }
+            match pending {
+                Pending::Prompt(epoch) if epoch == self.epoch && self.active => {
+                    self.query_state(json!({"type":"get_state"}), Pending::Barrier(epoch))?;
+                }
+                Pending::Barrier(epoch) if epoch == self.epoch && self.active => {
+                    self.state(data, None).await?;
+                }
+                Pending::EmptyEntries(epoch, session) if epoch == self.epoch && self.active => {
+                    let clean = data["entries"].as_array().is_some_and(|entries| {
+                        entries.iter().all(|entry| {
+                            matches!(
+                                entry["type"].as_str(),
+                                Some("model_change" | "thinking_level_change")
+                            )
+                        })
+                    });
+                    self.query_state(
+                        json!({"type":"get_state"}),
+                        Pending::EmptyState(epoch, session, clean),
+                    )?;
+                }
+                Pending::EmptyState(epoch, session, clean)
+                    if epoch == self.epoch && self.active =>
+                {
+                    let proof = (data["sessionId"] == session).then_some(clean);
+                    self.state(data, proof).await?;
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        if frame["type"] == "agent_start" {
+            self.store.mark_submitted(&self.session)?;
+        }
+        if frame["type"] == "agent_start" && !self.active {
+            self.epoch += 1;
+            self.active = true;
+            self.norm.reset();
+            self.assistant = uuid::Uuid::new_v4().to_string();
+            self.started(
+                self.request
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "default".into()),
+            )
+            .await?;
+        }
+        if frame["type"] == "message_start" && frame["message"]["role"] == "user" {
+            if self.initial_pending {
+                self.initial_pending = false;
+            } else {
+                self.confirm_delivery().await?;
+            }
+        }
+        for event in self.norm.map(&frame) {
+            self.emit(event).await?;
+        }
+        if frame["type"] == "agent_settled" {
+            self.query_state(json!({"type":"get_state"}), Pending::Barrier(self.epoch))?;
+        } else if matches!(string(&frame, "type"), "compaction_end" | "auto_retry_end")
+            && self.active
+            && std::mem::take(&mut self.recheck_state)
+        {
+            self.query_state(json!({"type":"get_state"}), Pending::Barrier(self.epoch))?;
+        }
+        Ok(())
+    }
+}
+/// Inline attachments as native image blocks, best-effort like the Claude
+/// driver: the path refs already ride the prompt text, so an unreadable,
+/// oversized or non-inlinable file (SVG, HEIC, TIFF, ...) must not fail the turn.
+/// The blocks are ACP's image content shape, so the ACP driver shares them.
+pub(crate) async fn load_images(paths: &[String]) -> Value {
+    load_images_capped(paths, 20 * 1024 * 1024, u64::MAX).await
 }
 
-/// One settled pi run: text + tool events streamed, usage accumulated from
-/// every assistant `message_end` (a tool-loop run spans several LLM calls),
-/// and the terminal error (if pi's own retries were exhausted) remembered
-/// for the Done.
-#[derive(Default)]
-struct TurnState {
-    /// Accumulated usage of the run's assistant messages, held until
-    /// `agent_settled` (emitted just before Done, codex-style).
-    pending_usage: Option<AgentEvent>,
-    /// Set when the final assistant message ended with `stopReason:
-    /// "error"` — the run settled in failure.
-    error: Option<String>,
-    /// An assistant message ended `aborted` (user Esc / our `abort`).
-    aborted: bool,
-}
-
-fn new_message_id() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
-/// Anthropic-style inline-image cap; larger files stay path refs (their path
-/// also rides the prompt text via zeron's `withAttachments` transport).
-const MAX_INLINE_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
-
-/// Media type for an inline image block — extension first, magic bytes as the
-/// fallback (pasted screenshots may carry odd names).
-fn image_media_type(path: &std::path::Path, bytes: &[u8]) -> Option<&'static str> {
-    let by_ext = match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("png") => Some("image/png"),
-        Some("jpg" | "jpeg") => Some("image/jpeg"),
-        Some("gif") => Some("image/gif"),
-        Some("webp") => Some("image/webp"),
-        _ => None,
-    };
-    by_ext.or(match bytes {
-        [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
-        [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
-        [b'G', b'I', b'F', b'8', ..] => Some("image/gif"),
-        [
-            b'R',
-            b'I',
-            b'F',
-            b'F',
-            _,
-            _,
-            _,
-            _,
-            b'W',
-            b'E',
-            b'B',
-            b'P',
-            ..,
-        ] => Some("image/webp"),
-        _ => None,
-    })
-}
-
-/// Load `RunRequest::attachments` into pi's `ImageContent` blocks
-/// (`{"type":"image","data":<base64>,"mimeType":...}`), best-effort: an
-/// unreadable, oversized, or unsupported file is skipped — its path ref
-/// still rides the prompt text — never fatal to the run.
-async fn load_image_blocks(paths: &[String]) -> Vec<Value> {
-    use base64::Engine as _;
-    let mut blocks = Vec::new();
+/// [`load_images`] under a cap per file and a cap on all inlined files
+/// together, in bytes. A file over either rides as its path ref only.
+pub(crate) async fn load_images_capped(paths: &[String], each: u64, total: u64) -> Value {
+    use base64::Engine;
+    let mut images = vec![];
+    let mut inlined = 0u64;
     for path in paths {
+        match tokio::fs::metadata(path).await {
+            Ok(meta) if meta.len() <= each && meta.len() <= total - inlined => {}
+            Ok(_) => {
+                tracing::debug!(%path, "Pi attachment over inline cap; path ref only");
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(%path, %error, "Pi attachment unreadable; path ref only");
+                continue;
+            }
+        }
         let bytes = match tokio::fs::read(path).await {
             Ok(bytes) => bytes,
-            Err(err) => {
-                tracing::warn!(target: "zeron_harness::pi", %path, error = %err, "attachment unreadable; path ref only");
+            Err(error) => {
+                tracing::warn!(%path, %error, "Pi attachment unreadable; path ref only");
                 continue;
             }
         };
-        if bytes.len() as u64 > MAX_INLINE_IMAGE_BYTES {
-            tracing::debug!(target: "zeron_harness::pi", %path, "attachment over inline cap; path ref only");
-            continue;
-        }
-        let Some(media_type) = image_media_type(std::path::Path::new(path), &bytes) else {
-            tracing::debug!(target: "zeron_harness::pi", %path, "attachment not an inline-supported image; path ref only");
+        let mime = if bytes.starts_with(b"\x89PNG") {
+            "image/png"
+        } else if bytes.starts_with(b"\xff\xd8\xff") {
+            "image/jpeg"
+        } else if bytes.starts_with(b"GIF8") {
+            "image/gif"
+        } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+            "image/webp"
+        } else {
+            tracing::debug!(%path, "Pi attachment is not an inlinable image; path ref only");
             continue;
         };
-        blocks.push(json!({
-            "type": "image",
-            "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
-            "mimeType": media_type,
-        }));
+        // The file may have grown since its metadata was read.
+        if bytes.len() as u64 > each || bytes.len() as u64 > total - inlined {
+            tracing::debug!(%path, "Pi attachment over inline cap; path ref only");
+            continue;
+        }
+        inlined += bytes.len() as u64;
+        images.push(json!({"type":"image","data":base64::engine::general_purpose::STANDARD.encode(bytes),"mimeType":mime}));
     }
-    blocks
-}
-
-/// Rotate the assistant message id; returns (previous, next).
-fn rotate(id: &mut String) -> (String, String) {
-    let prev = std::mem::replace(id, new_message_id());
-    (prev, id.clone())
-}
-
-async fn send(tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>, ev: AgentEvent) -> bool {
-    tx.send(Ok(ev)).await.is_ok()
-}
-
-/// The per-run event loop: one task multiplexing pi events, the steering
-/// mailbox, the interrupt token, and consumer liveness.
-async fn run_session(session: Session) {
-    let Session {
-        mut child,
-        client,
-        mut events,
-        event_tx,
-        controls,
-        request,
-        interrupt_grace,
-        kill_grace,
-        stderr_tail,
-    } = session;
-    let RunControls {
-        // pi's RPC surface has no input-request mechanism today (no
-        // AskUserQuestion equivalent) — the bridge is dropped; if pi grows
-        // one, it lands here.
-        request_input: _,
-        mut steering,
-        interrupt,
-    } = controls;
-
-    // ---- setup: get_state → model/thinking → SessionStarted → prompt ----
-    // (interruptible, like the codex handshake)
-    let setup = async {
-        let state = client.request(json!({"type": "get_state"})).await?;
-        let session_id = state
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
-        let mut model_label = state
-            .pointer("/model/name")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
-
-        // Model: the catalog's `provider/id` ids split back into set_model's
-        // provider + modelId pair. A bare id (foreign picker entry) is left
-        // to pi's configured default.
-        if let Some(model) = &request.model
-            && let Some((provider, model_id)) = model.split_once('/')
-        {
-            let switched = client
-                .request(json!({
-                    "type": "set_model",
-                    "provider": provider,
-                    "modelId": model_id,
-                }))
-                .await?;
-            // get_state ran BEFORE the switch: the label must come from the
-            // set_model response (the full Model object) or SessionStarted
-            // names the pre-switch model.
-            if let Some(name) = switched.get("name").and_then(Value::as_str) {
-                model_label = name.to_owned();
-            }
-        }
-        // Thinking level: our ladder maps 1:1; harness-specific levels have
-        // no pi equivalent and are skipped.
-        if let Some(level) = request.reasoning
-            && let Some(pi_level) = to_pi_thinking_level(level)
-        {
-            client
-                .request(json!({
-                    "type": "set_thinking_level",
-                    "level": pi_level,
-                }))
-                .await?;
-        }
-
-        let images = load_image_blocks(&request.attachments).await;
-        let mut prompt = json!({"type": "prompt", "message": request.prompt});
-        if !images.is_empty() {
-            prompt["images"] = Value::Array(images);
-        }
-        // The response means ACCEPTED (queued or running), never done —
-        // a failure here (no model/API key) fails the whole run.
-        client.request(prompt).await?;
-        Ok::<(String, String), HarnessError>((session_id, model_label))
-    };
-    let (session_id, model_label) = tokio::select! {
-        res = setup => match res {
-            Ok(pair) => pair,
-            Err(e) => {
-                let _ = event_tx
-                    .send(Ok(AgentEvent::Done {
-                        status: DoneStatus::Errored,
-                        result: None,
-                        error: Some(e.to_string()),
-                        session_id: None,
-                    }))
-                    .await;
-                shutdown_child(&mut child, kill_grace).await;
-                return;
-            }
-        },
-        _ = interrupt.cancelled() => {
-            let _ = event_tx
-                .send(Ok(AgentEvent::Done {
-                    status: DoneStatus::Interrupted,
-                    result: None,
-                    error: None,
-                    session_id: None,
-                }))
-                .await;
-            shutdown_child(&mut child, kill_grace).await;
-            return;
-        }
-    };
-
-    let mut assistant_message_id = new_message_id();
-    if !send(
-        &event_tx,
-        AgentEvent::SessionStarted {
-            harness: HarnessId::Pi,
-            model: model_label,
-            tools: Vec::new(),
-            cwd: request.cwd.clone(),
-            session_id: session_id.clone(),
-            assistant_message_id: assistant_message_id.clone(),
-        },
-    )
-    .await
-    {
-        shutdown_child(&mut child, kill_grace).await;
-        return;
-    }
-
-    let mut turn = TurnState::default();
-    // The initial prompt's turn is in flight from setup.
-    let mut turn_active = true;
-    // Tool calls in flight: call id → (tool name, args) from
-    // tool_execution_start, consulted at tool_execution_end for the
-    // structured diff (the end frame carries no args).
-    let mut open_tools: HashMap<String, (String, Value)> = HashMap::new();
-    let mut steering_open = true;
-    let mut interrupted = false;
-    let mut interrupt_sent = false;
-    let mut any_done = false;
-    let mut done_after_interrupt = false;
-    // Steers whose `steer` command lost the settle race; delivered as the
-    // next `prompt` once `agent_settled` lands.
-    let mut queued_steers: std::collections::VecDeque<String> = Default::default();
-    let mut escalation: Option<tokio::task::JoinHandle<()>> = None;
-
-    'main: loop {
-        tokio::select! {
-            ev = events.recv() => match ev {
-                Some(frame) => {
-                    let frame_type = frame.get("type").and_then(Value::as_str).unwrap_or("");
-                    match frame_type {
-                        "message_update" => {
-                            let ame = frame.get("assistantMessageEvent");
-                            let kind = ame
-                                .and_then(|a| a.get("type"))
-                                .and_then(Value::as_str)
-                                .unwrap_or("");
-                            let delta = || {
-                                ame.and_then(|a| a.get("delta"))
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_owned()
-                            };
-                            let ev = match kind {
-                                "text_delta" => Some(AgentEvent::TextDelta { text: delta() }),
-                                "thinking_delta" => {
-                                    Some(AgentEvent::ReasoningDelta { text: delta() })
-                                }
-                                _ => None,
-                            };
-                            if let Some(ev) = ev && !send(&event_tx, ev).await {
-                                break 'main;
-                            }
-                        }
-
-                        "message_end" => {
-                            let message = frame.get("message");
-                            if message
-                                .and_then(|m| m.get("role"))
-                                .and_then(Value::as_str)
-                                == Some("assistant")
-                            {
-                                // Usage accumulates across the run's
-                                // internal turns (each assistant message_end
-                                // carries ITS LLM call's usage; a tool-loop
-                                // run spans several). Held to the settle
-                                // boundary, emitted once before Done.
-                                let usage = message
-                                    .and_then(|m| m.pointer("/usage"))
-                                    .and_then(|u| {
-                                        let input = u.get("input").and_then(Value::as_u64)?;
-                                        let output = u.get("output").and_then(Value::as_u64)?;
-                                        Some((input, output))
-                                    });
-                                if let Some((input, output)) = usage {
-                                    let prev = match turn.pending_usage.take() {
-                                        Some(AgentEvent::Usage {
-                                            input_tokens,
-                                            output_tokens,
-                                        }) => (input_tokens, output_tokens),
-                                        _ => (0, 0),
-                                    };
-                                    turn.pending_usage = Some(AgentEvent::Usage {
-                                        input_tokens: prev.0 + input,
-                                        output_tokens: prev.1 + output,
-                                    });
-                                }
-                                match message
-                                    .and_then(|m| m.get("stopReason"))
-                                    .and_then(Value::as_str)
-                                {
-                                    Some("error") => {
-                                        turn.error = Some(
-                                            message
-                                                .and_then(|m| m.get("errorMessage"))
-                                                .and_then(Value::as_str)
-                                                .unwrap_or("pi agent error")
-                                                .to_owned(),
-                                        );
-                                    }
-                                    Some("aborted") => turn.aborted = true,
-                                    // A clean message_end supersedes an
-                                    // earlier failed attempt: pi auto-retries
-                                    // transient errors IN TURN, stripping the
-                                    // failed assistant message — the last
-                                    // message_end before agent_settled is the
-                                    // truth.
-                                    _ => {
-                                        turn.error = None;
-                                        turn.aborted = false;
-                                    }
-                                }
-                            }
-                        }
-
-                        "tool_execution_start" => {
-                            if let (Some(id), Some(name)) = (
-                                frame.get("toolCallId").and_then(Value::as_str),
-                                frame.get("toolName").and_then(Value::as_str),
-                            ) {
-                                open_tools.insert(
-                                    id.to_owned(),
-                                    (
-                                        name.to_owned(),
-                                        frame.get("args").cloned().unwrap_or(Value::Null),
-                                    ),
-                                );
-                            }
-                            let ev = tool_call_event(&frame);
-                            if let Some(ev) = ev && !send(&event_tx, ev).await {
-                                break 'main;
-                            }
-                        }
-
-                        "tool_execution_end" => {
-                            let ev = tool_result_event(&frame, &open_tools);
-                            if let (Some(id), Some(ev)) = (
-                                frame.get("toolCallId").and_then(Value::as_str),
-                                ev,
-                            ) {
-                                open_tools.remove(id);
-                                if !send(&event_tx, ev).await {
-                                    break 'main;
-                                }
-                            }
-                        }
-
-                        "agent_settled" => {
-                            // The turn settles: emit held usage, then Done.
-                            // Retries and compaction are pi's problem — it
-                            // emits agent_settled only when nothing else is
-                            // coming automatically.
-                            turn_active = false;
-                            if let Some(usage) = turn.pending_usage.take()
-                                && !send(&event_tx, usage).await
-                            {
-                                break 'main;
-                            }
-                            let status = if interrupted || turn.aborted {
-                                DoneStatus::Interrupted
-                            } else if turn.error.is_some() {
-                                DoneStatus::Errored
-                            } else {
-                                DoneStatus::Completed
-                            };
-                            any_done = true;
-                            if !send(
-                                &event_tx,
-                                AgentEvent::Done {
-                                    status,
-                                    result: None,
-                                    error: turn.error.clone(),
-                                    session_id: Some(session_id.clone()),
-                                },
-                            )
-                            .await
-                            {
-                                break 'main;
-                            }
-                            if interrupted {
-                                done_after_interrupt = true;
-                                break 'main;
-                            }
-                            // A steer that lost the settle race becomes the
-                            // next turn now; otherwise stay alive for the
-                            // mailbox — the caller owns teardown.
-                            if let Some(text) = queued_steers.pop_front() {
-                                if !start_turn(
-                                    &client,
-                                    &text,
-                                    &event_tx,
-                                    &mut turn,
-                                    &mut turn_active,
-                                    &mut assistant_message_id,
-                                )
-                                .await
-                                {
-                                    break 'main;
-                                }
-                            } else if !steering_open {
-                                break 'main;
-                            }
-                        }
-
-                        "extension_ui_request" => {
-                            // Extension UI sub-protocol: fire-and-forget
-                            // methods (notify/setStatus/setWidget/setTitle/
-                            // set_editor_text) are display noise — ignored.
-                            // DIALOG methods (select/confirm/input/editor)
-                            // BLOCK the agent until an extension_ui_response
-                            // arrives; without one the turn hangs forever
-                            // (dialogs without a timeout never auto-resolve).
-                            // zeron has no dialog surface for pi today, so
-                            // answer every dialog with cancelled — a refused
-                            // prompt beats a wedged run.
-                            let is_dialog = matches!(
-                                frame.get("method").and_then(Value::as_str),
-                                Some("select" | "confirm" | "input" | "editor")
-                            );
-                            if is_dialog {
-                                let id = frame.get("id").cloned().unwrap_or(Value::Null);
-                                tracing::debug!(
-                                    target: "zeron_harness::pi",
-                                    "auto-cancelling extension dialog {id}"
-                                );
-                                client.fire(json!({
-                                    "type": "extension_ui_response",
-                                    "id": id,
-                                    "cancelled": true,
-                                }));
-                            }
-                        }
-
-                        "extension_error" => {
-                            let message = frame
-                                .get("error")
-                                .and_then(Value::as_str)
-                                .unwrap_or("pi extension error")
-                                .to_owned();
-                            if !send(&event_tx, AgentEvent::Error { message }).await {
-                                break 'main;
-                            }
-                        }
-
-                        // agent_start/agent_end/turn_*/message_start,
-                        // queue_update, compaction_*, auto_retry_*,
-                        // summarization_retry_*: lifecycle noise the loop
-                        // tracks through agent_settled alone. Unknown event
-                        // types are tolerated by design.
-                        _ => {}
-                    }
-                }
-                None => break 'main, // reader EOF: pi exited
-            },
-
-            steer = steering.recv(), if steering_open && !interrupted => match steer {
-                Some(msg) => {
-                    if msg.follow_up && turn_active {
-                        // Queued prompt ("send after this turn"): park it —
-                        // agent_settled delivers it as the next prompt via
-                        // start_turn, which resets the turn state and
-                        // rotates the assistant message id. Never injected
-                        // mid-turn, by definition.
-                        queued_steers.push_back(msg.prompt);
-                    } else if turn_active {
-                        // Native mid-turn injection.
-                        match client
-                            .request(json!({"type": "steer", "message": msg.prompt}))
-                            .await
-                        {
-                            Ok(_) => {
-                                let (prev, next) = rotate(&mut assistant_message_id);
-                                if !send(
-                                    &event_tx,
-                                    AgentEvent::Steered {
-                                        assistant_message_id: Some(prev),
-                                        next_assistant_message_id: Some(next),
-                                    },
-                                )
-                                .await
-                                {
-                                    break 'main;
-                                }
-                            }
-                            // A failed `steer` does NOT mean the text is bad:
-                            // most commonly the turn settled between the UI
-                            // send and this command (pi rejects with "not
-                            // streaming"). Queue for redelivery as the next
-                            // prompt when agent_settled lands — the same
-                            // boundary the settle event is about to hit.
-                            Err(e) => {
-                                tracing::debug!(
-                                    target: "zeron_harness::pi",
-                                    "steer rejected (queued as next prompt): {e}"
-                                );
-                                queued_steers.push_back(msg.prompt);
-                            }
-                        }
-                    } else {
-                        // Between turns on a live session: the steer starts
-                        // the next turn directly.
-                        if !start_turn(
-                            &client,
-                            &msg.prompt,
-                            &event_tx,
-                            &mut turn,
-                            &mut turn_active,
-                            &mut assistant_message_id,
-                        )
-                        .await
-                        {
-                            break 'main;
-                        }
-                    }
-                }
-                None => {
-                    // Mailbox closed: finish the current turn, then the run.
-                    steering_open = false;
-                    if !turn_active {
-                        break 'main;
-                    }
-                }
-            },
-
-            _ = interrupt.cancelled(), if !interrupt_sent => {
-                interrupt_sent = true;
-                interrupted = true;
-                // Protocol-level abort; pi settles the run and emits
-                // agent_settled (which closes with Done::Interrupted).
-                client.fire(json!({"type": "abort"}));
-                // Escalate if pi doesn't wind down within the grace
-                // periods: SIGTERM (pi's own shutdown path), then SIGKILL.
-                if let Some(pid) = child.id() {
-                    escalation = Some(tokio::spawn(async move {
-                        tokio::time::sleep(interrupt_grace).await;
-                        send_signal(pid, Signal::Term);
-                        tokio::time::sleep(kill_grace).await;
-                        send_signal(pid, Signal::Kill);
-                    }));
-                }
-            },
-
-            _ = event_tx.closed() => break 'main,
-        }
-    }
-
-    // Terminal bookkeeping: never end the stream without a Done unless the
-    // consumer already hung up.
-    if !event_tx.is_closed() {
-        if interrupted && !done_after_interrupt {
-            let _ = event_tx
-                .send(Ok(AgentEvent::Done {
-                    status: DoneStatus::Interrupted,
-                    result: None,
-                    error: None,
-                    session_id: Some(session_id),
-                }))
-                .await;
-        } else if !interrupted && !any_done {
-            let status = child.try_wait().ok().flatten();
-            let _ = event_tx
-                .send(Ok(AgentEvent::Done {
-                    status: DoneStatus::Errored,
-                    result: None,
-                    error: Some(crate::crash_message("pi", status, &stderr_tail)),
-                    session_id: None,
-                }))
-                .await;
-        }
-    }
-
-    shutdown_child(&mut child, kill_grace).await;
-    if let Some(handle) = escalation {
-        handle.abort();
-    }
-}
-
-/// Start a new turn on the live session (a post-settle steer, or the
-/// redelivery of one that lost the settle race). Emits the Steered marker
-/// once the prompt is accepted so post-steer output folds into a fresh
-/// assistant message. Returns false when the loop should end.
-async fn start_turn(
-    client: &PiClient,
-    text: &str,
-    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
-    turn: &mut TurnState,
-    turn_active: &mut bool,
-    assistant_message_id: &mut String,
-) -> bool {
-    *turn = TurnState::default();
-    // Prompt first, THEN the Steered rotation (codex's steer_as_new_turn
-    // ordering): a rejected prompt must not rotate the message id for a
-    // turn that never started. Events arriving during the await sit in the
-    // channel until the loop resumes, so the marker still lands before any
-    // of the new turn's deltas.
-    match client
-        .request(json!({"type": "prompt", "message": text}))
-        .await
-    {
-        Ok(_) => {
-            *turn_active = true;
-            let (prev, next) = rotate(assistant_message_id);
-            send(
-                event_tx,
-                AgentEvent::Steered {
-                    assistant_message_id: Some(prev),
-                    next_assistant_message_id: Some(next),
-                },
-            )
-            .await
-        }
-        Err(e) => {
-            let _ = send(
-                event_tx,
-                AgentEvent::Error {
-                    message: format!("Steering failed: {e}"),
-                },
-            )
-            .await;
-            false
-        }
-    }
-}
-
-/// `tool_execution_start` → [`AgentEvent::ToolCall`]. pi's built-in tool
-/// names map onto the wire kinds (bash→Exec, read→ReadFile, write/edit→
-/// file mutation with the args' text, grep→Search, find→Glob); anything
-/// else rides as Unknown so the chip still renders.
-fn tool_call_event(frame: &Value) -> Option<AgentEvent> {
-    let id = frame.get("toolCallId").and_then(Value::as_str)?;
-    let name = frame.get("toolName").and_then(Value::as_str).unwrap_or("");
-    let args = frame.get("args").cloned().unwrap_or(Value::Null);
-    let str_field = |key: &str| {
-        args.get(key)
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned()
-    };
-    let call = match name {
-        "bash" => ToolCall::Exec {
-            command: str_field("command"),
-        },
-        "read" => ToolCall::ReadFile {
-            path: str_field("path"),
-        },
-        "ls" => ToolCall::ReadFile {
-            // A directory read — renders as a read chip, like the ACP
-            // adapter's "read" kind mapping for ls.
-            path: str_field("path"),
-        },
-        "write" => ToolCall::WriteFile {
-            path: str_field("path"),
-            content: args
-                .get("content")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        },
-        "edit" => ToolCall::EditFile {
-            path: str_field("path"),
-            old_string: args
-                .get("oldText")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            new_string: args
-                .get("newText")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        },
-        "grep" => ToolCall::Search {
-            pattern: str_field("pattern"),
-            path: args.get("path").and_then(Value::as_str).map(str::to_owned),
-        },
-        "find" => ToolCall::Glob {
-            pattern: str_field("pattern"),
-        },
-        _ => ToolCall::Unknown {
-            name: name.to_owned(),
-            input: args.as_object().cloned().map(Value::Object),
-        },
-    };
-    Some(AgentEvent::ToolCall {
-        id: id.to_owned(),
-        call,
-    })
-}
-
-/// `tool_execution_end` → [`AgentEvent::ToolResult`] with output text
-/// (content blocks joined) and, for file mutations, a structured diff
-/// built from the call's start-frame args (the end frame carries no args;
-/// pi's own `details.diff` is display-oriented line output, while the args
-/// hold the exact old/new text).
-fn tool_result_event(
-    frame: &Value,
-    open_tools: &HashMap<String, (String, Value)>,
-) -> Option<AgentEvent> {
-    let id = frame.get("toolCallId").and_then(Value::as_str)?;
-    let is_error = frame
-        .get("isError")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let output = frame
-        .pointer("/result/content")
-        .and_then(Value::as_array)
-        .map(|blocks| {
-            blocks
-                .iter()
-                .filter_map(|b| b.get("text").and_then(Value::as_str).map(str::to_owned))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .filter(|s| !s.is_empty());
-
-    let diff = open_tools.get(id).and_then(|(name, args)| {
-        let path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
-        match name.as_str() {
-            "edit" => Some(ToolDiff {
-                path,
-                old_text: args
-                    .get("oldText")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                new_text: args
-                    .get("newText")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned(),
-            }),
-            "write" => Some(ToolDiff {
-                path,
-                old_text: None,
-                new_text: args
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned(),
-            }),
-            _ => None,
-        }
-    });
-
-    Some(AgentEvent::ToolResult {
-        id: id.to_owned(),
-        is_error,
-        output,
-        diff,
-    })
+    Value::Array(images)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{load_images, load_images_capped};
 
-    #[test]
-    fn reasoning_ladder_maps_to_pi_levels() {
-        assert_eq!(to_pi_thinking_level(ReasoningLevel::Medium), Some("medium"));
-        assert_eq!(to_pi_thinking_level(ReasoningLevel::Max), Some("max"));
-        // pi has no equivalent for the harness-specific tiers.
-        assert_eq!(to_pi_thinking_level(ReasoningLevel::Ultra), None);
-        assert_eq!(to_pi_thinking_level(ReasoningLevel::Ultrathink), None);
+    #[tokio::test]
+    async fn unsupported_or_missing_attachments_do_not_fail_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("a.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\nrest").unwrap();
+        let svg = dir.path().join("b.svg");
+        std::fs::write(&svg, b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>").unwrap();
+        let missing = dir.path().join("gone.jpg");
+        let images = load_images(&[
+            svg.display().to_string(),
+            missing.display().to_string(),
+            png.display().to_string(),
+        ])
+        .await;
+        let images = images.as_array().unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0]["mimeType"], "image/png");
     }
 
-    #[test]
-    fn tool_results_carry_output_and_structured_diff() {
-        let mut open: HashMap<String, (String, Value)> = HashMap::new();
-        open.insert(
-            "c2".into(),
-            (
-                "edit".into(),
-                json!({"path": "/w/a.rs", "oldText": "a", "newText": "b"}),
-            ),
-        );
-        let frame = json!({
-            "type": "tool_execution_end",
-            "toolCallId": "c2",
-            "isError": false,
-            "result": {"content": [{"type": "text", "text": "ok"}]}
-        });
-        match tool_result_event(&frame, &open) {
-            Some(AgentEvent::ToolResult {
-                is_error,
-                output,
-                diff: Some(diff),
-                ..
-            }) => {
-                assert!(!is_error);
-                assert_eq!(output.as_deref(), Some("ok"));
-                assert_eq!(diff.path, "/w/a.rs");
-                assert_eq!(diff.old_text.as_deref(), Some("a"));
-                assert_eq!(diff.new_text, "b");
-            }
-            other => panic!("expected ToolResult with diff, got {other:?}"),
-        }
-
-        // Without a start frame (result for an unknown call), no diff —
-        // never a panic.
-        let frame = json!({
-            "type": "tool_execution_end",
-            "toolCallId": "ghost",
-            "isError": true,
-            "result": {"content": [{"type": "text", "text": "boom"}]}
-        });
-        match tool_result_event(&frame, &open) {
-            Some(AgentEvent::ToolResult {
-                is_error,
-                output,
-                diff,
-                ..
-            }) => {
-                assert!(is_error);
-                assert_eq!(output.as_deref(), Some("boom"));
-                assert!(diff.is_none());
-            }
-            other => panic!("expected ToolResult, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn tool_calls_map_to_wire_kinds() {
-        let frame = json!({
-            "type": "tool_execution_start",
-            "toolCallId": "c1",
-            "toolName": "bash",
-            "args": {"command": "cargo test"}
-        });
-        match tool_call_event(&frame) {
-            Some(AgentEvent::ToolCall {
-                call: ToolCall::Exec { command },
-                ..
-            }) => assert_eq!(command, "cargo test"),
-            other => panic!("expected Exec, got {other:?}"),
-        }
-
-        let frame = json!({
-            "type": "tool_execution_start",
-            "toolCallId": "c2",
-            "toolName": "edit",
-            "args": {"path": "/w/a.rs", "oldText": "a", "newText": "b"}
-        });
-        match tool_call_event(&frame) {
-            Some(AgentEvent::ToolCall {
-                call:
-                    ToolCall::EditFile {
-                        path,
-                        old_string,
-                        new_string,
-                    },
-                ..
-            }) => {
-                assert_eq!(path, "/w/a.rs");
-                assert_eq!(old_string.as_deref(), Some("a"));
-                assert_eq!(new_string.as_deref(), Some("b"));
-            }
-            other => panic!("expected EditFile, got {other:?}"),
-        }
-
-        // Unknown tools ride as Unknown, never dropped.
-        let frame = json!({
-            "type": "tool_execution_start",
-            "toolCallId": "c3",
-            "toolName": "venice_image_generate",
-            "args": {"prompt": "a cat"}
-        });
-        match tool_call_event(&frame) {
-            Some(AgentEvent::ToolCall {
-                call: ToolCall::Unknown { name, .. },
-                ..
-            }) => assert_eq!(name, "venice_image_generate"),
-            other => panic!("expected Unknown, got {other:?}"),
-        }
+    #[tokio::test]
+    async fn files_over_either_cap_ride_as_path_refs_only() {
+        use base64::Engine;
+        let dir = tempfile::tempdir().unwrap();
+        let png = |name: &str, len: usize| {
+            let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+            bytes.resize(len, b'.');
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path.display().to_string()
+        };
+        // 10 bytes each, 15 together: `big` is over its own cap, `third`
+        // over what is left of the total, `small` still fits.
+        let paths = [
+            png("first", 8),
+            png("big", 12),
+            png("third", 8),
+            png("small", 4),
+        ];
+        let images = load_images_capped(&paths, 10, 15).await;
+        let lengths: Vec<_> = images
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|image| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(image["data"].as_str().unwrap())
+                    .unwrap()
+                    .len()
+            })
+            .collect();
+        assert_eq!(lengths, [8, 4]);
     }
 }

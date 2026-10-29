@@ -4,6 +4,8 @@
 //! Done instead of indefinite Working. Own test binary: the env knob is
 //! process-global.
 
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -35,6 +37,8 @@ async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
     let (_steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        realtime: None,
+        execution_lease: None,
         request_input: Box::new(move |_| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Vec::new());
@@ -42,8 +46,10 @@ async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        turn: Default::default(),
     };
     let request = RunRequest {
+        mcp: None,
         prompt: "scenario:prompt-stall".into(),
         harness: None,
         model: None,
@@ -52,9 +58,12 @@ async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
         cwd: String::new(),
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
+        access: Default::default(),
+        plan: false,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
+        env: Default::default(),
     };
     let harness = AcpHarness::grok().with_executable(fixture_path());
     let stream = harness.run(request, controls).await.expect("run starts");

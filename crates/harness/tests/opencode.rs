@@ -17,7 +17,8 @@ use zeron_harness::{
     CancellationToken, Harness, HarnessError, OpencodeHarness, RunControls, SteerMessage,
 };
 use zeron_proto::{
-    AgentEvent, DoneStatus, ReasoningLevel, RunRequest, SandboxLevel, ToolCall, UserInputAnswer,
+    AccessMode, AgentEvent, DoneStatus, ReasoningLevel, RunRequest, SandboxLevel, ToolCall,
+    UserInputAnswer,
 };
 
 // ---------------------------------------------------------------------------
@@ -34,10 +35,17 @@ struct FakeOpencode {
     /// Recorded `(path, body)` of every POST.
     posts: Arc<Mutex<Vec<(String, Value)>>>,
     providers: Arc<Mutex<Value>>,
+    statuses: Arc<Mutex<serde_json::Map<String, Value>>>,
+    commands: Arc<Mutex<Value>>,
     /// Whether an SSE subscriber existed when the FIRST prompt_async landed
     /// (the no-replay bus makes prompting before the subscription a real
     /// event-loss race — observed live on fast-failing turns).
     first_prompt_had_subscriber: Arc<Mutex<Option<bool>>>,
+    /// Leading 500s to answer `POST /session` with (the opencode
+    /// lazy-migration crash class: first access 500s, retry succeeds).
+    fail_session_creates: Arc<Mutex<u32>>,
+    /// Answer `POST …/abort` with a 500 (a wedged server).
+    fail_aborts: Arc<Mutex<bool>>,
 }
 
 impl FakeOpencode {
@@ -51,7 +59,13 @@ impl FakeOpencode {
             backlog: Arc::new(Mutex::new(Vec::new())),
             posts: Arc::new(Mutex::new(Vec::new())),
             providers: Arc::new(Mutex::new(json!({ "all": [], "default": {} }))),
+            statuses: Arc::default(),
+            commands: Arc::new(Mutex::new(
+                json!([{ "name": "init", "description": "Create AGENTS.md" }]),
+            )),
             first_prompt_had_subscriber: Arc::new(Mutex::new(None)),
+            fail_session_creates: Arc::new(Mutex::new(0)),
+            fail_aborts: Arc::new(Mutex::new(false)),
         };
         let accept = fake.clone();
         tokio::spawn(async move {
@@ -69,6 +83,14 @@ impl FakeOpencode {
     /// Push one bus event (the driver accepts both the bare and the
     /// `/global/event` envelope; the fake uses the enveloped form).
     fn emit(&self, payload: Value) {
+        if payload["type"] == "session.status"
+            && let Some(id) = payload["properties"]["sessionID"].as_str()
+        {
+            self.statuses
+                .lock()
+                .unwrap()
+                .insert(id.to_owned(), payload["properties"]["status"].clone());
+        }
         let framed = format!(
             "data: {}\n\n",
             json!({ "directory": "/", "payload": payload })
@@ -195,14 +217,40 @@ impl FakeOpencode {
         match (method, path) {
             ("GET", "/global/health") => ("200 OK", json!({ "healthy": true })),
             ("GET", "/provider") => ("200 OK", self.providers.lock().unwrap().clone()),
-            ("GET", "/command") => (
+            ("GET", "/command") => ("200 OK", self.commands.lock().unwrap().clone()),
+            ("POST", "/session") => {
+                let mut fails = self.fail_session_creates.lock().unwrap();
+                if *fails > 0 {
+                    *fails -= 1;
+                    (
+                        "500 Internal Server Error",
+                        json!({
+                            "name": "UnknownError",
+                            "data": {
+                                "message": "Unexpected server error. Check server logs for details.",
+                                "ref": "err_test",
+                            },
+                        }),
+                    )
+                } else {
+                    ("200 OK", json!({ "id": "ses_test" }))
+                }
+            }
+            ("GET", "/session/status") => (
                 "200 OK",
-                json!([{ "name": "init", "description": "Create AGENTS.md" }]),
+                Value::Object(self.statuses.lock().unwrap().clone()),
             ),
-            ("POST", "/session") => ("200 OK", json!({ "id": "ses_test" })),
             ("GET", "/session/ses_resume") => ("200 OK", json!({ "id": "ses_resume" })),
+            ("GET", "/session/ses_test/children") => (
+                "200 OK",
+                json!([{ "id": "ses_listed", "parentID": "ses_test" }]),
+            ),
             ("GET", p) if p.starts_with("/session/") => ("404 Not Found", json!({})),
             ("POST", p) if p.ends_with("/prompt_async") => ("204 No Content", json!({})),
+            ("POST", p) if p.ends_with("/abort") && *self.fail_aborts.lock().unwrap() => (
+                "500 Internal Server Error",
+                json!({ "name": "UnknownError", "data": { "message": "abort failed" } }),
+            ),
             ("POST", p) if p.ends_with("/abort") => ("200 OK", json!(true)),
             ("POST", p) if p.contains("/permission/") || p.contains("/question/") => {
                 ("200 OK", json!(true))
@@ -218,6 +266,7 @@ impl FakeOpencode {
 
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
+        mcp: None,
         prompt: prompt.into(),
         harness: None,
         model: None,
@@ -226,9 +275,12 @@ fn request(prompt: &str) -> RunRequest {
         cwd: "/tmp".into(),
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
+        access: Default::default(),
+        plan: false,
         attachments: Vec::new(),
         resume: None,
         worktree: None,
+        env: Default::default(),
     }
 }
 
@@ -237,6 +289,8 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let (steer_tx, steering) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        realtime: None,
+        execution_lease: None,
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -251,6 +305,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
         }),
         steering,
         interrupt: token.clone(),
+        turn: Default::default(),
     };
     (controls, steer_tx, token)
 }
@@ -404,6 +459,49 @@ async fn thinking_streams_and_the_turn_settles_only_on_idle() {
 }
 
 #[tokio::test]
+async fn session_create_retries_once_through_the_lazy_migration_500() {
+    // opencode 1.18.x's first directory-scoped request can 500 inside
+    // Project.migrateProjectId while still committing the project row, so
+    // the retried create succeeds — the turn must not die (field report:
+    // `POST /session: 500 UnknownError`, ref-keyed `no such column:
+    // project_id` in the server log).
+    let fake = FakeOpencode::start().await;
+    *fake.fail_session_creates.lock().unwrap() = 1;
+    let (controls, _steer, _token) = controls();
+    let mut stream = harness(&fake)
+        .run(request("hi"), controls)
+        .await
+        .expect("run starts");
+
+    let started = next_event(&mut stream).await;
+    assert!(matches!(
+        &started,
+        AgentEvent::SessionStarted { session_id, .. } if session_id == "ses_test"
+    ));
+    let commands = next_event(&mut stream).await;
+    assert!(matches!(&commands, AgentEvent::AvailableCommands { .. }));
+
+    // Exactly one retry: the 500 must not surface as a chip or a dead turn.
+    let creates = wait_posts(&fake, "/session", 2).await;
+    assert_eq!(creates.len(), 2);
+    assistant_message(&fake, "ses_test", "msg_1");
+    idle(&fake, "ses_test");
+    let events = drain_to_done(&mut stream).await;
+    assert!(
+        !events
+            .iter()
+            .any(|ev| matches!(ev, AgentEvent::Error { .. }))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
 async fn foreign_session_idle_never_settles_our_turn() {
     // The exact bug in opencode's own ACP layer: the first idle observed —
     // any session's — settled the turn.
@@ -487,7 +585,8 @@ async fn steer_queues_mid_turn_and_delivers_at_idle() {
         .send(SteerMessage {
             prompt: "also do this".into(),
             message_id: None,
-            follow_up: false,
+            attachments: Vec::new(),
+            config: None,
         })
         .await
         .unwrap();
@@ -540,6 +639,368 @@ async fn interrupt_aborts_and_settles_interrupted() {
             ..
         })
     ));
+}
+
+/// Start a run on `driver` with a turn stop wired in, and wait until its
+/// first turn streams.
+async fn stoppable_turn(
+    fake: &FakeOpencode,
+    driver: OpencodeHarness,
+) -> (
+    futures::stream::BoxStream<'static, Result<AgentEvent, HarnessError>>,
+    mpsc::Sender<SteerMessage>,
+    zeron_harness::TurnControl,
+) {
+    let (mut controls, steer, _token) = controls();
+    let turn = zeron_harness::TurnControl::default();
+    controls.turn = turn.clone();
+    assert!(driver.stops_turn_in_place());
+    let mut stream = driver
+        .run(request("hi"), controls)
+        .await
+        .expect("run starts");
+    let _ = next_event(&mut stream).await;
+    let _ = next_event(&mut stream).await;
+    assistant_message(fake, "ses_test", "msg_1");
+    fake.emit(json!({
+        "type": "message.part.updated",
+        "properties": { "part": {
+            "id": "prt_t", "messageID": "msg_1", "sessionID": "ses_test",
+            "type": "text", "text": "working",
+        }},
+    }));
+    assert_eq!(
+        next_event(&mut stream).await,
+        AgentEvent::TextDelta {
+            text: "working".into()
+        }
+    );
+    (stream, steer, turn)
+}
+
+/// A stop the server never acknowledged must not leave the session taking
+/// prompts: the turn may still be running. The runtime goes, its mailbox
+/// closed before the stop reads settled.
+async fn assert_torn_down(
+    stream: &mut futures::stream::BoxStream<'static, Result<AgentEvent, HarnessError>>,
+    steer: &mpsc::Sender<SteerMessage>,
+) {
+    let events = drain_to_done(stream).await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Interrupted,
+                error: None,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+    assert!(
+        steer.is_closed(),
+        "the mailbox closes before the stop settles"
+    );
+    let end = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("stream ends");
+    assert!(end.is_none(), "the runtime is gone: {end:?}");
+}
+
+#[tokio::test]
+async fn a_stop_the_server_rejects_tears_the_runtime_down() {
+    let fake = FakeOpencode::start().await;
+    *fake.fail_aborts.lock().unwrap() = true;
+    let (mut stream, steer, turn) = stoppable_turn(&fake, harness(&fake)).await;
+    turn.stop_turn();
+    wait_posts(&fake, "/session/ses_test/abort", 1).await;
+    assert_torn_down(&mut stream, &steer).await;
+}
+
+#[tokio::test]
+async fn a_stop_the_server_never_settles_tears_the_runtime_down() {
+    let fake = FakeOpencode::start().await;
+    let driver = harness(&fake).with_graces(Duration::from_millis(200), Duration::from_millis(100));
+    let (mut stream, steer, turn) = stoppable_turn(&fake, driver).await;
+    turn.stop_turn();
+    wait_posts(&fake, "/session/ses_test/abort", 1).await;
+    // Accepted, but no idle ever follows.
+    assert_torn_down(&mut stream, &steer).await;
+}
+
+#[tokio::test]
+async fn an_acknowledged_stop_drops_late_output_and_keeps_the_session() {
+    let fake = FakeOpencode::start().await;
+    let (mut stream, steer, turn) = stoppable_turn(&fake, harness(&fake)).await;
+    turn.stop_turn();
+    wait_posts(&fake, "/session/ses_test/abort", 1).await;
+    // The stopped turn's output still in flight when the abort landed.
+    fake.emit(json!({
+        "type": "message.part.updated",
+        "properties": { "part": {
+            "id": "prt_late", "messageID": "msg_1", "sessionID": "ses_test",
+            "type": "text", "text": "late",
+        }},
+    }));
+    idle(&fake, "ses_test");
+    let events = drain_to_done(&mut stream).await;
+    assert_eq!(
+        events,
+        vec![AgentEvent::Done {
+            status: DoneStatus::Interrupted,
+            result: None,
+            error: None,
+            session_id: Some("ses_test".into()),
+        }],
+        "the stopped turn's late output is dropped"
+    );
+
+    // The same session takes the next prompt.
+    steer
+        .send(SteerMessage::text("carry on"))
+        .await
+        .expect("the mailbox stays open");
+    let prompts = wait_posts(&fake, "/session/ses_test/prompt_async", 2).await;
+    assert_eq!(prompts[1]["parts"][0]["text"], "carry on");
+    assistant_message(&fake, "ses_test", "msg_2");
+    idle(&fake, "ses_test");
+    let events = drain_to_done(&mut stream).await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+}
+
+/// A stop keeps the server up for the next prompt, so subagents must not
+/// outlive it: a background one does not end with its parent. Every child
+/// the bus announced is aborted, and so is any the server lists.
+#[tokio::test]
+async fn a_stop_aborts_the_turns_subagent_sessions() {
+    let fake = FakeOpencode::start().await;
+    let (mut stream, _steer, turn) = stoppable_turn(&fake, harness(&fake)).await;
+    fake.emit(json!({
+        "type": "session.created",
+        "properties": { "info": {
+            "id": "ses_child", "parentID": "ses_test", "title": "scan (@explore subagent)",
+        }},
+    }));
+    // A text frame after it proves the child was seen before the stop.
+    fake.emit(json!({
+        "type": "message.part.updated",
+        "properties": { "part": {
+            "id": "prt_t", "messageID": "msg_1", "sessionID": "ses_test",
+            "type": "text", "text": "working on",
+        }},
+    }));
+    assert_eq!(
+        next_event(&mut stream).await,
+        AgentEvent::TextDelta { text: " on".into() }
+    );
+    turn.stop_turn();
+    wait_posts(&fake, "/session/ses_test/abort", 1).await;
+    wait_posts(&fake, "/session/ses_child/abort", 1).await;
+    wait_posts(&fake, "/session/ses_listed/abort", 1).await;
+    idle(&fake, "ses_test");
+    let events = drain_to_done(&mut stream).await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Interrupted,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn images_sent_mid_turn_ride_the_queued_prompt() {
+    let fake = FakeOpencode::start().await;
+    let (controls, steer, _token) = controls();
+    let mut stream = harness(&fake)
+        .run(request("hi"), controls)
+        .await
+        .expect("run starts");
+    let _ = next_event(&mut stream).await;
+    let _ = next_event(&mut stream).await;
+    assistant_message(&fake, "ses_test", "msg_1");
+    // A running tool holds the steers for the turn's end (no preempt).
+    fake.emit(json!({
+        "type": "message.part.updated",
+        "properties": { "part": {
+            "id": "prt_tool", "messageID": "msg_1", "sessionID": "ses_test",
+            "type": "tool", "tool": "bash", "callID": "call_1",
+            "state": { "status": "running", "input": { "command": "sleep 1" } },
+        }},
+    }));
+    let _ = next_event(&mut stream).await; // ToolStarted
+    for (text, image) in [("first", "/tmp/one.png"), ("second", "/tmp/two.png")] {
+        steer
+            .send(SteerMessage {
+                prompt: text.into(),
+                message_id: None,
+                attachments: vec![image.into()],
+                config: None,
+            })
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fake.emit(json!({
+        "type": "message.part.updated",
+        "properties": { "part": {
+            "id": "prt_tool", "messageID": "msg_1", "sessionID": "ses_test",
+            "type": "tool", "tool": "bash", "callID": "call_1",
+            "state": { "status": "completed", "input": { "command": "sleep 1" }, "output": "" },
+        }},
+    }));
+    idle(&fake, "ses_test");
+
+    let prompts = wait_posts(&fake, "/session/ses_test/prompt_async", 2).await;
+    let parts = prompts[1]["parts"].as_array().expect("parts");
+    let text = parts
+        .iter()
+        .find(|p| p["type"] == "text")
+        .and_then(|p| p["text"].as_str())
+        .unwrap();
+    assert!(text.contains("first") && text.contains("second"), "{text}");
+    let images: Vec<&str> = parts
+        .iter()
+        .filter(|p| p["type"] == "file")
+        .filter_map(|p| p["url"].as_str())
+        .collect();
+    assert_eq!(images, ["file:///tmp/one.png", "file:///tmp/two.png"]);
+}
+
+/// A model switch reaches the live server: from the next prompt between
+/// turns, and mid-turn from the prompt of the message it was sent with —
+/// never merged into a prompt sent with the previous model.
+#[tokio::test]
+async fn a_model_switch_rides_the_next_prompt() {
+    let fake = FakeOpencode::start().await;
+    let (controls, steer, _token) = controls();
+    let mut opening = request("hi");
+    opening.model = Some("prov/model-a".into());
+    let driver = harness(&fake);
+    let mut switched = request("");
+    switched.model = Some("prov/model-b".into());
+    assert!(driver.reconfigures_in_place(&opening, &switched));
+    let mut stream = driver
+        .run(opening.clone(), controls)
+        .await
+        .expect("run starts");
+    let _ = next_event(&mut stream).await;
+    let _ = next_event(&mut stream).await;
+    assistant_message(&fake, "ses_test", "msg_1");
+    idle(&fake, "ses_test");
+    drain_to_done(&mut stream).await;
+
+    let send = |text: &str, config: Option<&RunRequest>| SteerMessage {
+        config: config.cloned().map(Box::new),
+        ..SteerMessage::text(text)
+    };
+    steer.send(send("on b", Some(&switched))).await.unwrap();
+    wait_posts(&fake, "/session/ses_test/prompt_async", 2).await;
+    assistant_message(&fake, "ses_test", "msg_2");
+    // A running tool holds what follows for the turn's end.
+    fake.emit(json!({
+        "type": "message.part.updated",
+        "properties": { "part": {
+            "id": "prt_tool", "messageID": "msg_2", "sessionID": "ses_test",
+            "type": "tool", "tool": "bash", "callID": "call_1",
+            "state": { "status": "running", "input": { "command": "sleep 1" } },
+        }},
+    }));
+    steer.send(send("still b", None)).await.unwrap();
+    steer.send(send("back on a", Some(&opening))).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fake.emit(json!({
+        "type": "message.part.updated",
+        "properties": { "part": {
+            "id": "prt_tool", "messageID": "msg_2", "sessionID": "ses_test",
+            "type": "tool", "tool": "bash", "callID": "call_1",
+            "state": { "status": "completed", "input": { "command": "sleep 1" }, "output": "" },
+        }},
+    }));
+    idle(&fake, "ses_test");
+    wait_posts(&fake, "/session/ses_test/prompt_async", 3).await;
+    assistant_message(&fake, "ses_test", "msg_3");
+    idle(&fake, "ses_test");
+    let prompts = wait_posts(&fake, "/session/ses_test/prompt_async", 4).await;
+    let sent: Vec<(String, String)> = prompts
+        .iter()
+        .map(|p| {
+            (
+                p["parts"][0]["text"].as_str().unwrap_or("").to_owned(),
+                p["model"]["modelID"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            ("hi".to_owned(), "model-a".to_owned()),
+            ("on b".to_owned(), "model-b".to_owned()),
+            ("still b".to_owned(), "model-b".to_owned()),
+            ("back on a".to_owned(), "model-a".to_owned()),
+        ]
+    );
+}
+
+/// A supervised plan-mode run names the plan agent on its prompt, and puts
+/// a command to the person instead of approving it: "No" rejects it.
+#[tokio::test]
+async fn supervised_plan_run_names_the_plan_agent_and_asks_before_commands() {
+    let fake = FakeOpencode::start().await;
+    let driver = harness(&fake);
+    assert_eq!(driver.access_modes(), AccessMode::ALL);
+    assert!(driver.supports_plan());
+    let (mut controls, _steer, _token) = controls();
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let seen = asked.clone();
+    controls.request_input = Box::new(move |questions| {
+        let (tx, rx) = oneshot::channel();
+        let answers = questions
+            .iter()
+            .map(|q| UserInputAnswer {
+                question_id: q.id.clone(),
+                labels: vec!["No".into()],
+            })
+            .collect();
+        seen.lock()
+            .unwrap()
+            .extend(questions.into_iter().map(|q| q.question));
+        let _ = tx.send(answers);
+        rx
+    });
+    let mut opening = request("plan the cleanup");
+    opening.auto_approve = false;
+    opening.access = AccessMode::Supervised;
+    opening.plan = true;
+    let mut stream = driver.run(opening, controls).await.expect("run starts");
+    let prompts = wait_posts(&fake, "/session/ses_test/prompt_async", 1).await;
+    assert_eq!(prompts[0]["agent"], "plan");
+    assistant_message(&fake, "ses_test", "msg_1");
+    fake.emit(json!({
+        "type": "permission.asked",
+        "properties": {
+            "id": "per_1", "sessionID": "ses_test", "permission": "bash",
+            "patterns": ["rm -rf build"], "metadata": { "command": "rm -rf build" },
+            "always": ["rm *"],
+        },
+    }));
+    let replies = wait_posts(&fake, "/permission/per_1/reply", 1).await;
+    assert_eq!(replies[0], json!({ "reply": "reject" }));
+    assert_eq!(
+        *asked.lock().unwrap(),
+        ["OpenCode wants to run `rm -rf build`. Allow it?"]
+    );
+    idle(&fake, "ses_test");
+    drain_to_done(&mut stream).await;
 }
 
 #[tokio::test]
@@ -869,7 +1330,347 @@ async fn models_discover_from_the_provider_catalog() {
     let models = harness.models().await.expect("models");
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].id, "opencode/big-pickle");
+    assert!(models[0].options.is_empty(), "v1 must not advertise agents");
     // Commands were primed off the same probe.
     let commands = harness.commands().await.expect("commands");
     assert_eq!(commands[0].name, "init");
+}
+
+#[tokio::test]
+async fn models_keep_large_catalog_on_empty_response_and_recover() {
+    let fake = FakeOpencode::start().await;
+    let harness = harness(&fake);
+    let models: serde_json::Map<String, Value> = (0..512)
+        .map(|i| (format!("model-{i}"), json!({"name": "x".repeat(2048)})))
+        .collect();
+    let catalog = json!({
+        "all": [{"id": "provider", "models": models}],
+        "connected": ["provider"],
+    });
+    fake.set_providers(catalog.clone());
+    assert_eq!(harness.models().await.unwrap().len(), 512);
+
+    fake.set_providers(json!({"all": [], "connected": []}));
+    // An empty response without a credential-context change is a failed probe,
+    // so the last successful catalog remains available.
+    let retained = harness.models().await.unwrap();
+    assert_eq!(retained.len(), 512);
+    assert!(
+        retained
+            .iter()
+            .all(|model| model.id.starts_with("provider/"))
+    );
+
+    fake.set_providers(json!({
+        "all": [{"id": "new-account", "models": {"fresh": {"name": "Fresh"}}}],
+        "connected": ["new-account"],
+    }));
+    let refreshed = harness.models().await.unwrap();
+    assert_eq!(refreshed.len(), 1);
+    assert_eq!(refreshed[0].id, "new-account/fresh");
+}
+
+#[tokio::test]
+async fn repeated_session_create_failure_stops_after_one_retry() {
+    let fake = FakeOpencode::start().await;
+    *fake.fail_session_creates.lock().unwrap() = 10;
+    let (controls, _, _) = controls();
+    let mut stream = harness(&fake).run(request("hi"), controls).await.unwrap();
+    let events = drain_to_done(&mut stream).await;
+    assert_eq!(
+        fake.posts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path == "/session")
+            .count(),
+        2
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SessionStarted { .. }))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Errored,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn slash_command_rejects_attachments_instead_of_dropping_them() {
+    let fake = FakeOpencode::start().await;
+    let (controls, _steer, _token) = controls();
+    let mut req = request("/init the repo");
+    req.attachments.push("/tmp/image.png".into());
+    let mut stream = harness(&fake).run(req, controls).await.unwrap();
+    let events = drain_to_done(&mut stream).await;
+    assert!(events.iter().any(|event| matches!(event,
+        AgentEvent::Done { status: DoneStatus::Errored, error: Some(message), .. }
+        if message.contains("attachments")
+    )));
+    assert!(fake.posts_to("/session/ses_test/command").is_empty());
+    assert!(fake.posts_to("/session/ses_test/prompt_async").is_empty());
+}
+
+#[tokio::test]
+async fn dollar_selected_skill_uses_opencode_native_command_with_arguments() {
+    use zeron_proto::{
+        HarnessId,
+        invocation::{Invocation, harness_prompt},
+    };
+    let fake = FakeOpencode::start().await;
+    *fake.commands.lock().unwrap() = json!([
+        {"name":"review","description":"Native skill","source":"skill"},
+        {"name":"init","source":"command"}
+    ]);
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::create_dir(cwd.path().join(".git")).unwrap();
+    let h = harness(&fake);
+    let skills = h.skills(cwd.path()).await.unwrap().unwrap();
+    let skill = skills
+        .into_iter()
+        .find(|skill| skill.name == "review")
+        .unwrap();
+    let invocation = Invocation::Skill {
+        name: skill.name,
+        path: skill.path,
+        command: skill.command,
+    };
+    let prompt = harness_prompt(
+        &format!("\n  {} inspect tests", invocation.link()),
+        HarnessId::Opencode,
+    );
+    assert_eq!(prompt, "\n  /review inspect tests");
+    let (controls, _steer, _) = controls();
+    let mut stream = h.run(request(&prompt), controls).await.unwrap();
+    let _ = next_event(&mut stream).await;
+    let _ = next_event(&mut stream).await;
+    let commands = wait_posts(&fake, "/session/ses_test/command", 1).await;
+    assert_eq!(commands[0]["command"], "review");
+    assert_eq!(commands[0]["arguments"], "inspect tests");
+    assert!(fake.posts_to("/session/ses_test/prompt_async").is_empty());
+    assistant_message(&fake, "ses_test", "msg_1");
+    idle(&fake, "ses_test");
+    drain_to_done(&mut stream).await;
+}
+
+// ---------------------------------------------------------------------------
+// Live
+// ---------------------------------------------------------------------------
+
+/// Collect a live turn: its text and its terminal status and error.
+async fn live_turn(
+    stream: &mut (impl futures::Stream<Item = Result<AgentEvent, HarnessError>> + Unpin),
+) -> (String, DoneStatus, Option<String>, Vec<String>) {
+    let mut text = String::new();
+    let mut errors = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(300), stream.next())
+            .await
+            .expect("live turn within budget")
+            .expect("stream open")
+            .expect("ok event");
+        match event {
+            AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
+            AgentEvent::Error { message } => errors.push(message),
+            AgentEvent::Done { status, error, .. } => return (text, status, error, errors),
+            _ => {}
+        }
+    }
+}
+
+/// Real turns against an installed opencode, isolated from the user's own
+/// data, config and logins (opencode's anonymous tier needs no account):
+/// an attachment whose name carries URL-reserved characters, a follow-up
+/// prompt, and a stop that keeps the session. Run with
+/// `ZERON_OPENCODE_LIVE_EXE=/path/to/opencode [ZERON_OPENCODE_LIVE_MODEL=provider/model]
+/// cargo test -p zeron-harness --test opencode live_ -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore = "drives a real opencode; set ZERON_OPENCODE_LIVE_EXE"]
+async fn live_turns_against_a_real_opencode() {
+    let Some(exe) = std::env::var_os("ZERON_OPENCODE_LIVE_EXE") else {
+        eprintln!("ZERON_OPENCODE_LIVE_EXE unset; skipping");
+        return;
+    };
+    let model = std::env::var("ZERON_OPENCODE_LIVE_MODEL")
+        .unwrap_or_else(|_| "opencode/big-pickle".to_owned());
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project dir");
+    std::fs::create_dir_all(&project).unwrap();
+    // A 1x1 PNG under a name `file://{path}` used to mangle (Windows file
+    // names cannot hold `?`).
+    let shot = project.join(if cfg!(windows) {
+        "shot #1 %.png"
+    } else {
+        "shot #1 ?%.png"
+    });
+    std::fs::write(
+        &shot,
+        [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0xF0, 0x1F, 0x00, 0x05, 0x00, 0x01, 0xFF, 0x89, 0x99,
+            0x3D, 0x1D, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ],
+    )
+    .unwrap();
+    let mut env = std::collections::BTreeMap::new();
+    for (key, dir) in [
+        ("XDG_DATA_HOME", "data"),
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_CACHE_HOME", "cache"),
+        ("XDG_STATE_HOME", "state"),
+    ] {
+        let dir = root.path().join(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        env.insert(key.to_owned(), dir.to_string_lossy().into_owned());
+    }
+    let mut first = request("Reply with exactly the word: pong");
+    first.cwd = project.to_string_lossy().into_owned();
+    first.model = Some(model.clone());
+    first.attachments = vec![shot.to_string_lossy().into_owned()];
+    first.env = env;
+    let (mut controls, steer, _token) = controls();
+    let turn = zeron_harness::TurnControl::default();
+    controls.turn = turn.clone();
+    let driver = OpencodeHarness::new().with_executable(std::path::PathBuf::from(exe));
+    let mut stream = driver.run(first, controls).await.expect("run starts");
+
+    let (text, status, error, errors) = live_turn(&mut stream).await;
+    eprintln!("turn 1: {status:?} {text:?} {error:?} {errors:?}");
+    for message in errors.iter().chain(error.iter()) {
+        let lower = message.to_ascii_lowercase();
+        assert!(
+            !lower.contains("attachment")
+                && !lower.contains("enoent")
+                && !lower.contains("file uri"),
+            "the attachment did not resolve: {message}"
+        );
+    }
+
+    steer
+        .send(SteerMessage::text("Reply with exactly the word: ping"))
+        .await
+        .unwrap();
+    let (text, status, error, _) = live_turn(&mut stream).await;
+    eprintln!("turn 2: {status:?} {text:?} {error:?}");
+    assert_eq!(status, DoneStatus::Completed, "{error:?}");
+    assert!(text.to_ascii_lowercase().contains("ping"), "{text}");
+
+    steer
+        .send(SteerMessage::text(
+            "Write the numbers from 1 to 400 in words, one per line.",
+        ))
+        .await
+        .unwrap();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(300), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if matches!(event, AgentEvent::TextDelta { .. }) {
+            break;
+        }
+    }
+    turn.stop_turn();
+    let (_, status, _, _) = live_turn(&mut stream).await;
+    assert_eq!(status, DoneStatus::Interrupted);
+
+    steer
+        .send(SteerMessage::text("Reply with exactly the word: done"))
+        .await
+        .unwrap();
+    let (text, status, error, _) = live_turn(&mut stream).await;
+    eprintln!("turn 4: {status:?} {text:?} {error:?}");
+    assert_eq!(status, DoneStatus::Completed, "{error:?}");
+    assert!(text.to_ascii_lowercase().contains("done"), "{text}");
+    drop(steer);
+}
+
+/// Restricted access modes against an installed opencode (isolated like
+/// [`live_turns_against_a_real_opencode`]): supervised asks before the
+/// command and the file and, refused, leaves no file; auto-accept edits
+/// writes the file unasked and still asks before the command. Run with
+/// `ZERON_OPENCODE_LIVE_EXE=/path/to/opencode cargo test -p zeron-harness
+/// --test opencode live_access -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore = "drives a real opencode; set ZERON_OPENCODE_LIVE_EXE"]
+async fn live_access_modes_against_a_real_opencode() {
+    let Some(exe) = std::env::var_os("ZERON_OPENCODE_LIVE_EXE") else {
+        eprintln!("ZERON_OPENCODE_LIVE_EXE unset; skipping");
+        return;
+    };
+    let model = std::env::var("ZERON_OPENCODE_LIVE_MODEL")
+        .unwrap_or_else(|_| "opencode/big-pickle".to_owned());
+    for access in [AccessMode::Supervised, AccessMode::AutoAcceptEdits] {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut env = std::collections::BTreeMap::new();
+        for (key, dir) in [
+            ("XDG_DATA_HOME", "data"),
+            ("XDG_CONFIG_HOME", "config"),
+            ("XDG_CACHE_HOME", "cache"),
+            ("XDG_STATE_HOME", "state"),
+        ] {
+            let dir = root.path().join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            env.insert(key.to_owned(), dir.to_string_lossy().into_owned());
+        }
+        let mut run = request(
+            "Use the bash tool to run `echo probe-ok`, then use the write tool to create \
+             note.txt containing the word hello. Do both even if one fails, then stop.",
+        );
+        run.cwd = project.to_string_lossy().into_owned();
+        run.model = Some(model.clone());
+        run.env = env;
+        run.auto_approve = false;
+        run.access = access;
+        let (mut controls, _steer, _token) = controls();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        controls.request_input = Box::new(move |questions| {
+            let (tx, rx) = oneshot::channel();
+            let answers = questions
+                .iter()
+                .map(|q| UserInputAnswer {
+                    question_id: q.id.clone(),
+                    labels: vec!["No".into()],
+                })
+                .collect();
+            seen.lock()
+                .unwrap()
+                .extend(questions.into_iter().map(|q| q.question));
+            let _ = tx.send(answers);
+            rx
+        });
+        let driver = OpencodeHarness::new().with_executable(std::path::PathBuf::from(&exe));
+        let mut stream = driver.run(run, controls).await.expect("run starts");
+        let (text, status, error, _) = live_turn(&mut stream).await;
+        let asked = asked.lock().unwrap().clone();
+        eprintln!("{access:?}: {status:?} {text:?} {error:?} asked {asked:?}");
+        assert!(
+            asked
+                .iter()
+                .any(|q| q.contains("wants to run `echo probe-ok`")),
+            "{asked:?}"
+        );
+        let wrote = project.join("note.txt").exists();
+        match access {
+            AccessMode::Supervised => {
+                assert!(asked.iter().any(|q| q.contains("note.txt")), "{asked:?}");
+                assert!(!wrote, "a refused edit was written");
+            }
+            _ => {
+                assert!(!asked.iter().any(|q| q.contains("note.txt")), "{asked:?}");
+                assert!(wrote, "an accepted edit was not written");
+            }
+        }
+    }
 }

@@ -26,6 +26,7 @@ fn main() {
         device_id: "device-rust".into(),
         status: Some(MessageStatus::Complete),
         continuation_of: None,
+        duration_ms: None,
     })
     .expect("push user message");
 
@@ -72,7 +73,6 @@ fn main() {
         payload: SessionCommandPayload::Steer {
             prompt: "also run clippy".into(),
             message_id: None,
-            follow_up: false,
         },
         issued_by: "device-rust".into(),
         issued_at: 1_700_000_002_000,

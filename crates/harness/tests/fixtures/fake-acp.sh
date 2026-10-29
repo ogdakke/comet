@@ -43,6 +43,22 @@ if has "$line" '"method":"session/load"'; then
     has "$line" '"method":"session/new"' || exit 1
     emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"s-fresh\"}}"
     SID="s-fresh"
+  elif has "$line" '"sessionId":"load-hang"' || has "$line" '"sessionId":"load-busy"' ||
+    has "$line" '"sessionId":"load-exit"'; then
+    # A restore that never answers, is refused for a reason other than a
+    # missing session, or loses the agent: none may fork to a fresh session.
+    # Should a session/new arrive anyway, answer it so the fork shows.
+    if has "$line" '"sessionId":"load-busy"'; then
+      emit "{\"id\":$(rid "$line"),\"error\":{\"code\":-32603,\"message\":\"session store is locked\"}}"
+    elif has "$line" '"sessionId":"load-exit"'; then
+      exit 3
+    fi
+    while read -r line; do
+      if has "$line" '"method":"session/new"'; then
+        emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"s-forked\"}}"
+      fi
+    done
+    exit 0
   else
     if [ "$MODEL_API" -eq 1 ]; then
       SID="existing-grok-session"
@@ -53,6 +69,10 @@ if has "$line" '"method":"session/load"'; then
     # drain these without emitting events (the doc already has them) and
     # without deadlocking on a full incoming channel.
     i=0
+    if has "$line" '"sessionId":"mcp-loaded"'; then
+      SID="mcp-loaded"
+      i=300
+    fi
     while [ $i -lt 300 ]; do
       update '{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"old prompt"}}'
       update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"old reply"}}'
@@ -65,7 +85,7 @@ if has "$line" '"method":"session/load"'; then
     fi
   fi
 elif has "$line" '"method":"session/new"'; then
-  has "$line" '"mcpServers":[]' || exit 1
+  has "$line" '"mcpServers":[]' || has "$line" '"name":"zeron"' || exit 1
   # Advertise config options: model (current differs from the tests' request,
   # forcing a set) and thought_level (current high). The model config option
   # feeds discovery first; the first-class `models` state (SessionModelState)
@@ -77,6 +97,13 @@ elif has "$line" '"method":"session/new"'; then
   fi
 else
   exit 1
+fi
+
+if [ -f .command-fixture ]; then
+  expected=$(pwd -P)
+  has "$line" "\"cwd\":\"$expected\"" || exit 1
+  name=$(cat .command-fixture)
+  emit "{\"method\":\"session/update\",\"params\":{\"sessionId\":\"$SID\",\"update\":{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":[{\"name\":\"$name\",\"description\":\"Project command\"}]}}}"
 fi
 
 # ---- model/config sets (0..n), then the first turn ---------------------------
@@ -97,6 +124,15 @@ has "$promptline" '"method":"session/prompt"' || exit 1
 pid=$(rid "$promptline")
 
 case "$promptline" in
+
+*scenario:mcp*)
+  has "$line" '"command":"/path with spaces/zeron"' || exit 1
+  has "$line" '"args":["mcp"]' || exit 1
+  has "$line" '"name":"ZERON_CHAT_ID","value":"origin-chat"' || exit 1
+  has "$line" '"name":"ZERON_IPC_PORT","value":"27699"' || exit 1
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"mcp configured"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
 
 *scenario:model-api*)
   if has "$MODEL_SETS" '"modelId":"grok-4.5"'; then
@@ -180,6 +216,51 @@ case "$promptline" in
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 
+*scenario:detached*)
+  # A command the agent starts in its own session (Devin does): not in the
+  # agent's process group, so a group kill alone leaves it running.
+  pidfile=$(printf '%s' "$promptline" | sed 's/.*scenario:detached \([^ "]*\).*/\1/')
+  python3 -c "import os,time; os.setsid(); open('$pidfile','w').write(str(os.getpid())); time.sleep(60)" &
+  while [ ! -s "$pidfile" ]; do sleep 0.05; done
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"started"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  cat >/dev/null
+  ;;
+
+*scenario:reconfigure*)
+  # Model switches: one sent between turns, one sent mid-turn. Each set must
+  # reach the session before the prompt it was sent with.
+  next_turn() { # reads 0..n sets then the prompt; leaves them in SETS / pid
+    SETS=""
+    read -r promptline || exit 1
+    while has "$promptline" '"method":"session/set_config_option"'; do
+      emit "{\"id\":$(rid "$promptline"),\"result\":{}}"
+      SETS="$SETS $promptline"
+      read -r promptline || exit 1
+    done
+    has "$promptline" '"method":"session/prompt"' || exit 1
+    pid=$(rid "$promptline")
+  }
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"turn1"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  next_turn
+  if has "$SETS" '"value":"grok-4-fast"'; then
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"on fast"}}'
+  else
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"switch missing"}}'
+  fi
+  sleep 0.5
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  next_turn
+  if has "$SETS" '"value":"grok-4.5"'; then
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"back on 4.5"}}'
+  else
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"switch missing"}}'
+  fi
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  cat >/dev/null
+  ;;
+
 *scenario:happy*)
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello"}}'
   update '{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking"}}'
@@ -223,39 +304,6 @@ case "$promptline" in
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 
-*scenario:exit-plan*)
-  # Grok plan-mode approval: the agent reverse-requests x.ai/exit_plan_mode
-  # with the plan body. A method-not-found here fails the tool (the live
-  # "Plan: Exit" red chip). The harness must answer {outcome:"approved"}.
-  emit "{\"id\":91,\"method\":\"x.ai/exit_plan_mode\",\"params\":{\"sessionId\":\"$SID\",\"toolCallId\":\"call-plan-1\",\"planContent\":\"# Dummy plan\\n\\nDo nothing.\"}}"
-  read -r ans || exit 1
-  { has "$ans" '"id":91' && has "$ans" '"outcome":"approved"'; } ||
-    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
-  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"plan approved"}}'
-  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
-  ;;
-
-*scenario:exit-plan-meta*)
-  # Live grok 1.0.5 prefixes extension methods with `_` (ACP reserve).
-  emit "{\"id\":92,\"method\":\"_x.ai/exit_plan_mode\",\"params\":{\"sessionId\":\"$SID\",\"toolCallId\":\"call-plan-2\",\"planContent\":\"# Dummy plan\\n\\nDo nothing.\"}}"
-  read -r ans || exit 1
-  { has "$ans" '"id":92' && has "$ans" '"outcome":"approved"'; } ||
-    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
-  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"plan approved"}}'
-  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
-  ;;
-
-*scenario:ask-user*)
-  # Grok ask_user_question reverse-request. method-not-found used to fail
-  # the tool ("Failed to reach the client … unsupported method").
-  emit "{\"id\":93,\"method\":\"_x.ai/ask_user_question\",\"params\":{\"sessionId\":\"$SID\",\"toolCallId\":\"call-q-1\",\"mode\":\"plan\",\"questions\":[{\"question\":\"Which dummy flavor should this test plan use?\",\"options\":[{\"label\":\"Keep it tiny\",\"description\":\"short\"},{\"label\":\"Make it look real\",\"description\":\"long\"}]}]}}"
-  read -r ans || exit 1
-  { has "$ans" '"id":93' && has "$ans" '"outcome":"accepted"' && has "$ans" 'Keep it tiny'; } ||
-    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
-  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"questions answered"}}'
-  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
-  ;;
-
 *scenario:permission*)
   emit "{\"id\":77,\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"$SID\",\"toolCall\":{\"toolCallId\":\"t1\"},\"options\":[{\"optionId\":\"once\",\"name\":\"Allow once\",\"kind\":\"allow_once\"},{\"optionId\":\"always\",\"name\":\"Always allow\",\"kind\":\"allow_always\"},{\"optionId\":\"no\",\"name\":\"Reject\",\"kind\":\"reject_once\"}]}}"
   read -r ans || exit 1
@@ -279,6 +327,32 @@ case "$promptline" in
     emit "{\"id\":$sid,\"error\":{\"code\":-32600,\"message\":\"bad steer\"}}"
     emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"
   fi
+  ;;
+
+*scenario:stop-steer*)
+  # "Send now" with a steer still in flight: the steering request is
+  # unanswered when the turn stop's session/cancel arrives, and answers
+  # promptRequired before the cancelled prompt settles. The cancelled steer
+  # must never run.
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
+  read -r steerline || exit 1
+  has "$steerline" '"method":"_session/steering"' || exit 1
+  sid=$(rid "$steerline")
+  read -r cancel || exit 1
+  has "$cancel" '"method":"session/cancel"' || exit 1
+  emit "{\"id\":$sid,\"result\":{\"outcome\":\"promptRequired\"}}"
+  sleep 0.2
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"cancelled\"}}"
+  read -r next || exit 1
+  has "$next" '"method":"session/prompt"' || exit 1
+  nid=$(rid "$next")
+  if has "$next" 'cancelled steer'; then
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"REPLAYED"}}'
+  else
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"fresh"}}'
+  fi
+  emit "{\"id\":$nid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  cat >/dev/null
   ;;
 
 *scenario:steer-race*)
@@ -413,45 +487,6 @@ case "$promptline" in
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 
-*scenario:quiet-starve*)
-  # Blanket dropped-reply settle, no adapter-specific evidence: content
-  # streamed, no open tool, then silence — the response never comes. The
-  # harness must settle off the generic quiet window (tests set
-  # ZERON_ACP_QUIET_SETTLE_MS small), well before this stream's 8s EOF.
-  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
-  sleep 8
-  exit 0
-  ;;
-
-*scenario:quiet-tool-guard*)
-  # The guard: an OPEN tool call makes silence legitimate. Quiet stretch is
-  # far past the test's settle window, but the pending tool must hold the
-  # settle off; the turn then ends normally — exactly one Done.
-  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
-  update '{"sessionUpdate":"tool_call","toolCallId":"slow-1","title":"slow build","kind":"execute","status":"pending","rawInput":{"command":"make"}}'
-  sleep 4
-  update '{"sessionUpdate":"tool_call_update","toolCallId":"slow-1","status":"completed","content":[]}'
-  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"finished"}}'
-  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
-  ;;
-
-*scenario:quiet-thinking*)
-  # The 2026-08-13 false settle: every tool RESOLVED, then a long silent
-  # thinking stretch (claude-agent-acp / grok / codex-acp / pi-acp
-  # forward little or no thinking traffic), then the turn continues and
-  # ends normally.
-  # This is exactly the "looks finished" state the blanket settle keys on;
-  # exempt agents must hold through it — a false settle here orphans the
-  # real turn (its response lands on a closed channel; the session
-  # strands Working).
-  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
-  update '{"sessionUpdate":"tool_call","toolCallId":"th-1","title":"quick read","kind":"read","status":"pending","rawInput":{"path":"/w/src/x.rs"}}'
-  update '{"sessionUpdate":"tool_call_update","toolCallId":"th-1","status":"completed","content":[]}'
-  sleep 4
-  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"finished"}}'
-  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
-  ;;
-
 *scenario:interrupt*)
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
   read -r intline || exit 1
@@ -460,6 +495,20 @@ case "$promptline" in
   else
     emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"
   fi
+  ;;
+
+*scenario:stop-in-place*)
+  # A turn stop: session/cancel settles the prompt `cancelled`; the agent
+  # and its session take the next session/prompt.
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
+  read -r intline || exit 1
+  has "$intline" '"method":"session/cancel"' || exit 8
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"cancelled\"}}"
+  read -r nextline || exit 1
+  has "$nextline" '"method":"session/prompt"' || exit 9
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"resumed"}}'
+  emit "{\"id\":$(rid "$nextline"),\"result\":{\"stopReason\":\"end_turn\"}}"
+  cat >/dev/null
   ;;
 
 *scenario:wedge*)
