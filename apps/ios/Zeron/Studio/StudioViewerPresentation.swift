@@ -6,7 +6,10 @@ import UIKit
 @MainActor
 enum StudioViewerPresentationHost {
     static func resolve(from anchor: UIViewController) -> UIViewController? {
-        guard let root = anchor.viewIfLoaded?.window?.rootViewController else { return nil }
+        // A screen with a thread pushed over it is out of the window; its
+        // navigation controller isn't.
+        let window = anchor.viewIfLoaded?.window ?? anchor.navigationController?.viewIfLoaded?.window
+        guard let root = window?.rootViewController else { return nil }
         return visibleController(from: root)
     }
 
