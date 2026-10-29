@@ -1178,19 +1178,21 @@ async fn models_discovers_visible_catalog_with_pagination() {
     assert_eq!(tier.choices[1].id, "fast");
     assert_eq!(tier.choices.len(), 2, "priority and fast dedupe");
 
-    // A failed probe stays useful and includes the new model in the fallback.
+    // An unavailable live catalog must not become a guessed model list.
     let failed_probe = tempfile::tempdir().unwrap();
     let failed_exe = failed_probe.path().join("failed-codex");
     std::fs::write(&failed_exe, "#!/bin/sh\nexit 1\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&failed_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let fallback = CodexHarness::new()
+    let error = CodexHarness::new()
         .with_executable(failed_exe)
         .models()
         .await
-        .expect("fallback models");
-    assert_eq!(fallback.len(), 9);
-    assert_eq!(fallback[0].id, "gpt-6-astra");
+        .expect_err("discovery failure must remain visible");
+    assert!(matches!(
+        error,
+        HarnessError::Protocol(_) | HarnessError::Discovery(_) | HarnessError::Io(_)
+    ));
 
     let missing = CodexHarness::new().with_executable("/nonexistent/codex-nowhere");
     // models() requires a resolvable binary… but with_executable trusts the

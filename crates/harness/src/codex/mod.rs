@@ -89,7 +89,7 @@ use zeron_proto::{
 use crate::jsonrpc::{Incoming, RpcClient, transport_lost};
 use crate::process::{Child, Command, Stdio};
 use crate::{Harness, HarnessError, RunControls};
-use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
+use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, to_effort};
 use normalize::{
     ChildRoute, Phase, ReasoningStream, delta_text, item_id, item_type, notification_thread_id,
     route_child_notification, settle_turn_error, turn_error_message, turn_id, usage_event,
@@ -347,6 +347,11 @@ impl CodexHarness {
                 if legacy_model_page(&page) {
                     tracing::warn!(binary_path = %exe.display(), binary_version = ?crate::executable::binary_version(&exe), "Model discovery response lacks hidden flags; CLI may be outdated");
                 }
+                if page.get("data").and_then(Value::as_array).is_none() {
+                    return Err(HarnessError::Protocol(
+                        "Codex model/list response has no model catalog".into(),
+                    ));
+                }
                 let (page_models, next_cursor) = parse_model_list_page(&page);
                 for (model, is_default) in page_models {
                     if model_ids.insert(model.id.clone()) {
@@ -360,7 +365,9 @@ impl CodexHarness {
                     break;
                 };
                 if !seen_cursors.insert(next.clone()) {
-                    break;
+                    return Err(HarnessError::Protocol(
+                        "Codex model/list repeated a pagination cursor".into(),
+                    ));
                 }
                 cursor = Some(next);
             }
@@ -736,15 +743,12 @@ impl Harness for CodexHarness {
             && (service_tier(next).is_some() || service_tier(live).is_none())
     }
 
-    /// The signed-in account's visible `model/list` is authoritative. A
-    /// curated snapshot keeps the picker operational when the experimental
-    /// discovery call is unavailable and no last-good catalog exists. Explicit
-    /// picker refreshes bypass cooldowns while overlapping callers coalesce.
+    /// The signed-in account's visible `model/list` is authoritative.
+    /// Discovery failures stay explicit: there is no curated snapshot at
+    /// runtime. Explicit picker refreshes bypass cooldowns while overlapping
+    /// callers coalesce.
     fn model_context(&self) -> Result<Option<crate::ModelContext>, HarnessError> {
         crate::model_context::context(self.id(), &self.resolve_executable()?, &[]).map(Some)
-    }
-    fn fallback_models(&self) -> Vec<Model> {
-        static_models()
     }
     async fn model_catalog(&self, force: bool) -> Result<crate::ModelCatalog, HarnessError> {
         self.model_context()?.unwrap().log();
@@ -758,14 +762,7 @@ impl Harness for CodexHarness {
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
-        match self.model_catalog(false).await {
-            Ok(catalog) => Ok(catalog.models),
-            Err(error) if !crate::CatalogFailure::classify(&error).allows_stale() => Err(error),
-            Err(error) => {
-                tracing::warn!(%error, source = "static", "Model discovery failed");
-                Ok(self.fallback_models())
-            }
-        }
+        self.model_catalog(false).await.map(|catalog| catalog.models)
     }
 
     async fn skills(

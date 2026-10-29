@@ -3737,6 +3737,11 @@ impl Transcript {
         } else {
             ListAlignment::Bottom
         };
+        // Deliberately NOT `measure_all()`: the own-turn hold, runway and
+        // viewport-restore logic rely on off-screen rows staying lazily
+        // measured (two tests pin "tail must remain virtualized"). The
+        // overlay scrollbar sizes its thumb from measured rows plus hints and
+        // converges as rows are painted.
         let list = ListState::new(0, alignment, px(OVERDRAW_PX));
         let weak = cx.weak_entity();
         list.set_scroll_handler(move |event: &ListScrollEvent, _window, cx| {
@@ -4240,79 +4245,103 @@ impl Transcript {
         let this = cx.weak_entity();
         cx.defer(move |cx| {
             this.update(cx, |this: &mut Transcript, cx| {
-                this.discard_pending_viewport();
-                this.list_took_input = false;
-                let escaped = std::mem::take(&mut this.input_escaped);
-                // Input owns the viewport immediately, including wheel-down
-                // after background streaming. A held turn can be stale while
-                // frame callbacks are paused; reasserting its old prompt here
-                // made scrolling down impossible until an upward gesture.
-                if this.own_turn.is_some() {
-                    let distance = this.distance_from_bottom();
-                    let previous = this.last_scroll_distance;
-                    this.last_scroll_distance = distance;
-                    // Reaching the end preserves normal tail-follow intent
-                    // without reasserting a possibly stale prompt hold.
-                    this.pinned = !escaped
-                        && (distance <= AT_BOTTOM_PX || Self::should_restick(distance, previous));
-                    this.spring.reset();
-                    this.spring_last_tick = None;
-                    // Re-stick only when returning to a short turn's actual
-                    // hold. An off-screen prompt belongs to an overflowing
-                    // reply, even if reservation refinement hasn't run yet.
-                    let at_hold = this.own_turn_anchor_ix().is_some_and(|ix| {
-                        this.list.bounds_for_item(ix).is_some_and(|bounds| {
-                            f32::from(bounds.top() - this.list.viewport_bounds().top())
-                                >= Self::own_send_inset(ix) - OWN_SEND_SCROLL_SLACK_PX - 2.0
-                        })
-                    });
-                    if !released_own_turn
-                        && !escaped
-                        && at_hold
-                        && Self::should_restick(distance, previous)
-                    {
-                        if let Some(anchor) = this.own_turn.as_mut() {
-                            anchor.held = true;
-                            anchor.positioned = false;
-                        }
-                        this.pinned = false;
-                        this.own_turn_kick = true;
-                    }
-                    if this.pinned {
-                        this.wake_spring();
-                    }
-                    this.show_jump_button = jump_visibility(this.show_jump_button, distance)
-                        && !this.own_turn.as_ref().is_some_and(|a| a.held);
-                    cx.notify();
-                    return;
-                }
-                let distance = this.distance_from_bottom();
-                let previous = this.last_scroll_distance;
-                this.last_scroll_distance = distance;
-                if escaped || (distance > previous + 1.0 && distance > AT_BOTTOM_PX) {
-                    // User input moving away from the bottom breaks the pin.
-                    // Content growth never lands here — it doesn't fire the
-                    // scroll handler (mugen §1e: interrupt from input, not
-                    // scrollbar position).
-                    this.pinned = false;
-                    this.spring.reset();
-                    this.spring_last_tick = None;
-                } else if distance <= AT_BOTTOM_PX || Self::should_restick(distance, previous) {
-                    // Returning toward the bottom inside the 70px band (or
-                    // arriving at it) re-engages the pin with a glide.
-                    if !this.pinned {
-                        this.pinned = true;
-                        this.wake_spring();
-                    }
-                }
-                let show = jump_visibility(this.show_jump_button, distance) && !this.pinned;
-                if show != this.show_jump_button {
-                    this.show_jump_button = show;
-                }
-                cx.notify();
+                this.apply_user_scroll(released_own_turn, cx);
             })
             .ok();
         });
+    }
+
+    /// Scrollbar-drag counterpart of [`Self::handle_scroll`]: the list
+    /// handler is wheel/touch only, so a thumb scrub has to apply the same
+    /// pin / jump-button rules itself. The overlay drag is not inside the
+    /// list's RefCell borrow, so this runs immediately.
+    fn handle_scrollbar_scrub(&mut self, cx: &mut Context<Self>) {
+        self.user_collapse_scroll = None;
+        self.cancel_user_hold();
+        let released_own_turn = self.own_turn.as_ref().is_some_and(|anchor| anchor.held);
+        self.release_own_turn_hold();
+        if self.own_turn.is_some() {
+            self.pinned = false;
+            self.spring.reset();
+            self.spring_last_tick = None;
+        }
+        self.apply_user_scroll(released_own_turn, cx);
+    }
+
+    /// Pin / jump-button decision after wheel, touch or scrollbar input moved
+    /// the list. Must run outside the list's internal borrow.
+    fn apply_user_scroll(&mut self, released_own_turn: bool, cx: &mut Context<Self>) {
+        let this = self;
+        this.discard_pending_viewport();
+        this.list_took_input = false;
+        let escaped = std::mem::take(&mut this.input_escaped);
+        // Input owns the viewport immediately, including wheel-down
+        // after background streaming. A held turn can be stale while
+        // frame callbacks are paused; reasserting its old prompt here
+        // made scrolling down impossible until an upward gesture.
+        if this.own_turn.is_some() {
+            let distance = this.distance_from_bottom();
+            let previous = this.last_scroll_distance;
+            this.last_scroll_distance = distance;
+            // Reaching the end preserves normal tail-follow intent
+            // without reasserting a possibly stale prompt hold.
+            this.pinned = !escaped
+                && (distance <= AT_BOTTOM_PX || Self::should_restick(distance, previous));
+            this.spring.reset();
+            this.spring_last_tick = None;
+            // Re-stick only when returning to a short turn's actual
+            // hold. An off-screen prompt belongs to an overflowing
+            // reply, even if reservation refinement hasn't run yet.
+            let at_hold = this.own_turn_anchor_ix().is_some_and(|ix| {
+                this.list.bounds_for_item(ix).is_some_and(|bounds| {
+                    f32::from(bounds.top() - this.list.viewport_bounds().top())
+                        >= Self::own_send_inset(ix) - OWN_SEND_SCROLL_SLACK_PX - 2.0
+                })
+            });
+            if !released_own_turn
+                && !escaped
+                && at_hold
+                && Self::should_restick(distance, previous)
+            {
+                if let Some(anchor) = this.own_turn.as_mut() {
+                    anchor.held = true;
+                    anchor.positioned = false;
+                }
+                this.pinned = false;
+                this.own_turn_kick = true;
+            }
+            if this.pinned {
+                this.wake_spring();
+            }
+            this.show_jump_button = jump_visibility(this.show_jump_button, distance)
+                && !this.own_turn.as_ref().is_some_and(|a| a.held);
+            cx.notify();
+            return;
+        }
+        let distance = this.distance_from_bottom();
+        let previous = this.last_scroll_distance;
+        this.last_scroll_distance = distance;
+        if escaped || (distance > previous + 1.0 && distance > AT_BOTTOM_PX) {
+            // User input moving away from the bottom breaks the pin.
+            // Content growth never lands here — it doesn't fire the
+            // scroll handler (mugen §1e: interrupt from input, not
+            // scrollbar position).
+            this.pinned = false;
+            this.spring.reset();
+            this.spring_last_tick = None;
+        } else if distance <= AT_BOTTOM_PX || Self::should_restick(distance, previous) {
+            // Returning toward the bottom inside the 70px band (or
+            // arriving at it) re-engages the pin with a glide.
+            if !this.pinned {
+                this.pinned = true;
+                this.wake_spring();
+            }
+        }
+        let show = jump_visibility(this.show_jump_button, distance) && !this.pinned;
+        if show != this.show_jump_button {
+            this.show_jump_button = show;
+        }
+        cx.notify();
     }
 
     /// A wheel notch headed for the top breaks the pin as it arrives, however
@@ -11449,6 +11478,17 @@ impl Render for Transcript {
             });
         }
         let rail = self.render_rail(cx);
+        let scrub = cx.weak_entity();
+        let scrollbar = crate::scrollbar::overlay("transcript", &self.list)
+            .inset_top(Theme::TITLEBAR_HEIGHT)
+            .inset_bottom(self.bottom_clearance)
+            .on_scrub(move |_, cx| {
+                scrub
+                    .update(cx, |this: &mut Transcript, cx| {
+                        this.handle_scrollbar_scrub(cx);
+                    })
+                    .ok();
+            });
         // The scroll-to-bottom pill is rendered by the SHELL (conversation
         // region overlay): it must float just above the composer and paint
         // OVER the bottom fade gradient, which is a later sibling of this
@@ -11504,7 +11544,8 @@ impl Render for Transcript {
                 cx.entity_id().as_u64(),
             ))
             .child(content)
-            .child(rail);
+            .child(rail)
+            .child(scrollbar);
         let root = root.children(self.render_image_menu(cx));
         let loader = self
             .loader_shown

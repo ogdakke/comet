@@ -105,6 +105,76 @@ pub(crate) fn diff_line_height(theme: &Theme) -> f32 {
     diff_text_size(theme) * (DIFF_LINE_HEIGHT / DIFF_TEXT_SIZE)
 }
 
+const DIFF_OVERDRAW: f32 = 256.0;
+const DIFF_LINE_LAYOUT_CACHE_CAP: usize = 512;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DiffLineLayoutKey {
+    file: u32,
+    hunk: u32,
+    line: u32,
+}
+
+struct CachedDiffLineLayout {
+    line: gpui::ShapedLine,
+    last_used: u64,
+}
+
+/// Shaped line layouts survive normal gpui frame-cache turnover, but only
+/// for a bounded working set. This matters when a scrollbar drag revisits a
+/// region after more than one frame.
+#[derive(Default)]
+struct DiffLineLayoutCache {
+    entries: HashMap<DiffLineLayoutKey, CachedDiffLineLayout>,
+    clock: u64,
+    theme_generation: u32,
+}
+
+impl DiffLineLayoutCache {
+    fn get(&mut self, key: DiffLineLayoutKey) -> Option<gpui::ShapedLine> {
+        self.sync_theme();
+        self.clock = self.clock.wrapping_add(1);
+        let entry = self.entries.get_mut(&key)?;
+        entry.last_used = self.clock;
+        Some(entry.line.clone())
+    }
+
+    fn insert(&mut self, key: DiffLineLayoutKey, line: gpui::ShapedLine) -> gpui::ShapedLine {
+        self.sync_theme();
+        self.clock = self.clock.wrapping_add(1);
+        if self.entries.len() >= DIFF_LINE_LAYOUT_CACHE_CAP
+            && !self.entries.contains_key(&key)
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| *key)
+        {
+            self.entries.remove(&oldest);
+        }
+        self.entries.insert(
+            key,
+            CachedDiffLineLayout {
+                line: line.clone(),
+                last_used: self.clock,
+            },
+        );
+        line
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn sync_theme(&mut self) {
+        let generation = crate::theme::style_generation();
+        if generation != self.theme_generation {
+            self.clear();
+            self.theme_generation = generation;
+        }
+    }
+}
+
 pub(crate) const UNIFIED_CODE_PADDING_LEFT: f32 = 12.0;
 pub(crate) const SPLIT_CODE_PADDING_LEFT: f32 = 6.0;
 /// Breathing room after the widest source line when scrolled fully right.
@@ -1635,6 +1705,7 @@ struct CommentDraft {
 /// The Changes pane entity. Lazy: no RPC until [`Changes::ensure_watch`] runs
 /// (the shell calls it when the pane first opens).
 pub struct Changes {
+    line_layouts: DiffLineLayoutCache,
     state: Entity<AppState>,
     diffs: Vec<CheckoutDiff>,
     started: bool,
@@ -1745,6 +1816,7 @@ impl Changes {
         let settings = crate::settings::current(cx);
         let mode = DiffMode::from_split(settings.diff_split);
         Self {
+            line_layouts: Default::default(),
             state,
             mode,
             wrap_lines: settings.diff_wrap,
@@ -1762,7 +1834,7 @@ impl Changes {
             fold_settle: None,
             // Rows are single lines now — a deep overdraw is cheap and keeps
             // fast wheel flicks from outrunning measurement.
-            list: ListState::new(0, ListAlignment::Top, px(1024.0)),
+            list: ListState::new(0, ListAlignment::Top, px(DIFF_OVERDRAW)),
             scope: DiffScope::default(),
             base_ref: None,
             branches: Vec::new(),
@@ -2309,6 +2381,7 @@ impl Changes {
                 self.list.reset(0);
                 self.folds.clear();
                 self.highlights.clear();
+                self.line_layouts.clear();
                 cx.notify();
             }
             return;
@@ -2343,6 +2416,7 @@ impl Changes {
                 let horizontal = files.iter().map(FileHorizontalState::new).collect();
                 changes.folds.clear();
                 changes.highlights.clear();
+                changes.line_layouts.clear();
                 let staged = changes.staged_comments(cx);
                 let draft = changes.draft_anchor();
                 let (rows, ranges) = flatten_rows(
@@ -3112,6 +3186,7 @@ impl Changes {
                         Some(highlights) => DiffHighlightState::Excerpt(highlights),
                         None => DiffHighlightState::Plain,
                     };
+                    changes.line_layouts.clear();
                     cx.notify();
                 }
             })
@@ -3179,6 +3254,7 @@ impl Changes {
                         && let Some(highlights) = highlights
                     {
                         slot.state = DiffHighlightState::Ready(highlights);
+                        changes.line_layouts.clear();
                         cx.notify();
                     }
                 })
@@ -3256,7 +3332,7 @@ impl Changes {
             DiffRow::Line {
                 file,
                 hunk,
-                line,
+                line: line_ix,
                 flat: _,
             } => {
                 let Some(file_diff) = files.get(file as usize) else {
@@ -3265,7 +3341,7 @@ impl Changes {
                 let Some(line) = file_diff
                     .hunks
                     .get(hunk as usize)
-                    .and_then(|h| h.lines.get(line as usize))
+                    .and_then(|h| h.lines.get(line_ix as usize))
                 else {
                     return gpui::Empty.into_any_element();
                 };
@@ -3274,6 +3350,25 @@ impl Changes {
                     .map(|highlights| highlights.spans(line))
                     .unwrap_or(&[]);
                 let gutter_px = gutter_width(file_diff);
+                let layout_key = DiffLineLayoutKey {
+                    file,
+                    hunk,
+                    line: line_ix,
+                };
+                let shaped = (!matches!(code_width, DiffCodeWidth::Wrapped)
+                    && line.kind != LineKind::Meta)
+                    .then(|| {
+                        self.line_layouts.get(layout_key).unwrap_or_else(|| {
+                            let runs = line_runs(line, highlight.as_deref(), &theme);
+                            let shaped = window.text_system().shape_line(
+                                line.text.clone().into(),
+                                px(diff_text_size(&theme)),
+                                &runs,
+                                None,
+                            );
+                            self.line_layouts.insert(layout_key, shaped)
+                        })
+                    });
                 let row = diff_line_row(
                     line,
                     spans,
@@ -3281,6 +3376,7 @@ impl Changes {
                     gutter_px,
                     code_width,
                     Some(code_scroll.slot("unified")),
+                    shaped,
                 );
                 let Some((side, line_no)) = line_anchor(line) else {
                     return row;
@@ -4387,6 +4483,27 @@ pub(crate) fn hunk_header_row(header: &str, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
+fn shaped_diff_text(shaped: gpui::ShapedLine, line_height: f32) -> AnyElement {
+    gpui::canvas(
+        move |_, _, _| shaped.clone(),
+        move |bounds, shaped, window, cx| {
+            window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                let _ = shaped.paint(
+                    bounds.origin,
+                    px(line_height),
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+            });
+        },
+    )
+    .w_full()
+    .h(px(line_height))
+    .into_any_element()
+}
+
 /// The only part of a diff row allowed to exceed its viewport. The outer
 /// element keeps row chrome fixed; the inner element owns the intrinsic code
 /// width and is the only plane moved by the file's horizontal scroll handle.
@@ -4398,6 +4515,7 @@ fn code_text_viewport(
     content_width: Option<f32>,
     wrapped: bool,
     scroll: Option<DiffCodeScroll>,
+    shaped: Option<gpui::ShapedLine>,
 ) -> AnyElement {
     let content = div()
         .when(wrapped, |el| el.w_full().min_w_0())
@@ -4418,7 +4536,12 @@ fn code_text_viewport(
                 el.whitespace_nowrap()
             }
         })
-        .child(gpui::StyledText::new(text).with_runs(runs));
+        .child(match shaped {
+            Some(shaped) if !wrapped => shaped_diff_text(shaped, diff_line_height(theme)),
+            _ => gpui::StyledText::new(text)
+                .with_runs(runs)
+                .into_any_element(),
+        });
     let viewport = div()
         .flex_1()
         .min_w_0()
@@ -4452,7 +4575,7 @@ pub(crate) fn readonly_diff_line(
     theme: &Theme,
     gutter_px: f32,
 ) -> AnyElement {
-    diff_line_row(line, spans, theme, gutter_px, DiffCodeWidth::Clipped, None)
+    diff_line_row(line, spans, theme, gutter_px, DiffCodeWidth::Clipped, None, None)
 }
 
 /// Read-only unified row whose code plane scrolls with `scroll` while the
@@ -4480,6 +4603,7 @@ pub(crate) fn readonly_scrolled_diff_line(
             handle: scroll.clone(),
             id: format!("pr-code-{row}").into(),
         }),
+        None,
     )
 }
 
@@ -4538,6 +4662,7 @@ fn diff_line_row(
     gutter_px: f32,
     code_width: DiffCodeWidth,
     scroll: Option<DiffCodeScroll>,
+    shaped: Option<gpui::ShapedLine>,
 ) -> AnyElement {
     if line.kind == LineKind::Meta {
         return meta_line_row(
@@ -4664,6 +4789,7 @@ fn diff_line_row(
             content_width,
             wrapped,
             scroll,
+            shaped,
         ))
         .into_any_element()
 }
@@ -4803,6 +4929,7 @@ fn split_line_cell(
             content_width,
             wrapped,
             scroll,
+            None,
         ))
 }
 
@@ -4930,6 +5057,7 @@ pub(crate) fn render_file_body_with_syntax(
                 gutter_px,
                 DiffCodeWidth::Clipped,
                 None,
+                None,
             ));
         }
     }
@@ -4992,6 +5120,7 @@ fn render_file_body_upto(
                             scroll
                                 .as_ref()
                                 .map(|scroll| scroll.slot(format_args!("{hunk_ix}-{line_ix}"))),
+                            None,
                         ));
                         y += diff_line_height(theme);
                     }
@@ -5170,6 +5299,7 @@ impl Render for Changes {
                                             .size_full()
                                             .with_sizing_behavior(gpui::ListSizingBehavior::Auto),
                                     )
+                                    .child(crate::scrollbar::overlay("changes", &self.list))
                                     .when_some(sticky_header, |el, header| el.child(header)),
                             )
                             .into_any_element()
@@ -5326,6 +5456,27 @@ similarity index 90%
 rename from old_name.rs
 rename to new_name.rs
 ";
+
+    #[test]
+    fn shaped_diff_line_cache_has_a_hard_entry_cap() {
+        let key = |line| DiffLineLayoutKey {
+            file: 0,
+            hunk: 0,
+            line,
+        };
+        let mut cache = DiffLineLayoutCache::default();
+        for line in 0..DIFF_LINE_LAYOUT_CACHE_CAP as u32 + 32 {
+            cache.insert(key(line), gpui::ShapedLine::default());
+        }
+        assert_eq!(cache.entries.len(), DIFF_LINE_LAYOUT_CACHE_CAP);
+        assert!(cache.get(key(0)).is_none(), "the oldest line is evicted");
+        assert!(
+            cache
+                .get(key(DIFF_LINE_LAYOUT_CACHE_CAP as u32 + 31))
+                .is_some(),
+            "the newest line stays cached"
+        );
+    }
 
     #[test]
     fn parses_files_hunks_and_lines() {

@@ -2,10 +2,12 @@
 //! `packages/harness/src/codex.ts`.
 //!
 //! The live catalog comes from the app server's paginated `model/list`
-//! (experimentalApi). This snapshot is the failure/offline fallback, kept in
-//! newest-first order so a picker remains useful when discovery cannot run.
+//! (experimentalApi). The historical snapshot below is retained only for tests;
+//! runtime discovery failures remain explicit.
 
-use zeron_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel, SandboxLevel};
+#[cfg(test)]
+use zeron_proto::{Model, ModelOption, ModelOptionChoice};
+use zeron_proto::{ReasoningLevel, SandboxLevel};
 
 /// The unified reasoning ladder Codex accepts (`minimal` is offered but clamped
 /// on the wire — see [`to_effort`]).
@@ -65,6 +67,7 @@ pub(crate) fn sandbox_policy_value(sandbox: SandboxLevel) -> serde_json::Value {
     serde_json::Value::Object(policy)
 }
 
+#[cfg(test)]
 const ULTRA_LADDER: &[ReasoningLevel] = &[
     ReasoningLevel::Low,
     ReasoningLevel::Medium,
@@ -74,6 +77,7 @@ const ULTRA_LADDER: &[ReasoningLevel] = &[
     ReasoningLevel::Ultra,
 ];
 
+#[cfg(test)]
 const MAX_LADDER: &[ReasoningLevel] = &[
     ReasoningLevel::Low,
     ReasoningLevel::Medium,
@@ -82,6 +86,7 @@ const MAX_LADDER: &[ReasoningLevel] = &[
     ReasoningLevel::Max,
 ];
 
+#[cfg(test)]
 const XHIGH_LADDER: &[ReasoningLevel] = &[
     ReasoningLevel::Low,
     ReasoningLevel::Medium,
@@ -92,6 +97,7 @@ const XHIGH_LADDER: &[ReasoningLevel] = &[
 /// The service-tier select the app server reports per model (`serviceTiers` /
 /// `additionalSpeedTiers` in `model/list`); "default" means Standard and is
 /// omitted from the wire params entirely.
+#[cfg(test)]
 fn service_tier() -> ModelOption {
     ModelOption {
         id: "serviceTier".into(),
@@ -110,6 +116,7 @@ fn service_tier() -> ModelOption {
     }
 }
 
+#[cfg(test)]
 fn model(
     id: &str,
     label: &str,
@@ -130,6 +137,7 @@ fn model(
 /// app server reports them. Daybreak Blue reports NO service tiers, so it
 /// carries no trait — sending `serviceTier: priority` for it would be
 /// rejected. The live `model/list` remains authoritative whenever available.
+#[cfg(test)]
 pub(crate) fn static_models() -> Vec<Model> {
     vec![
         model(

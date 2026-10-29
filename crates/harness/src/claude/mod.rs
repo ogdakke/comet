@@ -554,6 +554,16 @@ impl ClaudeHarness {
             Some(cwd) => self.probe_initialize(Some(cwd)).await?,
             None => self.initialize().await?,
         };
+        if response
+            .get("response")
+            .and_then(|payload| payload.get("commands"))
+            .and_then(Value::as_array)
+            .is_none()
+        {
+            return Err(HarnessError::Unsupported(
+                "Claude stream-json initialize response does not expose commands".into(),
+            ));
+        }
         Ok(parse_initialize_commands(&response))
     }
 

@@ -38,6 +38,25 @@ use super::artifact::{
 use super::page::StudioPage;
 use super::rail as tick_rail;
 
+/// Selection key prefix of a feed prompt (`studio-prompt-{turn id}`).
+const FEED_PROMPT_SELECTION_PREFIX: &str = "studio-prompt-";
+
+/// Pointer and edge-scroll timer of an in-flight prompt selection drag.
+#[derive(Default)]
+struct FeedSelectionDrag {
+    pointer: Option<Point<Pixels>>,
+    task: Option<gpui::Task<()>>,
+}
+
+thread_local! {
+    static FEED_SELECTION_DRAG: std::cell::RefCell<FeedSelectionDrag> =
+        std::cell::RefCell::new(FeedSelectionDrag::default());
+}
+
+fn stop_feed_selection_scroll() {
+    FEED_SELECTION_DRAG.with(|drag| *drag.borrow_mut() = FeedSelectionDrag::default());
+}
+
 /// Scroll runway below the final Studio turn. The composer floats 18px above
 /// the viewport and is 191px tall at its largest first-release configuration;
 /// a 30px generate-more pill sits 10px above that. The remaining space keeps
@@ -1270,6 +1289,88 @@ impl StudioPage {
         cx.notify();
     }
 
+    /// Whether the live markdown selection drag was anchored in a feed prompt.
+    fn feed_owns_selection() -> bool {
+        crate::markdown::selection::anchor_key()
+            .is_some_and(|key| key.starts_with(FEED_PROMPT_SELECTION_PREFIX))
+    }
+
+    fn on_feed_selection_move(
+        &mut self,
+        event: &gpui::MouseMoveEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.dragging()
+            || !Self::feed_owns_selection()
+            || !crate::markdown::selection::is_dragging()
+        {
+            stop_feed_selection_scroll();
+            return;
+        }
+        FEED_SELECTION_DRAG.with(|drag| drag.borrow_mut().pointer = Some(event.position));
+        if render::update_drag_at(event.position) {
+            cx.notify();
+        }
+        self.schedule_feed_selection_scroll(cx);
+    }
+
+    fn on_feed_selection_up(&mut self, cx: &mut Context<Self>) {
+        let had_pointer = FEED_SELECTION_DRAG.with(|drag| drag.borrow().pointer.is_some());
+        stop_feed_selection_scroll();
+        if had_pointer && Self::feed_owns_selection() {
+            if let Some(_text) = crate::markdown::selection::end_active_drag() {
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                cx.write_to_primary(ClipboardItem::new_string(_text));
+            }
+            cx.notify();
+        }
+    }
+
+    /// Edge autoscroll while a prompt selection drag sits near the viewport
+    /// edge: the same driver the transcript and Markdown preview use. The
+    /// pointer/task live in a thread-local because the page struct is
+    /// owned elsewhere.
+    fn schedule_feed_selection_scroll(&mut self, cx: &mut Context<Self>) {
+        if FEED_SELECTION_DRAG.with(|drag| drag.borrow().task.is_some()) {
+            return;
+        }
+        let Some(position) = FEED_SELECTION_DRAG.with(|drag| drag.borrow().pointer) else {
+            return;
+        };
+        if transcript::selection_scroll_step(self.feed_list.viewport_bounds(), position) == 0.0 {
+            return;
+        }
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(16))
+                .await;
+            let _ = this.update(cx, |page: &mut StudioPage, cx| {
+                FEED_SELECTION_DRAG.with(|drag| drag.borrow_mut().task = None);
+                if !Self::feed_owns_selection() || !crate::markdown::selection::is_dragging() {
+                    return;
+                }
+                let Some(position) = FEED_SELECTION_DRAG.with(|drag| drag.borrow().pointer) else {
+                    return;
+                };
+                // Resolve against the rows painted after the previous step
+                // before moving again, so a stationary pointer keeps
+                // consuming newly painted turns.
+                render::update_drag_at(position);
+                let step = transcript::selection_scroll_step(page.feed_list.viewport_bounds(), position);
+                if step == 0.0 {
+                    return;
+                }
+                page.feed_list.scroll_by(px(step));
+                page.sync_feed_visible_rows();
+                page.sync_feed_viewport_fulls();
+                page.request_visible_feed_images(cx);
+                cx.notify();
+                page.schedule_feed_selection_scroll(cx);
+            });
+        });
+        FEED_SELECTION_DRAG.with(|drag| drag.borrow_mut().task = Some(task));
+    }
 
     fn feed_content_width(&self, window: &Window) -> f32 {
         let rail_gutter = if self.rail_should_show(self.feed_container_width(window)) {
@@ -1820,6 +1921,11 @@ impl StudioPage {
             .min_w_0()
             .h_full()
             .overflow_hidden()
+            .on_mouse_move(cx.listener(Self::on_feed_selection_move))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|page, _, _, cx| page.on_feed_selection_up(cx)),
+            )
             .child(render::selection_frame_reset())
             .child(
                 canvas(

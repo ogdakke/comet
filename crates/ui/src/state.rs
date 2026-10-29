@@ -1805,9 +1805,6 @@ impl AppState {
         {
             device.name = "Local".to_string();
         }
-        if self.devices == devices {
-            return false;
-        }
         for device in &devices {
             self.change_requests
                 .clear_unsupported_on_version_change(&device.id, device.version.as_deref());
