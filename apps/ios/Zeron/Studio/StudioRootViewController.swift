@@ -284,7 +284,6 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
             }
         )
         StudioViewerNativeTransition.configure(controller, session: session, source: transitionSource)
-        controller.modalPresentationStyle = .fullScreen
         viewer = controller
         presenter.present(controller, animated: true) { [weak self, weak controller] in
             controller?.presentationController?.delegate = self

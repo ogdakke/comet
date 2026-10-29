@@ -68,7 +68,7 @@ private final class StudioThreadStore {
 ///
 /// The stores are @Observable; `updateProperties()` reads them, so UIKit
 /// re-runs it whenever what it read changes.
-final class StudioThreadViewController: UIViewController, UICollectionViewDelegate {
+final class StudioThreadViewController: UIViewController, UICollectionViewDelegate, StudioGalleryTransitionSourceProvider {
     private enum Section: Hashable {
         case prompt(String)
         case run(String)
@@ -212,6 +212,24 @@ final class StudioThreadViewController: UIViewController, UICollectionViewDelega
             bottom.bottomAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -8),
             down,
         ])
+    }
+
+    /// The viewer closes back into this thread's tiles while it's on top.
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        transitionSource.provider = self
+    }
+
+    func transitionImageView(for artifactId: String) -> UIView? {
+        guard let indexPath = dataSource.indexPath(for: .artifact(artifactId)) else { return nil }
+        return (collectionView.cellForItem(at: indexPath) as? StudioArtifactCell)?.transitionView
+    }
+
+    func prepareTransitionImageView(for artifactId: String) {
+        guard let indexPath = dataSource.indexPath(for: .artifact(artifactId)),
+              collectionView.cellForItem(at: indexPath) == nil else { return }
+        collectionView.scrollToItem(at: indexPath, at: .centeredVertically, animated: false)
+        collectionView.layoutIfNeeded()
     }
 
     override func viewDidDisappear(_ animated: Bool) {
@@ -836,6 +854,7 @@ private final class StudioRunCell: UICollectionViewCell {
 /// One square thumbnail; videos carry a play glyph.
 private final class StudioArtifactCell: UICollectionViewCell {
     private var preview: StudioMediaPreviewView?
+    var transitionView: UIView? { preview?.transitionView }
     private let play = UIImageView(image: UIImage(systemName: "play.fill", withConfiguration: UIImage.SymbolConfiguration(pointSize: 11, weight: .semibold)))
 
     override init(frame: CGRect) {

@@ -150,6 +150,9 @@ final class StudioMediaPreviewView: UIView {
         requestedId = nil
     }
 
+    /// The view a viewer transition zooms from and back to.
+    var transitionView: UIView { imageView }
+
     private func show(_ image: UIImage?) {
         imageView.image = image
         placeholder.isHidden = image != nil

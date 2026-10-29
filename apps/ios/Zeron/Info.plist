@@ -56,6 +56,8 @@
 			</array>
 		</dict>
 	</dict>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Save Studio images and videos to your library.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Attach photos to messages.</string>
 	<key>NSMicrophoneUsageDescription</key>

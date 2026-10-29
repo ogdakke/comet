@@ -117,7 +117,6 @@ final class StudioViewerFixtureHostController: UIViewController, StudioGalleryTr
             requestThread: { _ in }
         )
         StudioViewerNativeTransition.configure(viewer, session: session, source: transitionSource)
-        viewer.modalPresentationStyle = .fullScreen
         present(viewer, animated: true) {
             guard ProcessInfo.processInfo.arguments.contains("-studio-viewer-autoplay") else { return }
             Task {

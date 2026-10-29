@@ -97,6 +97,12 @@ final class StudioGalleryViewController: UIViewController,
         transitionSource.provider = self
     }
 
+    /// Back from a thread: the viewer closes into the grid again.
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        transitionSource.provider = self
+    }
+
     /// Tracks the store: reads here re-run this when they change.
     override func updateProperties() {
         super.updateProperties()
@@ -296,7 +302,7 @@ final class StudioGalleryViewController: UIViewController,
         guard let item = item(at: indexPath) else { return nil }
         return UIContextMenuConfiguration(identifier: item.id as NSString, previewProvider: nil) { [weak self] _ in
             UIMenu(children: [
-                UIAction(title: "Download", image: UIImage(systemName: "square.and.arrow.down")) { _ in
+                UIAction(title: "Save to Photos", image: UIImage(systemName: "square.and.arrow.down")) { _ in
                     self?.download(StudioArtifactDetail(item: item))
                 },
                 UIAction(title: "Show in Thread", image: UIImage(systemName: "rectangle.stack")) { _ in
