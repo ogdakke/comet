@@ -191,9 +191,15 @@ struct StudioComposerModel: Codable, Hashable, Identifiable {
 }
 
 struct StudioProviderConnection: Codable, Hashable, Identifiable {
+    enum ValidationState: String, Codable, Hashable {
+        case notValidated, valid, invalid, unavailable
+    }
+
     var providerId: String
     var displayLabel: String
     var configured: Bool
+    var validationState: ValidationState?
+    var validationMessage: String?
 
     var id: String { providerId }
 }

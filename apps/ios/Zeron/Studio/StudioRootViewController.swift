@@ -14,6 +14,8 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
     private var mode = Mode.gallery
     private var appToken: AnyObject?
     private var hostIds: [String]?
+    /// Whether each desktop has a Studio provider key (absent: not asked yet).
+    private var providerHosts: [String: Bool] = [:]
     private var watchKey: String?
     private var watches: [Task<Void, Never>] = []
     private weak var viewer: StudioGalleryViewerController?
@@ -88,6 +90,28 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
         guard force || ids != hostIds else { return }
         hostIds = ids
         browser.resolveDevice(from: service.hosts, online: service.isOnline)
+        refreshProviderHosts()
+    }
+
+    /// Ask each online desktop whether it has a provider key.
+    private func refreshProviderHosts() {
+        guard !app.isDemo else { return }
+        for host in service.hosts where service.isOnline(host.id) {
+            Task { [weak self, service] in
+                guard let providers = try? await service.listStudioProviders(deviceId: host.id), let self else { return }
+                self.providerHosts[host.id] = providers.contains(where: \.configured)
+                self.preferProviderHost()
+            }
+        }
+    }
+
+    /// Until a desktop is picked by hand, open on one that can create.
+    private func preferProviderHost() {
+        guard UserDefaults.standard.string(forKey: "studioDeviceId") == nil,
+              let current = browser.selectedDeviceId, providerHosts[current] == false,
+              let other = service.hosts.first(where: { providerHosts[$0.id] == true && service.isOnline($0.id) })
+        else { return }
+        browser.selectDevice(other.id)
     }
 
     /// Tracks the store: reads here re-run this when they change. Restarts
@@ -163,14 +187,25 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
     }
 
     private func machineActions() -> [UIMenuElement] {
-        service.hosts.map { device in
+        let hosts: [UIMenuElement] = service.hosts.map { device in
             let selected = browser.selectedDeviceId == device.id
             let symbol = selected ? "checkmark"
                 : service.isOnline(device.id) ? "desktopcomputer" : "desktopcomputer.trianglebadge.exclamationmark"
-            return UIAction(title: device.name, image: UIImage(systemName: symbol)) { [weak self] _ in
+            let action = UIAction(title: device.name, image: UIImage(systemName: symbol)) { [weak self] _ in
                 self?.browser.selectDevice(device.id)
             }
+            if providerHosts[device.id] == false { action.subtitle = "No provider key" }
+            return action
         }
+        guard let deviceId = browser.selectedDeviceId, service.isOnline(deviceId) else { return hosts }
+        let providers = UIAction(title: "Providers…", image: UIImage(systemName: "key")) { [weak self] _ in
+            guard let self else { return }
+            self.presentStudioProviders(service: self.service, deviceId: deviceId) { [weak self] in
+                self?.refreshProviderHosts()
+            }
+        }
+        providers.accessibilityIdentifier = "studio-providers-open"
+        return [UIMenu(options: .displayInline, children: hosts), providers]
     }
 
     // MARK: Threads

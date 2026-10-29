@@ -1,7 +1,11 @@
 //! Device-scoped Studio provider credentials.
 //!
-//! Only connection metadata is written below the device root. Secret values are delegated to the
-//! platform credential store and never serialized into a profile or an RPC response.
+//! Only connection metadata is written below the device root. Secret values go to the platform
+//! credential store (Keychain via `security`, Secret Service via `secret-tool`) and are never
+//! serialized into a profile or an RPC response. A headless machine often has neither: no
+//! unlocked login keychain without a GUI session, no Secret Service daemon on a server. There
+//! the secret falls back to an owner-only file below the device root. `ZERON_STUDIO_<PROVIDER>_KEY`
+//! in the engine's environment supplies (and overrides) a provider's secret on any machine.
 
 use std::{
     collections::BTreeMap,
@@ -174,6 +178,120 @@ impl StudioSecretBackend for SystemStudioSecretBackend {
     }
 }
 
+/// The platform store when it works, else an owner-only file per provider in `dir`. A secret
+/// lives in one place: saving to the platform store drops any file copy.
+pub struct FallbackStudioSecretBackend {
+    platform: Arc<dyn StudioSecretBackend>,
+    dir: PathBuf,
+}
+
+impl FallbackStudioSecretBackend {
+    pub fn new(platform: Arc<dyn StudioSecretBackend>, dir: PathBuf) -> Self {
+        Self { platform, dir }
+    }
+
+    fn path(&self, provider_id: &ProviderId) -> PathBuf {
+        self.dir
+            .join(format!("{}.key", safe_name(provider_id.as_str())))
+    }
+
+    fn write_file(&self, provider_id: &ProviderId, secret: &Secret) -> std::io::Result<()> {
+        let mut dir = std::fs::DirBuilder::new();
+        dir.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
+        dir.create(&self.dir)?;
+        let path = self.path(provider_id);
+        let temporary = self.dir.join(format!(
+            ".key.tmp-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&temporary)?;
+        file.write_all(secret.expose().as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)
+    }
+}
+
+#[async_trait]
+impl StudioSecretBackend for FallbackStudioSecretBackend {
+    async fn set(
+        &self,
+        provider_id: &ProviderId,
+        secret: &Secret,
+    ) -> Result<(), StudioCredentialError> {
+        match self.platform.set(provider_id, secret).await {
+            Ok(()) => match std::fs::remove_file(self.path(provider_id)) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+                _ => Ok(()),
+            },
+            Err(platform) => {
+                tracing::info!(
+                    provider = provider_id.as_str(),
+                    "platform secret store unavailable ({platform}); saving the Studio credential to an owner-only file"
+                );
+                self.write_file(provider_id, secret).map_err(Into::into)
+            }
+        }
+    }
+
+    async fn get(&self, provider_id: &ProviderId) -> Result<Secret, StudioCredentialError> {
+        match std::fs::read_to_string(self.path(provider_id)) {
+            Ok(value) if !value.is_empty() => Ok(Secret::new(value)),
+            Ok(_) => Err(StudioCredentialError::NotConfigured),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.platform.get(provider_id).await
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn remove(&self, provider_id: &ProviderId) -> Result<(), StudioCredentialError> {
+        // Clear both: which one holds it can change between saves.
+        let platform = self.platform.remove(provider_id).await;
+        match std::fs::remove_file(self.path(provider_id)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => platform,
+        }
+    }
+}
+
+/// `ZERON_STUDIO_<PROVIDER>_KEY`, the provider id upper-cased with anything else as `_`.
+pub fn environment_variable(provider_id: &ProviderId) -> String {
+    let name: String = provider_id
+        .as_str()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("ZERON_STUDIO_{name}_KEY")
+}
+
+fn safe_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+type Environment = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ConnectionMetadata {
@@ -189,11 +307,19 @@ pub struct StudioCredentials {
     metadata_path: PathBuf,
     connections: Mutex<BTreeMap<ProviderId, ConnectionMetadata>>,
     backend: Arc<dyn StudioSecretBackend>,
+    environment: Environment,
 }
 
 impl StudioCredentials {
     pub fn open(device_root: &Path) -> Result<Self, StudioCredentialError> {
-        Self::with_backend(device_root, Arc::new(SystemStudioSecretBackend))
+        let files = device_root.join("provider-accounts").join("secrets");
+        Self::with_backend(
+            device_root,
+            Arc::new(FallbackStudioSecretBackend::new(
+                Arc::new(SystemStudioSecretBackend),
+                files,
+            )),
+        )
     }
 
     pub fn with_backend(
@@ -212,6 +338,41 @@ impl StudioCredentials {
             metadata_path,
             connections: Mutex::new(connections),
             backend,
+            environment: Arc::new(|name| std::env::var(name).ok()),
+        })
+    }
+
+    /// Read `ZERON_STUDIO_<PROVIDER>_KEY` from `environment` instead of the process's.
+    pub fn with_environment(
+        mut self,
+        environment: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.environment = Arc::new(environment);
+        self
+    }
+
+    fn environment_secret(&self, provider_id: &ProviderId) -> Option<Secret> {
+        (self.environment)(&environment_variable(provider_id))
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .map(Secret::new)
+    }
+
+    /// The stored metadata, or a fresh entry when the environment supplies the secret.
+    fn metadata(
+        &self,
+        connections: &BTreeMap<ProviderId, ConnectionMetadata>,
+        provider_id: &ProviderId,
+    ) -> Option<ConnectionMetadata> {
+        connections.get(provider_id).cloned().or_else(|| {
+            self.environment_secret(provider_id)
+                .map(|_| ConnectionMetadata {
+                    display_label: provider_id.as_str().to_owned(),
+                    validation_state: ProviderValidationState::NotValidated,
+                    validated_at: None,
+                    validation_message: None,
+                    safe_mode: false,
+                })
         })
     }
 
@@ -219,12 +380,13 @@ impl StudioCredentials {
         &self,
         provider_id: &ProviderId,
     ) -> Result<Option<StudioProviderConnection>, StudioCredentialError> {
-        Ok(self
+        let connections = self
             .connections
             .lock()
-            .map_err(|_| StudioCredentialError::LockPoisoned)?
-            .get(provider_id)
-            .map(|metadata| as_connection(provider_id.clone(), metadata)))
+            .map_err(|_| StudioCredentialError::LockPoisoned)?;
+        Ok(self
+            .metadata(&connections, provider_id)
+            .map(|metadata| as_connection(provider_id.clone(), &metadata)))
     }
 
     pub fn list(&self) -> Result<Vec<StudioProviderConnection>, StudioCredentialError> {
@@ -269,9 +431,10 @@ impl StudioCredentials {
             .connections
             .lock()
             .map_err(|_| StudioCredentialError::LockPoisoned)?;
-        let metadata = connections
-            .get_mut(&provider_id)
+        let metadata = self
+            .metadata(&connections, &provider_id)
             .ok_or(StudioCredentialError::NotConfigured)?;
+        let metadata = connections.entry(provider_id.clone()).or_insert(metadata);
         metadata.safe_mode = safe_mode;
         let result = as_connection(provider_id, metadata);
         persist(&self.metadata_path, &connections)?;
@@ -279,6 +442,9 @@ impl StudioCredentials {
     }
 
     pub async fn secret(&self, provider_id: &ProviderId) -> Result<Secret, StudioCredentialError> {
+        if let Some(secret) = self.environment_secret(provider_id) {
+            return Ok(secret);
+        }
         if self.connection(provider_id)?.is_none() {
             return Err(StudioCredentialError::NotConfigured);
         }
@@ -295,9 +461,10 @@ impl StudioCredentials {
             .connections
             .lock()
             .map_err(|_| StudioCredentialError::LockPoisoned)?;
-        let metadata = connections
-            .get_mut(&provider_id)
+        let metadata = self
+            .metadata(&connections, &provider_id)
             .ok_or(StudioCredentialError::NotConfigured)?;
+        let metadata = connections.entry(provider_id.clone()).or_insert(metadata);
         metadata.validation_state = state;
         metadata.validated_at = Some(Utc::now());
         metadata.validation_message = message;

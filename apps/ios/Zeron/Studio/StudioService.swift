@@ -29,6 +29,24 @@ final class StudioService {
         return response.providers
     }
 
+    /// Store `secret` for `providerId` on the desktop (its credential store,
+    /// never this phone's), then check it against the provider.
+    func setStudioProviderCredential(
+        deviceId: String,
+        providerId: String,
+        displayLabel: String,
+        secret: String
+    ) async throws -> StudioProviderConnection {
+        let _: StudioProviderConnection = try await call(deviceId, "SetStudioProviderCredential", [
+            "providerId": providerId, "displayLabel": displayLabel, "secret": secret,
+        ])
+        return try await call(deviceId, "ValidateStudioProvider", ["providerId": providerId])
+    }
+
+    func removeStudioProviderCredential(deviceId: String, providerId: String) async throws {
+        let _: JSONValue = try await call(deviceId, "RemoveStudioProviderCredential", ["providerId": providerId])
+    }
+
     func listStudioModels(
         deviceId: String,
         providerId: String,

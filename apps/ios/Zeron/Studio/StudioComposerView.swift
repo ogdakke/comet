@@ -255,6 +255,11 @@ final class StudioComposerView: UIView, UITextViewDelegate, UIGestureRecognizerD
             errorLabel.text = error
             errorLabel.isHidden = false
             conflictButton.isHidden = true
+        } else if store.missingProvider {
+            errorLabel.isHidden = true
+            let name = deviceId.flatMap { id in service.hosts.first { $0.id == id }?.name } ?? "this desktop"
+            conflictButton.configuration?.title = "No provider key on \(name). Add one"
+            conflictButton.isHidden = false
         } else if let conflict = evaluation?.conflicts.first {
             errorLabel.isHidden = true
             conflictButton.configuration?.title = conflict.title
@@ -549,6 +554,15 @@ final class StudioComposerView: UIView, UITextViewDelegate, UIGestureRecognizerD
     }
 
     private func showConflict() {
+        if store.missingProvider {
+            guard let deviceId, var host = findViewController() else { return }
+            while let presented = host.presentedViewController { host = presented }
+            host.presentStudioProviders(service: service, deviceId: deviceId) { [weak self] in
+                guard let self else { return }
+                Task { await self.store.load(workspace: self.service, deviceId: deviceId) }
+            }
+            return
+        }
         guard let conflict = store.evaluation?.conflicts.first else { return }
         let controller = StudioConflictController(conflict: conflict) { [weak self] action in
             guard let self, let deviceId = self.deviceId else { return }

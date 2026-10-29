@@ -91,7 +91,8 @@ pub use studio::{
     StudioProviderRegistry, StudioRegistryError, StudioStore, StudioStoreError,
 };
 pub use studio_credentials::{
-    StudioCredentialError, StudioCredentials, StudioSecretBackend, SystemStudioSecretBackend,
+    FallbackStudioSecretBackend, StudioCredentialError, StudioCredentials, StudioSecretBackend,
+    SystemStudioSecretBackend, environment_variable as studio_environment_variable,
 };
 pub use studio_sync::{StudioSync, StudioSyncError, StudioSyncOutcome};
 pub use terminals::Terminals;
@@ -865,8 +866,12 @@ pub(crate) async fn refresh_configured_studio_catalogs(
     providers: &studio::StudioProviderRegistry,
     credentials: &StudioCredentials,
 ) {
-    let connections = match credentials.list() {
-        Ok(connections) => connections,
+    // Every registered provider with a connection, the environment's included.
+    let connections = match providers.list() {
+        Ok(descriptors) => descriptors
+            .into_iter()
+            .filter_map(|provider| credentials.connection(&provider.id).ok().flatten())
+            .collect::<Vec<_>>(),
         Err(error) => {
             tracing::warn!(error = %error, "studio catalog boot refresh skipped");
             return;

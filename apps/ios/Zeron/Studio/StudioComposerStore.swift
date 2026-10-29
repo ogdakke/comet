@@ -13,6 +13,8 @@ final class StudioComposerStore {
     var loading = false
     var sending = false
     var error: String?
+    /// The desktop has no Studio provider key: the composer offers to add one.
+    var missingProvider = false
     var modelPickerRequested = false
 
     @ObservationIgnored private var evaluationTask: Task<Void, Never>?
@@ -48,11 +50,13 @@ final class StudioComposerStore {
         guard !loading, provider == nil else { return }
         loading = true
         error = nil
+        missingProvider = false
         defer { loading = false }
         do {
             let providers = try await workspace.listStudioProviders(deviceId: deviceId)
             guard let provider = providers.first(where: \.configured) else {
-                throw StudioComposerError.noConfiguredProvider
+                missingProvider = true
+                return
             }
             self.provider = provider
             let response = try await workspace.listStudioModels(
