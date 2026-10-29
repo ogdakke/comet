@@ -34,6 +34,13 @@ reqwest.workspace = true
 sha2.workspace = true
 base64 = "0.22"
 async-trait.workspace = true
+# Demo Studio: the real composer evaluator and Venice catalog normalizer, and
+# gallery previews encoded like the engine's (JPEG + thumbhash). zeron-studio
+# and image already reach the mobile core through zeron-proto; thumbhash is
+# the engine's own (dependency-free) encoder.
+zeron-studio.workspace = true
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+thumbhash = "0.1"
 
 [dev-dependencies]
 tempfile.workspace = true

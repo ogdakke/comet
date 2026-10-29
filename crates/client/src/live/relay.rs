@@ -42,7 +42,7 @@ pub(crate) fn deadline(method: &str) -> Duration {
     }
 }
 
-fn map_rpc(device_id: &str, method: &str, err: RpcError) -> ClientError {
+pub(crate) fn map_rpc(device_id: &str, method: &str, err: RpcError) -> ClientError {
     match err {
         RpcError::UnknownMethod(m) => ClientError::Unsupported(format!("{m} on {device_id}")),
         RpcError::BadParams(m)

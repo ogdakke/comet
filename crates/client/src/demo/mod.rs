@@ -11,6 +11,7 @@
 
 mod fixtures;
 mod png;
+mod studio;
 mod terminal;
 mod transcripts;
 mod visuals;
@@ -84,6 +85,9 @@ pub(crate) struct DemoHost {
     terminals: terminal::DemoTerminals,
     /// Forked side chats → the chat they copy.
     forks: Mutex<HashMap<String, String>>,
+    /// The Mac's Studio, built on first use (painting its gallery's
+    /// thumbhashes isn't free).
+    studio: std::sync::OnceLock<Arc<studio::DemoStudio>>,
 }
 
 fn doc_err(err: zeron_doc::DocError) -> ClientError {
@@ -106,7 +110,20 @@ impl DemoHost {
             cancel: Mutex::new(None),
             terminals: terminal::DemoTerminals::default(),
             forks: Mutex::new(HashMap::new()),
+            studio: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Studio lives on the Mac; other hosts answer like an engine without it.
+    fn studio(&self, device_id: &str, method: &str) -> Result<Arc<studio::DemoStudio>> {
+        if device_id != fixtures::MAC {
+            return Err(ClientError::Unsupported(format!("{method} on {device_id}")));
+        }
+        let fast = self.options.stream_speed == StreamSpeed::Fast;
+        Ok(self
+            .studio
+            .get_or_init(|| studio::DemoStudio::new(self.cancel_token(), fast))
+            .clone())
     }
 
     fn client(&self) -> Result<Arc<ClientInner>> {
@@ -791,6 +808,15 @@ impl DemoHost {
         if !client.network_online() || !self.host_online(&client, device_id) {
             return Err(ClientError::HostUnavailable(device_id.to_owned()));
         }
+        if studio::is_studio(method) {
+            // Studio paces its own replies (media reads are quick, provider
+            // round trips slow).
+            return self
+                .studio(device_id, method)?
+                .rpc(method, params)
+                .await
+                .map_err(|err| crate::live::relay::map_rpc(device_id, method, err));
+        }
         tokio::time::sleep(Duration::from_millis(80)).await;
         if let Some(reply) = self.companion_rpc(&client, method, &params)? {
             return Ok(reply);
@@ -998,8 +1024,8 @@ impl DemoHost {
         }))
     }
 
-    /// Host streams: terminal output, and a subagent's transcript (a
-    /// running one grows a part every couple of seconds).
+    /// Host streams: terminal output, a subagent's transcript (a running
+    /// one grows a part every couple of seconds), and Studio's watches.
     pub(crate) async fn host_subscribe(
         self: &Arc<Self>,
         device_id: &str,
@@ -1012,6 +1038,13 @@ impl DemoHost {
             return Err(ClientError::HostUnavailable(device_id.to_owned()));
         }
         tokio::time::sleep(Duration::from_millis(60)).await;
+        if studio::is_studio(method) {
+            return self
+                .studio(device_id, method)?
+                .subscribe(method, params)
+                .map(crate::host_stream::HostStream::Local)
+                .map_err(|err| crate::live::relay::map_rpc(device_id, method, err));
+        }
         match method {
             m::SUBSCRIBE_TERMINAL => {
                 let id = params["terminalId"].as_str().unwrap_or_default();
