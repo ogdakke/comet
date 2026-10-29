@@ -105,10 +105,12 @@ final class StudioService {
         throw StudioError.message("Studio did not commit the attachment")
     }
 
+    /// Starts the turn's runs; the host answers with the whole thread as it
+    /// stands (`conversation_view`), the new turn's runs still pending.
     func createStudioTurn(
         deviceId: String,
         snapshot: StudioComposerSnapshot
-    ) async throws -> StudioTurn {
+    ) async throws -> StudioThread {
         let request = StudioCreateTurnRequest(
             conversationId: snapshot.conversationId ?? "",
             prompt: snapshot.prompt,

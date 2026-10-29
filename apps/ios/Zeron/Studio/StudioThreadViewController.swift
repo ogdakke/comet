@@ -114,6 +114,9 @@ final class StudioThreadViewController: UIViewController, UICollectionViewDelega
         collectionView.backgroundColor = .clear
         collectionView.alwaysBounceVertical = true
         collectionView.keyboardDismissMode = .interactive
+        // A run's error row appearing (a constraint change, not a content
+        // size one) must grow its cell, not draw over the header.
+        collectionView.selfSizingInvalidation = .enabledIncludingConstraints
         collectionView.delegate = self
         collectionView.accessibilityIdentifier = "studio-thread"
         view.addSubview(collectionView)

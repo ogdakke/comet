@@ -164,7 +164,6 @@ final class StudioComposerView: UIView, UITextViewDelegate, UIGestureRecognizerD
         durationChip.accessibilityLabel = "Duration"
         modelsChip.addAction(UIAction { [weak self] _ in self?.showModelPicker() }, for: .touchUpInside)
         chipStrip.addArrangedSubview(modeSegment)
-        chipStrip.addArrangedSubview(durationChip)
         chipStrip.addArrangedSubview(modelsChip)
 
         actionButton.translatesAutoresizingMaskIntoConstraints = false
@@ -272,6 +271,7 @@ final class StudioComposerView: UIView, UITextViewDelegate, UIGestureRecognizerD
         errorLabel.superview?.isHidden = errorLabel.isHidden && conflictButton.isHidden
 
         modeSegment.mode = snapshot.mode
+        let showsDuration: Bool
         if snapshot.mode == .video, let duration = evaluation?.globals.duration {
             durationChip.configuration?.title = duration.label
             let choices = evaluation?.globals.durationChoices ?? []
@@ -281,27 +281,28 @@ final class StudioComposerView: UIView, UITextViewDelegate, UIGestureRecognizerD
                     self.store.setDuration(choice.value, workspace: self.service, deviceId: deviceId)
                 }
             })
-            durationChip.isHidden = false
+            showsDuration = true
         } else {
-            durationChip.isHidden = true
+            showsDuration = false
         }
         let chips = evaluation?.models ?? []
         let labels = chips.map { modelChipLabel($0, mode: snapshot.mode) }
         if labels != modelChipLabels {
             modelChipLabels = labels
-            modelChips.forEach { $0.removeFromSuperview() }
             modelChips = zip(chips, labels).map { chip, label in
                 let button = Self.chip(label)
                 let modelId = chip.modelId
                 button.addAction(UIAction { [weak self] _ in self?.showConfiguration(modelId: modelId) }, for: .touchUpInside)
                 return button
             }
-            for (offset, button) in modelChips.enumerated() {
-                chipStrip.insertArrangedSubview(button, at: 2 + offset)
-            }
-            // Place the new chips now: left to the card's animated layout
-            // pass they stayed at the strip's origin, under the switch.
-            UIView.performWithoutAnimation { chipStrip.layoutIfNeeded() }
+        }
+        // The row holds only what shows, rebuilt in order when that changes:
+        // a chip inserted after a hidden one (the duration in image mode) got
+        // no spacing to it and slid under the switch.
+        let row = [modeSegment] + (showsDuration ? [durationChip] : []) + modelChips + [modelsChip]
+        if chipStrip.arrangedSubviews != row {
+            chipStrip.arrangedSubviews.forEach { $0.removeFromSuperview() }
+            row.forEach(chipStrip.addArrangedSubview)
         }
 
         if let evaluation, evaluation.attachments.addEnabled || !evaluation.attachments.items.isEmpty {
