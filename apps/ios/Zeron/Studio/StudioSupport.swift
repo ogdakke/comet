@@ -1,32 +1,49 @@
 import Foundation
 
 /// Studio media and control calls share the device relay. Keep chunked media
-/// transfers ordered so gallery prefetch cannot create a wall of RPCs that
+/// transfers bounded so gallery prefetch cannot create a wall of RPCs that
 /// starves the relay or the image being opened.
+///
+/// Foreground reads (the viewer's original, a video's chunks) go one at a
+/// time and first: while one runs or waits, no preview starts. Previews run
+/// a few at once (the relay is latency-bound, so one at a time leaves it
+/// idle between round trips), squares on screen before prefetch, the one
+/// that came on screen last first: in a fling it's the one that stays.
 actor StudioMediaRequestGate {
     private struct Waiter {
         let id: UUID
+        let key: String?
         let continuation: CheckedContinuation<Void, Error>
     }
 
-    private var occupied = false
+    private let previewSlots: Int
+    private var foregroundActive = false
+    private var previewsActive = 0
     private var foreground: [Waiter] = []
-    private var background: [Waiter] = []
+    private var visible: [Waiter] = []
+    private var prefetch: [Waiter] = []
+    /// Promoted before they queued (a prefetch whose square appeared while
+    /// it was still checking the disk cache).
+    private var promotedKeys: Set<String> = []
 
-    func acquire(priority: StudioMediaRequestPriority) async throws {
+    init(previewSlots: Int = 3) {
+        self.previewSlots = previewSlots
+    }
+
+    func acquire(priority: StudioMediaRequestPriority, key: String? = nil) async throws {
         try Task.checkCancellation()
-        if !occupied {
-            occupied = true
-            return
-        }
+        var priority = priority
+        if priority == .prefetch, let key, promotedKeys.remove(key) != nil { priority = .visible }
+        if tryGrant(priority) { return }
 
         let id = UUID()
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                let waiter = Waiter(id: id, continuation: continuation)
+                let waiter = Waiter(id: id, key: key, continuation: continuation)
                 switch priority {
                 case .foreground: foreground.append(waiter)
-                case .background: background.append(waiter)
+                case .visible: visible.append(waiter)
+                case .prefetch: prefetch.append(waiter)
                 }
                 if Task.isCancelled {
                     cancelWaiter(id: id)
@@ -37,35 +54,75 @@ actor StudioMediaRequestGate {
         }
 
         if Task.isCancelled {
-            release()
+            release(priority: priority)
             throw CancellationError()
         }
     }
 
-    func release() {
-        if let waiter = popNext() {
-            waiter.continuation.resume()
+    /// Release with the priority the hold was acquired with (a promoted
+    /// prefetch is still a preview slot).
+    func release(priority: StudioMediaRequestPriority) {
+        if priority == .foreground {
+            foregroundActive = false
         } else {
-            occupied = false
+            previewsActive = max(0, previewsActive - 1)
+        }
+        pump()
+    }
+
+    /// A square came on screen: its queued prefetch moves to the front.
+    func promote(key: String) {
+        if let index = prefetch.firstIndex(where: { $0.key == key }) {
+            visible.append(prefetch.remove(at: index))
+        } else if !visible.contains(where: { $0.key == key }) {
+            if promotedKeys.count > 512 { promotedKeys.removeAll() }
+            promotedKeys.insert(key)
         }
     }
 
-    private func popNext() -> Waiter? {
-        if !foreground.isEmpty { return foreground.removeFirst() }
-        if !background.isEmpty { return background.removeFirst() }
-        return nil
+    private func tryGrant(_ priority: StudioMediaRequestPriority) -> Bool {
+        switch priority {
+        case .foreground:
+            guard !foregroundActive, foreground.isEmpty else { return false }
+            foregroundActive = true
+            return true
+        case .visible, .prefetch:
+            guard !foregroundActive, foreground.isEmpty, previewsActive < previewSlots,
+                  visible.isEmpty, priority == .visible || prefetch.isEmpty else { return false }
+            previewsActive += 1
+            return true
+        }
+    }
+
+    private func pump() {
+        if !foregroundActive, !foreground.isEmpty {
+            foregroundActive = true
+            foreground.removeFirst().continuation.resume()
+        }
+        guard !foregroundActive, foreground.isEmpty else { return }
+        while previewsActive < previewSlots {
+            let next: Waiter
+            if let last = visible.popLast() {
+                next = last
+            } else if !prefetch.isEmpty {
+                next = prefetch.removeFirst()
+            } else {
+                return
+            }
+            previewsActive += 1
+            next.continuation.resume()
+        }
     }
 
     private func cancelWaiter(id: UUID) {
         if let index = foreground.firstIndex(where: { $0.id == id }) {
             foreground.remove(at: index).continuation.resume(throwing: CancellationError())
-            return
-        }
-        if let index = background.firstIndex(where: { $0.id == id }) {
-            background.remove(at: index).continuation.resume(throwing: CancellationError())
+        } else if let index = visible.firstIndex(where: { $0.id == id }) {
+            visible.remove(at: index).continuation.resume(throwing: CancellationError())
+        } else if let index = prefetch.firstIndex(where: { $0.id == id }) {
+            prefetch.remove(at: index).continuation.resume(throwing: CancellationError())
         }
     }
-
 }
 
 /// A JSON value for the Studio wire fields the app passes through untyped.

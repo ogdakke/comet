@@ -2,17 +2,21 @@ import UIKit
 
 /// The Studio gallery: every creation on the selected desktop as a grid of
 /// squares (three columns on a phone, more as the width allows), oldest at
-/// the top and opened at the newest (the bottom). Scrolling near the top
-/// pages in older items; previews prefetch ahead of the scroll. Answers the
-/// viewer's zoom transition for its cells.
+/// the top and opened at the newest (the bottom). Scrolling toward the top
+/// pages in older items well before it gets there; previews and thumbhashes
+/// prefetch ahead of the scroll. Answers the viewer's zoom transition for
+/// its cells.
+///
+/// Built for libraries in the thousands: the grid is plain arithmetic (no
+/// per-item layout pass), a page of older items is a batch insert above
+/// what's on screen (no diff of the whole library), and the offset moves by
+/// exactly the rows inserted, in the same pass.
 final class StudioGalleryViewController: UIViewController,
+    UICollectionViewDataSource,
     UICollectionViewDelegate,
     UICollectionViewDataSourcePrefetching,
     StudioGalleryTransitionSourceProvider
 {
-    private enum Section { case gallery }
-    private static let spacing: CGFloat = 2
-
     private let browser: StudioBrowserStore
     private let service: StudioService
     private let transitionSource: StudioGalleryTransitionSource
@@ -20,16 +24,13 @@ final class StudioGalleryViewController: UIViewController,
     private let showThread: (String) -> Void
 
     private var collectionView: StudioGalleryCollectionView!
-    private var dataSource: UICollectionViewDiffableDataSource<Section, String>!
+    private let layout = StudioGalleryGridLayout()
     private let loadingView = StudioLoadingView("Loading gallery…")
     private var items: [StudioGalleryItem] = []
-    private var itemsById: [String: StudioGalleryItem] = [:]
     private var prefetchedIds: Set<String> = []
     private var requestedOldestId: String?
     private var didSetInitialPosition = false
     private var positioningInitialItem = false
-    /// Columns in the current layout (the grid's width decides).
-    private var columns = 3
 
     init(
         browser: StudioBrowserStore,
@@ -52,24 +53,6 @@ final class StudioGalleryViewController: UIViewController,
         super.viewDidLoad()
         view.backgroundColor = .clear
 
-        // Squares of about 130pt: three across a phone, more in landscape and
-        // on iPad, where three would stretch the 448px previews past sharp.
-        let layout = UICollectionViewCompositionalLayout { [weak self] _, environment in
-            let width = environment.container.effectiveContentSize.width
-            let columns = max(3, Int((width + Self.spacing) / 132))
-            self?.columns = columns
-            let side = floor((width - Self.spacing * CGFloat(columns - 1)) / CGFloat(columns))
-            // The square itself: a full-width item would fill the row alone.
-            let item = NSCollectionLayoutItem(layoutSize: .init(widthDimension: .absolute(side), heightDimension: .absolute(side)))
-            let group = NSCollectionLayoutGroup.horizontal(
-                layoutSize: .init(widthDimension: .fractionalWidth(1), heightDimension: .absolute(side)),
-                repeatingSubitem: item, count: columns
-            )
-            group.interItemSpacing = .fixed(Self.spacing)
-            let section = NSCollectionLayoutSection(group: group)
-            section.interGroupSpacing = Self.spacing
-            return section
-        }
         collectionView = StudioGalleryCollectionView(frame: view.bounds, collectionViewLayout: layout)
         collectionView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         collectionView.backgroundColor = .clear
@@ -77,19 +60,12 @@ final class StudioGalleryViewController: UIViewController,
         collectionView.contentInsetAdjustmentBehavior = .automatic
         collectionView.keyboardDismissMode = .onDrag
         collectionView.topEdgeEffect.style = .soft
+        collectionView.dataSource = self
         collectionView.delegate = self
         collectionView.prefetchDataSource = self
         collectionView.register(StudioGalleryCell.self, forCellWithReuseIdentifier: StudioGalleryCell.reuseIdentifier)
         collectionView.layoutChanged = { [weak self] in self?.positionInitialItemIfPossible() }
         view.addSubview(collectionView)
-
-        dataSource = UICollectionViewDiffableDataSource(collectionView: collectionView) { [weak self] cv, path, id in
-            guard let self, let item = self.itemsById[id],
-                  let cell = cv.dequeueReusableCell(withReuseIdentifier: StudioGalleryCell.reuseIdentifier, for: path) as? StudioGalleryCell
-            else { return UICollectionViewCell() }
-            self.configure(cell, with: item)
-            return cell
-        }
 
         loadingView.frame = view.bounds
         loadingView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -127,66 +103,140 @@ final class StudioGalleryViewController: UIViewController,
         } else {
             contentUnavailableConfiguration = nil
         }
-        apply(gallery)
+        StudioGalleryPerf.time({ apply(gallery) }) { ms in
+            StudioGalleryPerf.applies += 1
+            StudioGalleryPerf.maxApplyMs = max(StudioGalleryPerf.maxApplyMs, ms)
+            StudioGalleryPerf.totalApplyMs += ms
+        }
+    }
+
+    /// `-studio-bench`: scripted flings through the whole library.
+    func runBench() {
+        guard let collectionView else { return }
+        StudioGalleryBench(collectionView: collectionView, hasMore: { [weak self] in
+            self?.browser.galleryHasMore ?? false
+        }, tileState: { cell in
+            (cell as? StudioGalleryCell).map { ($0.displayedImage != nil, $0.showsPreviewImage) }
+        }).run()
     }
 
     // MARK: Items
 
     private func apply(_ incoming: [StudioGalleryItem]) {
-        // A repeated id would crash the snapshot (a page boundary shifting
-        // under a merge): keep its first place.
-        var seen = Set<String>()
-        let newItems = incoming.filter { seen.insert($0.id).inserted }
-        let oldIds = items.map(\.id)
-        let newIds = newItems.map(\.id)
-        guard oldIds != newIds else {
+        // The store hands the same array back when nothing changed.
+        if incoming == items { return }
+        // A repeated id would show one artifact twice (a page boundary
+        // shifting under a merge): keep its first place.
+        var seen = Set<String>(minimumCapacity: incoming.count)
+        var newItems = incoming
+        if Set(incoming.map(\.id)).count != incoming.count {
+            newItems = incoming.filter { seen.insert($0.id).inserted }
+        }
+        let old = items
+
+        guard old.count != newItems.count || !old.indices.allSatisfy({ old[$0].id == newItems[$0].id }) else {
             // Same squares; an item's details may have landed since (its
-            // thumbhash, a video's duration).
-            let changed = newItems.filter { itemsById[$0.id] != $0 }.map(\.id)
-            guard !changed.isEmpty else { return }
+            // thumbhash, a video's duration): only squares on screen care.
             items = newItems
-            itemsById = Dictionary(uniqueKeysWithValues: newItems.map { ($0.id, $0) })
-            var snapshot = dataSource.snapshot()
-            snapshot.reconfigureItems(changed)
-            dataSource.apply(snapshot, animatingDifferences: false)
+            for indexPath in collectionView.indexPathsForVisibleItems {
+                guard let cell = collectionView.cellForItem(at: indexPath) as? StudioGalleryCell,
+                      old[indexPath.item] != newItems[indexPath.item] else { continue }
+                configure(cell, with: newItems[indexPath.item])
+            }
             return
         }
 
-        cancelAllPrefetching()
-        let oldFirstId = oldIds.first
-        let oldContentHeight = collectionView.contentSize.height
-        let oldOffset = collectionView.contentOffset.y
-        let wasNearBottom = oldContentHeight - collectionView.bounds.height - oldOffset < 100
+        if newItems.isEmpty || old.isEmpty || collectionView.window == nil {
+            // Emptied (another machine, a reload): open at the newest again.
+            if newItems.isEmpty { didSetInitialPosition = false }
+            requestedOldestId = nil
+            items = newItems
+            layout.resetLeadingBlanks()
+            collectionView.reloadData()
+            if didSetInitialPosition { collectionView.layoutIfNeeded() } else { positionInitialItemIfPossible() }
+            return
+        }
 
-        items = newItems
-        itemsById = Dictionary(uniqueKeysWithValues: newItems.map { ($0.id, $0) })
-        if newIds.first != oldFirstId { requestedOldestId = nil }
-        // Emptied (another machine, a reload): open at the newest again.
-        if newItems.isEmpty { didSetInitialPosition = false }
+        let start = CACurrentMediaTime()
+        let wasNearBottom = collectionView.contentSize.height - collectionView.bounds.height
+            + collectionView.adjustedContentInset.bottom - collectionView.contentOffset.y < 100
+        // What's on screen stays where it is: the topmost visible square's
+        // distance from the top of the viewport, before and after.
+        let anchor = topVisibleIndex().flatMap { index -> (id: String, gap: CGFloat)? in
+            guard old.indices.contains(index) else { return nil }
+            return (old[index].id, layout.frame(forItem: index).minY - collectionView.contentOffset.y)
+        }
+        if newItems.first?.id != old.first?.id { requestedOldestId = nil }
 
-        var snapshot = NSDiffableDataSourceSnapshot<Section, String>()
-        snapshot.appendSections([.gallery])
-        snapshot.appendItems(newIds)
-        dataSource.apply(snapshot, animatingDifferences: false) { [weak self] in
-            guard let self, let collectionView = self.collectionView else { return }
+        let prepended = newItems.count > old.count
+            && zip(newItems[(newItems.count - old.count)...], old).allSatisfy { $0.id == $1.id }
+        let appended = !prepended && newItems.count > old.count
+            && zip(newItems, old).allSatisfy { $0.id == $1.id }
+        UIView.performWithoutAnimation {
+            if prepended {
+                // Older items above: the columns of what's here stay put
+                // (blank leading slots absorb a page that isn't a whole
+                // number of rows), so nothing on screen reflows.
+                let inserted = newItems.count - old.count
+                layout.prependItems(inserted)
+                collectionView.performBatchUpdates {
+                    items = newItems
+                    collectionView.insertItems(at: (0..<inserted).map { IndexPath(item: $0, section: 0) })
+                }
+            } else if appended {
+                collectionView.performBatchUpdates {
+                    items = newItems
+                    collectionView.insertItems(at: (old.count..<newItems.count).map { IndexPath(item: $0, section: 0) })
+                }
+            } else {
+                items = newItems
+                collectionView.reloadData()
+            }
             collectionView.layoutIfNeeded()
-            if !self.didSetInitialPosition {
-                self.positionInitialItemIfPossible()
-            } else if let oldFirstId, let newIndex = newIds.firstIndex(of: oldFirstId), newIndex > 0 {
-                // Older items landed above: hold what's on screen still.
-                collectionView.contentOffset.y = oldOffset + collectionView.contentSize.height - oldContentHeight
-            } else if wasNearBottom, newIds.count > oldIds.count, !newItems.isEmpty {
-                collectionView.scrollToItem(at: IndexPath(item: newItems.count - 1, section: 0), at: .bottom, animated: false)
+        }
+        StudioGalleryPerf.maxSnapshotMs = max(StudioGalleryPerf.maxSnapshotMs, (CACurrentMediaTime() - start) * 1000)
+
+        let relayoutStart = CACurrentMediaTime()
+        if !didSetInitialPosition {
+            positionInitialItemIfPossible()
+        } else if appended, wasNearBottom {
+            collectionView.scrollToItem(at: IndexPath(item: newItems.count - 1, section: 0), at: .bottom, animated: false)
+        } else if let anchor, let index = newItems.firstIndex(where: { $0.id == anchor.id }) {
+            let target = layout.frame(forItem: index).minY - anchor.gap
+            if abs(target - collectionView.contentOffset.y) > 0.25 {
+                // Set mid-fling too: the scroll view decelerates on from here.
+                collectionView.contentOffset.y = target
             }
         }
+        StudioGalleryPerf.maxRelayoutMs = max(StudioGalleryPerf.maxRelayoutMs, (CACurrentMediaTime() - relayoutStart) * 1000)
+        if let anchor, let index = newItems.firstIndex(where: { $0.id == anchor.id }),
+           let cell = collectionView.cellForItem(at: IndexPath(item: index, section: 0)) {
+            // What the user would see move: the anchor square's on-screen spot.
+            let drift = abs(cell.frame.minY - collectionView.contentOffset.y - anchor.gap)
+            StudioGalleryPerf.maxAnchorDriftPt = max(StudioGalleryPerf.maxAnchorDriftPt, drift)
+        }
+        if prepended, let requested = StudioGalleryPerf.pageRequestedAt {
+            StudioGalleryPerf.pageLatenciesMs.append((CACurrentMediaTime() - requested) * 1000)
+            StudioGalleryPerf.pageRequestedAt = nil
+        }
+        loadOlderIfNear()
     }
 
     private func item(at indexPath: IndexPath) -> StudioGalleryItem? {
         items.indices.contains(indexPath.item) ? items[indexPath.item] : nil
     }
 
+    private func indexPath(for artifactId: String) -> IndexPath? {
+        items.firstIndex { $0.id == artifactId }.map { IndexPath(item: $0, section: 0) }
+    }
+
     private func configure(_ cell: StudioGalleryCell, with item: StudioGalleryItem) {
-        cell.configure(item: item, browser: browser, service: service, deviceId: browser.selectedDeviceId)
+        StudioGalleryPerf.time({
+            cell.configure(item: item, browser: browser, service: service, deviceId: browser.selectedDeviceId)
+        }) { ms in
+            StudioGalleryPerf.configures += 1
+            StudioGalleryPerf.maxConfigureMs = max(StudioGalleryPerf.maxConfigureMs, ms)
+        }
     }
 
     /// The newest item at the bottom, once the grid is on screen with a size
@@ -196,32 +246,47 @@ final class StudioGalleryViewController: UIViewController,
         guard !didSetInitialPosition, !positioningInitialItem, !items.isEmpty,
               let collectionView, collectionView.window != nil,
               collectionView.bounds.width > 0, collectionView.bounds.height > 0,
-              dataSource.snapshot().numberOfItems == items.count else { return }
+              collectionView.numberOfItems(inSection: 0) == items.count else { return }
         positioningInitialItem = true
         collectionView.layoutIfNeeded()
         didSetInitialPosition = true
         collectionView.scrollToItem(at: IndexPath(item: items.count - 1, section: 0), at: .bottom, animated: false)
         collectionView.layoutIfNeeded()
         positioningInitialItem = false
-        // Rows laid out at the top before the jump don't count; a gallery
-        // short enough to show its top still pages in what's older.
-        if collectionView.indexPathsForVisibleItems.contains(where: { $0.item < olderThreshold }) {
-            loadOlderOnce()
-        }
+        // A gallery short enough to show its top still pages in what's older.
+        loadOlderIfNear()
     }
 
-    /// The first rows (about four) page in older items as they appear.
-    private var olderThreshold: Int { columns * 4 }
+    /// The topmost square at least partly on screen (arithmetic, not a
+    /// layout query: this runs every scrolled frame).
+    private func topVisibleIndex() -> Int? {
+        guard let collectionView, !items.isEmpty else { return nil }
+        let index = layout.firstItem(atOrBelow: collectionView.contentOffset.y + collectionView.adjustedContentInset.top)
+        return min(max(index, 0), items.count - 1)
+    }
 
-    /// Once per oldest item: a failed page clears it, so scrolling back to
+    /// Older items page in while about three screens of rows remain above
+    /// (a hard fling covers that in about half a second, a page's round
+    /// trip with time to spare).
+    private func loadOlderIfNear() {
+        guard didSetInitialPosition, !positioningInitialItem, let collectionView,
+              browser.galleryHasMore, let top = topVisibleIndex() else { return }
+        let rowsPerScreen = max(1, Int(collectionView.bounds.height / max(layout.rowHeight, 1)))
+        if top < layout.columns * rowsPerScreen * 3 { loadOlderOnce() }
+    }
+
+    /// Once per oldest item: a failed page clears it, so scrolling toward
     /// the top tries again.
     private func loadOlderOnce() {
         let oldestId = items.first?.id
-        guard requestedOldestId != oldestId, let deviceId = browser.selectedDeviceId else { return }
+        guard requestedOldestId != oldestId, !browser.galleryLoadingMore,
+              let deviceId = browser.selectedDeviceId else { return }
         requestedOldestId = oldestId
+        if StudioGalleryPerf.pageRequestedAt == nil { StudioGalleryPerf.pageRequestedAt = CACurrentMediaTime() }
         Task { [weak self, browser, service] in
             await browser.loadMoreGallery(workspace: service, deviceId: deviceId)
             guard let self, self.items.first?.id == oldestId, self.requestedOldestId == oldestId else { return }
+            // Nothing older arrived (a failed page): free to ask again.
             self.requestedOldestId = nil
         }
     }
@@ -229,7 +294,7 @@ final class StudioGalleryViewController: UIViewController,
     // MARK: Transition source
 
     func transitionImageView(for artifactId: String) -> UIView? {
-        guard let collectionView, let indexPath = dataSource?.indexPath(for: artifactId) else { return nil }
+        guard let collectionView, let indexPath = indexPath(for: artifactId) else { return nil }
         // Never move or synchronously lay out a thousand-item gallery from
         // inside UIKit's transition callback. If paging moved away from a
         // visible source, returning nil gives UIKit a clean fade fallback.
@@ -237,13 +302,27 @@ final class StudioGalleryViewController: UIViewController,
     }
 
     func prepareTransitionImageView(for artifactId: String) {
-        guard let collectionView, let indexPath = dataSource?.indexPath(for: artifactId),
+        guard let collectionView, let indexPath = indexPath(for: artifactId),
               collectionView.cellForItem(at: indexPath) == nil else { return }
         collectionView.scrollToItem(at: indexPath, at: .centeredVertically, animated: false)
         collectionView.layoutIfNeeded()
     }
 
     // MARK: Collection view
+
+    func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
+        items.count
+    }
+
+    func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
+        let cell = collectionView.dequeueReusableCell(withReuseIdentifier: StudioGalleryCell.reuseIdentifier, for: indexPath)
+        if let cell = cell as? StudioGalleryCell, let item = item(at: indexPath) { configure(cell, with: item) }
+        return cell
+    }
+
+    func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        loadOlderIfNear()
+    }
 
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
         guard let item = item(at: indexPath) else { return }
@@ -264,10 +343,11 @@ final class StudioGalleryViewController: UIViewController,
 
     func collectionView(_ collectionView: UICollectionView, willDisplay cell: UICollectionViewCell, forItemAt indexPath: IndexPath) {
         guard let item = item(at: indexPath) else { return }
-        endPrefetch(for: item.id)
+        // A cell kept by cell prefetching comes back without a dequeue: its
+        // read was let go when it left, so it asks again (a no-op otherwise).
         if let cell = cell as? StudioGalleryCell { configure(cell, with: item) }
-        // Not while the first layout passes the top on its way to the newest.
-        if didSetInitialPosition, !positioningInitialItem, indexPath.item < olderThreshold { loadOlderOnce() }
+        // After the square's own (visible) hold, so the read isn't dropped.
+        endPrefetch(for: item.id)
     }
 
     func collectionView(_ collectionView: UICollectionView, didEndDisplaying cell: UICollectionViewCell, forItemAt indexPath: IndexPath) {
@@ -275,10 +355,11 @@ final class StudioGalleryViewController: UIViewController,
     }
 
     func collectionView(_ collectionView: UICollectionView, prefetchItemsAt indexPaths: [IndexPath]) {
+        let upcoming = indexPaths.compactMap(item(at:))
+        browser.warmThumbhashes(upcoming)
         guard let deviceId = browser.selectedDeviceId else { return }
-        for indexPath in indexPaths {
-            guard let item = item(at: indexPath), prefetchedIds.insert(item.id).inserted else { continue }
-            _ = browser.beginPreviewRequest(artifactId: item.id, deviceId: deviceId, workspace: service)
+        for item in upcoming where prefetchedIds.insert(item.id).inserted {
+            _ = browser.beginPreviewRequest(artifactId: item.id, deviceId: deviceId, workspace: service, priority: .prefetch)
         }
     }
 
@@ -291,11 +372,6 @@ final class StudioGalleryViewController: UIViewController,
     private func endPrefetch(for artifactId: String) {
         guard prefetchedIds.remove(artifactId) != nil else { return }
         browser.endPreviewRequest(artifactId: artifactId)
-    }
-
-    private func cancelAllPrefetching() {
-        for id in prefetchedIds { browser.endPreviewRequest(artifactId: id) }
-        prefetchedIds.removeAll()
     }
 
     func collectionView(_ collectionView: UICollectionView, contextMenuConfigurationForItemAt indexPath: IndexPath, point: CGPoint) -> UIContextMenuConfiguration? {
@@ -343,7 +419,7 @@ final class StudioGalleryViewController: UIViewController,
         sheet.addAction(UIAlertAction(title: "Delete", style: .destructive) { [weak self] _ in self?.delete(artifact) })
         sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         if let popover = sheet.popoverPresentationController {
-            if let path = dataSource.indexPath(for: artifact.id), let cell = collectionView.cellForItem(at: path) {
+            if let path = indexPath(for: artifact.id), let cell = collectionView.cellForItem(at: path) {
                 popover.sourceView = cell
                 popover.sourceRect = cell.bounds
             } else {
@@ -401,24 +477,138 @@ private final class StudioGalleryCollectionView: UICollectionView {
     }
 }
 
-/// One gallery square: the cached preview or thumbhash at once, the relayed
-/// preview when it lands, a duration badge on videos.
+
+/// The gallery's grid as arithmetic: squares of about 130pt, three across a
+/// phone and more in landscape and on iPad (where three would stretch the
+/// 448px previews past sharp), 2pt apart. Every frame is computed from its
+/// index, so a library of thousands costs the same as a screenful, and
+/// inserting a page above moves the offset by whole rows.
+final class StudioGalleryGridLayout: UICollectionViewLayout {
+    static let spacing: CGFloat = 2
+
+    private(set) var columns = 3
+    private(set) var side: CGFloat = 0
+    private var count = 0
+    private var width: CGFloat = 0
+    /// Empty slots before the oldest item: a page inserted above that isn't
+    /// a whole number of rows leaves the squares below in their columns.
+    private(set) var leadingBlanks = 0
+    /// Rows a pending insert above adds: applied as the update's offset.
+    private var pendingRowShift = 0
+
+    var rowHeight: CGFloat { side + Self.spacing }
+
+    override func prepare() {
+        super.prepare()
+        guard let collectionView else { return }
+        let width = collectionView.bounds.width - collectionView.adjustedContentInset.left - collectionView.adjustedContentInset.right
+        if width != self.width {
+            self.width = width
+            let columns = max(3, Int((width + Self.spacing) / 132))
+            if columns != self.columns { leadingBlanks = 0 }
+            self.columns = columns
+            side = max(1, floor((width - Self.spacing * CGFloat(columns - 1)) / CGFloat(columns)))
+        }
+        count = collectionView.numberOfSections > 0 ? collectionView.numberOfItems(inSection: 0) : 0
+    }
+
+    /// `inserted` items are about to go in above the oldest.
+    func prependItems(_ inserted: Int) {
+        let blanks = ((leadingBlanks - inserted) % columns + columns) % columns
+        pendingRowShift = (inserted + blanks - leadingBlanks) / columns
+        leadingBlanks = blanks
+    }
+
+    /// Back to a plain grid (a reload).
+    func resetLeadingBlanks() {
+        leadingBlanks = 0
+        pendingRowShift = 0
+    }
+
+    override var collectionViewContentSize: CGSize {
+        let rows = count == 0 ? 0 : (count + leadingBlanks + columns - 1) / columns
+        return CGSize(width: width, height: max(0, CGFloat(rows) * rowHeight - Self.spacing))
+    }
+
+    func frame(forItem index: Int) -> CGRect {
+        let slot = index + leadingBlanks
+        return CGRect(
+            x: CGFloat(slot % columns) * (side + Self.spacing),
+            y: CGFloat(slot / columns) * rowHeight,
+            width: side, height: side
+        )
+    }
+
+    /// The first item whose row reaches `y` or below it.
+    func firstItem(atOrBelow y: CGFloat) -> Int {
+        let row = max(0, Int(floor((y + Self.spacing) / max(rowHeight, 1))))
+        return row * columns - leadingBlanks
+    }
+
+    override func layoutAttributesForElements(in rect: CGRect) -> [UICollectionViewLayoutAttributes]? {
+        guard count > 0, rowHeight > 1 else { return [] }
+        let firstRow = max(0, Int(floor(rect.minY / rowHeight)))
+        let lastRow = Int(floor(rect.maxY / rowHeight))
+        let first = max(0, firstRow * columns - leadingBlanks)
+        let last = min(count - 1, (lastRow + 1) * columns - 1 - leadingBlanks)
+        guard first <= last else { return [] }
+        return (first...last).map { attributes(forItem: $0) }
+    }
+
+    override func layoutAttributesForItem(at indexPath: IndexPath) -> UICollectionViewLayoutAttributes? {
+        guard indexPath.section == 0, indexPath.item >= 0, indexPath.item < count else { return nil }
+        return attributes(forItem: indexPath.item)
+    }
+
+    private func attributes(forItem index: Int) -> UICollectionViewLayoutAttributes {
+        let attributes = UICollectionViewLayoutAttributes(forCellWith: IndexPath(item: index, section: 0))
+        attributes.frame = frame(forItem: index)
+        return attributes
+    }
+
+    override func shouldInvalidateLayout(forBoundsChange newBounds: CGRect) -> Bool {
+        guard let collectionView else { return false }
+        return newBounds.width != collectionView.bounds.width
+    }
+
+    /// After an insert above, the offset moves down by the rows inserted, in
+    /// the update itself: what's on screen never moves, and the cells for
+    /// the inserted rows are never made.
+    override func targetContentOffset(forProposedContentOffset proposedContentOffset: CGPoint) -> CGPoint {
+        guard pendingRowShift != 0 else { return super.targetContentOffset(forProposedContentOffset: proposedContentOffset) }
+        let shift = CGFloat(pendingRowShift) * rowHeight
+        pendingRowShift = 0
+        return CGPoint(x: proposedContentOffset.x, y: proposedContentOffset.y + shift)
+    }
+
+    override func finalizeCollectionViewUpdates() {
+        super.finalizeCollectionViewUpdates()
+        pendingRowShift = 0
+    }
+}
+
+/// One gallery square: the cached preview, else the thumbhash (decoded
+/// ahead, so it's there on the first frame), the relayed preview when it
+/// lands, a duration badge on videos.
 final class StudioGalleryCell: UICollectionViewCell {
     static let reuseIdentifier = "StudioGalleryCell"
+    private static let photoGlyph = UIImage(systemName: "photo")
+    private static let videoGlyph = UIImage(systemName: "film")
 
     let imageView = UIImageView()
     private let placeholderView = UIImageView()
     private let highlight = UIView()
     private let videoBadge = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
     private let videoLabel = UILabel()
-    private var representedId: String?
+    private var item: StudioGalleryItem?
     /// The relayed preview is on screen (not the thumbhash standing in).
     private var showsPreview = false
-    private var browser: StudioBrowserStore?
+    private weak var browser: StudioBrowserStore?
     private var requestActive = false
     private var loadTask: Task<Void, Never>?
 
     var displayedImage: UIImage? { imageView.image }
+    var showsPreviewImage: Bool { showsPreview }
 
     override var isHighlighted: Bool {
         didSet { highlight.isHidden = !isHighlighted }
@@ -439,6 +629,7 @@ final class StudioGalleryCell: UICollectionViewCell {
         placeholderView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         placeholderView.contentMode = .center
         placeholderView.tintColor = Palette.color(.textFaint).withAlphaComponent(0.45)
+        placeholderView.isHidden = true
         contentView.addSubview(placeholderView)
 
         // A press dims the square (the image view itself is the zoom's source).
@@ -465,6 +656,7 @@ final class StudioGalleryCell: UICollectionViewCell {
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        guard !videoBadge.isHidden else { return }
         let badgeSize = videoLabel.sizeThatFits(CGSize(width: 90, height: 22))
         let width = max(34, ceil(badgeSize.width) + 14)
         videoBadge.frame = CGRect(x: contentView.bounds.width - width - 6, y: contentView.bounds.height - 26, width: width, height: 20)
@@ -474,62 +666,68 @@ final class StudioGalleryCell: UICollectionViewCell {
     override func prepareForReuse() {
         super.prepareForReuse()
         cancelPreviewRequest()
-        representedId = nil
+        // The image stays until `configure` replaces it in the same pass:
+        // clearing it here would only cost a second image swap.
+        item = nil
         showsPreview = false
-        imageView.image = nil
-        placeholderView.image = nil
-        placeholderView.isHidden = false
-        videoBadge.isHidden = true
-        accessibilityLabel = nil
     }
 
     func configure(item: StudioGalleryItem, browser: StudioBrowserStore, service: StudioService, deviceId: String?) {
-        if representedId != item.id {
+        let same = self.item?.id == item.id
+        if !same {
             cancelPreviewRequest()
             showsPreview = false
         }
-        representedId = item.id
         self.browser = browser
-        let video = item.mediaKind == .video
-        let duration = video ? Self.duration(item.durationSeconds) : nil
-        accessibilityLabel = [video ? "Video" : "Image", duration, item.prompt, item.modelDisplayName]
-            .compactMap { $0?.isEmpty == false ? $0 : nil }.joined(separator: ", ")
-        placeholderView.image = UIImage(systemName: video ? "film" : "photo")
-        videoBadge.isHidden = !video
-        if videoLabel.text != duration {
-            videoLabel.text = duration
-            // The badge fits its text ("Video" or "1:02:05").
-            setNeedsLayout()
+        if self.item != item {
+            self.item = item
+            let video = item.mediaKind == .video
+            let duration = video ? Self.duration(item.durationSeconds) : nil
+            accessibilityLabel = [video ? "Video" : "Image", duration, item.prompt, item.modelDisplayName]
+                .compactMap { $0?.isEmpty == false ? $0 : nil }.joined(separator: ", ")
+            placeholderView.image = video ? Self.videoGlyph : Self.photoGlyph
+            videoBadge.isHidden = !video
+            if videoLabel.text != duration {
+                videoLabel.text = duration
+                // The badge fits its text ("Video" or "1:02:05").
+                setNeedsLayout()
+            }
         }
 
-        // Configured again (willDisplay, a reconfigure): keep what's shown.
+        // Configured again (willDisplay, a detail change): keep what's shown.
         if showsPreview { return }
         if let cached = browser.cachedPreview(artifactId: item.id) {
-            imageView.image = cached
-            placeholderView.isHidden = true
-            showsPreview = true
+            show(cached, preview: true)
             return
         }
-        let thumbhash = browser.thumbhashImage(item.thumbhash, aspectRatio: item.aspectRatio)
-        imageView.image = thumbhash
-        placeholderView.isHidden = thumbhash != nil
+        if !same || imageView.image == nil {
+            // Never blank: the thumbhash (or, lacking one, the glyph) now.
+            show(browser.thumbhashImage(item.thumbhash, aspectRatio: item.aspectRatio), preview: false)
+        }
         guard !requestActive, let deviceId else { return }
         requestActive = true
         let artifactId = item.id
         let request = browser.beginPreviewRequest(artifactId: artifactId, deviceId: deviceId, workspace: service)
         loadTask = Task { [weak self] in
             let image = await request.value
-            guard !Task.isCancelled, let self, self.representedId == artifactId, let image else { return }
-            self.imageView.image = image
-            self.placeholderView.isHidden = true
-            self.showsPreview = true
+            guard !Task.isCancelled, let self, self.item?.id == artifactId else { return }
+            // Landed (or failed): this square's hold ends with its read.
+            self.cancelPreviewRequest()
+            guard let image else { return }
+            self.show(image, preview: true)
         }
+    }
+
+    private func show(_ image: UIImage?, preview: Bool) {
+        if imageView.image !== image { imageView.image = image }
+        placeholderView.isHidden = image != nil
+        showsPreview = preview && image != nil
     }
 
     func cancelPreviewRequest() {
         loadTask?.cancel()
         loadTask = nil
-        if requestActive, let representedId { browser?.endPreviewRequest(artifactId: representedId) }
+        if requestActive, let item { browser?.endPreviewRequest(artifactId: item.id) }
         requestActive = false
     }
 

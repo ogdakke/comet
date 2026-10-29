@@ -22,7 +22,9 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
     /// Launch arguments for screenshots and profiling: `-studio-threads`
     /// (the Threads list), `-studio-thread` (open the newest thread),
     /// `-studio-viewer` (open the newest creation). Each runs once.
-    private var launchSteps = Set(["-studio-threads", "-studio-thread", "-studio-viewer"]
+    /// `-studio-bench` flings the gallery through the whole library and
+    /// writes `Documents/studio-bench.json`.
+    private var launchSteps = Set(["-studio-threads", "-studio-thread", "-studio-viewer", "-studio-bench"]
         .filter(ProcessInfo.processInfo.arguments.contains))
     private weak var viewer: StudioGalleryViewerController?
 
@@ -175,6 +177,10 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
            let thread = browser.threads.first(where: { !$0.archived }) {
             launchSteps.remove("-studio-thread")
             DispatchQueue.main.async { self.pushThread(thread.id) }
+        }
+        if launchSteps.contains("-studio-bench"), !browser.gallery.isEmpty, view.window != nil {
+            launchSteps.remove("-studio-bench")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.gallery.runBench() }
         }
         if launchSteps.contains("-studio-viewer"), let newest = browser.gallery.last, view.window != nil {
             launchSteps.remove("-studio-viewer")

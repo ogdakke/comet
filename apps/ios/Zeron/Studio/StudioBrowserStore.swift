@@ -18,11 +18,14 @@ final class StudioBrowserStore {
 
     @ObservationIgnored private let previews = NSCache<NSString, UIImage>()
     @ObservationIgnored private let displayImages = NSCache<NSString, UIImage>()
-    @ObservationIgnored private let thumbhashImages = NSCache<NSString, UIImage>()
+    @ObservationIgnored private let thumbhashes = StudioThumbHashCache.shared
     @ObservationIgnored private let previewDiskCache = StudioPreviewDiskCache.shared
     @ObservationIgnored private var previewTasks: [String: Task<UIImage?, Never>] = [:]
     @ObservationIgnored private var previewTaskGenerations: [String: UUID] = [:]
     @ObservationIgnored private var previewDemand: [String: Int] = [:]
+    /// Preview reads started by prefetch alone: a square coming on screen
+    /// promotes them once.
+    @ObservationIgnored private var prefetchOnlyPreviews: Set<String> = []
     @ObservationIgnored private var displayTasks: [String: Task<UIImage?, Never>] = [:]
     @ObservationIgnored private var displayTaskGenerations: [String: UUID] = [:]
     @ObservationIgnored private var displayDemand: [String: Int] = [:]
@@ -31,14 +34,16 @@ final class StudioBrowserStore {
     @ObservationIgnored private var galleryCursor: StudioGalleryCursor?
 
     private let galleryPageSize = 60
+    /// Older pages come bigger: fewer relay round trips while flinging up.
+    private let olderPageSize = 120
 
     init() {
-        previews.countLimit = 160
-        previews.totalCostLimit = 64 * 1024 * 1024
+        // A 448px preview is ~800 KB decoded: about 120 squares, a few
+        // screens back each way.
+        previews.countLimit = 240
+        previews.totalCostLimit = 96 * 1024 * 1024
         displayImages.countLimit = 6
         displayImages.totalCostLimit = 144 * 1024 * 1024
-        thumbhashImages.countLimit = 640
-        thumbhashImages.totalCostLimit = 4 * 1024 * 1024
         Task { await previewDiskCache.prepare() }
     }
 
@@ -72,13 +77,14 @@ final class StudioBrowserStore {
         galleryError = nil
         previews.removeAllObjects()
         displayImages.removeAllObjects()
-        thumbhashImages.removeAllObjects()
+        thumbhashes.removeAll()
         previewTasks.values.forEach { $0.cancel() }
         displayTasks.values.forEach { $0.cancel() }
         displayPreheatReleaseTasks.values.forEach { $0.cancel() }
         previewTasks.removeAll()
         previewTaskGenerations.removeAll()
         previewDemand.removeAll()
+        prefetchOnlyPreviews.removeAll()
         displayTasks.removeAll()
         displayTaskGenerations.removeAll()
         displayDemand.removeAll()
@@ -131,22 +137,39 @@ final class StudioBrowserStore {
             )
             for try await response in stream {
                 guard !Task.isCancelled, selectedDeviceId == deviceId else { return }
-                let firstPage = Self.galleryItemsOldestFirst(response.artifacts)
+                // Sorted off the main thread: the watch re-sends the newest
+                // page on every change on the desktop.
+                let firstPage = await Task.detached(priority: .userInitiated) {
+                    StudioThumbHashCache.shared.warm(response.artifacts)
+                    return Self.galleryItemsOldestFirst(response.artifacts)
+                }.value
+                guard !Task.isCancelled, selectedDeviceId == deviceId else { return }
+                // Observation fires on every set, equal or not.
+                if galleryLoading { galleryLoading = false }
                 if gallery.count <= galleryPageSize {
-                    gallery = firstPage
+                    // Only while the gallery is this page alone does its cursor
+                    // say where older items start; once older pages are in,
+                    // `loadMoreGallery` owns the cursor (taking the watch's
+                    // would page in what's already here again).
+                    galleryCursor = response.nextCursor
+                    if gallery != firstPage { gallery = firstPage }
                 } else if let pageOldest = firstPage.first,
                           let anchorIndex = gallery.firstIndex(where: { $0.id == pageOldest.id }) {
+                    // Nothing changed (most re-sends): leave the gallery be,
+                    // so the grid doesn't diff a thousand squares for nothing.
+                    guard !gallery[anchorIndex...].elementsEqual(firstPage) else { continue }
                     gallery = Array(gallery[..<anchorIndex]) + firstPage
-                } else {
+                } else if let pageOldest = firstPage.first {
+                    // The page's oldest item is new here (or it was deleted):
+                    // keep what's strictly older than the page.
                     let incomingIds = Set(firstPage.map(\.id))
-                    let older = gallery.filter {
-                        $0.createdDate < (firstPage.first?.createdDate ?? .distantPast)
-                            && !incomingIds.contains($0.id)
-                    }
+                    let oldestDate = pageOldest.createdDate
+                    let older = gallery.prefix(Self.olderPrefixCount(gallery, than: oldestDate))
+                        .filter { !incomingIds.contains($0.id) }
                     gallery = older + firstPage
+                } else {
+                    gallery = []
                 }
-                galleryCursor = response.nextCursor
-                galleryLoading = false
             }
             guard !Task.isCancelled, selectedDeviceId == deviceId else { return }
             galleryLoading = false
@@ -162,40 +185,75 @@ final class StudioBrowserStore {
 
     func loadMoreGallery(workspace: StudioService, deviceId: String) async {
         guard selectedDeviceId == deviceId,
-              let cursor = galleryCursor,
+              var cursor = galleryCursor,
               !galleryLoadingMore else { return }
         galleryLoadingMore = true
         defer { galleryLoadingMore = false }
         do {
-            let response = try await workspace.listStudioGalleryPage(
-                deviceId: deviceId,
-                pageSize: galleryPageSize,
-                cursor: cursor
-            )
-            guard !Task.isCancelled, selectedDeviceId == deviceId else { return }
-            let existing = Set(gallery.map(\.id))
-            let older = Self.galleryItemsOldestFirst(
-                response.artifacts.filter { !existing.contains($0.id) }
-            )
-            gallery.insert(contentsOf: older, at: 0)
-            galleryCursor = response.nextCursor
+            // A page wholly already here (a merge moved the boundary) moves
+            // the cursor on; keep going until something older arrives.
+            for _ in 0..<8 {
+                let response = try await workspace.listStudioGalleryPage(
+                    deviceId: deviceId,
+                    pageSize: olderPageSize,
+                    cursor: cursor
+                )
+                guard !Task.isCancelled, selectedDeviceId == deviceId else { return }
+                let existing = Set(gallery.map(\.id))
+                let fresh = response.artifacts.filter { !existing.contains($0.id) }
+                // Sorted, and every thumbhash decoded, off the main thread:
+                // the squares show their placeholder on their first frame.
+                let older = await Task.detached(priority: .userInitiated) {
+                    StudioThumbHashCache.shared.warm(fresh)
+                    return Self.galleryItemsOldestFirst(fresh)
+                }.value
+                guard !Task.isCancelled, selectedDeviceId == deviceId else { return }
+                galleryCursor = response.nextCursor
+                if !older.isEmpty {
+                    StudioGalleryPerf.time({ gallery.insert(contentsOf: older, at: 0) }) {
+                        StudioGalleryPerf.maxPageMergeMs = max(StudioGalleryPerf.maxPageMergeMs, $0)
+                    }
+                    return
+                }
+                guard let next = response.nextCursor else { return }
+                cursor = next
+            }
         } catch {
             guard !Task.isCancelled, selectedDeviceId == deviceId else { return }
             galleryError = error.localizedDescription
         }
     }
 
+    /// Older pages remain on the desktop.
+    var galleryHasMore: Bool { galleryCursor != nil }
+
     func shouldLoadMore(after item: StudioGalleryItem) -> Bool {
         galleryCursor != nil && gallery.prefix(12).contains(where: { $0.id == item.id })
     }
 
+    /// Oldest first by (createdAt, id). Each date is parsed once, not per
+    /// comparison.
     nonisolated static func galleryItemsOldestFirst(
         _ items: [StudioGalleryItem]
     ) -> [StudioGalleryItem] {
-        items.sorted {
-            if $0.createdDate != $1.createdDate { return $0.createdDate < $1.createdDate }
-            return $0.id < $1.id
+        items.map { ($0.createdDate, $0) }
+            .sorted {
+                if $0.0 != $1.0 { return $0.0 < $1.0 }
+                return $0.1.id < $1.1.id
+            }
+            .map(\.1)
+    }
+
+    /// How many of `gallery` (oldest first) are older than `date`: a binary
+    /// search, a few date parses rather than one per item.
+    private static func olderPrefixCount(_ gallery: [StudioGalleryItem], than date: Date) -> Int {
+        var low = 0
+        var high = gallery.count
+        while low < high {
+            let mid = (low + high) / 2
+            if gallery[mid].createdDate < date { low = mid + 1 } else { high = mid }
         }
+        return low
     }
 
     func removeArtifact(_ artifactId: String) {
@@ -208,6 +266,7 @@ final class StudioBrowserStore {
         previewTasks.removeValue(forKey: artifactId)
         previewTaskGenerations.removeValue(forKey: artifactId)
         previewDemand.removeValue(forKey: artifactId)
+        prefetchOnlyPreviews.remove(artifactId)
         displayTasks.removeValue(forKey: artifactId)
         displayTaskGenerations.removeValue(forKey: artifactId)
         displayDemand.removeValue(forKey: artifactId)
@@ -226,20 +285,25 @@ final class StudioBrowserStore {
         displayImages.object(forKey: artifactId as NSString)
     }
 
+    /// The blurred stand-in, decoded here only when no page warm-up or
+    /// prefetch got to it first (a few dozen microseconds).
     func thumbhashImage(
         _ thumbhash: String?,
         aspectRatio: CGFloat?
     ) -> UIImage? {
         guard let thumbhash else { return nil }
-        let ratioKey = aspectRatio.map { String(format: "%.4f", Double($0)) } ?? "raw"
-        let key = "\(thumbhash):\(ratioKey)" as NSString
-        if let image = thumbhashImages.object(forKey: key) { return image }
-        guard let image = StudioThumbHash.image(base64: thumbhash, aspectRatio: aspectRatio) else {
-            return nil
+        if let image = thumbhashes.image(thumbhash, aspectRatio: aspectRatio) { return image }
+        StudioGalleryPerf.mainThumbhashDecodes += 1
+        return thumbhashes.decode(thumbhash, aspectRatio: aspectRatio)
+    }
+
+    /// Thumbhashes of squares ahead of the scroll, off the main thread.
+    func warmThumbhashes(_ items: [StudioGalleryItem]) {
+        let missing = items.filter { item in
+            item.thumbhash.map { thumbhashes.image($0, aspectRatio: item.aspectRatio) == nil } ?? false
         }
-        let cost = Int(image.size.width * image.scale * image.size.height * image.scale * 4)
-        thumbhashImages.setObject(image, forKey: key, cost: cost)
-        return image
+        guard !missing.isEmpty else { return }
+        Task.detached(priority: .userInitiated) { StudioThumbHashCache.shared.warm(missing) }
     }
 
 #if DEBUG
@@ -355,51 +419,65 @@ final class StudioBrowserStore {
         return await request.value
     }
 
+    /// Holds demand on an artifact's preview until `endPreviewRequest`.
+    /// `.prefetch` reads queue behind squares on screen; a `.visible`
+    /// request for one already prefetching moves it ahead.
     func beginPreviewRequest(
         artifactId: String,
         deviceId: String,
-        workspace: StudioService
+        workspace: StudioService,
+        priority: StudioMediaRequestPriority = .visible
     ) -> Task<UIImage?, Never> {
         let key = artifactId as NSString
         if let image = previews.object(forKey: key) {
             return Task { image }
         }
         previewDemand[artifactId, default: 0] += 1
-        if let task = previewTasks[artifactId] { return task }
+        // A cancelled read may still be unwinding: never hand that one out,
+        // its square would wait on it for nothing.
+        if let task = previewTasks[artifactId], !task.isCancelled {
+            if priority != .prefetch, prefetchOnlyPreviews.remove(artifactId) != nil {
+                workspace.promotePreview(artifactId: artifactId)
+            }
+            return task
+        }
+        if priority == .prefetch {
+            prefetchOnlyPreviews.insert(artifactId)
+        } else {
+            prefetchOnlyPreviews.remove(artifactId)
+        }
 
         let generation = UUID()
-        let task = Task<UIImage?, Never> {
+        let previews = previews
+        let previewDiskCache = previewDiskCache
+        let task = Task<UIImage?, Never>(priority: .userInitiated) {
             if let diskData = await previewDiskCache.data(deviceId: deviceId, artifactId: artifactId) {
-                let diskImage = await Task.detached(priority: .utility) {
+                let diskImage = await Task.detached(priority: .userInitiated) {
                     Self.downsample(data: diskData, maximumPixelSize: 448)
                 }.value
-                guard !Task.isCancelled else { return nil }
                 if let diskImage {
-                    let cost = Int(
-                        diskImage.size.width * diskImage.scale
-                            * diskImage.size.height * diskImage.scale * 4
-                    )
-                    previews.setObject(diskImage, forKey: key, cost: cost)
+                    previews.setObject(diskImage, forKey: key, cost: Self.cost(diskImage))
                     return diskImage
                 }
                 await previewDiskCache.remove(deviceId: deviceId, artifactId: artifactId)
             }
+            guard !Task.isCancelled else { return nil }
 
             guard let relayData = try? await workspace.readStudioPreview(
                 deviceId: deviceId,
-                artifactId: artifactId
+                artifactId: artifactId,
+                priority: priority
             ) else { return nil }
-            let relayImage = await Task.detached(priority: .utility) {
+            // Kept even if its square has gone: the bytes crossed the relay
+            // already, and a square flung past comes back.
+            let relayImage = await Task.detached(priority: .userInitiated) {
                 Self.downsample(data: relayData, maximumPixelSize: 448)
             }.value
-            guard !Task.isCancelled else { return nil }
             if let relayImage {
-                let cost = Int(
-                    relayImage.size.width * relayImage.scale
-                        * relayImage.size.height * relayImage.scale * 4
-                )
-                previews.setObject(relayImage, forKey: key, cost: cost)
-                await previewDiskCache.store(relayData, deviceId: deviceId, artifactId: artifactId)
+                previews.setObject(relayImage, forKey: key, cost: Self.cost(relayImage))
+                Task.detached(priority: .utility) {
+                    await previewDiskCache.store(relayData, deviceId: deviceId, artifactId: artifactId)
+                }
             }
             return relayImage
         }
@@ -411,6 +489,7 @@ final class StudioBrowserStore {
                   self.previewTaskGenerations[artifactId] == generation else { return }
             self.previewTasks.removeValue(forKey: artifactId)
             self.previewTaskGenerations.removeValue(forKey: artifactId)
+            self.prefetchOnlyPreviews.remove(artifactId)
         }
         return task
     }
@@ -425,6 +504,10 @@ final class StudioBrowserStore {
         }
     }
 
+    private nonisolated static func cost(_ image: UIImage) -> Int {
+        Int(image.size.width * image.scale * image.size.height * image.scale * 4)
+    }
+
     private nonisolated static func downsample(data: Data, maximumPixelSize: Int) -> UIImage? {
         let options = [kCGImageSourceShouldCache: false] as CFDictionary
         guard let source = CGImageSourceCreateWithData(data as CFData, options) else { return nil }
@@ -437,7 +520,10 @@ final class StudioBrowserStore {
         guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions) else {
             return nil
         }
-        return UIImage(cgImage: image)
+        // In the display's own format here, off the main thread: otherwise
+        // Core Animation converts it on the main thread at first draw.
+        let decoded = UIImage(cgImage: image)
+        return decoded.preparingForDisplay() ?? decoded
     }
 
     private nonisolated static func decodeImage(

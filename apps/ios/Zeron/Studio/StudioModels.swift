@@ -284,9 +284,16 @@ struct StudioArtifactBytes: Sendable {
     var done: Bool
 }
 
-private func studioDate(_ value: String) -> Date {
-    let fractional = ISO8601DateFormatter()
-    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    if let date = fractional.date(from: value) { return date }
-    return ISO8601DateFormatter().date(from: value) ?? .distantPast
+/// Made once: building an `ISO8601DateFormatter` loads ICU tables (about a
+/// millisecond), and sorts call this per comparison. The formatter is
+/// thread-safe for parsing.
+private nonisolated(unsafe) let studioFractionalDates: ISO8601DateFormatter = {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter
+}()
+private nonisolated(unsafe) let studioWholeSecondDates = ISO8601DateFormatter()
+
+func studioDate(_ value: String) -> Date {
+    studioFractionalDates.date(from: value) ?? studioWholeSecondDates.date(from: value) ?? .distantPast
 }

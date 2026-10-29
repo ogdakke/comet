@@ -6,7 +6,7 @@ import UIKit
 // Copyright (c) 2023 Evan Wallace
 
 enum StudioThumbHash {
-    static func image(base64: String?, aspectRatio: CGFloat? = nil) -> UIImage? {
+    nonisolated static func image(base64: String?, aspectRatio: CGFloat? = nil) -> UIImage? {
         guard let base64,
               let hash = Data(base64Encoded: base64),
               let decoded = decode(hash, aspectRatio: aspectRatio) else { return nil }
@@ -17,7 +17,7 @@ enum StudioThumbHash {
         let image: UIImage
     }
 
-    private static func decode(_ hash: Data, aspectRatio: CGFloat?) -> DecodedImage? {
+    private nonisolated static func decode(_ hash: Data, aspectRatio: CGFloat?) -> DecodedImage? {
         guard hash.count >= 5 else { return nil }
         let bytes = [UInt8](hash)
         let header24 = UInt32(bytes[0]) | UInt32(bytes[1]) << 8 | UInt32(bytes[2]) << 16
@@ -80,49 +80,47 @@ enum StudioThumbHash {
         let height = Int(round(ratio > 1 ? 32 / ratio : 32))
         guard width > 0, height > 0 else { return nil }
 
-        var rgba = Data(count: width * height * 4)
         let xStop = max(luminanceX, hasAlpha ? 5 : 3)
         let yStop = max(luminanceY, hasAlpha ? 5 : 3)
-        var xCoefficients = [Float32](repeating: 0, count: xStop)
-        var yCoefficients = [Float32](repeating: 0, count: yStop)
+        // The cosine bases, once per column and row (not per pixel).
+        var xCos = [Float32](repeating: 0, count: width * xStop)
+        for x in 0..<width {
+            for cx in 0..<xStop {
+                xCos[x * xStop + cx] = cos(Float32.pi / Float32(width) * (Float32(x) + 0.5) * Float32(cx))
+            }
+        }
+        var yCos = [Float32](repeating: 0, count: height * yStop)
+        for y in 0..<height {
+            for cy in 0..<yStop {
+                yCos[y * yStop + cy] = cos(Float32.pi / Float32(height) * (Float32(y) + 0.5) * Float32(cy)) * 2
+            }
+        }
 
-        rgba.withUnsafeMutableBytes { rawBuffer in
+        // BGRA, premultiplied first, little-endian: the display's native
+        // format, so Core Animation draws it as is.
+        var bgra = Data(count: width * height * 4)
+        bgra.withUnsafeMutableBytes { rawBuffer in
             guard var output = rawBuffer.baseAddress?.bindMemory(
                 to: UInt8.self,
                 capacity: rawBuffer.count
             ) else { return }
 
-            var y = 0
-            while y < height {
-                var x = 0
-                while x < width {
+            for y in 0..<height {
+                let yRow = y * yStop
+                for x in 0..<width {
+                    let xRow = x * xStop
                     var luminance = luminanceDC
                     var p = pDC
                     var q = qDC
                     var alpha = alphaDC
 
-                    var cx = 0
-                    while cx < xStop {
-                        xCoefficients[cx] = cos(
-                            Float32.pi / Float32(width) * (Float32(x) + 0.5) * Float32(cx)
-                        )
-                        cx += 1
-                    }
-                    var cy = 0
-                    while cy < yStop {
-                        yCoefficients[cy] = cos(
-                            Float32.pi / Float32(height) * (Float32(y) + 0.5) * Float32(cy)
-                        )
-                        cy += 1
-                    }
-
                     var coefficient = 0
-                    cy = 0
+                    var cy = 0
                     while cy < luminanceY {
-                        cx = cy > 0 ? 0 : 1
-                        let fy = yCoefficients[cy] * 2
+                        var cx = cy > 0 ? 0 : 1
+                        let fy = yCos[yRow + cy]
                         while cx * luminanceY < luminanceX * (luminanceY - cy) {
-                            luminance += luminanceAC[coefficient] * xCoefficients[cx] * fy
+                            luminance += luminanceAC[coefficient] * xCos[xRow + cx] * fy
                             coefficient += 1
                             cx += 1
                         }
@@ -132,10 +130,10 @@ enum StudioThumbHash {
                     coefficient = 0
                     cy = 0
                     while cy < 3 {
-                        cx = cy > 0 ? 0 : 1
-                        let fy = yCoefficients[cy] * 2
+                        var cx = cy > 0 ? 0 : 1
+                        let fy = yCos[yRow + cy]
                         while cx < 3 - cy {
-                            let factor = xCoefficients[cx] * fy
+                            let factor = xCos[xRow + cx] * fy
                             p += pAC[coefficient] * factor
                             q += qAC[coefficient] * factor
                             coefficient += 1
@@ -148,10 +146,10 @@ enum StudioThumbHash {
                         coefficient = 0
                         cy = 0
                         while cy < 5 {
-                            cx = cy > 0 ? 0 : 1
-                            let fy = yCoefficients[cy] * 2
+                            var cx = cy > 0 ? 0 : 1
+                            let fy = yCos[yRow + cy]
                             while cx < 5 - cy {
-                                alpha += alphaAC[coefficient] * xCoefficients[cx] * fy
+                                alpha += alphaAC[coefficient] * xCos[xRow + cx] * fy
                                 coefficient += 1
                                 cx += 1
                             }
@@ -168,18 +166,16 @@ enum StudioThumbHash {
                     alpha = max(0, 255 * min(1, alpha))
 
                     let alphaByte = UInt16(alpha)
-                    output[0] = UInt8(min(255, UInt16(red) * alphaByte / 255))
+                    output[0] = UInt8(min(255, UInt16(blue) * alphaByte / 255))
                     output[1] = UInt8(min(255, UInt16(green) * alphaByte / 255))
-                    output[2] = UInt8(min(255, UInt16(blue) * alphaByte / 255))
+                    output[2] = UInt8(min(255, UInt16(red) * alphaByte / 255))
                     output[3] = UInt8(alphaByte)
                     output = output.advanced(by: 4)
-                    x += 1
                 }
-                y += 1
             }
         }
 
-        guard let provider = CGDataProvider(data: rgba as CFData),
+        guard let provider = CGDataProvider(data: bgra as CFData),
               let cgImage = CGImage(
                 width: width,
                 height: height,
@@ -188,8 +184,8 @@ enum StudioThumbHash {
                 bytesPerRow: width * 4,
                 space: CGColorSpaceCreateDeviceRGB(),
                 bitmapInfo: CGBitmapInfo(
-                    rawValue: CGBitmapInfo.byteOrder32Big.rawValue
-                        | CGImageAlphaInfo.premultipliedLast.rawValue
+                    rawValue: CGBitmapInfo.byteOrder32Little.rawValue
+                        | CGImageAlphaInfo.premultipliedFirst.rawValue
                 ),
                 provider: provider,
                 decode: nil,
@@ -199,12 +195,55 @@ enum StudioThumbHash {
         return DecodedImage(image: UIImage(cgImage: cgImage))
     }
 
-    private static func approximateAspectRatio(_ hash: [UInt8]) -> Float32 {
+    private nonisolated static func approximateAspectRatio(_ hash: [UInt8]) -> Float32 {
         let header = hash[3]
         let hasAlpha = (hash[2] & 0x80) != 0
         let landscape = (hash[4] & 0x80) != 0
         let x = landscape ? (hasAlpha ? 5 : 7) : header & 7
         let y = landscape ? header & 7 : (hasAlpha ? 5 : 7)
         return Float32(x) / Float32(max(y, 1))
+    }
+}
+
+/// Decoded thumbhashes by hash and aspect ratio, shared by every Studio
+/// screen and safe from any thread: gallery pages and prefetch decode them
+/// in the background, so a square has its placeholder on its first frame.
+/// A 32px image is 4 KB; the limit holds a few thousand.
+final class StudioThumbHashCache: @unchecked Sendable {
+    static let shared = StudioThumbHashCache()
+    private let cache = NSCache<NSString, UIImage>()
+
+    private init() {
+        cache.countLimit = 4_000
+        cache.totalCostLimit = 16 * 1024 * 1024
+    }
+
+    func image(_ thumbhash: String, aspectRatio: CGFloat?) -> UIImage? {
+        cache.object(forKey: Self.key(thumbhash, aspectRatio))
+    }
+
+    /// Decodes and keeps it (any thread).
+    @discardableResult
+    func decode(_ thumbhash: String, aspectRatio: CGFloat?) -> UIImage? {
+        let key = Self.key(thumbhash, aspectRatio)
+        if let image = cache.object(forKey: key) { return image }
+        guard let image = StudioThumbHash.image(base64: thumbhash, aspectRatio: aspectRatio) else { return nil }
+        let cost = Int(image.size.width * image.scale * image.size.height * image.scale * 4)
+        cache.setObject(image, forKey: key, cost: cost)
+        return image
+    }
+
+    /// Every item's thumbhash, ahead of display (call off the main thread).
+    func warm(_ items: [StudioGalleryItem]) {
+        for item in items {
+            if let thumbhash = item.thumbhash { decode(thumbhash, aspectRatio: item.aspectRatio) }
+        }
+    }
+
+    func removeAll() { cache.removeAllObjects() }
+
+    private static func key(_ thumbhash: String, _ aspectRatio: CGFloat?) -> NSString {
+        guard let aspectRatio, aspectRatio.isFinite else { return "\(thumbhash):raw" as NSString }
+        return "\(thumbhash):\(Int((aspectRatio * 10_000).rounded()))" as NSString
     }
 }

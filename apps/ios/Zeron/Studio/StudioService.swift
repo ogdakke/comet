@@ -132,10 +132,14 @@ final class StudioService {
         pageSize: Int,
         cursor: StudioGalleryCursor
     ) async throws -> StudioGalleryResponse {
-        try await call(deviceId, "ListStudioArtifacts", [
+        // Decoded off the main thread: a page is a hundred-odd items.
+        let reply = try await Self.rawCall(client, deviceId, "ListStudioArtifacts", [
             "limit": pageSize,
             "cursor": ["createdAt": cursor.createdAt, "artifactId": cursor.artifactId],
         ])
+        return try await Task.detached(priority: .userInitiated) {
+            try JSONDecoder().decode(StudioGalleryResponse.self, from: Data(reply.utf8))
+        }.value
     }
 
     func markStudioThreadSeen(deviceId: String, threadId: String) async {
@@ -175,16 +179,25 @@ final class StudioService {
 
     /// Preview reads stay bounded. Originals come only through
     /// `downloadStudioArtifact`, one at a time, into a temporary file.
-    func readStudioPreview(deviceId: String, artifactId: String) async throws -> Data {
-        try await mediaGate.acquire(priority: .background)
-        defer { Task { await mediaGate.release() } }
+    /// Off the main thread: each chunk is a base64 string in JSON, and a
+    /// gallery fling reads dozens of them.
+    nonisolated func readStudioPreview(
+        deviceId: String,
+        artifactId: String,
+        priority: StudioMediaRequestPriority = .visible
+    ) async throws -> Data {
+        let gate = mediaGate
+        let held: StudioMediaRequestPriority = priority == .foreground ? .foreground : .visible
+        try await gate.acquire(priority: priority, key: artifactId)
+        defer { Task { await gate.release(priority: held) } }
         var result = Data()
         var offset: UInt64 = 0
         repeat {
             try Task.checkCancellation()
-            let chunk: StudioArtifactChunk = try await call(
-                deviceId, "ReadStudioPreviewChunk", ["artifactId": artifactId, "offset": offset]
+            let reply = try await Self.rawCall(
+                client, deviceId, "ReadStudioPreviewChunk", ["artifactId": artifactId, "offset": offset]
             )
+            let chunk = try JSONDecoder().decode(StudioArtifactChunk.self, from: Data(reply.utf8))
             guard chunk.artifactId == artifactId,
                   chunk.nextOffset >= offset,
                   let bytes = Data(base64Encoded: chunk.data) else {
@@ -202,13 +215,19 @@ final class StudioService {
         } while true
     }
 
+    /// A square came on screen: its preview read goes ahead of prefetch.
+    nonisolated func promotePreview(artifactId: String) {
+        let gate = mediaGate
+        Task { await gate.promote(key: artifactId) }
+    }
+
     func readStudioArtifactChunk(
         deviceId: String,
         artifactId: String,
         offset: UInt64
     ) async throws -> StudioArtifactBytes {
         try await mediaGate.acquire(priority: .foreground)
-        defer { Task { await mediaGate.release() } }
+        defer { Task { await mediaGate.release(priority: .foreground) } }
         let chunk: StudioArtifactChunk = try await call(
             deviceId, "ReadStudioArtifactChunk", ["artifactId": artifactId, "offset": offset]
         )
@@ -243,7 +262,7 @@ final class StudioService {
         let (maximumBytes, overflow) = declaredSize.addingReportingOverflow(allowance)
         guard !overflow else { throw StudioError.message("Studio reported an invalid artifact size") }
         try await mediaGate.acquire(priority: .foreground)
-        defer { Task { await mediaGate.release() } }
+        defer { Task { await mediaGate.release(priority: .foreground) } }
 
         let directory = FileManager.default.temporaryDirectory
             .appending(path: "ZeronStudioViewer", directoryHint: .isDirectory)
@@ -311,6 +330,21 @@ final class StudioService {
         return try JSONDecoder().decode(Response.self, from: Data(reply.utf8))
     }
 
+    /// `call` without the main actor, for media reads.
+    private nonisolated static func rawCall(
+        _ client: CoreClient,
+        _ deviceId: String,
+        _ method: String,
+        _ params: [String: Any]
+    ) async throws -> String {
+        let body = try encode(params)
+        do {
+            return try await client.studioCall(deviceId: deviceId, method: method, paramsJson: body)
+        } catch let error as CoreError {
+            throw StudioError(error)
+        }
+    }
+
     private func watch<Item: Decodable & Sendable>(
         _ deviceId: String,
         _ method: String,
@@ -337,7 +371,7 @@ final class StudioService {
         return stream
     }
 
-    private static func encode(_ params: [String: Any]) throws -> String {
+    private nonisolated static func encode(_ params: [String: Any]) throws -> String {
         let data = try JSONSerialization.data(withJSONObject: params)
         return String(decoding: data, as: UTF8.self)
     }
@@ -394,7 +428,10 @@ struct StudioDownloadedFile: Sendable {
     let mimeType: String
 }
 
-enum StudioMediaRequestPriority {
+enum StudioMediaRequestPriority: Sendable {
     case foreground
-    case background
+    /// A preview on screen now.
+    case visible
+    /// A preview ahead of the scroll.
+    case prefetch
 }
