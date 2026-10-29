@@ -233,7 +233,11 @@ enum StudioAttachmentOrigin: Hashable, Codable {
     case asset
     case artifact(String)
 
-    private enum CodingKeys: String, CodingKey { case type, artifactId }
+    // Serde renames only the enum's tags: the variant's field stays snake_case.
+    private enum CodingKeys: String, CodingKey {
+        case type
+        case artifactId = "artifact_id"
+    }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)

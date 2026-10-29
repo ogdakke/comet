@@ -1,7 +1,9 @@
 import Observation
 import UIKit
 
-/// One thread off the host's watch stream.
+/// One thread off the host's watch stream. A dropped stream (the desktop
+/// went offline, the link reconnected) is reopened with backoff; meanwhile
+/// `error` says why, over the last thread seen.
 @MainActor
 @Observable
 private final class StudioThreadStore {
@@ -9,20 +11,44 @@ private final class StudioThreadStore {
     var loading = true
     var error: String?
 
-    func watch(service: StudioService, deviceId: String, threadId: String) async {
+    /// Another desktop: what showed belongs to the old one.
+    func reset() {
+        thread = nil
         loading = true
         error = nil
-        do {
-            let stream = try service.watchStudioThread(deviceId: deviceId, threadId: threadId)
-            for try await thread in stream {
+    }
+
+    /// A send's reply, ahead of the watch. Only taken when it has more turns
+    /// than what shows: an older snapshot would rewind runs the watch has
+    /// already moved on.
+    func adopt(_ reply: StudioThread) {
+        guard reply.conversation.id == thread?.conversation.id,
+              reply.turns.count > thread?.turns.count ?? 0 else { return }
+        thread = reply
+    }
+
+    func watch(service: StudioService, deviceId: String, threadId: String) async {
+        loading = thread == nil
+        var delay = Duration.seconds(1)
+        while !Task.isCancelled {
+            do {
+                let stream = try service.watchStudioThread(deviceId: deviceId, threadId: threadId)
+                for try await thread in stream {
+                    guard !Task.isCancelled else { return }
+                    self.thread = thread
+                    loading = false
+                    error = nil
+                    delay = .seconds(1)
+                }
                 guard !Task.isCancelled else { return }
-                self.thread = thread
-                loading = false
+                error = "The desktop stopped sending updates"
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.error = error.localizedDescription
             }
-        } catch {
-            guard !Task.isCancelled else { return }
             loading = false
-            self.error = error.localizedDescription
+            try? await Task.sleep(for: delay)
+            delay = min(delay * 2, .seconds(30))
         }
     }
 }
@@ -131,6 +157,7 @@ final class StudioThreadViewController: UIViewController, UICollectionViewDelega
 
         composer = StudioComposerView(store: composerStore, browser: browser, service: service)
         composer.onHeightChange = { [weak self] in self?.view.setNeedsLayout() }
+        composerStore.onSent = { [weak self] thread in self?.store.adopt(thread) }
         bottom.axis = .vertical
         bottom.alignment = .fill
         bottom.translatesAutoresizingMaskIntoConstraints = false
@@ -179,6 +206,11 @@ final class StudioThreadViewController: UIViewController, UICollectionViewDelega
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
         guard isMovingFromParent || navigationController?.isBeingDismissed == true else { return }
+        // Runs that finished while this was open were seen: no "Done" badge.
+        if watchKey != nil, let deviceId = browser.selectedDeviceId {
+            let (service, threadId) = (service, threadId)
+            Task { await service.markStudioThreadSeen(deviceId: deviceId, threadId: threadId) }
+        }
         watchTasks.forEach { $0.cancel() }
         watchTasks = []
         watchKey = nil
@@ -220,11 +252,17 @@ final class StudioThreadViewController: UIViewController, UICollectionViewDelega
 
         loadingView.isHidden = !(store.loading && thread == nil)
         if let error = store.error, thread == nil {
-            var unavailable = UIContentUnavailableConfiguration.empty()
-            unavailable.image = UIImage(systemName: "exclamationmark.triangle")
-            unavailable.text = "Thread unavailable"
-            unavailable.secondaryText = error
-            contentUnavailableConfiguration = unavailable
+            contentUnavailableConfiguration = StudioUnavailable.configuration(
+                title: "Thread unavailable",
+                message: error,
+                symbol: "exclamationmark.triangle"
+            )
+        } else if deviceId == nil {
+            contentUnavailableConfiguration = StudioUnavailable.configuration(
+                title: "No desktop",
+                message: "Studio runs on a desktop signed in to this account.",
+                symbol: "desktopcomputer"
+            )
         } else {
             contentUnavailableConfiguration = nil
         }
@@ -234,17 +272,26 @@ final class StudioThreadViewController: UIViewController, UICollectionViewDelega
         bottomFade.isHidden = thread == nil
         guard let thread else { return }
         let active = thread.turns.flatMap(\.runs).first { $0.state.isCreating }
-        status.update(label: active?.state.label)
+        // A dropped watch shows over the last thread seen while it reconnects.
+        status.update(label: store.error != nil ? "Reconnecting…" : active?.state.label)
         if thread != shown { apply(thread) }
     }
 
     private func restartWatchIfNeeded(deviceId: String?) {
         let key = "\(deviceId ?? "none")-\(threadId)"
         guard key != watchKey else { return }
+        let switched = watchKey != nil
         watchKey = key
         watchTasks.forEach { $0.cancel() }
         watchTasks = []
-        guard let deviceId else { return }
+        if switched {
+            store.reset()
+            shown = nil
+        }
+        guard let deviceId else {
+            store.loading = false
+            return
+        }
         let (store, service, composer, threadId) = (store, service, composerStore, threadId)
         watchTasks = [
             Task {
@@ -257,8 +304,11 @@ final class StudioThreadViewController: UIViewController, UICollectionViewDelega
 
     private func apply(_ thread: StudioThread) {
         let first = shown == nil
-        let pinned = first || isAtBottom
+        // A new turn (this phone's send, or the desktop's) is followed down.
+        let newTurn = !first && thread.turns.count > shown?.turns.count ?? 0
+        let pinned = first || newTurn || isAtBottom
         shown = thread
+        let (oldTurns, oldRuns, oldArtifacts) = (turns, runs, artifacts)
         turns = [:]
         runs = [:]
         artifacts = [:]
@@ -278,14 +328,33 @@ final class StudioThreadViewController: UIViewController, UICollectionViewDelega
                 snapshot.appendItems(sorted.map { .artifact($0.id) })
             }
         }
-        // Rows keep their identity; a run's state or a prompt can still change.
-        snapshot.reconfigureItems(snapshot.itemIdentifiers)
+        // Rows keep their identity; a run's state or a prompt can still
+        // change. Only rows that did are reconfigured: the stream sends the
+        // whole thread on every progress tick.
+        let existing = Set(dataSource.snapshot().itemIdentifiers)
+        let changed = snapshot.itemIdentifiers.filter { item in
+            guard existing.contains(item) else { return false }
+            switch item {
+            case .prompt(let id): return oldTurns[id]?.prompt != turns[id]?.prompt
+            case .run(let id): return oldRuns[id]?.run != runs[id]?.run
+            case .artifact(let id):
+                return oldArtifacts[id]?.artifact != artifacts[id]?.artifact
+                    || oldArtifacts[id]?.run.model.displayName != artifacts[id]?.run.model.displayName
+            }
+        }
+        snapshot.reconfigureItems(changed)
         dataSource.apply(snapshot, animatingDifferences: !first) { [weak self] in
             if pinned { self?.scrollToBottom() }
         }
         if first {
-            collectionView.layoutIfNeeded()
             scrollToBottom()
+            // An empty thread has one thing to do: describe what to make.
+            if thread.turns.isEmpty {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.view.window != nil else { return }
+                    self.composer.becomeFirstResponder()
+                }
+            }
         }
     }
 
@@ -300,8 +369,16 @@ final class StudioThreadViewController: UIViewController, UICollectionViewDelega
         )
     }
 
+    /// Rows above the end are only estimated until they're laid out: settle
+    /// the content size once at the end, then land on its real bottom.
     private func scrollToBottom() {
-        collectionView.contentOffset.y = maxOffsetY
+        collectionView.layoutIfNeeded()
+        for _ in 0..<2 {
+            let target = maxOffsetY
+            guard abs(collectionView.contentOffset.y - target) > 0.5 else { return }
+            collectionView.contentOffset.y = target
+            collectionView.layoutIfNeeded()
+        }
     }
 
     // MARK: Layout
@@ -310,7 +387,11 @@ final class StudioThreadViewController: UIViewController, UICollectionViewDelega
         UICollectionViewCompositionalLayout { [weak self] index, environment in
             guard let self, let section = self.dataSource?.sectionIdentifier(for: index) else { return nil }
             let last = index == self.dataSource.snapshot().numberOfSections - 1
-            let width = environment.container.effectiveContentSize.width - 32
+            // Phones: 16pt gutters. Wider (iPad, landscape): a centered
+            // column as wide as the composer's glass, less its 4pt.
+            let available = environment.container.effectiveContentSize.width
+            let gutter = max(16, ((available - 760) / 2).rounded(.down))
+            let width = available - gutter * 2
             let layoutSection: NSCollectionLayoutSection
             var top: CGFloat
             switch section {
@@ -337,7 +418,7 @@ final class StudioThreadViewController: UIViewController, UICollectionViewDelega
                 layoutSection.interGroupSpacing = 3
                 top = 10
             }
-            layoutSection.contentInsets = NSDirectionalEdgeInsets(top: top, leading: 16, bottom: last ? 12 : 0, trailing: 16)
+            layoutSection.contentInsets = NSDirectionalEdgeInsets(top: top, leading: gutter, bottom: last ? 12 : 0, trailing: gutter)
             return layoutSection
         }
     }
@@ -499,6 +580,13 @@ private final class StudioThreadStatusView: UIStackView {
         label.textColor = Palette.secondary
         addArrangedSubview(spinner)
         addArrangedSubview(label)
+        isAccessibilityElement = true
+        accessibilityTraits = .updatesFrequently
+    }
+
+    override var accessibilityLabel: String? {
+        get { label.text }
+        set {}
     }
 
     required init(coder: NSCoder) { fatalError() }
@@ -521,7 +609,8 @@ private final class StudioPromptCell: UICollectionViewCell {
         bubble.layer.cornerRadius = 18
         bubble.layer.cornerCurve = .continuous
         bubble.translatesAutoresizingMaskIntoConstraints = false
-        label.font = Fonts.ui(.sans, 16)
+        // Scales with the text size, like the composer it was typed in.
+        label.font = Fonts.ui(.sans, UIFontMetrics(forTextStyle: .body).scaledValue(for: 16))
         label.textColor = Palette.text
         label.numberOfLines = 0
         label.translatesAutoresizingMaskIntoConstraints = false
@@ -595,6 +684,7 @@ private final class StudioRunCell: UICollectionViewCell {
             stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
         ])
+        isAccessibilityElement = true
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -619,6 +709,8 @@ private final class StudioRunCell: UICollectionViewCell {
         let message = run.artifacts.isEmpty ? run.error.flatMap { $0.isEmpty ? nil : $0 } : nil
         error.text = message
         errorRow.isHidden = message == nil
+        accessibilityLabel = [run.model.displayName, run.state.label, message].compactMap(\.self).joined(separator: ", ")
+        accessibilityValue = run.state.isCreating ? run.progress.map { "\(Int(($0 * 100).rounded())) percent" } : nil
     }
 }
 
@@ -648,9 +740,14 @@ private final class StudioArtifactCell: UICollectionViewCell {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    /// What the preview was last configured with.
+    private var shownId: String?
+    private var shownThumbhash: String?
+
     override func prepareForReuse() {
         super.prepareForReuse()
         preview?.reset()
+        shownId = nil
     }
 
     func configure(
@@ -668,6 +765,14 @@ private final class StudioArtifactCell: UICollectionViewCell {
             self.preview = view
             return view
         }()
+        // A fresh artifact shows before its preview is derived; the preview
+        // view only loads once per artifact, so its thumbhash arriving (the
+        // preview now exists) restarts the load.
+        if shownId == artifact.id, shownThumbhash != artifact.thumbhash {
+            preview.reset()
+        }
+        shownId = artifact.id
+        shownThumbhash = artifact.thumbhash
         preview.configure(
             artifactId: artifact.id,
             mediaKind: artifact.mediaKind,

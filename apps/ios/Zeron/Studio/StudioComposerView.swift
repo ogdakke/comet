@@ -1,3 +1,4 @@
+import ImageIO
 import PhotosUI
 import UIKit
 import UniformTypeIdentifiers
@@ -19,7 +20,13 @@ final class StudioComposerView: UIView, UITextViewDelegate, UIGestureRecognizerD
     private let service: StudioService
 
     private let errorLabel = UILabel()
+    /// The notice line that acts: a conflict to resolve, a missing provider
+    /// key to add, or a failed load to retry.
     private let conflictButton = UIButton(type: .system)
+    private let conflictGlyph = UIImageView()
+    private var noticeAction: NoticeAction?
+    private enum NoticeAction { case retry, provider, conflict }
+    private let column = UIStackView()
     private let glass = Glass.surface(interactive: false, radius: 25)
     let textView = UITextView()
     private let placeholderLabel = UILabel()
@@ -75,7 +82,9 @@ final class StudioComposerView: UIView, UITextViewDelegate, UIGestureRecognizerD
         conflict.image = UIImage(systemName: "exclamationmark.circle", withConfiguration: UIImage.SymbolConfiguration(pointSize: 11.5, weight: .medium))
         conflict.imagePadding = 6
         conflict.baseForegroundColor = Palette.warning
-        conflict.contentInsets = NSDirectionalEdgeInsets(top: 2, leading: 0, bottom: 2, trailing: 18)
+        // Tall insets for the tap target; the stack's spacing below is
+        // trimmed to match, so the line sits where it did.
+        conflict.contentInsets = NSDirectionalEdgeInsets(top: 7, leading: 0, bottom: 7, trailing: 18)
         conflict.titleLineBreakMode = .byTruncatingTail
         conflict.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attrs in
             var a = attrs
@@ -84,24 +93,25 @@ final class StudioComposerView: UIView, UITextViewDelegate, UIGestureRecognizerD
         }
         conflictButton.configuration = conflict
         conflictButton.contentHorizontalAlignment = .leading
-        let chevron = UIImageView(image: UIImage(systemName: "chevron.up", withConfiguration: UIImage.SymbolConfiguration(pointSize: 9, weight: .semibold)))
-        chevron.tintColor = Palette.warning
-        chevron.translatesAutoresizingMaskIntoConstraints = false
-        conflictButton.addSubview(chevron)
+        conflictGlyph.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 9, weight: .semibold)
+        conflictGlyph.translatesAutoresizingMaskIntoConstraints = false
+        conflictButton.addSubview(conflictGlyph)
         NSLayoutConstraint.activate([
-            chevron.trailingAnchor.constraint(equalTo: conflictButton.trailingAnchor),
-            chevron.centerYAnchor.constraint(equalTo: conflictButton.centerYAnchor),
+            conflictGlyph.trailingAnchor.constraint(equalTo: conflictButton.trailingAnchor),
+            conflictGlyph.centerYAnchor.constraint(equalTo: conflictButton.centerYAnchor),
         ])
-        conflictButton.addAction(UIAction { [weak self] _ in self?.showConflict() }, for: .touchUpInside)
+        conflictButton.addAction(UIAction { [weak self] _ in self?.noticeTapped() }, for: .touchUpInside)
 
         // The notice lines sit 24pt in from the screen edge, past the bar's 12.
         let notices = UIStackView(arrangedSubviews: [errorLabel, conflictButton])
         notices.axis = .vertical
         notices.isLayoutMarginsRelativeArrangement = true
         notices.directionalLayoutMargins = NSDirectionalEdgeInsets(top: 0, leading: 12, bottom: 0, trailing: 12)
-        let stack = UIStackView(arrangedSubviews: [notices, glass])
+        let stack = column
+        stack.addArrangedSubview(notices)
+        stack.addArrangedSubview(glass)
         stack.axis = .vertical
-        stack.spacing = 6
+        stack.spacing = 1
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
 
@@ -135,6 +145,7 @@ final class StudioComposerView: UIView, UITextViewDelegate, UIGestureRecognizerD
         textView.textContainer.lineFragmentPadding = 0
         textView.keyboardDismissMode = .interactive
         textView.accessibilityIdentifier = "studio-composer-input"
+        textView.accessibilityLabel = "Prompt"
         textView.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(textView)
 
@@ -157,7 +168,12 @@ final class StudioComposerView: UIView, UITextViewDelegate, UIGestureRecognizerD
         toolbar.addSubview(chipScroll)
 
         modeSegment.onChange = { [weak self] mode in
-            guard let self, let deviceId = self.deviceId else { return }
+            guard let self else { return }
+            guard let deviceId = self.deviceId else {
+                // Nothing to switch on: the segment snaps back.
+                self.modeSegment.mode = self.store.snapshot.mode
+                return
+            }
             self.store.setMode(mode, workspace: self.service, deviceId: deviceId)
         }
         durationChip.showsMenuAsPrimaryAction = true
@@ -250,30 +266,50 @@ final class StudioComposerView: UIView, UITextViewDelegate, UIGestureRecognizerD
             ? "Describe the image you want to create"
             : "Describe the video you want to create"
 
-        if let error = store.error {
-            errorLabel.text = error
-            errorLabel.isHidden = false
-            conflictButton.isHidden = true
+        let notice: (title: String, action: NoticeAction)?
+        if let error = store.error, store.loadFailed {
+            notice = (error, .retry)
+        } else if store.error != nil {
+            notice = nil
         } else if store.missingProvider {
-            errorLabel.isHidden = true
             let name = deviceId.flatMap { id in service.hosts.first { $0.id == id }?.name } ?? "this desktop"
-            conflictButton.configuration?.title = "No provider key on \(name). Add one"
-            conflictButton.isHidden = false
+            notice = ("No provider key on \(name). Add one", .provider)
         } else if let conflict = evaluation?.conflicts.first {
-            errorLabel.isHidden = true
-            conflictButton.configuration?.title = conflict.title
-            conflictButton.isHidden = false
+            notice = (conflict.title, .conflict)
         } else {
-            errorLabel.isHidden = true
-            conflictButton.isHidden = true
+            notice = nil
         }
-        // No notice, no gap above the glass.
+        errorLabel.text = store.error
+        errorLabel.isHidden = store.error == nil || notice != nil
+        noticeAction = notice?.action
+        conflictButton.isHidden = notice == nil
+        if let notice {
+            let retry = notice.action == .retry
+            let tint = retry ? Palette.danger : Palette.warning
+            conflictButton.configuration?.title = notice.title
+            conflictButton.configuration?.baseForegroundColor = tint
+            conflictButton.configuration?.image = UIImage(
+                systemName: retry ? "exclamationmark.triangle" : "exclamationmark.circle",
+                withConfiguration: UIImage.SymbolConfiguration(pointSize: 11.5, weight: .medium)
+            )
+            conflictGlyph.image = UIImage(systemName: retry ? "arrow.clockwise" : "chevron.up")
+            conflictGlyph.tintColor = tint
+            conflictButton.accessibilityHint = switch notice.action {
+            case .retry: "Tries loading Studio again"
+            case .provider: "Adds a provider key on the desktop"
+            case .conflict: "Shows ways to resolve it"
+            }
+        }
+        // No notice, no gap above the glass; a plain error line keeps the
+        // 6pt the button's insets otherwise make up.
         errorLabel.superview?.isHidden = errorLabel.isHidden && conflictButton.isHidden
+        column.setCustomSpacing(errorLabel.isHidden ? 1 : 6, after: column.arrangedSubviews[0])
 
         modeSegment.mode = snapshot.mode
         let showsDuration: Bool
         if snapshot.mode == .video, let duration = evaluation?.globals.duration {
             durationChip.configuration?.title = duration.label
+            durationChip.accessibilityValue = duration.label
             let choices = evaluation?.globals.durationChoices ?? []
             durationChip.menu = UIMenu(children: choices.map { choice in
                 UIAction(title: choice.label, state: choice.value == duration ? .on : .off) { [weak self] _ in
@@ -331,7 +367,8 @@ final class StudioComposerView: UIView, UITextViewDelegate, UIGestureRecognizerD
         actionButton.isEnabled = enabled
 
         // An evaluation (or a conflict action) can ask for the model picker.
-        if store.modelPickerRequested {
+        // Not while the thread is covered (the viewer, another sheet).
+        if store.modelPickerRequested, window != nil {
             store.modelPickerRequested = false
             DispatchQueue.main.async { [weak self] in self?.showModelPicker() }
         }
@@ -374,9 +411,16 @@ final class StudioComposerView: UIView, UITextViewDelegate, UIGestureRecognizerD
 
     // MARK: Resting ↔ card
 
-    /// Composing (focused), holding references, or a sheet up from here.
+    /// Composing (focused), holding references, a sheet up from here, or
+    /// picked items still being read (the picker is gone, they're not yet
+    /// staged: without this the card drops and springs back).
     private var wantsCard: Bool {
         textView.isFirstResponder || !openSheets.isEmpty || !store.snapshot.attachments.isEmpty
+            || readingPicks > 0
+    }
+
+    private var readingPicks = 0 {
+        didSet { updateMode(animated: true) }
     }
 
     private func updateMode(animated: Bool) {
@@ -554,16 +598,26 @@ final class StudioComposerView: UIView, UITextViewDelegate, UIGestureRecognizerD
         presentSheet(StudioSheetController(rootViewController: configuration))
     }
 
-    private func showConflict() {
-        if store.missingProvider {
-            guard let deviceId, var host = findViewController() else { return }
+    private func noticeTapped() {
+        guard let deviceId else { return }
+        switch noticeAction {
+        case .retry:
+            Task { await store.load(workspace: service, deviceId: deviceId) }
+        case .provider:
+            guard var host = findViewController() else { return }
             while let presented = host.presentedViewController { host = presented }
             host.presentStudioProviders(service: service, deviceId: deviceId) { [weak self] in
                 guard let self else { return }
                 Task { await self.store.load(workspace: self.service, deviceId: deviceId) }
             }
-            return
+        case .conflict:
+            showConflict()
+        case nil:
+            break
         }
+    }
+
+    private func showConflict() {
         guard let conflict = store.evaluation?.conflicts.first else { return }
         let controller = StudioConflictController(conflict: conflict) { [weak self] action in
             guard let self, let deviceId = self.deviceId else { return }
@@ -578,7 +632,9 @@ final class StudioComposerView: UIView, UITextViewDelegate, UIGestureRecognizerD
         var config = PHPickerConfiguration(photoLibrary: .shared())
         config.filter = .any(of: [.images, .videos])
         config.selectionLimit = 12
-        config.preferredAssetRepresentationMode = .current
+        // The host takes PNG/JPEG/WebP/GIF and MP4/QuickTime only: let Photos
+        // hand HEIC stills over as JPEG.
+        config.preferredAssetRepresentationMode = .compatible
         let picker = PHPickerViewController(configuration: config)
         picker.delegate = self
         presentSheet(picker)
@@ -592,6 +648,9 @@ final class StudioComposerView: UIView, UITextViewDelegate, UIGestureRecognizerD
     }
 
     func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+        // Hold the card across the gap between the picker going and the
+        // first reference being staged.
+        readingPicks += results.count
         picker.dismiss(animated: true)
         sheetClosed(picker)
         guard !results.isEmpty else { return }
@@ -599,66 +658,87 @@ final class StudioComposerView: UIView, UITextViewDelegate, UIGestureRecognizerD
             // One at a time, in the order picked.
             for result in results {
                 let loaded = await Self.loadMedia(result.itemProvider)
-                guard let self, let deviceId = self.deviceId else { return }
-                guard let (data, type) = loaded else {
-                    self.store.error = "A selected item could not be read."
-                    continue
+                guard let self else { return }
+                defer { self.readingPicks -= 1 }
+                guard let deviceId = self.deviceId else { continue }
+                do {
+                    let (data, type) = try loaded.get()
+                    try self.stage(data, type: type, deviceId: deviceId)
+                } catch {
+                    self.store.error = error.localizedDescription
                 }
-                let mime = type?.preferredMIMEType ?? StudioPickedMedia.sniff(data)?.mime
-                guard let mime, let kind = StudioPickedMedia.kind(mime: mime) else {
-                    self.store.error = "A selected item is not a supported Studio reference."
-                    continue
-                }
-                self.store.importAttachment(
-                    data: data,
-                    mimeType: mime,
-                    kind: kind,
-                    preview: kind == .image ? UIImage(data: data) : nil,
-                    workspace: self.service,
-                    deviceId: deviceId
-                )
             }
         }
     }
 
-    /// The item's bytes in its first image or movie representation.
-    private static func loadMedia(_ provider: NSItemProvider) async -> (Data, UTType?)? {
+    /// The item's bytes in its first image or movie representation. Movies
+    /// come as a file whose size is checked before it's read into memory.
+    private nonisolated static func loadMedia(_ provider: NSItemProvider) async -> Result<(Data, UTType?), Swift.Error> {
         let type = provider.registeredTypeIdentifiers
             .compactMap { UTType($0) }
             .first { $0.conforms(to: .image) || $0.conforms(to: .movie) }
-        guard let type else { return nil }
+        guard let type else { return .failure(StudioPickedMedia.Error.unsupported) }
         return await withCheckedContinuation { continuation in
-            provider.loadDataRepresentation(forTypeIdentifier: type.identifier) { data, _ in
-                continuation.resume(returning: data.map { ($0, type) })
+            if type.conforms(to: .movie) {
+                _ = provider.loadFileRepresentation(forTypeIdentifier: type.identifier) { url, _ in
+                    // The file is gone once this returns: read it here.
+                    continuation.resume(returning: Result {
+                        guard let url else { throw StudioPickedMedia.Error.unreadable }
+                        return (try StudioPickedMedia.read(url), type)
+                    })
+                }
+            } else {
+                _ = provider.loadDataRepresentation(forTypeIdentifier: type.identifier) { data, _ in
+                    continuation.resume(returning: data.map { .success(($0, type)) }
+                        ?? .failure(StudioPickedMedia.Error.unreadable))
+                }
             }
         }
     }
 
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-        sheetClosed(controller)
+        defer { sheetClosed(controller) }
         guard let deviceId else { return }
+        // Staged before the sheet counts as closed, so the card holds.
         for url in urls {
             let accessed = url.startAccessingSecurityScopedResource()
             defer { if accessed { url.stopAccessingSecurityScopedResource() } }
             do {
-                let data = try Data(contentsOf: url, options: .mappedIfSafe)
-                let type = UTType(filenameExtension: url.pathExtension)
-                let mime = type?.preferredMIMEType ?? StudioPickedMedia.sniff(data)?.mime
-                guard let mime, let kind = StudioPickedMedia.kind(mime: mime) else {
-                    throw StudioPickedMedia.Error.unsupported
-                }
-                store.importAttachment(
-                    data: data,
-                    mimeType: mime,
-                    kind: kind,
-                    preview: kind == .image ? UIImage(data: data) : nil,
-                    workspace: service,
-                    deviceId: deviceId
-                )
+                let data = try StudioPickedMedia.read(url)
+                try stage(data, type: UTType(filenameExtension: url.pathExtension), deviceId: deviceId)
             } catch {
                 store.error = error.localizedDescription
             }
         }
+    }
+
+    /// Hands one picked file to the store: still images the host can't read
+    /// (HEIC from Files, say) go over as JPEG; images get a small preview.
+    private func stage(_ data: Data, type: UTType?, deviceId: String) throws {
+        let sniffed = StudioPickedMedia.sniff(data)?.mime
+        guard let declared = sniffed ?? type?.preferredMIMEType,
+              let kind = StudioPickedMedia.kind(mime: declared) else {
+            throw StudioPickedMedia.Error.unsupported
+        }
+        var data = data
+        var mime = declared
+        if kind == .image, !StudioPickedMedia.hostImageTypes.contains(declared) {
+            guard let jpeg = UIImage(data: data)?.jpegData(compressionQuality: 0.9) else {
+                throw StudioPickedMedia.Error.unsupported
+            }
+            data = jpeg
+            mime = "image/jpeg"
+        }
+        let image = kind == .image ? StudioPickedMedia.thumbnail(data) : nil
+        store.importAttachment(
+            data: data,
+            mimeType: mime,
+            kind: kind,
+            preview: image?.preview,
+            pixelSize: image?.pixelSize,
+            workspace: service,
+            deviceId: deviceId
+        )
     }
 
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
@@ -836,28 +916,45 @@ private final class StudioReferenceChip: UIView {
             spinner.startAnimating()
             tile.addSubview(spinner)
         }
-        var x = UIButton.Configuration.filled()
-        x.image = UIImage(systemName: "xmark", withConfiguration: UIImage.SymbolConfiguration(pointSize: 8, weight: .bold))
-        x.baseBackgroundColor = UIColor.black.withAlphaComponent(0.7)
-        x.baseForegroundColor = .white
-        x.cornerStyle = .capsule
+        tile.isAccessibilityElement = true
+        let noun = switch attachment.kind {
+        case .image: "Image"
+        case .video: "Video"
+        case .audio: "Audio"
+        }
+        tile.accessibilityLabel = attachment.pending ? "\(noun) reference, uploading" : "\(noun) reference"
+        self.tile = tile
+
+        // An 18pt badge on the corner, in a 28pt button so it can be hit.
+        var x = UIButton.Configuration.plain()
+        x.image = UIImage(
+            systemName: "xmark.circle.fill",
+            withConfiguration: UIImage.SymbolConfiguration(pointSize: 17, weight: .semibold)
+                .applying(UIImage.SymbolConfiguration(paletteColors: [.white, UIColor.black.withAlphaComponent(0.7)]))
+        )
         x.contentInsets = .zero
         remove.configuration = x
         remove.accessibilityLabel = "Remove reference"
-        remove.frame = CGRect(x: 48 - 18 + 5, y: -5, width: 18, height: 18)
+        remove.frame = CGRect(x: 44 - 14, y: 4 - 14, width: 28, height: 28)
         remove.addAction(UIAction { [weak self] _ in self?.onRemove?() }, for: .touchUpInside)
         addSubview(remove)
         NSLayoutConstraint.activate([
             widthAnchor.constraint(equalToConstant: 48),
             heightAnchor.constraint(equalToConstant: 48),
         ])
+        // A CGColor doesn't follow light/dark on its own.
+        registerForTraitChanges([UITraitUserInterfaceStyle.self]) { (self: Self, _) in
+            self.tile?.layer.borderColor = Palette.hairline.resolvedColor(with: self.traitCollection).cgColor
+        }
     }
+
+    private weak var tile: UIView?
 
     required init?(coder: NSCoder) { fatalError() }
 
-    /// The remove badge hangs past the corner; it still takes taps there.
+    /// The remove button hangs past the corner; it still takes taps there.
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
-        bounds.insetBy(dx: -6, dy: -6).contains(point)
+        bounds.contains(point) || remove.frame.contains(point)
     }
 }
 
@@ -929,6 +1026,19 @@ private final class StudioModelPickerController: UITableViewController, UISearch
         }
         selected = Set(store.snapshot.selected.map(\.modelId))
         tableView.reloadData()
+        if !visible.isEmpty {
+            contentUnavailableConfiguration = nil
+        } else if !search.isEmpty {
+            contentUnavailableConfiguration = UIContentUnavailableConfiguration.search()
+        } else if store.loading {
+            contentUnavailableConfiguration = UIContentUnavailableConfiguration.loading()
+        } else {
+            contentUnavailableConfiguration = StudioUnavailable.configuration(
+                title: kind == .image ? "No image models" : "No video models",
+                message: store.error ?? "The desktop's Studio provider offers none.",
+                symbol: kind == .image ? "photo" : "video"
+            )
+        }
     }
 
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
@@ -1016,7 +1126,8 @@ private final class StudioModelConfigurationController: UITableViewController {
         if store.snapshot.mode == .image, let selected {
             sections.append(Section(title: "Amount", rows: [.amount(selected.outputCount)]))
         }
-        for control in chip?.controls ?? model.controls.filter({ $0.id != "duration" }) {
+        // Duration is the toolbar's global chip, not a per-model setting.
+        for control in (chip?.controls ?? model.controls) where control.id != "duration" {
             let value = chip?.values[control.id] ?? selected?.controls[control.id]
             let rows: [Row]
             if control.kind == .boolean {
@@ -1052,7 +1163,7 @@ private final class StudioModelConfigurationController: UITableViewController {
         let row = sections[indexPath.section].rows[indexPath.row]
         if case .amount(let count) = row {
             let cell = tableView.dequeueReusableCell(withIdentifier: "amount", for: indexPath) as! StudioAmountCell
-            cell.configure(count: count) { [weak self] delta in
+            cell.configure(count: count, maximum: max(model.maximumOutputCount, 1)) { [weak self] delta in
                 guard let self else { return }
                 self.store.adjustOutputCount(modelId: self.model.id, delta: delta, workspace: self.service, deviceId: self.deviceId)
             }
@@ -1136,8 +1247,11 @@ private final class StudioAmountCell: UITableViewCell {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func configure(count value: UInt32, adjust: @escaping (Int) -> Void) {
+    func configure(count value: UInt32, maximum: UInt32, adjust: @escaping (Int) -> Void) {
         count.text = "\(value)"
+        count.accessibilityLabel = value == 1 ? "1 output" : "\(value) outputs"
+        minus.isEnabled = value > 1
+        plus.isEnabled = value < maximum
         self.adjust = adjust
     }
 }
@@ -1246,7 +1360,49 @@ private enum StudioPickedMedia {
     struct Sniffed { let mime: String }
     enum Error: LocalizedError {
         case unsupported
-        var errorDescription: String? { "This file is not a supported Studio reference." }
+        case unreadable
+        case tooLarge
+
+        var errorDescription: String? {
+            switch self {
+            case .unsupported: "This file is not a supported Studio reference."
+            case .unreadable: "A selected item could not be read."
+            case .tooLarge: "Studio references must be 64 MB or smaller."
+            }
+        }
+    }
+
+    /// Still images the host imports as they are (`STUDIO_INPUT_MIMES`).
+    static let hostImageTypes: Set<String> = ["image/png", "image/jpeg", "image/webp", "image/gif"]
+
+    /// A file's bytes, refused before reading when it's over the host's cap.
+    static func read(_ url: URL) throws -> Data {
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        guard size <= 64 * 1024 * 1024 else { throw Error.tooLarge }
+        do {
+            return try Data(contentsOf: url, options: .mappedIfSafe)
+        } catch {
+            throw Error.unreadable
+        }
+    }
+
+    /// A tray-sized preview (decoded small, not the whole photo) and the
+    /// image's pixel size, upright.
+    static func thumbnail(_ data: Data) -> (preview: UIImage, pixelSize: CGSize)? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceCreateThumbnailWithTransform: true,
+                  kCGImageSourceThumbnailMaxPixelSize: 160,
+              ] as CFDictionary) else { return nil }
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        var width = properties?[kCGImagePropertyPixelWidth] as? Int ?? image.width
+        var height = properties?[kCGImagePropertyPixelHeight] as? Int ?? image.height
+        // EXIF orientations 5–8 are quarter turns: the upright image is tall.
+        if let orientation = properties?[kCGImagePropertyOrientation] as? Int, orientation >= 5 {
+            swap(&width, &height)
+        }
+        return (UIImage(cgImage: image), CGSize(width: width, height: height))
     }
 
     static func kind(mime: String) -> StudioComposerMediaKind? {
@@ -1265,10 +1421,22 @@ private enum StudioPickedMedia {
            String(bytes: bytes[8..<12], encoding: .ascii) == "WEBP" {
             return Sniffed(mime: "image/webp")
         }
+        if bytes.starts(with: Array("GIF8".utf8)) { return Sniffed(mime: "image/gif") }
         if bytes.count >= 12, String(bytes: bytes[4..<8], encoding: .ascii) == "ftyp" {
-            return Sniffed(mime: "video/mp4")
+            // ISO media: HEIC/AVIF stills (re-encoded before import),
+            // QuickTime, else MP4.
+            switch String(bytes: bytes[8..<12], encoding: .ascii) {
+            case "heic", "heix", "hevc", "hevx", "mif1", "msf1": return Sniffed(mime: "image/heic")
+            case "avif", "avis": return Sniffed(mime: "image/avif")
+            case "qt  ": return Sniffed(mime: "video/quicktime")
+            default: return Sniffed(mime: "video/mp4")
+            }
         }
-        if bytes.starts(with: [0x52, 0x49, 0x46, 0x46]) { return Sniffed(mime: "audio/wav") }
+        if bytes.count >= 12,
+           String(bytes: bytes[0..<4], encoding: .ascii) == "RIFF",
+           String(bytes: bytes[8..<12], encoding: .ascii) == "WAVE" {
+            return Sniffed(mime: "audio/wav")
+        }
         if bytes.starts(with: [0x49, 0x44, 0x33]) { return Sniffed(mime: "audio/mpeg") }
         return nil
     }

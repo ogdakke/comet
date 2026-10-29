@@ -12,14 +12,25 @@ final class StudioComposerStore {
     var previews: [String: UIImage] = [:]
     var loading = false
     var sending = false
+    /// What last went wrong: a load, send, import or pick. The next edit
+    /// clears it (an evaluation doesn't: it would wipe an import's failure
+    /// the moment it was shown); a failed load holds until it's retried.
     var error: String?
+    /// The provider or its models didn't load: the notice offers a retry.
+    var loadFailed = false
     /// The desktop has no Studio provider key: the composer offers to add one.
     var missingProvider = false
     var modelPickerRequested = false
+    /// A send's reply: the whole thread with the new turn, ahead of the watch.
+    @ObservationIgnored var onSent: ((StudioThread) -> Void)?
 
     @ObservationIgnored private var evaluationTask: Task<Void, Never>?
     @ObservationIgnored private var importTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var rememberedSelections: [StudioComposerMode: [StudioSelectedModel]] = [:]
+    /// The desktop the provider, models and staged assets belong to.
+    @ObservationIgnored private var loadedDeviceId: String?
+    /// Bumped by a device switch: replies for the old desktop are dropped.
+    @ObservationIgnored private var generation = 0
 
     init(threadId: String) {
         self.threadId = threadId
@@ -31,6 +42,7 @@ final class StudioComposerStore {
         set {
             guard snapshot.prompt != newValue else { return }
             snapshot.prompt = newValue
+            clearError()
             scheduleEvaluation()
         }
     }
@@ -41,41 +53,79 @@ final class StudioComposerStore {
             && !sending
     }
 
-    var selectedModels: [StudioComposerModel] {
-        let ids = Set(snapshot.selected.map(\.modelId))
-        return models.filter { ids.contains($0.id) }
-    }
-
     func load(workspace: StudioService, deviceId: String) async {
+        if deviceId != loadedDeviceId { reset(for: deviceId) }
         guard !loading, provider == nil else { return }
+        let generation = generation
         loading = true
         error = nil
+        loadFailed = false
         missingProvider = false
-        defer { loading = false }
+        defer { if generation == self.generation { loading = false } }
         do {
             let providers = try await workspace.listStudioProviders(deviceId: deviceId)
+            guard generation == self.generation else { return }
             guard let provider = providers.first(where: \.configured) else {
                 missingProvider = true
                 return
             }
-            self.provider = provider
             let response = try await workspace.listStudioModels(
                 deviceId: deviceId,
                 providerId: provider.providerId
             )
+            guard generation == self.generation else { return }
+            self.provider = provider
             models = response.models.filter {
                 $0.operation != .imageEdit && $0.operation != .upscale
             }
             snapshot.catalogFetchedAt = response.fetchedAt
-            guard let initial = models.first(where: { $0.outputKind == .image }) else {
-                throw StudioComposerError.noImageModels
+            // Keep a draft's models across a reload (a key just added);
+            // otherwise start on the mode's first model.
+            let outputKind: StudioMediaKind = snapshot.mode == .image ? .image : .video
+            snapshot.selected.removeAll { selected in
+                !models.contains { $0.id == selected.modelId && $0.outputKind == outputKind }
             }
-            snapshot.selected = [selection(for: initial)]
-            rememberedSelections[.image] = snapshot.selected
+            if snapshot.selected.isEmpty {
+                guard let initial = models.first(where: { $0.outputKind == outputKind }) else {
+                    throw outputKind == .image ? StudioComposerError.noImageModels : StudioComposerError.noVideoModels
+                }
+                snapshot.selected = [selection(for: initial)]
+            }
+            rememberedSelections[snapshot.mode] = snapshot.selected
+            seedDurationIfNeeded()
             try await evaluate(workspace: workspace, deviceId: deviceId)
         } catch {
+            guard generation == self.generation, !Task.isCancelled else { return }
+            // Retrying starts over from the providers.
+            provider = nil
+            loadFailed = true
             self.error = error.localizedDescription
         }
+    }
+
+    /// A different desktop: its own providers, models and assets. The
+    /// prompt and mode carry over; everything tied to the old host goes.
+    private func reset(for deviceId: String) {
+        loadedDeviceId = deviceId
+        generation += 1
+        evaluationTask?.cancel()
+        importTasks.values.forEach { $0.cancel() }
+        importTasks.removeAll()
+        rememberedSelections.removeAll()
+        provider = nil
+        models = []
+        evaluation = nil
+        previews = [:]
+        loading = false
+        sending = false
+        error = nil
+        loadFailed = false
+        missingProvider = false
+        snapshot.selected = []
+        snapshot.attachments = []
+        snapshot.duration = nil
+        snapshot.sourceTurnId = nil
+        snapshot.catalogFetchedAt = nil
     }
 
     func setMode(
@@ -84,9 +134,13 @@ final class StudioComposerStore {
         deviceId: String
     ) {
         guard snapshot.mode != mode else { return }
+        clearError()
         rememberedSelections[snapshot.mode] = snapshot.selected
         snapshot.mode = mode
         snapshot.duration = nil
+        for index in snapshot.selected.indices {
+            snapshot.selected[index].controls.removeValue(forKey: "duration")
+        }
         let outputKind: StudioMediaKind = mode == .image ? .image : .video
         let restored = rememberedSelections[mode]?.filter { selected in
             models.contains { $0.id == selected.modelId && $0.outputKind == outputKind }
@@ -97,7 +151,7 @@ final class StudioComposerStore {
             snapshot.selected = restored
         }
         seedDurationIfNeeded()
-        Task { try? await evaluate(workspace: workspace, deviceId: deviceId) }
+        reevaluate(workspace: workspace, deviceId: deviceId)
     }
 
     func toggleModel(
@@ -105,13 +159,14 @@ final class StudioComposerStore {
         workspace: StudioService,
         deviceId: String
     ) {
+        clearError()
         if snapshot.selected.contains(where: { $0.modelId == model.id }) {
             snapshot.selected.removeAll { $0.modelId == model.id }
         } else {
             snapshot.selected.append(selection(for: model))
         }
         seedDurationIfNeeded()
-        Task { try? await evaluate(workspace: workspace, deviceId: deviceId) }
+        reevaluate(workspace: workspace, deviceId: deviceId)
     }
 
     func setDuration(
@@ -119,11 +174,9 @@ final class StudioComposerStore {
         workspace: StudioService,
         deviceId: String
     ) {
-        snapshot.duration = value
-        for index in snapshot.selected.indices {
-            snapshot.selected[index].controls["duration"] = value
-        }
-        Task { try? await evaluate(workspace: workspace, deviceId: deviceId) }
+        clearError()
+        applyDuration(value)
+        reevaluate(workspace: workspace, deviceId: deviceId)
     }
 
     func setControl(
@@ -136,8 +189,9 @@ final class StudioComposerStore {
         guard let index = snapshot.selected.firstIndex(where: { $0.modelId == modelId }) else {
             return
         }
+        clearError()
         snapshot.selected[index].controls[controlId] = value
-        Task { try? await evaluate(workspace: workspace, deviceId: deviceId) }
+        reevaluate(workspace: workspace, deviceId: deviceId)
     }
 
     func adjustOutputCount(
@@ -149,21 +203,27 @@ final class StudioComposerStore {
         guard snapshot.mode == .image,
               let index = snapshot.selected.firstIndex(where: { $0.modelId == modelId }),
               let model = models.first(where: { $0.id == modelId }) else { return }
+        clearError()
         let current = Int(snapshot.selected[index].outputCount)
         snapshot.selected[index].outputCount = UInt32(
             min(max(current + delta, 1), Int(max(model.maximumOutputCount, 1)))
         )
-        Task { try? await evaluate(workspace: workspace, deviceId: deviceId) }
+        reevaluate(workspace: workspace, deviceId: deviceId)
     }
 
+    /// Stages a reference and uploads it. A multi-pick reports one item's
+    /// failure without the next item's start clearing it, so this leaves
+    /// `error` alone.
     func importAttachment(
         data: Data,
         mimeType: String,
         kind: StudioComposerMediaKind,
         preview: UIImage?,
+        pixelSize: CGSize?,
         workspace: StudioService,
         deviceId: String
     ) {
+        guard deviceId == loadedDeviceId else { return }
         let assetId = UUID().uuidString.lowercased()
         let pending = StudioComposerAttachment(
             id: assetId,
@@ -172,8 +232,8 @@ final class StudioComposerStore {
             origin: .asset,
             mimeType: mimeType,
             byteSize: UInt64(data.count),
-            width: preview.map { UInt32($0.size.width * $0.scale) },
-            height: preview.map { UInt32($0.size.height * $0.scale) },
+            width: pixelSize.map { UInt32($0.width) },
+            height: pixelSize.map { UInt32($0.height) },
             durationSeconds: nil,
             contentHash: "",
             roleHint: nil
@@ -191,20 +251,18 @@ final class StudioComposerStore {
                     mimeType: mimeType
                 )
                 guard !Task.isCancelled else { return }
+                self.importTasks.removeValue(forKey: assetId)
                 guard let index = self.snapshot.attachments.firstIndex(where: { $0.id == assetId })
-                else {
-                    self.importTasks.removeValue(forKey: assetId)
-                    return
-                }
+                else { return }
                 self.snapshot.attachments[index] = committed
-                self.importTasks.removeValue(forKey: assetId)
                 try await self.evaluate(workspace: workspace, deviceId: deviceId)
-            } catch is CancellationError {
-                self.importTasks.removeValue(forKey: assetId)
             } catch {
+                // Removed (or the desktop switched) while uploading: not a failure.
+                guard !Task.isCancelled, !(error is CancellationError) else { return }
+                self.importTasks.removeValue(forKey: assetId)
+                guard self.snapshot.attachments.contains(where: { $0.id == assetId }) else { return }
                 self.snapshot.attachments.removeAll { $0.id == assetId }
                 self.previews.removeValue(forKey: assetId)
-                self.importTasks.removeValue(forKey: assetId)
                 self.error = error.localizedDescription
                 try? await self.evaluate(workspace: workspace, deviceId: deviceId)
             }
@@ -216,28 +274,39 @@ final class StudioComposerStore {
         workspace: StudioService,
         deviceId: String
     ) {
+        clearError()
         importTasks.removeValue(forKey: assetId)?.cancel()
         snapshot.attachments.removeAll { $0.id == assetId }
         previews.removeValue(forKey: assetId)
-        Task { try? await evaluate(workspace: workspace, deviceId: deviceId) }
+        reevaluate(workspace: workspace, deviceId: deviceId)
     }
 
     func send(workspace: StudioService, deviceId: String) {
+        guard canSend, deviceId == loadedDeviceId else { return }
         let trimmed = snapshot.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, canSend else { return }
-        snapshot.prompt = trimmed
+        var request = snapshot
+        request.prompt = trimmed
+        let generation = generation
         sending = true
-        error = nil
+        clearError()
         Task {
-            defer { sending = false }
+            defer { if generation == self.generation { sending = false } }
             do {
-                _ = try await workspace.createStudioTurn(deviceId: deviceId, snapshot: snapshot)
-                snapshot.prompt = ""
-                snapshot.attachments = []
-                previews = [:]
+                let thread = try await workspace.createStudioTurn(deviceId: deviceId, snapshot: request)
+                guard generation == self.generation else { return }
+                onSent?(thread)
+                // Clear what was sent; anything typed or attached while it
+                // went out stays in the draft.
+                if snapshot.prompt.trimmingCharacters(in: .whitespacesAndNewlines) == trimmed {
+                    snapshot.prompt = ""
+                }
+                let sent = Set(request.attachments.map(\.id))
+                snapshot.attachments.removeAll { sent.contains($0.id) }
+                previews = previews.filter { !sent.contains($0.key) }
                 snapshot.sourceTurnId = nil
-                try await evaluate(workspace: workspace, deviceId: deviceId)
+                try? await evaluate(workspace: workspace, deviceId: deviceId)
             } catch {
+                guard generation == self.generation else { return }
                 self.error = error.localizedDescription
             }
         }
@@ -253,6 +322,7 @@ final class StudioComposerStore {
             error = "Studio returned an invalid conflict action"
             return
         }
+        clearError()
         switch type {
         case "remove_unsupported_references":
             let ids = stringArray(object["asset_ids"])
@@ -271,12 +341,9 @@ final class StudioComposerStore {
             let ids = stringArray(object["model_ids"])
             snapshot.selected.removeAll { !ids.contains($0.modelId) }
         case "clamp_duration":
-            snapshot.duration = decode(StudioControlValue.self, from: object["value"])
+            applyDuration(decode(StudioControlValue.self, from: object["value"]))
         case "clear_duration":
-            snapshot.duration = nil
-            for index in snapshot.selected.indices {
-                snapshot.selected[index].controls.removeValue(forKey: "duration")
-            }
+            applyDuration(nil)
         case "open_model_picker":
             modelPickerRequested = true
         case "refresh_catalog":
@@ -316,28 +383,39 @@ final class StudioComposerStore {
             if let restored = decode([StudioSelectedModel].self, from: object["selected"]) {
                 snapshot.selected = restored
             }
-            snapshot.duration = decode(StudioControlValue.self, from: object["duration"])
+            applyDuration(decode(StudioControlValue.self, from: object["duration"]))
         case "dismiss_warn": break
         default:
             error = "This Studio resolution is not available on iPhone yet"
             return
         }
-        Task { try? await evaluate(workspace: workspace, deviceId: deviceId) }
+        reevaluate(workspace: workspace, deviceId: deviceId)
     }
 
     private func refreshCatalog(workspace: StudioService, deviceId: String) async {
         guard let provider else { return }
+        let generation = generation
         do {
             let response = try await workspace.listStudioModels(
                 deviceId: deviceId,
                 providerId: provider.providerId,
                 refresh: true
             )
+            guard generation == self.generation else { return }
             models = response.models.filter { $0.operation != .imageEdit && $0.operation != .upscale }
             snapshot.catalogFetchedAt = response.fetchedAt
             try await evaluate(workspace: workspace, deviceId: deviceId)
         } catch {
+            guard generation == self.generation else { return }
             self.error = error.localizedDescription
+        }
+    }
+
+    /// Supersedes any debounced evaluation: this edit's reply covers it.
+    private func reevaluate(workspace: StudioService, deviceId: String) {
+        evaluationTask?.cancel()
+        evaluationTask = Task { [weak self] in
+            try? await self?.evaluate(workspace: workspace, deviceId: deviceId)
         }
     }
 
@@ -347,28 +425,38 @@ final class StudioComposerStore {
             try? await Task.sleep(for: .milliseconds(140))
             guard let self, !Task.isCancelled,
                   let workspace = self.currentWorkspace,
-                  let deviceId = self.currentDeviceId else { return }
+                  let deviceId = self.loadedDeviceId else { return }
             try? await self.evaluate(workspace: workspace, deviceId: deviceId)
         }
     }
 
     @ObservationIgnored private weak var currentWorkspace: StudioService?
-    @ObservationIgnored private var currentDeviceId: String?
 
     private func evaluate(workspace: StudioService, deviceId: String) async throws {
         currentWorkspace = workspace
-        currentDeviceId = deviceId
+        guard deviceId == loadedDeviceId else { return }
         guard let provider else { throw StudioComposerError.noConfiguredProvider }
         let requested = snapshot
+        let generation = generation
         let view = try await workspace.evaluateStudioComposer(
             deviceId: deviceId,
             snapshot: requested,
             providerId: provider.providerId
         )
-        guard requested == snapshot else { return }
+        // Out of order, or for a draft that has since changed: a newer
+        // evaluation is on its way.
+        guard generation == self.generation, requested == snapshot else { return }
+        let previous = evaluation
         evaluation = view
+        // The host asks for the picker on every evaluation while nothing is
+        // selected; open it once, not again on each keystroke after it's
+        // dismissed.
+        if view.openPicker, previous?.openPicker != true { modelPickerRequested = true }
+    }
+
+    private func clearError() {
+        guard !loadFailed else { return }
         error = nil
-        if view.openPicker { modelPickerRequested = true }
     }
 
     private func selection(for model: StudioComposerModel) -> StudioSelectedModel {
@@ -386,23 +474,34 @@ final class StudioComposerStore {
         )
     }
 
+    /// The global duration, mirrored onto every selected model's controls.
+    private func applyDuration(_ value: StudioControlValue?) {
+        snapshot.duration = value
+        for index in snapshot.selected.indices {
+            if let value {
+                snapshot.selected[index].controls["duration"] = value
+            } else {
+                snapshot.selected[index].controls.removeValue(forKey: "duration")
+            }
+        }
+    }
+
+    /// Video drafts always carry a duration, on every selected model (one
+    /// added later included).
     private func seedDurationIfNeeded() {
         guard snapshot.mode == .video else {
             snapshot.duration = nil
             return
         }
-        guard snapshot.duration == nil else { return }
-        let selectedIds = Set(snapshot.selected.map(\.modelId))
-        let durations = models
-            .filter { selectedIds.contains($0.id) }
-            .flatMap(\.controls)
-            .first(where: { $0.id == "duration" })
-        snapshot.duration = durations?.default ?? durations?.choices.first?.value
-        if let duration = snapshot.duration {
-            for index in snapshot.selected.indices {
-                snapshot.selected[index].controls["duration"] = duration
-            }
+        if snapshot.duration == nil {
+            let selectedIds = Set(snapshot.selected.map(\.modelId))
+            let durations = models
+                .filter { selectedIds.contains($0.id) }
+                .flatMap(\.controls)
+                .first(where: { $0.id == "duration" })
+            snapshot.duration = durations?.default ?? durations?.choices.first?.value
         }
+        applyDuration(snapshot.duration)
     }
 
     private func stringArray(_ value: JSONValue?) -> Set<String> {
@@ -420,11 +519,13 @@ final class StudioComposerStore {
 private enum StudioComposerError: LocalizedError {
     case noConfiguredProvider
     case noImageModels
+    case noVideoModels
 
     var errorDescription: String? {
         switch self {
         case .noConfiguredProvider: "Configure a Studio provider on the desktop first."
         case .noImageModels: "The configured Studio provider has no image models."
+        case .noVideoModels: "The configured Studio provider has no video models."
         }
     }
 }
