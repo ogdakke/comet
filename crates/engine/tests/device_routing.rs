@@ -1699,7 +1699,9 @@ async fn workspace_file_surface_proxies_over_the_relay() {
         )
         .await
         .expect("remote watch");
-    let baseline = tokio::time::timeout(Duration::from_secs(5), stream.recv())
+    // Native watcher startup can wait on macOS FSEvents registration. Keep
+    // the separate deadline for delivering actual changes below unchanged.
+    let baseline = tokio::time::timeout(Duration::from_secs(20), stream.recv())
         .await
         .expect("baseline timeout")
         .expect("watch alive");

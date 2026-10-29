@@ -649,12 +649,15 @@ impl WorkspaceFiles {
             .map_err(|error| {
                 WorkspaceFilesError::Io(format!("watch budget worker failed: {error}"))
             })?;
-        let candidate = CheckoutWatch::start(
-            workspace.checkout_id.clone(),
-            workspace.root,
-            over_budget,
-            self.inner.cancel.child_token(),
-        );
+        // Native watcher registration can block (notably FSEvents on macOS).
+        // Keep it off the async executor so RPC deadlines and other requests run.
+        let checkout_id = workspace.checkout_id.clone();
+        let cancel = self.inner.cancel.child_token();
+        let candidate = tokio::task::spawn_blocking(move || {
+            CheckoutWatch::start(checkout_id, workspace.root, over_budget, cancel)
+        })
+        .await
+        .map_err(|error| WorkspaceFilesError::Io(format!("watch worker failed: {error}")))?;
         let subscription = {
             let mut watches = lock(&self.inner.watches);
             if let Some(existing) = watches.get(&workspace.checkout_id) {

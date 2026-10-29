@@ -503,8 +503,9 @@ async fn git_history_search_is_fuzzy_complete_and_accepts_sha_prefixes() {
         .search_history(&repo_dir, &sha[..8], 0, 20)
         .await
         .expect("sha history search");
-    assert_eq!(by_sha.commits.len(), 1);
-    assert_eq!(by_sha.commits[0].sha, sha);
+    // Hashes participate in fuzzy matching too, so other commits may match
+    // the same subsequence. The requested exact prefix must still be found.
+    assert!(by_sha.commits.iter().any(|commit| commit.sha == sha));
 }
 
 #[tokio::test]

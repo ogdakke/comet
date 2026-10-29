@@ -220,18 +220,18 @@ strip = "debuginfo"
 # (gpui::EdgeFadeEase). Patched at the source so gpui-base resolves to the
 # same gpui. Rebase comet-fork when bumping the zui rev above.
 [patch."https://github.com/zeronsh/zui"]
-collections = { git = "https://github.com/ogdakke/zui", rev = "49f201f27d1f4f1c16660de0a3ba67bc62e3089a" }
-derive_refineable = { git = "https://github.com/ogdakke/zui", rev = "49f201f27d1f4f1c16660de0a3ba67bc62e3089a" }
-gpui = { git = "https://github.com/ogdakke/zui", rev = "49f201f27d1f4f1c16660de0a3ba67bc62e3089a" }
-gpui_macros = { git = "https://github.com/ogdakke/zui", rev = "49f201f27d1f4f1c16660de0a3ba67bc62e3089a" }
-gpui_platform = { git = "https://github.com/ogdakke/zui", rev = "49f201f27d1f4f1c16660de0a3ba67bc62e3089a" }
-gpui_shared_string = { git = "https://github.com/ogdakke/zui", rev = "49f201f27d1f4f1c16660de0a3ba67bc62e3089a" }
-gpui_tokio = { git = "https://github.com/ogdakke/zui", rev = "49f201f27d1f4f1c16660de0a3ba67bc62e3089a" }
-gpui_util = { git = "https://github.com/ogdakke/zui", rev = "49f201f27d1f4f1c16660de0a3ba67bc62e3089a" }
-http_client = { git = "https://github.com/ogdakke/zui", rev = "49f201f27d1f4f1c16660de0a3ba67bc62e3089a" }
-media = { git = "https://github.com/ogdakke/zui", rev = "49f201f27d1f4f1c16660de0a3ba67bc62e3089a" }
-perf = { git = "https://github.com/ogdakke/zui", rev = "49f201f27d1f4f1c16660de0a3ba67bc62e3089a" }
-refineable = { git = "https://github.com/ogdakke/zui", rev = "49f201f27d1f4f1c16660de0a3ba67bc62e3089a" }
-scheduler = { git = "https://github.com/ogdakke/zui", rev = "49f201f27d1f4f1c16660de0a3ba67bc62e3089a" }
-sum_tree = { git = "https://github.com/ogdakke/zui", rev = "49f201f27d1f4f1c16660de0a3ba67bc62e3089a" }
-util_macros = { git = "https://github.com/ogdakke/zui", rev = "49f201f27d1f4f1c16660de0a3ba67bc62e3089a" }
+collections = { git = "https://github.com/ogdakke/zui", rev = "fd588ea94f514d78728af782f7fc48b8ff84b878" }
+derive_refineable = { git = "https://github.com/ogdakke/zui", rev = "fd588ea94f514d78728af782f7fc48b8ff84b878" }
+gpui = { git = "https://github.com/ogdakke/zui", rev = "fd588ea94f514d78728af782f7fc48b8ff84b878" }
+gpui_macros = { git = "https://github.com/ogdakke/zui", rev = "fd588ea94f514d78728af782f7fc48b8ff84b878" }
+gpui_platform = { git = "https://github.com/ogdakke/zui", rev = "fd588ea94f514d78728af782f7fc48b8ff84b878" }
+gpui_shared_string = { git = "https://github.com/ogdakke/zui", rev = "fd588ea94f514d78728af782f7fc48b8ff84b878" }
+gpui_tokio = { git = "https://github.com/ogdakke/zui", rev = "fd588ea94f514d78728af782f7fc48b8ff84b878" }
+gpui_util = { git = "https://github.com/ogdakke/zui", rev = "fd588ea94f514d78728af782f7fc48b8ff84b878" }
+http_client = { git = "https://github.com/ogdakke/zui", rev = "fd588ea94f514d78728af782f7fc48b8ff84b878" }
+media = { git = "https://github.com/ogdakke/zui", rev = "fd588ea94f514d78728af782f7fc48b8ff84b878" }
+perf = { git = "https://github.com/ogdakke/zui", rev = "fd588ea94f514d78728af782f7fc48b8ff84b878" }
+refineable = { git = "https://github.com/ogdakke/zui", rev = "fd588ea94f514d78728af782f7fc48b8ff84b878" }
+scheduler = { git = "https://github.com/ogdakke/zui", rev = "fd588ea94f514d78728af782f7fc48b8ff84b878" }
+sum_tree = { git = "https://github.com/ogdakke/zui", rev = "fd588ea94f514d78728af782f7fc48b8ff84b878" }
+util_macros = { git = "https://github.com/ogdakke/zui", rev = "fd588ea94f514d78728af782f7fc48b8ff84b878" }

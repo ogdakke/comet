@@ -138,7 +138,9 @@ async fn workspace_file_rpcs_list_search_read_write_and_watch() {
         )
         .await
         .expect("watch subscribe");
-    let baseline = tokio::time::timeout(Duration::from_secs(3), watch.recv())
+    // Native watcher startup can wait on macOS FSEvents registration. Keep
+    // the separate deadline for delivering actual changes below unchanged.
+    let baseline = tokio::time::timeout(Duration::from_secs(20), watch.recv())
         .await
         .expect("baseline timeout")
         .expect("watch alive");
