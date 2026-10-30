@@ -17,6 +17,8 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
     private var onlineHostIds: Set<String> = []
     /// Whether each desktop has a Studio provider key (absent: not asked yet).
     private var providerHosts: [String: Bool] = [:]
+    /// Desktops whose engine has no Studio: nothing there to browse.
+    private var studiolessHosts: Set<String> = []
     private var watchKey: String?
     private var watches: [Task<Void, Never>] = []
     /// Launch arguments for screenshots and profiling: `-studio-threads`
@@ -36,7 +38,7 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
         service: service,
         transitionSource: transitionSource,
         openViewer: { [weak self] in self?.openViewer($0) },
-        showThread: { [weak self] in self?.showThread($0) }
+        showThread: { [weak self] in self?.showThread($0, revealing: $1) }
     )
     private lazy var threads = StudioThreadsListController(browser: browser, service: service) { [weak self] id in
         self?.pushThread(id)
@@ -127,10 +129,20 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
     private func refreshProviderHosts(_ only: Set<String>? = nil) {
         for host in service.hosts where service.isOnline(host.id) && only?.contains(host.id) != false {
             Task { [weak self, service] in
-                let providers = try? await service.listStudioProviders(deviceId: host.id)
+                var providers: [StudioProviderConnection]?
+                var studioless = false
+                do {
+                    providers = try await service.listStudioProviders(deviceId: host.id)
+                } catch StudioError.unsupported {
+                    studioless = true
+                } catch {}
                 guard let self else { return }
                 // An engine without Studio (or that can't answer) can't create either.
                 self.providerHosts[host.id] = providers?.contains(where: \.configured) ?? false
+                if studioless != self.studiolessHosts.contains(host.id) {
+                    if studioless { self.studiolessHosts.insert(host.id) } else { self.studiolessHosts.remove(host.id) }
+                    self.setNeedsUpdateProperties()
+                }
                 self.preferProviderHost()
             }
         }
@@ -167,6 +179,10 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
         } else if let deviceId, !online {
             let others = service.hosts.contains { $0.id != deviceId && service.isOnline($0.id) }
             showUnavailable("Desktop is offline", "Reconnect \(deviceName(deviceId)) to browse its Studio library\(others ? ", or pick another desktop from the menu" : "").")
+        } else if let deviceId, studiolessHosts.contains(deviceId) {
+            // Its watches fail with the engine's raw "not supported" error.
+            let others = service.hosts.contains { $0.id != deviceId && service.isOnline($0.id) && !studiolessHosts.contains($0.id) }
+            showUnavailable("No Studio on this desktop", "Update Zeron on \(deviceName(deviceId)) to create there\(others ? ", or pick another desktop from the menu" : "").")
         } else {
             contentUnavailableConfiguration = nil
             show(mode == .gallery ? gallery as UIViewController : threads)
@@ -268,13 +284,16 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
             action.state = browser.selectedDeviceId == device.id ? .on : .off
             if !online {
                 action.subtitle = "Offline"
+            } else if studiolessHosts.contains(device.id) {
+                action.subtitle = "No Studio"
             } else if providerHosts[device.id] == false {
                 action.subtitle = "No provider key"
             }
             return action
         }
         let desktops = UIMenu(title: "Desktop", options: .displayInline, children: hosts)
-        guard let deviceId = browser.selectedDeviceId, service.isOnline(deviceId) else { return [desktops] }
+        guard let deviceId = browser.selectedDeviceId, service.isOnline(deviceId),
+              !studiolessHosts.contains(deviceId) else { return [desktops] }
         let providers = UIAction(title: "Providers…", image: UIImage(systemName: "key")) { [weak self] _ in
             guard let self else { return }
             self.presentStudioProviders(service: self.service, deviceId: deviceId) { [weak self] in
@@ -287,9 +306,10 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
 
     // MARK: Threads
 
-    private func pushThread(_ threadId: String) {
+    private func pushThread(_ threadId: String, revealing artifactId: String? = nil) {
         let thread = StudioThreadViewController(
             threadId: threadId,
+            revealing: artifactId,
             browser: browser,
             service: service,
             transitionSource: transitionSource,
@@ -299,14 +319,14 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
     }
 
     /// "Show in Thread" (gallery, viewer): the Threads list with that
-    /// thread open over it.
-    func showThread(_ threadId: String) {
+    /// thread open over it, scrolled to the creation it was asked from.
+    func showThread(_ threadId: String, revealing artifactId: String? = nil) {
         mode = .threads
         setNeedsUpdateProperties()
         if let nav = navigationController, nav.topViewController !== self {
             nav.popToViewController(self, animated: false)
         }
-        pushThread(threadId)
+        pushThread(threadId, revealing: artifactId)
     }
 
     // MARK: Viewer
@@ -323,8 +343,8 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
             workspace: service,
             deviceId: browser.selectedDeviceId,
             requestDismissal: { [weak self] in self?.dismissViewer(presented) },
-            requestThread: { [weak self] threadId in
-                self?.dismissViewer(presented) { self?.showThread(threadId) }
+            requestThread: { [weak self] threadId, artifactId in
+                self?.dismissViewer(presented) { self?.showThread(threadId, revealing: artifactId) }
             },
             selectedArtifactChanged: { [weak transitionSource] artifactId in
                 transitionSource?.prepareForDismissal(to: artifactId)

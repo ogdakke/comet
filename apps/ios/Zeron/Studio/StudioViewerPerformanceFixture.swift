@@ -114,7 +114,7 @@ final class StudioViewerFixtureHostController: UIViewController, StudioGalleryTr
             requestDismissal: { [weak self] in
                 self?.dismiss(animated: true) { [weak self] in self?.finishProfiling() }
             },
-            requestThread: { _ in }
+            requestThread: { _, _ in }
         )
         StudioViewerNativeTransition.configure(viewer, session: session, source: transitionSource)
         present(viewer, animated: true) {

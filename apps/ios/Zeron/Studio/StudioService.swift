@@ -413,10 +413,14 @@ private final class StreamSink: StudioStreamSink, @unchecked Sendable {
 
 enum StudioError: LocalizedError {
     case message(String)
+    /// The desktop's engine has no Studio (or too old a one for the call).
+    case unsupported(String)
 
     init(_ error: CoreError) {
         switch error {
-        case .NotFound(let message), .InvalidArgument(let message), .Unsupported(let message),
+        case .Unsupported(let message):
+            self = .unsupported(message)
+        case .NotFound(let message), .InvalidArgument(let message),
              .Network(let message), .HostError(let message), .Auth(let message),
              .Storage(let message), .NotImplemented(let message), .Internal(let message):
             self = .message(message)
@@ -429,7 +433,7 @@ enum StudioError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .message(let message): message
+        case .message(let message), .unsupported(let message): message
         }
     }
 }

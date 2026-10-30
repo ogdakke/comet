@@ -1303,9 +1303,13 @@ private final class StudioConflictController: UIViewController {
             var config = UIButton.Configuration.borderedProminent()
             config.title = action.label
             config.cornerStyle = .capsule
+            // Resolved once this sheet is gone: an action that opens the
+            // model picker presented it over this sheet mid-dismissal,
+            // and UIKit dropped it.
             let button = UIButton(configuration: config, primaryAction: UIAction { [weak self] _ in
-                self?.resolve(action)
-                self?.dismiss(animated: true)
+                guard let self else { return }
+                let resolve = self.resolve
+                self.dismiss(animated: true) { resolve(action) }
             })
             actions.addArrangedSubview(button)
         }

@@ -95,6 +95,9 @@ final class StudioThreadViewController: UIViewController,
     }
 
     private let threadId: String
+    /// "Show in Thread": the creation the thread opens on, instead of the
+    /// newest turn at the bottom.
+    private let revealArtifactId: String?
     private let browser: StudioBrowserStore
     private let service: StudioService
     private let transitionSource: StudioGalleryTransitionSource
@@ -143,12 +146,14 @@ final class StudioThreadViewController: UIViewController,
 
     init(
         threadId: String,
+        revealing artifactId: String? = nil,
         browser: StudioBrowserStore,
         service: StudioService,
         transitionSource: StudioGalleryTransitionSource,
         openViewer: @escaping (StudioViewerSession) -> Void
     ) {
         self.threadId = threadId
+        revealArtifactId = artifactId
         self.browser = browser
         self.service = service
         self.transitionSource = transitionSource
@@ -394,7 +399,10 @@ final class StudioThreadViewController: UIViewController,
         let first = shown == nil
         // A new turn (this phone's send, or the desktop's) is followed down.
         let newTurn = !first && thread.turns.count > shown?.turns.count ?? 0
-        let pinned = first || newTurn || isAtBottom
+        let reveal = first ? revealArtifactId.flatMap { id in
+            thread.turns.contains { $0.runs.contains { $0.artifacts.contains { $0.id == id } } } ? Item.artifact(id) : nil
+        } : nil
+        let pinned = (first && reveal == nil) || newTurn || isAtBottom
         shown = thread
         let (oldTurns, oldRuns, oldArtifacts) = (turns, runs, artifacts)
         turns = [:]
@@ -501,6 +509,15 @@ final class StudioThreadViewController: UIViewController,
             // Again once UIKit has settled the update (and the composer's
             // inset, which a run finishing changes with the status line).
             DispatchQueue.main.async { [weak self] in self?.scrollToBottom() }
+        }
+        if let reveal, let path = indexPath(for: reveal) {
+            collectionView.layoutIfNeeded()
+            collectionView.scrollToItem(at: path, at: .centeredVertically, animated: false)
+            // Again once the push has given the list its final insets.
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.indexPath(for: reveal) == path else { return }
+                self.collectionView.scrollToItem(at: path, at: .centeredVertically, animated: false)
+            }
         }
         if first {
             runLaunchSteps()

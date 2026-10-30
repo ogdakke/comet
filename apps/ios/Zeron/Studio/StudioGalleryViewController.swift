@@ -21,7 +21,7 @@ final class StudioGalleryViewController: UIViewController,
     private let service: StudioService
     private let transitionSource: StudioGalleryTransitionSource
     private let openViewer: (StudioViewerSession) -> Void
-    private let showThread: (String) -> Void
+    private let showThread: (_ threadId: String, _ artifactId: String) -> Void
 
     private var collectionView: StudioGalleryCollectionView!
     private let layout = StudioGalleryGridLayout()
@@ -37,7 +37,7 @@ final class StudioGalleryViewController: UIViewController,
         service: StudioService,
         transitionSource: StudioGalleryTransitionSource,
         openViewer: @escaping (StudioViewerSession) -> Void,
-        showThread: @escaping (String) -> Void
+        showThread: @escaping (_ threadId: String, _ artifactId: String) -> Void
     ) {
         self.browser = browser
         self.service = service
@@ -148,7 +148,10 @@ final class StudioGalleryViewController: UIViewController,
 
         if newItems.isEmpty || old.isEmpty || collectionView.window == nil {
             // Emptied (another machine, a reload): open at the newest again.
-            if newItems.isEmpty { didSetInitialPosition = false }
+            // Changed off screen (Threads up, a run finishing) while the
+            // newest was in view: back at the newest on return, not at the
+            // old offset, which left new creations below the fold.
+            if newItems.isEmpty || (collectionView.window == nil && isNearNewest) { didSetInitialPosition = false }
             requestedOldestId = nil
             items = newItems
             layout.resetLeadingBlanks()
@@ -158,8 +161,7 @@ final class StudioGalleryViewController: UIViewController,
         }
 
         let start = CACurrentMediaTime()
-        let wasNearBottom = collectionView.contentSize.height - collectionView.bounds.height
-            + collectionView.adjustedContentInset.bottom - collectionView.contentOffset.y < 100
+        let wasNearBottom = isNearNewest
         // What's on screen stays where it is: the topmost visible square's
         // distance from the top of the viewport, before and after.
         let anchor = topVisibleIndex().flatMap { index -> (id: String, gap: CGFloat)? in
@@ -220,6 +222,12 @@ final class StudioGalleryViewController: UIViewController,
             StudioGalleryPerf.pageRequestedAt = nil
         }
         loadOlderIfNear()
+    }
+
+    /// Scrolled to (or nearly to) the bottom, where the newest are.
+    private var isNearNewest: Bool {
+        collectionView.contentSize.height - collectionView.bounds.height
+            + collectionView.adjustedContentInset.bottom - collectionView.contentOffset.y < 100
     }
 
     private func item(at indexPath: IndexPath) -> StudioGalleryItem? {
@@ -382,7 +390,7 @@ final class StudioGalleryViewController: UIViewController,
                     self?.download(StudioArtifactDetail(item: item))
                 },
                 UIAction(title: "Show in Thread", image: UIImage(systemName: "rectangle.stack")) { _ in
-                    self?.showThread(item.conversationId)
+                    self?.showThread(item.conversationId, item.id)
                 },
                 UIAction(title: "Delete", image: UIImage(systemName: "trash"), attributes: .destructive) { _ in
                     self?.confirmDelete(StudioArtifactDetail(item: item))

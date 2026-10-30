@@ -301,7 +301,8 @@ final class StudioGalleryViewerController: UIViewController,
     private let workspace: StudioService?
     private let deviceId: String?
     private let requestDismissal: () -> Void
-    private let requestThread: (String) -> Void
+    /// The thread to show, and the creation to bring into view there.
+    private let requestThread: (_ threadId: String, _ artifactId: String) -> Void
     private let selectedArtifactChanged: (String) -> Void
     private let media: StudioViewerMediaStore
     private let pager: StudioViewerPagerController
@@ -353,7 +354,7 @@ final class StudioGalleryViewerController: UIViewController,
         workspace: StudioService?,
         deviceId: String?,
         requestDismissal: @escaping () -> Void,
-        requestThread: @escaping (String) -> Void,
+        requestThread: @escaping (_ threadId: String, _ artifactId: String) -> Void,
         selectedArtifactChanged: @escaping (String) -> Void = { _ in }
     ) {
         self.session = session
@@ -770,7 +771,7 @@ final class StudioGalleryViewerController: UIViewController,
         if session.openedFromGallery {
             buttons.append(cardActionButton("Thread", symbol: "rectangle.stack") { [weak self] in
                 guard let self, let selected else { return }
-                requestThread(selected.conversationId)
+                requestThread(selected.conversationId, selected.id)
             })
         }
         let delete = cardActionButton("Delete", symbol: "trash", destructive: true) { [weak self] in
@@ -1147,7 +1148,7 @@ final class StudioGalleryViewerController: UIViewController,
         if !selected.prompt.isEmpty {
             primary.append(UIAction(title: "Copy Prompt", image: UIImage(systemName: "doc.on.doc")) { [weak self] _ in
                 UIPasteboard.general.string = selected.prompt
-                Toast.show("Copied", in: self?.view.window, above: self?.bottomChrome)
+                Toast.show("Copied", in: self?.view.window, above: self?.toastAnchor)
             })
         }
         primary.append(UIAction(title: "Details", image: UIImage(systemName: "info.circle")) { [weak self] _ in
@@ -1156,7 +1157,7 @@ final class StudioGalleryViewerController: UIViewController,
         // From a thread, the viewer is already over that thread.
         if session.openedFromGallery {
             primary.append(UIAction(title: "Show in Thread", image: UIImage(systemName: "rectangle.stack")) { [weak self] _ in
-                self?.requestThread(selected.conversationId)
+                self?.requestThread(selected.conversationId, selected.id)
             })
         }
         var menu: [UIMenuElement] = [UIMenu(options: .displayInline, children: primary)]
@@ -1208,7 +1209,7 @@ final class StudioGalleryViewerController: UIViewController,
                 Toast.show(
                     selected.mediaKind == .video ? "Video saved to Photos" : "Saved to Photos",
                     in: view.window,
-                    above: bottomChrome.alpha > 0.05 ? bottomChrome : nil
+                    above: toastAnchor
                 )
             } catch StudioArtifactActionError.photoAccessDenied {
                 self?.presentPhotoAccessDenied()
@@ -1217,6 +1218,13 @@ final class StudioGalleryViewerController: UIViewController,
             }
             self?.setBusy(nil)
         }
+    }
+
+    /// What a toast floats above: the open card's buttons (a toast at the
+    /// bottom chrome's height landed on them), else the bottom bar.
+    private var toastAnchor: UIView? {
+        if scrollView.contentOffset.y > 1 { return cardActions }
+        return bottomChrome.alpha > 0.05 ? bottomChrome : nil
     }
 
     private func shareSelected() {
