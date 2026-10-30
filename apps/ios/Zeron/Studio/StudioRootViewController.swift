@@ -27,7 +27,7 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
     /// `-studio-thread-tile`, `-studio-thread-compose`) run on it.
     /// `-studio-bench` flings the gallery through the whole library and
     /// writes `Documents/studio-bench.json`.
-    private var launchSteps = Set(["-studio-threads", "-studio-thread", "-studio-viewer", "-studio-bench"]
+    private var launchSteps = Set(["-studio-threads", "-studio-thread", "-studio-viewer", "-studio-viewer-oldest", "-studio-bench"]
         .filter(ProcessInfo.processInfo.arguments.contains))
     private weak var viewer: StudioGalleryViewerController?
 
@@ -191,14 +191,18 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
             launchSteps.remove("-studio-bench")
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.gallery.runBench() }
         }
-        if launchSteps.contains("-studio-viewer"), let newest = browser.gallery.last, view.window != nil {
-            launchSteps.remove("-studio-viewer")
+        // `-studio-viewer-oldest`: on the oldest loaded creation, where the
+        // viewer should page older history in.
+        for step in ["-studio-viewer", "-studio-viewer-oldest"] where launchSteps.contains(step) {
+            guard let item = step == "-studio-viewer" ? browser.gallery.last : browser.gallery.first,
+                  view.window != nil else { continue }
+            launchSteps.remove(step)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 self.openViewer(StudioViewerSession(
                     artifacts: self.browser.gallery.map(StudioArtifactDetail.init(item:)),
-                    selectedId: newest.id,
+                    selectedId: item.id,
                     openedFromGallery: true,
-                    openingPreview: self.browser.cachedPreview(artifactId: newest.id)
+                    openingPreview: self.browser.cachedPreview(artifactId: item.id)
                 ))
             }
         }
@@ -310,19 +314,23 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
     /// The full-screen viewer, zooming out of the thumbnail it opened from.
     func openViewer(_ session: StudioViewerSession) {
         guard viewer == nil, let presenter = StudioViewerPresentationHost.resolve(from: self) else { return }
+        // The viewer's requests name it: the root's own reference may already
+        // be gone, and a viewer that asks must always be dismissed.
+        weak var presented: StudioGalleryViewerController?
         let controller = StudioGalleryViewerController(
             session: session,
             browser: browser,
             workspace: service,
             deviceId: browser.selectedDeviceId,
-            requestDismissal: { [weak self] in self?.dismissViewer() },
+            requestDismissal: { [weak self] in self?.dismissViewer(presented) },
             requestThread: { [weak self] threadId in
-                self?.dismissViewer { self?.showThread(threadId) }
+                self?.dismissViewer(presented) { self?.showThread(threadId) }
             },
             selectedArtifactChanged: { [weak transitionSource] artifactId in
                 transitionSource?.prepareForDismissal(to: artifactId)
             }
         )
+        presented = controller
         StudioViewerNativeTransition.configure(controller, session: session, source: transitionSource)
         viewer = controller
         presenter.present(controller, animated: true) { [weak self, weak controller] in
@@ -330,14 +338,21 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
         }
     }
 
-    private func dismissViewer(completion: (() -> Void)? = nil) {
-        guard let viewer else {
+    private func dismissViewer(_ target: StudioGalleryViewerController? = nil, completion: (() -> Void)? = nil) {
+        guard let viewer = target ?? viewer else {
             completion?()
             return
         }
         viewer.session.presentationActive = false
-        viewer.dismiss(animated: true) { [weak self] in
-            self?.viewer = nil
+        viewer.dismiss(animated: true) { [weak self, weak viewer] in
+            // UIKit runs this for a dragged close that sprang back too, with
+            // the viewer still up: forgetting it then left every later close
+            // a no-op, and the viewer stuck with its controls switched off.
+            if let viewer, viewer.presentingViewController != nil {
+                viewer.session.presentationActive = true
+                return
+            }
+            if self?.viewer == nil || self?.viewer === viewer { self?.viewer = nil }
             completion?()
         }
     }

@@ -962,11 +962,17 @@ final class StudioGalleryViewerController: UIViewController,
         pager.refresh(selectedId)
     }
 
+    /// Near the oldest loaded creation, ask for the page before it. The
+    /// page reaches the pager and filmstrip through `updateProperties`,
+    /// whoever loaded it: the grid underneath pages too (the close
+    /// transition scrolls it to the current item), and a load already
+    /// running makes this request a no-op.
     private func loadOlderIfNeeded() {
         guard session.openedFromGallery,
               !isLoadingOlder,
-              let item = browser.gallery.first(where: { $0.id == selectedId }),
-              browser.shouldLoadMore(after: item),
+              browser.galleryHasMore,
+              let index = artifacts.firstIndex(where: { $0.id == selectedId }),
+              index < Self.olderThreshold,
               let workspace,
               let deviceId else { return }
         isLoadingOlder = true
@@ -974,15 +980,31 @@ final class StudioGalleryViewerController: UIViewController,
             guard let self else { return }
             defer { isLoadingOlder = false }
             await browser.loadMoreGallery(workspace: workspace, deviceId: deviceId)
-            guard !Task.isCancelled, !isDismissing else { return }
-            let updated = browser.gallery.map(StudioArtifactDetail.init(item:))
-            let current = selectedId
-            guard updated.contains(where: { $0.id == current }) else { return }
-            artifacts = updated
-            session.replaceArtifacts(with: updated)
-            pager.replaceArtifacts(updated)
-            filmstrip.replaceArtifacts(updated)
         }
+    }
+
+    /// How close to the oldest loaded creation the next page is asked for:
+    /// a fast filmstrip swipe crosses a few dozen in a second.
+    private static let olderThreshold = 40
+
+    /// Tracks the gallery (reads here re-run when it changes): older pages,
+    /// new creations and deletions reach a viewer opened from it.
+    override func updateProperties() {
+        super.updateProperties()
+        guard session.openedFromGallery, !isDismissing else { return }
+        let gallery = browser.gallery
+        guard gallery.count != artifacts.count
+            || gallery.first?.id != artifacts.first?.id
+            || gallery.last?.id != artifacts.last?.id else { return }
+        let current = selectedId
+        guard gallery.contains(where: { $0.id == current }) else { return }
+        let updated = gallery.map(StudioArtifactDetail.init(item:))
+        artifacts = updated
+        session.replaceArtifacts(with: updated)
+        pager.replaceArtifacts(updated)
+        filmstrip.replaceArtifacts(updated)
+        // Still near the old edge (a short page): keep going.
+        loadOlderIfNeeded()
     }
 
     // MARK: Chrome
@@ -1482,13 +1504,18 @@ final class StudioViewerFilmstripController: UIViewController,
     func replaceArtifacts(_ artifacts: [StudioArtifactDetail], selecting: String? = nil) {
         let keepSelected = selecting ?? selectedId
         guard self.artifacts != artifacts || keepSelected != selectedId else { return }
+        let anchor = selecting == nil ? StudioStripAnchor.capture(collectionView, ids: self.artifacts) : nil
         self.artifacts = artifacts
         artifactIndex = Self.index(artifacts)
         selectedId = keepSelected
         lastReportedCenteredId = keepSelected
         collectionView.reloadData()
-        pendingSelectionId = selectedId
         collectionView.layoutIfNeeded()
+        if let anchor {
+            StudioStripAnchor.restore(anchor, in: collectionView, index: artifactIndex[anchor.id])
+            return
+        }
+        pendingSelectionId = selectedId
         positionPendingSelection()
     }
 
@@ -1783,5 +1810,25 @@ private final class StudioFilmstripCell: UICollectionViewCell {
         contentView.layer.borderWidth = selected ? 2 : 0
         // Unselected thumbnails recede so the current one reads at a glance.
         contentView.alpha = selected ? 1 : 0.72
+    }
+}
+
+/// While a strip is being swiped, a list swap (an older page arriving)
+/// keeps the item on screen where it is, shifting the offset by what was
+/// inserted, instead of re-centering the selection and killing the fling.
+@MainActor
+enum StudioStripAnchor {
+    static func capture(_ collectionView: UICollectionView, ids: [StudioArtifactDetail]) -> (id: String, x: CGFloat)? {
+        guard collectionView.isDragging || collectionView.isDecelerating,
+              let first = collectionView.indexPathsForVisibleItems.min(),
+              ids.indices.contains(first.item),
+              let frame = collectionView.layoutAttributesForItem(at: first)?.frame else { return nil }
+        return (ids[first.item].id, frame.minX - collectionView.contentOffset.x)
+    }
+
+    static func restore(_ anchor: (id: String, x: CGFloat), in collectionView: UICollectionView, index: Int?) {
+        guard let index,
+              let frame = collectionView.layoutAttributesForItem(at: IndexPath(item: index, section: 0))?.frame else { return }
+        collectionView.contentOffset.x = frame.minX - anchor.x
     }
 }

@@ -106,12 +106,17 @@ final class StudioViewerPagerController: UIViewController,
     func replaceArtifacts(_ artifacts: [StudioArtifactDetail], selecting: String? = nil) {
         let keepSelected = selecting ?? selectedId
         guard self.artifacts != artifacts || keepSelected != selectedId else { return }
+        let anchor = selecting == nil ? StudioStripAnchor.capture(collectionView, ids: self.artifacts) : nil
         self.artifacts = artifacts
         artifactIndex = Self.index(artifacts)
         selectedId = keepSelected
         collectionView.reloadData()
-        pendingSelectionId = keepSelected
         collectionView.layoutIfNeeded()
+        if let anchor {
+            StudioStripAnchor.restore(anchor, in: collectionView, index: artifactIndex[anchor.id])
+            return
+        }
+        pendingSelectionId = keepSelected
         positionPendingSelection()
     }
 
