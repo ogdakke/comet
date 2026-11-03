@@ -79,13 +79,14 @@ final class MainTabController: UIViewController, AppRouter {
         return item
     }()
 
-    /// The bar: Studio · Search · voice (when a host can run it, or a call
-    /// is live) · New session. Rebuilt only when what it shows changes (the
-    /// voice observer also fires for audio levels mid-call).
-    private var shownBar: (live: Bool, voice: Bool)?
+    /// The bar: Studio (unless Settings hides it) · Search · voice (when a
+    /// host can run it, or a call is live) · New session. Rebuilt only when
+    /// what it shows changes (the voice observer also fires for audio levels
+    /// mid-call).
+    private var shownBar: (live: Bool, voice: Bool, studio: Bool)?
     private func updateBottomBar() {
         let voice = app.voice
-        let state = (live: voice.live, voice: voice.live || voice.available)
+        let state = (live: voice.live, voice: voice.live || voice.available, studio: app.showStudio)
         if let shownBar, shownBar == state { return }
         shownBar = state
         voiceItem.image = UIImage(systemName: state.live ? "waveform.circle.fill" : "waveform")
@@ -95,7 +96,8 @@ final class MainTabController: UIViewController, AppRouter {
         // Holding the live call must not offer to change its host.
         voiceItem.menu = state.live ? nil : voiceMenu(app: app)
         // Fixed spaces split the glass: each control its own shape.
-        var items: [UIBarButtonItem] = [studioItem, .fixedSpace(0), sessionsList.navigationItem.searchBarPlacementBarButtonItem, .fixedSpace(0)]
+        var items: [UIBarButtonItem] = state.studio ? [studioItem, .fixedSpace(0)] : []
+        items += [sessionsList.navigationItem.searchBarPlacementBarButtonItem, .fixedSpace(0)]
         if state.voice { items += [voiceItem, .fixedSpace(0)] }
         items.append(composeItem)
         // `viewIfLoaded`: loading the list outside its nav controller lays it
@@ -148,6 +150,7 @@ final class MainTabController: UIViewController, AppRouter {
     /// Studio's library over the list (the bottom bar steps aside); back to
     /// it as it was when it's already on the stack.
     func showStudio() {
+        guard app.showStudio else { return }
         if presentedViewController != nil { dismiss(animated: false) }
         if let studio = nav.viewControllers.first(where: { $0 is StudioRootViewController }) {
             nav.popToViewController(studio, animated: true)

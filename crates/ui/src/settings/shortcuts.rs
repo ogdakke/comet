@@ -873,6 +873,45 @@ impl Render for ShortcutsPage {
                     })),
             )
             .search_anchor(SettingId::CompactModelPicker);
+        let show_studio = crate::settings::show_studio(cx);
+        let show_studio_row = widgets::card_row(&theme, false)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(widgets::row_title(&theme, "Show Studio"))
+                    .child(widgets::meta_line(
+                        &theme,
+                        vec![
+                            div()
+                                .child("Image and video generation in the sidebar and settings.")
+                                .into_any_element(),
+                        ],
+                    )),
+            )
+            .child(
+                widgets::toggle_switch(&theme, show_studio, "show-studio")
+                    .id("show-studio-toggle")
+                    .tab_index(0)
+                    .role(gpui::Role::Switch)
+                    .aria_label("Show Studio")
+                    .aria_toggled(if show_studio {
+                        gpui::Toggled::True
+                    } else {
+                        gpui::Toggled::False
+                    })
+                    .focus_visible(|s| s.border_2().border_color(theme.accent))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        crate::settings::update(
+                            crate::settings::SavePolicy::Debounced,
+                            cx,
+                            |settings| settings.show_studio = !show_studio,
+                        );
+                        cx.notify();
+                    })),
+            )
+            .search_anchor(SettingId::ShowStudio);
         let escape_behavior_row = widgets::card_row(&theme, false)
             .child(
                 div()
@@ -977,7 +1016,8 @@ impl Render for ShortcutsPage {
                                             .child(send_behavior_row)
                                             .child(compact_mode_row)
                                             .child(compact_model_picker_row)
-                                            .child(escape_behavior_row),
+                                            .child(escape_behavior_row)
+                                            .child(show_studio_row),
                                     )
                                     .child(widgets::section(
                                         &theme,

@@ -61,12 +61,14 @@ impl Shell {
 
     fn on_settings_search_edited(&mut self, cx: &mut Context<Self>) {
         let cloud_offered = self.state.read(cx).cloud_offered();
+        let studio_shown = self.studio_shown;
         let Some(search) = self.settings_search.as_mut() else {
             return;
         };
-        // Only what the nav shows: Cloud and Billing follow the account.
+        // Only what the nav shows: Cloud and Billing follow the account,
+        // Studio providers follow Show Studio.
         search.hits = settings::search::search(search.input.read(cx).text(), |section| {
-            section.shown_in_nav(cloud_offered)
+            section.shown_in_nav(cloud_offered, studio_shown)
         });
         search.active = 0;
         search.results.set_offset(Point::default());

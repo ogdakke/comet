@@ -28,6 +28,7 @@ final class SplitRootController: UISplitViewController, UISplitViewControllerDel
     private var modeBeforeInspector: UISplitViewController.DisplayMode?
     private lazy var tabs = MainTabController(app: app)
     private(set) var currentChatId: String?
+    private var studioToken: AnyObject?
 
     init(app: AppModel) {
         self.app = app
@@ -63,6 +64,11 @@ final class SplitRootController: UISplitViewController, UISplitViewControllerDel
         setViewController(inspector, for: .inspector)
         hide(.inspector)
         setViewController(tabs, for: .compact)
+        // Settings hid Studio while it was open in the main column.
+        studioToken = app.observe { [weak self] in
+            guard let self, !self.app.showStudio, self.detail.viewControllers.first is StudioRootViewController else { return }
+            self.detail.setViewControllers([], animated: false)
+        }
         // A phone in landscape is compact in height but can be regular in
         // width (the larger models); it keeps the tab shell. The split
         // collapses on its own horizontal class, so pin that to compact.
@@ -182,6 +188,7 @@ final class SplitRootController: UISplitViewController, UISplitViewControllerDel
 
     /// Studio's library in the main column, in place of the session.
     func showStudio() {
+        guard app.showStudio else { return }
         guard !isCollapsed else { return tabs.showStudio() }
         if presentedViewController != nil { dismiss(animated: true) }
         if detail.viewControllers.first is StudioRootViewController {
@@ -447,13 +454,15 @@ final class SidebarViewController: UIViewController, UISearchResultsUpdating {
         probe.isAccessibilityElement = false
         list.toolbarItems = [settings, options, studio, .flexibleSpace(), probe, compose]
         nav.isToolbarHidden = false
-        // Voice beside compose, once a host can run it.
+        // Voice beside compose, once a host can run it; Studio unless
+        // Settings hides it.
         let voiceBar = VoiceBarItem(app: app, host: self)
         self.voiceBar = voiceBar
         let syncVoice = { [weak self, weak voiceBar] in
             guard let self, let voiceBar else { return }
-            let items = voiceBar.visible ? [settings, options, studio, .flexibleSpace(), probe, voiceBar.item, compose] : [settings, options, studio, .flexibleSpace(), probe, compose]
-            if self.list.toolbarItems?.count != items.count {
+            var items: [UIBarButtonItem] = self.app.showStudio ? [settings, options, studio] : [settings, options]
+            items += voiceBar.visible ? [.flexibleSpace(), probe, voiceBar.item, compose] : [.flexibleSpace(), probe, compose]
+            if self.list.toolbarItems?.count != items.count || self.list.toolbarItems?.contains(studio) != self.app.showStudio {
                 self.list.setToolbarItems(items, animated: self.view.window != nil)
             }
         }

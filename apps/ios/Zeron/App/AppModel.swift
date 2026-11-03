@@ -32,6 +32,17 @@ final class AppModel {
         }
     }
 
+    /// Studio (image and video generation) in the bottom bar and the iPad
+    /// sidebar. On unless turned off here; local to this phone.
+    var showStudio: Bool {
+        get { UserDefaults.standard.object(forKey: "showStudio") as? Bool ?? true }
+        set {
+            guard newValue != showStudio else { return }
+            UserDefaults.standard.set(newValue, forKey: "showStudio")
+            observers.values.forEach { $0() }
+        }
+    }
+
     struct LiveCounts: Equatable {
         var working = 0
         var awaiting = 0

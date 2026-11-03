@@ -151,6 +151,10 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
             app.groupByProject = on
             return
         }
+        if id == "showStudio" {
+            app.showStudio = on
+            return
+        }
         if id == "math:render" {
             MathSettings.render = on
             return reload()
@@ -243,6 +247,10 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
         s.appendItems([
             Row(id: "groupByProject", title: "Group by Project", subtitle: "Sessions outside your sections, under their project", symbol: "square.stack.3d.up", accessory: .toggle(app.groupByProject)),
             Row(id: "archived", title: "Archived Sessions", symbol: "archivebox"),
+        ])
+        s.appendSections(["Studio"])
+        s.appendItems([
+            Row(id: "showStudio", title: "Show Studio", subtitle: "Image and video generation in the toolbar", symbol: "photo.stack", accessory: .toggle(app.showStudio)),
         ])
         s.appendSections([" "])
         s.appendItems([Row(id: "signout", title: "Sign Out", symbol: "rectangle.portrait.and.arrow.right", accessory: .none, destructive: true)])

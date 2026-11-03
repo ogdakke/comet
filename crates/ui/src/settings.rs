@@ -569,6 +569,13 @@ pub fn compact_model_picker(cx: &App) -> bool {
         .is_some_and(|store| store.current.compact_model_picker)
 }
 
+/// Whether Studio appears anywhere in the window (sidebar, settings, archive).
+/// Read on every sidebar render, so without cloning the settings.
+pub fn show_studio(cx: &App) -> bool {
+    cx.try_global::<SettingsStore>()
+        .is_none_or(|store| store.current.show_studio)
+}
+
 /// Read on every wheel notch, so without cloning the settings. Without a
 /// store (not the app) wheel input is left alone.
 pub fn smooth_scrolling(cx: &App) -> bool {
@@ -1073,6 +1080,8 @@ pub struct UiSettings {
         std::collections::HashMap<zeron_proto::HarnessId, SkillCompletionSettings>,
     /// Open model selection with an effort slider and a separate model list.
     pub compact_model_picker: bool,
+    /// Show Studio (image and video generation) in the sidebar and settings.
+    pub show_studio: bool,
     pub sidebar_width: f32,
     pub sidebar_collapsed: bool,
     /// Legacy: the grouped-by-project toggle predates spaces (which group by
@@ -1333,6 +1342,7 @@ impl Default for UiSettings {
             skills_in_slash_menu: false,
             skill_completion_by_harness: Default::default(),
             compact_model_picker: true,
+            show_studio: true,
             appshots_enabled: false,
             appshot_sound_enabled: true,
             appshot_destination: crate::appshots::AppshotDestination::Automatic,
@@ -2137,6 +2147,7 @@ impl UiSettings {
             skills_in_slash_menu,
             skill_completion_by_harness,
             compact_model_picker,
+            show_studio,
             sidebar_width,
             sidebar_collapsed,
             sidebar_grouped,
@@ -2514,6 +2525,19 @@ mod tests {
         settings.skills_in_slash_menu = true;
         settings.save(dir.path()).unwrap();
         assert!(UiSettings::load(dir.path()).skills_in_slash_menu);
+    }
+
+    #[test]
+    fn studio_is_shown_by_default_and_hiding_it_persists() {
+        let legacy: UiSettings = serde_json::from_str("{}").unwrap();
+        assert!(legacy.show_studio);
+        let settings = UiSettings {
+            show_studio: false,
+            ..legacy
+        };
+        let saved = serde_json::to_string(&settings).unwrap();
+        let loaded: UiSettings = serde_json::from_str(&saved).unwrap();
+        assert!(!loaded.show_studio);
     }
 
     #[test]
@@ -3365,6 +3389,7 @@ mod tests {
             skills_in_slash_menu: true,
             skill_completion_by_harness: Default::default(),
             compact_model_picker: true,
+            show_studio: false,
             appshots_enabled: false,
             appshot_sound_enabled: true,
             // The destination is only persisted where Appshots exist (macOS and

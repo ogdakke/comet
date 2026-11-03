@@ -683,10 +683,13 @@ impl SettingsSection {
         self != Self::Agents && (self != Self::Appshots || crate::appshots::is_desktop())
     }
 
-    /// [`Self::visible_in_nav`], plus what depends on the account: Cloud
-    /// and Billing only when the account is offered Cloud.
-    fn shown_in_nav(self, cloud_offered: bool) -> bool {
-        self.visible_in_nav() && (!self.needs_account() || cloud_offered)
+    /// [`Self::visible_in_nav`], plus what depends on the account (Cloud
+    /// and Billing only when the account is offered Cloud) and on Settings →
+    /// General → Show Studio (Studio providers).
+    fn shown_in_nav(self, cloud_offered: bool, studio_shown: bool) -> bool {
+        self.visible_in_nav()
+            && (!self.needs_account() || cloud_offered)
+            && (self != Self::Providers || studio_shown)
     }
 
     /// Pages about the signed-in account (they open General when signed out).
@@ -2168,6 +2171,10 @@ pub struct Shell {
     voice_stage_selection: Option<String>,
     _voice_observation: gpui::Subscription,
     _voice_catalog: gpui::Subscription,
+    /// Settings → General → Show Studio, as last applied (see
+    /// [`Shell::apply_studio_setting`]).
+    studio_shown: bool,
+    _studio_setting: gpui::Subscription,
     /// Measured height of the bottom chrome stack (status strip + composer +
     /// terminal dock) the full-height transcript scrolls under. Paint-time
     /// measurement schedules another frame whenever this value changes.
@@ -2640,6 +2647,10 @@ impl Shell {
             cx.observe_global::<crate::pickers::HarnessCatalogChanged>(|this: &mut Shell, cx| {
                 this.check_voice_codex(true, cx)
             });
+        let studio_setting =
+            cx.observe_global::<crate::settings::SettingsStore>(|this: &mut Shell, cx| {
+                this.apply_studio_setting(cx)
+            });
         let links = Self::session_links(None, cx);
         transcript.update(cx, |transcript, _| {
             transcript.set_workspace_link_handler(links)
@@ -2746,7 +2757,7 @@ impl Shell {
                 state.update(cx, |s, _| s.auto_selected = true);
                 Route::Chat
             }
-            Some("studio") => Route::Studio,
+            Some("studio") if crate::settings::show_studio(cx) => Route::Studio,
             _ => Route::Chat,
         };
         // More capture knobs of the same kind: `ZERON_OPEN_DIALOG=rename|delete`
@@ -2812,6 +2823,8 @@ impl Shell {
             voice_stage_selection: None,
             _voice_observation: voice_observation,
             _voice_catalog: voice_catalog,
+            studio_shown: crate::settings::show_studio(cx),
+            _studio_setting: studio_setting,
             // Seed with the compact composer stack's rough height so the
             // first frame's clearance isn't zero (the measure corrects it).
             bottom_stack: std::rc::Rc::new(std::cell::Cell::new(120.0)),
@@ -3124,6 +3137,7 @@ impl Shell {
             self.side_chats.clear();
         }
         if state.read(cx).engine().is_some()
+            && self.studio_shown
             && self.studio_page.is_none()
             && self.studio_warm_task.is_none()
         {
@@ -5979,6 +5993,9 @@ impl Shell {
     }
 
     fn open_studio(&mut self, cx: &mut Context<Self>) {
+        if !self.studio_shown {
+            return;
+        }
         self.route = Route::Studio;
         self.nav.push(self.studio_nav_entry(cx));
         if let Some(page) = self.studio_page.as_ref() {
@@ -5988,6 +6005,41 @@ impl Shell {
         self.close_chat_menu(cx);
         self.close_studio_menu(cx);
         cx.notify();
+    }
+
+    /// Settings → General → Show Studio changed. Off: leave any Studio route
+    /// (or the Studio providers page) and stop the boot warmup. Either way the
+    /// archive rebuilds, since it lists archived Studio threads only when shown.
+    fn apply_studio_setting(&mut self, cx: &mut Context<Self>) {
+        let shown = crate::settings::show_studio(cx);
+        if shown == self.studio_shown {
+            return;
+        }
+        self.studio_shown = shown;
+        self.archived_page = None;
+        if !shown {
+            self.studio_warm_task = None;
+            self.leave_hidden_studio(cx);
+        }
+        cx.notify();
+    }
+
+    /// With Studio hidden, nothing may land on it: not a back/forward entry
+    /// from before, and not the settings return route.
+    fn leave_hidden_studio(&mut self, cx: &mut Context<Self>) {
+        if self.studio_shown {
+            return;
+        }
+        if matches!(self.settings_return_route, Route::Studio | Route::StudioArtifact { .. }) {
+            self.settings_return_route = Route::Chat;
+        }
+        match self.route {
+            Route::Studio | Route::StudioArtifact { .. } => self.close_studio(cx),
+            Route::Settings(SettingsSection::Providers) => {
+                self.open_settings(SettingsSection::General, cx)
+            }
+            _ => {}
+        }
     }
 
     fn close_studio(&mut self, cx: &mut Context<Self>) {
@@ -6189,6 +6241,7 @@ impl Shell {
         self.close_user_menu(cx);
         self.close_chat_menu(cx);
         self.close_studio_menu(cx);
+        self.leave_hidden_studio(cx);
         cx.notify();
     }
 
@@ -6476,8 +6529,12 @@ impl Shell {
             SettingsSection::Archived => {
                 if self.archived_page.is_none() {
                     let state = self.state.clone();
-                    let studio = self.ensure_studio_page(cx);
-                    self.archived_page = Some(cx.new(|cx| ArchivedPage::with_studio(state, studio, cx)));
+                    self.archived_page = Some(if self.studio_shown {
+                        let studio = self.ensure_studio_page(cx);
+                        cx.new(|cx| ArchivedPage::with_studio(state, studio, cx))
+                    } else {
+                        cx.new(|cx| ArchivedPage::new(state, cx))
+                    });
                 }
                 match &self.archived_page {
                     Some(page) => page.clone().into_any_element(),
@@ -9111,6 +9168,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let cloud_offered = self.state.read(cx).cloud_offered();
+        let studio_shown = self.studio_shown;
         settings::widgets::scroll_faded(
             "settings-nav-scroll",
             div()
@@ -9134,7 +9192,7 @@ impl Shell {
                         .children(
                             SettingsSection::ALL
                                 .into_iter()
-                                .filter(|item| item.shown_in_nav(cloud_offered))
+                                .filter(|item| item.shown_in_nav(cloud_offered, studio_shown))
                                 .map(|item| {
                                     let index = SettingsSection::ALL
                                         .iter()
@@ -9174,7 +9232,7 @@ impl Shell {
                                         move |this, event: &gpui::KeyDownEvent, window, cx| {
                                             let items: Vec<_> = SettingsSection::ALL
                                                 .into_iter()
-                                                .filter(|s| s.shown_in_nav(cloud_offered))
+                                                .filter(|s| s.shown_in_nav(cloud_offered, studio_shown))
                                                 .collect();
                                             let current =
                                                 items.iter().position(|s| *s == item).unwrap_or(0);
@@ -11203,7 +11261,7 @@ impl Shell {
             // window above this column.)
             .child(filter_row)
             .child(sidebar_lists)
-            .child(
+            .when(self.studio_shown, |el| el.child(
                 div().px(px(Theme::SPACE_SM)).pb(px(Theme::SPACE_SM)).child(
                     div()
                         .id("open-studio")
@@ -11223,7 +11281,7 @@ impl Shell {
                         )
                         .child(SharedString::from("Studio")),
                 ),
-            )
+            ))
             // Global connection pill (durable-by-design UI truth): appears
             // whenever the edge posture is degraded; hidden while healthy —
             // appearing IS the signal.

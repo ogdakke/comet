@@ -73,6 +73,8 @@ settings_index! {
         "effort reasoning slider model list"),
     (EscapeStopsAgent, General, None, "Stop agent with Escape",
         "esc interrupt cancel halt run keyboard"),
+    (ShowStudio, General, None, "Show Studio",
+        "studio image video generation gallery hide sidebar feature"),
     (PullRequestDestination, General, Some("Links"), "Open pull requests in",
         "pr pull request badges board browser github"),
     (ThreadNaming, General, None, "Thread naming",
