@@ -14,6 +14,8 @@ edge/.wrangler.production.generated.jsonc
 apps/ios/Zeron/Private.*.xcconfig
 build/
 edge/dist/
+# the card pages' static files, copied in by `npm -C edge run card-assets`
+edge/public/
 .agents
 .claude
 CLAUDE.md

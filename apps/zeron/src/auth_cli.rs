@@ -240,7 +240,7 @@ async fn live_engine_scope(ipc_port: u16, data_dir: &std::path::Path) -> Option<
 }
 
 fn install_kind_label() -> &'static str {
-    match crate::defaults::install_kind() {
+    match zeron_update::detect_install() {
         zeron_update::InstallKind::MacApp { .. } => "Zeron.app",
         zeron_update::InstallKind::Managed { .. } => "managed (~/.zeron/app)",
         zeron_update::InstallKind::UserInstalled => "user CLI (~/.local/bin/zeron)",
