@@ -774,6 +774,7 @@ async fn host_rpcs_ride_the_device_relay() {
                 name: "shot.png".into(),
                 mime_type: "image/png".into(),
                 data: vec![1, 2, 3, 4, 5],
+                path: None,
             }],
             worktree: None,
             busy: Default::default(),

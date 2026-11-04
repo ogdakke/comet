@@ -41,6 +41,10 @@ pub mod capabilities {
     /// interface asks for it on connect and offers Stable on an engine
     /// without it.
     pub const ZGX_INTERFACE_V1: &str = "zgx-interface-v1";
+    /// The host fetches a `pending://` attachment from the edge's transfer
+    /// named by its upload id (docs/design/file-transfer.md), so a client may
+    /// send it there, up to 4 GiB, instead of over the relay.
+    pub const ATTACHMENTS_R2_V1: &str = "attachments-r2-v1";
 
     pub const CURRENT: &[&str] = &[
         COMPOSER_REFERENCES_V1,
@@ -55,6 +59,7 @@ pub mod capabilities {
         PROVIDER_SWITCH_V1,
         BACKGROUND_TASKS_V1,
         ZGX_INTERFACE_V1,
+        ATTACHMENTS_R2_V1,
         crate::voice::remote::CAPABILITY,
     ];
 

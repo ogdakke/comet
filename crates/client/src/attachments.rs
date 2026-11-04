@@ -41,7 +41,7 @@ pub fn with_attachments(text: &str, paths: &[String]) -> String {
         return text.to_owned();
     }
     let body = if text.trim().is_empty() {
-        ATTACHMENT_ONLY_TEXT
+        attachment_only_text(paths)
     } else {
         text
     };
@@ -51,6 +51,16 @@ pub fn with_attachments(text: &str, paths: &[String]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("{body}\n\n{ATTACHMENT_MARKER}\n{refs}")
+}
+
+/// The body of a message with only attachments: "image(s)" while they all
+/// are, "file(s)" otherwise (like the desktop).
+pub fn attachment_only_text(paths: &[String]) -> &'static str {
+    if paths.iter().all(|p| zeron_proto::attachment_mentions::is_image_path(p)) {
+        ATTACHMENT_ONLY_TEXT
+    } else {
+        FILE_ATTACHMENT_ONLY_TEXT
+    }
 }
 
 /// The host's upload-name rule (uploads.rs `sanitize`): basename, anything

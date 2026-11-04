@@ -406,22 +406,31 @@ impl ClientInner {
         }
     }
 
-    /// Mint `pending://` refs for picked images and keep their bytes local
-    /// (the echo renders them immediately; the escort pushes them).
+    /// Mint `pending://` refs for picked files and keep their bytes local
+    /// (the echo renders them immediately; the escort pushes them). Through
+    /// the edge a file may be up to 4 GiB; over the relay, 24 MB.
     pub(crate) fn stage_attachments(
         &self,
         chat_id: &str,
         device_id: &str,
         attachments: &[OutgoingAttachment],
     ) -> Result<Vec<String>> {
-        if let Some(too_big) = attachments
-            .iter()
-            .find(|a| a.data.len() > attachments::MAX_ATTACHMENT_BYTES)
-        {
-            return Err(ClientError::InvalidArgument(format!(
-                "{} is larger than 24 MB",
-                too_big.name
-            )));
+        let edge = self.live().is_some() && self.host_has(device_id, capability::ATTACHMENTS_R2_V1);
+        let max = if edge { zeron_transfer::MAX_BYTES } else { attachments::MAX_ATTACHMENT_BYTES as u64 };
+        for attachment in attachments {
+            let size = match &attachment.path {
+                Some(path) => std::fs::metadata(path)
+                    .map_err(|e| ClientError::InvalidArgument(format!("{}: {e}", attachment.name)))?
+                    .len(),
+                None => attachment.data.len() as u64,
+            };
+            if size > max {
+                return Err(ClientError::InvalidArgument(if edge {
+                    format!("{} is larger than 4 GB", attachment.name)
+                } else {
+                    format!("{} is larger than 24 MB (update Zeron on the host for larger files)", attachment.name)
+                }));
+            }
         }
         attachments
             .iter()
@@ -436,16 +445,31 @@ impl ClientInner {
                         host_device_id: device_id.to_owned(),
                         name: name.clone(),
                         created_at_ms: now_ms(),
+                        edge,
+                        mime_type: attachment.mime_type.clone(),
                     };
-                    live.escorts
-                        .stash(&meta, &attachment.data)
-                        .map_err(|e| ClientError::Storage(e.to_string()))?;
+                    match &attachment.path {
+                        Some(path) => live.escorts.stash_file(&meta, std::path::Path::new(path)),
+                        None => live.escorts.stash(&meta, &attachment.data),
+                    }
+                    .map_err(|e| ClientError::Storage(e.to_string()))?;
                 }
-                self.attachment_cache
-                    .put(device_id, &reference, Arc::new(attachment.data.clone()));
+                // Images for the echo; a file by path shows as a name pill.
+                if attachment.path.is_none() {
+                    self.attachment_cache
+                        .put(device_id, &reference, Arc::new(attachment.data.clone()));
+                }
                 Ok(reference)
             })
             .collect()
+    }
+
+    /// Whether the host's device row advertises `cap`.
+    pub(crate) fn host_has(&self, device_id: &str, cap: &str) -> bool {
+        self.workspace
+            .snapshot()
+            .device(device_id)
+            .is_some_and(|d| d.capabilities.iter().any(|c| c == cap))
     }
 
     /// A command/queue row was written: wake the host (and escort any

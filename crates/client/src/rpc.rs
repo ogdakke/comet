@@ -20,6 +20,8 @@ pub mod capability {
     pub const PROJECTLESS_SCRATCH_V1: &str = zeron_proto::capabilities::PROJECTLESS_SCRATCH_V1;
     /// The host can move a chat to another provider between turns.
     pub const PROVIDER_SWITCH_V1: &str = zeron_proto::capabilities::PROVIDER_SWITCH_V1;
+    /// The host fetches attachments from the edge (up to 4 GiB).
+    pub const ATTACHMENTS_R2_V1: &str = zeron_proto::capabilities::ATTACHMENTS_R2_V1;
 
     /// Every queue capability (demo hosts advertise the full surface).
     pub const ALL_QUEUE: &[&str] = &[

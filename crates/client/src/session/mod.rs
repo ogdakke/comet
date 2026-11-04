@@ -67,12 +67,15 @@ enum QueueAction {
     Remove,
 }
 
-/// Image bytes picked in the composer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A file picked in the composer: its bytes, or (`path`) a file on this
+/// device the core takes over — moved into its stash, never read whole into
+/// memory. Large files (videos) go by path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OutgoingAttachment {
     pub name: String,
     pub mime_type: String,
     pub data: Vec<u8>,
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -1121,7 +1124,7 @@ impl SessionHandle {
         {
             let text = if refs.is_empty() || caps.clean_attachment_text {
                 if prompt_text.is_empty() {
-                    attachments::ATTACHMENT_ONLY_TEXT.to_owned()
+                    attachments::attachment_only_text(&refs).to_owned()
                 } else {
                     prompt_text.clone()
                 }

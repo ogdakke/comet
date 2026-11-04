@@ -4289,7 +4289,9 @@ impl DocHost {
             // while the bytes chase it over the peer link. Hold it (in order)
             // until they land — UploadCommit re-drains — rather than handing
             // the agent refs it cannot open.
-            if !self.missing_row_attachments(&head).is_empty() {
+            let missing = self.missing_row_attachments(&head);
+            if !missing.is_empty() {
+                self.fetch_from_edge(&handle.chat_id, &missing);
                 tracing::info!(chat = %handle.chat_id, row = %head.id,
                     "queued row held: attachment bytes in transit");
                 self.arm_attachment_wait(handle);
@@ -5303,7 +5305,10 @@ impl DocHost {
             if matches!(disposition, CommandDisposition::Execute) {
                 let missing = self.missing_attachments(&entry);
                 if !missing.is_empty() {
-                    if now_ms().saturating_sub(entry.issued_at) < ATTACHMENT_WAIT_MAX_MS {
+                    self.fetch_from_edge(&handle.chat_id, &missing);
+                    if now_ms().saturating_sub(entry.issued_at) < ATTACHMENT_WAIT_MAX_MS
+                        || self.edge_bringing(&missing)
+                    {
                         tracing::info!(chat = %handle.chat_id, command = %entry.id,
                             missing = missing.len(), "command deferred: attachment bytes in transit");
                         self.arm_attachment_wait(handle);
@@ -5365,6 +5370,35 @@ impl DocHost {
             }
             lock(&self.inner.executing).remove(&entry.id);
         }
+    }
+
+    /// Pull `refs` (missing `pending://` refs) from the edge, where a phone
+    /// uploads them as transfers named by their upload id; each landing
+    /// re-drains every chat.
+    fn fetch_from_edge(&self, chat_id: &str, refs: &[String]) {
+        let (Some(uploads), Some(transfers)) = (self.inner.uploads.get(), self.transfers()) else {
+            return;
+        };
+        for r in refs {
+            let Some((upload_id, file_name)) = crate::uploads::parse_pending_ref(r) else {
+                continue;
+            };
+            let host = self.clone();
+            transfers.fetch_incoming(chat_id, upload_id, uploads.pending_target(upload_id, file_name), move || {
+                host.kick_drains()
+            });
+        }
+    }
+
+    /// Some of `refs` are still on their way through the edge (a large file
+    /// may take longer than the relay window).
+    fn edge_bringing(&self, refs: &[String]) -> bool {
+        let Some(transfers) = self.transfers() else {
+            return false;
+        };
+        refs.iter()
+            .filter_map(|r| crate::uploads::parse_pending_ref(r))
+            .any(|(upload_id, _)| transfers.awaiting(upload_id))
     }
 
     /// The command's `pending://` attachment refs whose bytes are NOT on this

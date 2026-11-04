@@ -108,14 +108,19 @@ fn http() -> &'static reqwest::Client {
     })
 }
 
+/// The edge's transfer client, while signed in.
+pub(crate) fn edge_client(inner: &Arc<ClientInner>) -> Option<EdgeClient> {
+    let live = inner.live()?;
+    Some(EdgeClient::new(
+        http().clone(),
+        live.edge.clone(),
+        Arc::new(TransferBearer(Arc::downgrade(inner))),
+    ))
+}
+
 impl Client {
     fn transfer_client(&self) -> Option<EdgeClient> {
-        let live = self.inner.live()?;
-        Some(EdgeClient::new(
-            http().clone(),
-            live.edge.clone(),
-            Arc::new(TransferBearer(Arc::downgrade(&self.inner))),
-        ))
+        edge_client(&self.inner)
     }
 
     /// A URL a player (AVPlayer, a web view) can stream with byte ranges,

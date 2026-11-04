@@ -20,7 +20,12 @@ pub enum BusyPolicy {
 pub struct OutgoingAttachment {
     pub name: String,
     pub mime_type: String,
+    /// The bytes; empty when `path` names the file instead.
     pub data: Vec<u8>,
+    /// A file on this device the core takes over (moves into its stash):
+    /// large files go this way, never through memory.
+    #[uniffi(default = None)]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -52,6 +57,7 @@ impl From<SendRequest> for zc::SendRequest {
                     name: a.name,
                     mime_type: a.mime_type,
                     data: a.data,
+                    path: a.path,
                 })
                 .collect(),
             worktree: r.worktree.map(|w| zc::WorktreeSpec {

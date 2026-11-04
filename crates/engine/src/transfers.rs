@@ -4,6 +4,10 @@
 //! folder is zipped), names it a transfer, and an outbox job uploads it to
 //! the edge in the background — retrying for days, resumed after restarts —
 //! so viewers can open it from R2 while this device sleeps.
+//!
+//! Inbound (a phone's attachment): a command names `pending://{id}/{name}`;
+//! while its bytes aren't here, the host polls the edge for transfer `{id}`
+//! and downloads it (resumable) to the ref's target the moment it's sealed.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
@@ -30,6 +34,15 @@ const ARTIFACTS_FILE: &str = "artifacts.json";
 const OUTBOX_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const RETRY_FIRST: Duration = Duration::from_secs(5);
 const RETRY_CAP: Duration = Duration::from_secs(10 * 60);
+/// Inbound: how long a pending ref's transfer may take to appear on the edge
+/// (the sender may be using the relay instead), how long its parts may stop
+/// arriving, and the ceiling (the sender's write token lasts 48 h).
+const INCOMING_APPEAR: Duration = Duration::from_secs(15 * 60);
+const INCOMING_STALL_MS: i64 = 2 * 60 * 60 * 1000;
+const INCOMING_MAX: Duration = Duration::from_secs(48 * 60 * 60);
+const INCOMING_POLL_CAP: Duration = Duration::from_secs(15);
+/// Inbound downloads' resumable work dirs.
+const INCOMING_DIR: &str = "incoming";
 
 /// A file `send_file` stored, ready to fold into the reply.
 #[derive(Debug, Clone)]
@@ -65,6 +78,8 @@ struct Inner {
     http: reqwest::Client,
     /// Transfers with an upload task alive in this process.
     running: Mutex<HashSet<String>>,
+    /// Inbound transfers being waited on or downloaded.
+    incoming: Mutex<HashSet<String>>,
     /// Serializes `artifacts.json` read-modify-writes.
     artifacts: Mutex<()>,
 }
@@ -89,6 +104,7 @@ impl Transfers {
                 edge,
                 http: reqwest::Client::new(),
                 running: Mutex::new(HashSet::new()),
+                incoming: Mutex::new(HashSet::new()),
                 artifacts: Mutex::new(()),
             }),
         }
@@ -216,6 +232,124 @@ impl Transfers {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&transfer_id);
         });
+    }
+
+    /// Whether an inbound transfer is still being waited on or downloaded
+    /// (a deferred command keeps waiting past the relay window meanwhile).
+    pub fn awaiting(&self, transfer_id: &str) -> bool {
+        self.inner
+            .incoming
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(transfer_id)
+    }
+
+    /// Wait for inbound transfer `transfer_id` of `chat_id` and download it
+    /// to `dest`, then call `landed`. Gives up when it never appears, stalls,
+    /// is cancelled, or `dest` lands another way (the relay).
+    pub fn fetch_incoming(
+        &self,
+        chat_id: &str,
+        transfer_id: &str,
+        dest: PathBuf,
+        landed: impl Fn() + Send + 'static,
+    ) {
+        let Some(client) = self.client() else { return };
+        if !zeron_transfer::valid_id(transfer_id) || !zeron_transfer::valid_id(chat_id) {
+            return;
+        }
+        if !self
+            .inner
+            .incoming
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(transfer_id.to_owned())
+        {
+            return;
+        }
+        let this = self.clone();
+        let (chat_id, transfer_id) = (chat_id.to_owned(), transfer_id.to_owned());
+        tokio::spawn(async move {
+            if this.receive(&client, &chat_id, &transfer_id, &dest).await {
+                landed();
+            }
+            this.inner
+                .incoming
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&transfer_id);
+        });
+    }
+
+    /// `true` once `dest` holds the transfer's bytes.
+    async fn receive(
+        &self,
+        client: &EdgeClient,
+        chat_id: &str,
+        transfer_id: &str,
+        dest: &Path,
+    ) -> bool {
+        let started = tokio::time::Instant::now();
+        let work = zeron_transfer::work_dir(&self.inner.uploads.join(INCOMING_DIR), transfer_id);
+        let mut wait = Duration::from_secs(2);
+        loop {
+            if dest.exists() {
+                let _ = tokio::fs::remove_dir_all(&work).await;
+                return false;
+            }
+            if started.elapsed() > INCOMING_MAX {
+                tracing::warn!(transfer = %transfer_id, "inbound transfer gave up after 48 h");
+                return false;
+            }
+            match client.status(chat_id, transfer_id).await {
+                Ok(None) if started.elapsed() > INCOMING_APPEAR => return false,
+                Ok(None) => {}
+                Ok(Some(status)) if status.cancelled => {
+                    tracing::info!(transfer = %transfer_id, "inbound transfer cancelled by its sender");
+                    let _ = tokio::fs::remove_dir_all(&work).await;
+                    return false;
+                }
+                Ok(Some(status)) if status.done => {
+                    match zeron_transfer::download(client, chat_id, transfer_id, dest, &work, None)
+                        .await
+                    {
+                        Ok(manifest) => {
+                            tracing::info!(transfer = %transfer_id, bytes = manifest.size, "inbound transfer landed");
+                            // Landed: the edge copy is no longer needed.
+                            if let Err(err) = client.delete(chat_id, transfer_id, false).await {
+                                tracing::debug!(transfer = %transfer_id, error = %err, "inbound transfer cleanup failed");
+                            }
+                            return true;
+                        }
+                        Err(err) if err.is_transient() => {
+                            tracing::warn!(transfer = %transfer_id, error = %err, "inbound transfer interrupted; resuming");
+                        }
+                        Err(err) => {
+                            tracing::warn!(transfer = %transfer_id, error = %err, "inbound transfer failed");
+                            return false;
+                        }
+                    }
+                }
+                Ok(Some(status)) => {
+                    let last = status.last_part_at.unwrap_or(0);
+                    if last > 0 && now_ms() - last > INCOMING_STALL_MS {
+                        tracing::warn!(transfer = %transfer_id, "inbound transfer stalled");
+                        return false;
+                    }
+                    // Uploading: look again soon.
+                    wait = Duration::from_secs(2);
+                }
+                Err(err) if err.is_transient() || matches!(err, TransferError::Unauthorized) => {
+                    tracing::debug!(transfer = %transfer_id, error = %err, "inbound transfer status unavailable");
+                }
+                Err(err) => {
+                    tracing::warn!(transfer = %transfer_id, error = %err, "inbound transfer refused");
+                    return false;
+                }
+            }
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(INCOMING_POLL_CAP);
+        }
     }
 
     /// Resume every queued upload (engine start).
