@@ -466,6 +466,20 @@ fn veil(host: &str, now: i64) -> Vec<SessionMessageEntry> {
                     false,
                     Some("** BUILD SUCCEEDED **"),
                 ),
+                // Before/after captures: with the sent screenshot, the
+                // thread's lightbox has a few pages to flip through.
+                MessagePart::Image {
+                    id: "i0".into(),
+                    path: DEMO_IMAGES[2].0.into(),
+                    name: "veil-after.png".into(),
+                    mime_type: "image/png".into(),
+                },
+                MessagePart::Image {
+                    id: "i1".into(),
+                    path: DEMO_IMAGES[1].0.into(),
+                    name: "veil-long-chat.png".into(),
+                    mime_type: "image/png".into(),
+                },
                 text("t1", VEIL_IMPL),
             ],
         ),

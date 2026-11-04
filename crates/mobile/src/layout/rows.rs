@@ -82,9 +82,11 @@ pub(crate) struct UserBubble {
     /// chat sent through Zeron's `send_message`.
     pub sender: Option<PText>,
     pub text: PText,
+    /// Every image attached, chipped or not: previews like a received image's.
     pub images: Vec<String>,
-    /// Non-image attachments (desktop-sent ZIPs, docs): icon asset + name.
-    pub files: Vec<(String, PText)>,
+    /// Every other attachment (desktop-sent ZIPs, docs, videos): a card like
+    /// a received file's.
+    pub files: Vec<SentFile>,
     pub pending: bool,
     pub expanded: bool,
     pub more: PText,
@@ -120,6 +122,15 @@ pub(crate) enum Content {
     Working { since_ms: Option<i64>, streaming: bool },
     /// An agent visual: its height comes from its worker.
     Visual(Arc<crate::visual::VisualSlot>),
+}
+
+/// A file attached to a prompt, as a card: icon, name over kind. `widget`
+/// opens it (none while it's still uploading).
+pub(crate) struct SentFile {
+    pub icon: String,
+    pub name: PText,
+    pub meta: PText,
+    pub widget: Option<WidgetKind>,
 }
 
 pub(crate) struct FileCard {
@@ -172,8 +183,6 @@ pub(crate) mod geom {
     pub const FADE: f32 = 28.0;
     pub const BUBBLE_FOLD_LINES: usize = 8;
     pub const BUBBLE_FOLD_SHOW: usize = 6;
-    pub const THUMB: f32 = 76.0;
-    pub const FILE_PILL: f32 = 32.0;
     /// Between a caption over a user bubble (an agent sender) and the bubble.
     pub const CAPTION_GAP: f32 = 6.0;
     pub const CHIP_LINE: f32 = 32.0;
@@ -661,7 +670,6 @@ impl RowBuilder {
         // Chips stand in for their attachments (as on the desktop): those
         // leave the strip, and an image chip opens its upload on tap.
         let mentions = zeron_proto::attachment_mentions::attachment_mentions(&parsed.text);
-        let chipped = |path: &str| mentions.iter().any(|mention| mention.names_attachment(path));
         let previews: Vec<(u32, String)> = mentions
             .iter()
             .filter(|mention| mention.is_image)
@@ -675,19 +683,43 @@ impl RowBuilder {
         let body = zeron_proto::attachment_mentions::attachment_mention_prompt(&parsed.text);
         let (msize, mlh) = TYPE.small;
         let mstyle = ctx.typo.style(Family::Sans, Weight::Medium, false, msize);
-        // Only images go to image widgets; other files (desktop-sent ZIPs)
-        // get a name pill, never an image load.
-        let (images, others): (Vec<_>, Vec<_>) = parsed
-            .images
-            .into_iter()
-            .filter(|i| !chipped(&i.path))
-            .partition(|i| zeron_proto::attachment_mentions::is_image_path(&i.path));
+        let soft = ctx.typo.style(Family::Sans, Weight::Regular, false, msize);
+        // Sent attachments preview as received ones do, chips or not (a chip
+        // names it in the prompt; the preview shows it): images as pictures,
+        // everything else as a file card. Only images reach image loading.
+        let (images, others): (Vec<_>, Vec<_>) =
+            parsed.images.into_iter().partition(|i| zeron_proto::attachment_mentions::is_image_path(&i.path));
         let images = images.into_iter().map(|i| i.path).collect();
         let files = others
             .iter()
             .map(|f| {
                 let name = zeron_proto::attachment_mentions::attachment_display_name(&f.name);
-                (file_icon_asset(name), prepare_plain(ctx, name, mstyle, ctx.typo.px(mlh), ColorRole::Text, WhiteSpace::Pre))
+                let mime = mime_for_name(name);
+                let icon = if mime.starts_with("video/") {
+                    "play.rectangle.fill".to_owned()
+                } else if mime.starts_with("audio/") {
+                    "waveform".to_owned()
+                } else {
+                    file_icon_asset(name)
+                };
+                // A queued upload has nothing to open yet.
+                let widget = (!f.path.starts_with("pending://")).then(|| WidgetKind::File {
+                    id: f.path.clone(),
+                    path: f.path.clone(),
+                    name: name.to_owned(),
+                    mime_type: mime.to_owned(),
+                    size: 0,
+                    transfer_id: None,
+                    artifact: name.to_owned(),
+                    version: 1,
+                });
+                let lh = ctx.typo.px(mlh);
+                SentFile {
+                    icon,
+                    name: prepare_plain(ctx, name, mstyle, lh, ColorRole::Text, WhiteSpace::Pre),
+                    meta: prepare_plain(ctx, &file_kind(name, mime), soft, lh, ColorRole::TextSecondary, WhiteSpace::Pre),
+                    widget,
+                }
             })
             .collect();
         let expanded = self.expanded.contains(&key);
@@ -889,17 +921,44 @@ struct FileFields<'a> {
     caption: &'a Option<String>,
 }
 
-/// "PDF · 2.4 MB · v2": the file's kind, its size, and its version once
-/// there's more than one.
-fn file_meta(name: &str, mime_type: &str, size: u64, version: u32) -> String {
+/// "PDF", "Video": what a file is, by its extension, else its type.
+fn file_kind(name: &str, mime_type: &str) -> String {
     let ext = std::path::Path::new(name).extension().and_then(|e| e.to_str()).filter(|e| e.len() <= 8);
-    let kind = match (ext, mime_type.split('/').next()) {
+    match (ext, mime_type.split('/').next()) {
         (Some(ext), _) => ext.to_ascii_uppercase(),
         (None, Some("video")) => "Video".into(),
         (None, Some("audio")) => "Audio".into(),
         (None, Some("text")) => "Text".into(),
         _ => "File".into(),
-    };
+    }
+}
+
+/// A sent attachment's type, from its name (a prompt carries no MIME type):
+/// enough to pick its card's icon and how it opens.
+fn mime_for_name(name: &str) -> &'static str {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "wav" => "audio/wav",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "html" | "htm" => "text/html",
+        "md" | "markdown" => "text/markdown",
+        "txt" | "log" => "text/plain",
+        "json" => "application/json",
+        "csv" => "text/csv",
+        _ => "application/octet-stream",
+    }
+}
+
+/// "PDF · 2.4 MB · v2": the file's kind, its size, and its version once
+/// there's more than one.
+fn file_meta(name: &str, mime_type: &str, size: u64, version: u32) -> String {
+    let kind = file_kind(name, mime_type);
     let mut meta = format!("{kind} · {}", zeron_proto::view::human_bytes(size));
     if version > 1 {
         meta.push_str(&format!(" · v{version}"));
@@ -1292,12 +1351,14 @@ fn place_user(u: &UserBubble, px: Px, x: f32, y: f32, cw: f32, out: Option<&mut 
     let more_h = if folds { u.more.lh + px.v(4.0) } else { 0.0 };
     let bubble_w = if folds { max_w } else { stats.max_line_width.ceil() + pad_x * 2.0 };
     let bubble_h = if stats.line_count == 0 { 0.0 } else { text_h + more_h + pad_y * 2.0 };
-    let side = px.v(THUMB);
     let gap = px.v(6.0);
-    let pill_h = px.v(FILE_PILL);
-    // Thumbnails row, then one pill per file, stacked above the bubble.
-    let files_y = if u.images.is_empty() { 0.0 } else { side + gap };
-    let attach_h = (files_y + u.files.len() as f32 * (pill_h + gap) - gap).max(0.0);
+    // Pictures as a received image is sized: one alone at full size, more in
+    // a right-aligned grid of up to three across; then one card per file.
+    let grid = SentGrid::new(u.images.len(), px, max_w);
+    let card_w = px.v(FILE_CARD_W).min(max_w);
+    let card_h = px.v(FILE_CARD);
+    let files_y = if u.images.is_empty() { 0.0 } else { grid.height + gap };
+    let attach_h = (files_y + u.files.len() as f32 * (card_h + gap) - gap).max(0.0);
     let thumbs_h = if attach_h > 0.0 { attach_h + if bubble_h > 0.0 { px.v(8.0) } else { 0.0 } } else { 0.0 };
     let caption_h = u.sender.as_ref().map_or(0.0, |c| c.lh + px.v(CAPTION_GAP));
     let h = caption_h + thumbs_h + bubble_h;
@@ -1310,26 +1371,30 @@ fn place_user(u: &UserBubble, px: Px, x: f32, y: f32, cw: f32, out: Option<&mut 
         place_text_lines(caption, x + cw - cw_caption, y, cw_caption, 1, px, out);
     }
     let y = y + caption_h;
-    // Thumbnails right-aligned above the bubble.
-    let mut tx = x + cw - side;
-    for img in u.images.iter().rev() {
-        out.fill(tx, y, side, side, px.v(12.0), ColorRole::ChipBackground);
-        out.widget(WidgetKind::Image { reference: img.clone() }, (tx, y, side, side), None);
-        tx -= side + gap;
+    // Pictures above the bubble, in reading order, each grid row flush right.
+    let radius = px.v(if grid.side > px.v(120.0) { 14.0 } else { 12.0 });
+    for (i, img) in u.images.iter().enumerate() {
+        let (tx, ty) = grid.origin(i, x + cw, y);
+        out.fill(tx, ty, grid.side, grid.side, radius, ColorRole::ChipBackground);
+        out.widget(WidgetKind::Image { reference: img.clone() }, (tx, ty, grid.side, grid.side), None);
     }
-    // Files: right-aligned icon + name pills; long names fade at the edge.
-    let is = px.v(16.0);
-    let inset = px.v(10.0) + is + px.v(8.0);
-    let chrome = inset + px.v(12.0);
-    let name_w = (max_w - chrome).max(1.0);
+    // Files: a received file's card (icon, name over kind), flush right.
+    let pad = px.v(14.0);
+    let is = px.v(28.0);
     let mut fy = y + files_y;
-    for (icon, name) in &u.files {
-        let pw = chrome + name.p.max_content_width().ceil().min(name_w);
-        let fx = x + cw - pw;
-        out.fill(fx, fy, pw, pill_h, px.v(12.0), ColorRole::ChipBackground);
-        out.widget(WidgetKind::Icon { name: icon.clone(), color: ColorRole::TextSoft }, (fx + px.v(10.0), fy + (pill_h - is) / 2.0, is, is), None);
-        place_text_lines(name, fx + inset, fy + (pill_h - name.lh) / 2.0, name_w, 1, px, out);
-        fy += pill_h + gap;
+    for f in &u.files {
+        let fx = x + cw - card_w;
+        let text_x = fx + pad + is + px.v(12.0);
+        let text_w = (fx + card_w - pad - text_x).max(1.0);
+        out.fill(fx, fy, card_w, card_h, px.v(14.0), ColorRole::ChipBackground);
+        out.widget(WidgetKind::Icon { name: f.icon.clone(), color: ColorRole::TextSoft }, (fx + pad, fy + (card_h - is) / 2.0, is, is), None);
+        let ty = fy + (card_h - f.name.lh - f.meta.lh) / 2.0;
+        place_text_lines(&f.name, text_x, ty, text_w, 1, px, out);
+        place_text_lines(&f.meta, text_x, ty + f.name.lh, text_w, 1, px, out);
+        if let Some(widget) = &f.widget {
+            out.widget(widget.clone(), (fx, fy, card_w, card_h), None);
+        }
+        fy += card_h + gap;
     }
     if bubble_h > 0.0 {
         let bx = x + cw - bubble_w;
@@ -1350,6 +1415,42 @@ fn place_user(u: &UserBubble, px: Px, x: f32, y: f32, cw: f32, out: Option<&mut 
         }
     }
     h
+}
+
+/// Where a prompt's pictures go: one alone at a received image's size, two
+/// or four two across, otherwise three across; rows fill in reading order
+/// and sit flush right, a short last row included.
+struct SentGrid {
+    count: usize,
+    cols: usize,
+    side: f32,
+    gap: f32,
+    height: f32,
+}
+
+impl SentGrid {
+    fn new(count: usize, px: Px, max_w: f32) -> Self {
+        use geom::IMAGE;
+        let gap = px.v(6.0);
+        let cols = match count {
+            0 | 1 => 1,
+            2 | 4 => 2,
+            _ => 3,
+        };
+        let side = ((max_w - gap * (cols as f32 - 1.0)) / cols as f32).min(px.v(IMAGE)).floor().max(1.0);
+        let rows = count.div_ceil(cols);
+        let height = if rows == 0 { 0.0 } else { rows as f32 * side + (rows as f32 - 1.0) * gap };
+        Self { count, cols, side, gap, height }
+    }
+
+    /// Top-left of picture `i`, for a grid whose right edge is `right`.
+    fn origin(&self, i: usize, right: f32, top: f32) -> (f32, f32) {
+        let row = i / self.cols;
+        let in_row = (self.count - row * self.cols).min(self.cols);
+        let col = i % self.cols;
+        let x = right - in_row as f32 * self.side - (in_row as f32 - 1.0) * self.gap + col as f32 * (self.side + self.gap);
+        (x, top + row as f32 * (self.side + self.gap))
+    }
 }
 
 /// Heap held by a row's prepared text (diagnostics; blocks recurse).
@@ -1377,7 +1478,7 @@ pub(crate) fn content_heap_bytes(content: &Content) -> usize {
     }
     match content {
         Content::Block(b) => block(b),
-        Content::User(u) => u.sender.as_ref().map_or(0, |c| c.p.heap_bytes()) + u.text.p.heap_bytes() + u.more.p.heap_bytes() + u.files.iter().map(|(_, n)| n.p.heap_bytes()).sum::<usize>(),
+        Content::User(u) => u.sender.as_ref().map_or(0, |c| c.p.heap_bytes()) + u.text.p.heap_bytes() + u.more.p.heap_bytes() + u.files.iter().map(|f| f.name.p.heap_bytes() + f.meta.p.heap_bytes()).sum::<usize>(),
         Content::Tools(t) => super::tools::heap_bytes(t),
         Content::Chip(c) => c.text.p.heap_bytes(),
         Content::Caption { text, .. } => text.p.heap_bytes(),

@@ -86,6 +86,10 @@ protocol SessionSource: AnyObject {
     func fileViewer(for file: SharedFile) -> UIViewController?
     /// An attachment's picture, for opening it full size (an image chip).
     func image(_ reference: String) async -> UIImage?
+    /// A shared or sent file for the lightbox: with `streaming`, a URL to
+    /// play from the edge when it has a copy there; otherwise (or without
+    /// one) the file fetched to disk. Nil when it can't be had.
+    func mediaURL(for file: SharedFile, streaming: Bool) async -> URL?
     /// Workspace files for `@` mentions.
     func searchFiles(_ query: String) async -> [FileMatch]
 }
@@ -239,6 +243,7 @@ final class FixtureSessionSource: SessionSource {
     func loadImage(_ reference: String, into view: UIImageView) {}
     func fileViewer(for file: SharedFile) -> UIViewController? { nil }
     func image(_ reference: String) async -> UIImage? { nil }
+    func mediaURL(for file: SharedFile, streaming: Bool) async -> URL? { nil }
     func searchFiles(_ query: String) async -> [FileMatch] { [] }
 }
 

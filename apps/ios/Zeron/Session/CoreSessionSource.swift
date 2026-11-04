@@ -393,6 +393,18 @@ final class CoreSessionSource: SessionSource {
         return FileViewerController.presentable(file: file, client: client, chatId: chatId, hostDevice: hostDevice)
     }
 
+    func mediaURL(for file: SharedFile, streaming: Bool) async -> URL? {
+        guard !hostDevice.isEmpty else { return nil }
+        if streaming, let transferId = file.transferId,
+           let remote = try? await client.sharedFileUrl(chatId: chatId, transferId: transferId),
+           let url = URL(string: remote) {
+            return url
+        }
+        let request = SharedFileRequest(deviceId: hostDevice, chatId: chatId, transferId: file.transferId, path: file.path, name: file.name)
+        guard let path = try? await client.fetchSharedFile(file: request) else { return nil }
+        return URL(fileURLWithPath: path)
+    }
+
     private static let images = NSCache<NSString, UIImage>()
 
     func image(_ reference: String) async -> UIImage? {

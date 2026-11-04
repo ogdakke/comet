@@ -44,11 +44,10 @@ enum StudioViewerPresentationHost {
 @MainActor
 enum StudioViewerNativeTransition {
     static func configure(
-        _ controller: StudioGalleryViewerController,
-        session: StudioViewerSession,
+        _ controller: some MediaViewerTransitionHost,
         source: StudioGalleryTransitionSource
     ) {
-        let transition = StudioViewerTransitionController(session: session, source: source)
+        let transition = StudioViewerTransitionController(source: source)
         transition.viewer = controller
         // `transitioningDelegate` is weak; the viewer keeps it alive.
         controller.transitionController = transition
@@ -57,18 +56,35 @@ enum StudioViewerNativeTransition {
     }
 }
 
+/// A full-screen media viewer the zoom transition and dragged close can
+/// drive: Studio's gallery viewer, a thread's lightbox.
+@MainActor
+protocol MediaViewerTransitionHost: UIViewController {
+    /// Owns the transition (`transitioningDelegate` is weak).
+    var transitionController: StudioViewerTransitionController? { get set }
+    /// The item on screen: the thumbnail the viewer closes into.
+    var transitionSelectedId: String { get }
+    /// What the transition flies: the page's current image, and the live
+    /// player for a video (so it never freezes on a stale frame).
+    var transitionContent: (image: UIImage?, player: AVPlayer?) { get }
+    func transitionImageFrame(in coordinateView: UIView) -> CGRect
+    /// Backdrop opacity, chrome opacity, and whether the pager's own copy of
+    /// the media is hidden while the transition view stands in for it.
+    func setTransitionState(backdrop: CGFloat, chrome: CGFloat, mediaHidden: Bool)
+    /// A dragged close that sprang back.
+    func interactiveDismissalDidCancel()
+}
+
 @MainActor
 final class StudioViewerTransitionController: NSObject, UIViewControllerTransitioningDelegate {
-    weak var viewer: StudioGalleryViewerController?
+    weak var viewer: (any MediaViewerTransitionHost)?
     /// The viewer's dismiss pan hands its dismissal in here just before it
     /// asks to be dismissed, and it's cleared once that transition ends.
     var interactiveDismissal: StudioViewerInteractiveDismissal?
 
-    private weak var session: StudioViewerSession?
     private weak var source: StudioGalleryTransitionSource?
 
-    init(session: StudioViewerSession, source: StudioGalleryTransitionSource) {
-        self.session = session
+    init(source: StudioGalleryTransitionSource) {
         self.source = source
     }
 
@@ -101,11 +117,12 @@ final class StudioViewerTransitionController: NSObject, UIViewControllerTransiti
     /// The selected artifact's thumbnail, scrolled into view if the grid
     /// can, with its frame in `container`'s coordinates.
     func sourceView(in container: UIView, scrollIntoView: Bool) -> (view: UIView, frame: CGRect, radius: CGFloat)? {
-        guard let session, let source else { return nil }
+        guard let viewer, let source else { return nil }
+        let selectedId = viewer.transitionSelectedId
         if scrollIntoView {
-            source.prepareForDismissal(to: session.selectedId)
+            source.prepareForDismissal(to: selectedId)
         }
-        guard let view = source.imageView(for: session.selectedId) else { return nil }
+        guard let view = source.imageView(for: selectedId) else { return nil }
         view.superview?.layoutIfNeeded()
         let frame = view.convert(view.bounds, to: container)
         // A thumbnail scrolled under the chrome or off screen isn't a place to land.
@@ -211,7 +228,7 @@ final class StudioViewerZoomAnimator: NSObject, UIViewControllerAnimatedTransiti
     private func present(_ context: any UIViewControllerContextTransitioning) {
         let container = context.containerView
         guard let toView = context.view(forKey: .to),
-              let viewer = context.viewController(forKey: .to) as? StudioGalleryViewerController else {
+              let viewer = context.viewController(forKey: .to) as? any MediaViewerTransitionHost else {
             if let toView = context.view(forKey: .to) { container.addSubview(toView) }
             context.completeTransition(true)
             return
@@ -265,7 +282,7 @@ final class StudioViewerZoomAnimator: NSObject, UIViewControllerAnimatedTransiti
     private func dismiss(_ context: any UIViewControllerContextTransitioning) {
         let container = context.containerView
         guard let fromView = context.view(forKey: .from),
-              let viewer = context.viewController(forKey: .from) as? StudioGalleryViewerController else {
+              let viewer = context.viewController(forKey: .from) as? any MediaViewerTransitionHost else {
             context.view(forKey: .from)?.removeFromSuperview()
             context.completeTransition(true)
             return
@@ -324,7 +341,7 @@ final class StudioViewerZoomAnimator: NSObject, UIViewControllerAnimatedTransiti
 @MainActor
 final class StudioViewerInteractiveDismissal: NSObject, UIViewControllerInteractiveTransitioning {
     private weak var transition: StudioViewerTransitionController?
-    private weak var viewer: StudioGalleryViewerController?
+    private weak var viewer: (any MediaViewerTransitionHost)?
     private let touchStart: CGPoint
     private var context: (any UIViewControllerContextTransitioning)?
     private var flying: StudioViewerTransitionView?
@@ -340,7 +357,7 @@ final class StudioViewerInteractiveDismissal: NSObject, UIViewControllerInteract
     /// A release past this (and not flung back up) closes.
     private static let closeDistance: CGFloat = 110
 
-    init(transition: StudioViewerTransitionController, viewer: StudioGalleryViewerController, touch: CGPoint) {
+    init(transition: StudioViewerTransitionController, viewer: any MediaViewerTransitionHost, touch: CGPoint) {
         self.transition = transition
         self.viewer = viewer
         touchStart = touch

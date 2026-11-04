@@ -11,6 +11,12 @@ struct SharedFile {
     let path: String
     let transferId: String?
     let size: UInt64
+
+    /// Plays or shows as a picture: opens in the thread's gallery rather
+    /// than the file viewer (SVG renders as a document there).
+    var isGalleryMedia: Bool {
+        mimeType.hasPrefix("video/") || (mimeType.hasPrefix("image/") && mimeType != "image/svg+xml")
+    }
 }
 
 /// Opens a shared file: streams audio/video, renders HTML/SVG in a sandboxed

@@ -416,18 +416,6 @@ final class StudioViewerPageCell: UICollectionViewCell, UIScrollViewDelegate {
         player: AVPlayer?,
         parentViewController: UIViewController
     ) {
-        if representedId != artifact.id {
-            detachPlayer()
-            representedId = artifact.id
-            resetZoom()
-        }
-        isVideo = artifact.mediaKind == .video
-        placeholderView.image = UIImage(systemName: isVideo ? "film" : "photo")
-        let kind = isVideo ? "Video" : "Image"
-        imageView.accessibilityLabel = artifact.prompt.isEmpty ? kind : "\(kind), \(artifact.prompt)"
-        // A video's preview is a poster, not something to zoom into.
-        imageScrollView.maximumZoomScale = isVideo ? 1 : 6
-
         // Metadata dimensions are what the thumbnail zooms from; the decoded
         // image stands in when a provider didn't report them.
         let ratio: CGFloat
@@ -439,6 +427,42 @@ final class StudioViewerPageCell: UICollectionViewCell, UIScrollViewDelegate {
             // The thumbhash's recorded shape, so nothing reshapes from square.
             ratio = artifact.aspectRatio
         }
+        let kind = artifact.mediaKind == .video ? "Video" : "Image"
+        configure(
+            id: artifact.id,
+            isVideo: artifact.mediaKind == .video,
+            accessibilityLabel: artifact.prompt.isEmpty ? kind : "\(kind), \(artifact.prompt)",
+            aspectRatio: ratio,
+            image: image,
+            originalState: originalState,
+            player: player,
+            parentViewController: parentViewController
+        )
+    }
+
+    /// The page for any picture or video (a thread's lightbox uses this;
+    /// Studio's artifacts come through the overload above).
+    func configure(
+        id: String,
+        isVideo: Bool,
+        accessibilityLabel: String,
+        aspectRatio ratio: CGFloat,
+        image: UIImage?,
+        originalState: StudioViewerOriginalState,
+        player: AVPlayer?,
+        parentViewController: UIViewController
+    ) {
+        if representedId != id {
+            detachPlayer()
+            representedId = id
+            resetZoom()
+        }
+        self.isVideo = isVideo
+        placeholderView.image = UIImage(systemName: isVideo ? "film" : "photo")
+        imageView.accessibilityLabel = accessibilityLabel
+        // A video's preview is a poster, not something to zoom into.
+        imageScrollView.maximumZoomScale = isVideo ? 1 : 6
+
         if abs(max(0.01, ratio) - mediaAspectRatio) > 0.001 {
             mediaAspectRatio = max(0.01, ratio)
             resetZoom()
@@ -459,7 +483,8 @@ final class StudioViewerPageCell: UICollectionViewCell, UIScrollViewDelegate {
         }
         detachPlayer()
         imageScrollView.isUserInteractionEnabled = true
-        setOriginalState(isVideo ? .ready : originalState)
+        // A video still on its way (a thread's download) shows the spinner too.
+        setOriginalState(originalState)
     }
 
     func detachPlayer() {

@@ -291,7 +291,8 @@ final class StudioGalleryViewerController: UIViewController,
     UIGestureRecognizerDelegate,
     StudioViewerPagerDelegate,
     StudioViewerFilmstripDelegate,
-    UIContextMenuInteractionDelegate
+    UIContextMenuInteractionDelegate,
+    MediaViewerTransitionHost
 {
     let session: StudioViewerSession
     /// Owns the custom zoom transition (see `StudioViewerNativeTransition`).
@@ -534,6 +535,8 @@ final class StudioGalleryViewerController: UIViewController,
     }
 
     // MARK: Transition hooks
+
+    var transitionSelectedId: String { selectedId }
 
     /// What the transition flies: the page's current image, and the live
     /// player for a video (so it never freezes on a stale frame).
@@ -1409,7 +1412,7 @@ protocol StudioViewerFilmstripDelegate: AnyObject {
     )
 }
 
-private final class StudioCenteredFilmstripLayout: UICollectionViewFlowLayout {
+final class StudioCenteredFilmstripLayout: UICollectionViewFlowLayout {
     override func targetContentOffset(
         forProposedContentOffset proposedContentOffset: CGPoint,
         withScrollingVelocity velocity: CGPoint

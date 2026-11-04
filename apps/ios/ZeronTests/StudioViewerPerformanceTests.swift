@@ -50,7 +50,7 @@ final class StudioViewerPerformanceTests: XCTestCase {
             workspace: nil,
             deviceId: nil,
             requestDismissal: {},
-            requestThread: { _ in }
+            requestThread: { _, _ in }
         )
 
         controller.loadViewIfNeeded()
@@ -76,7 +76,7 @@ final class StudioViewerPerformanceTests: XCTestCase {
             workspace: nil,
             deviceId: nil,
             requestDismissal: {},
-            requestThread: { _ in }
+            requestThread: { _, _ in }
         )
         controller.loadViewIfNeeded()
         controller.view.frame = CGRect(x: 0, y: 0, width: 393, height: 852)

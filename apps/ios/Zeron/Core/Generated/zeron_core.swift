@@ -3122,6 +3122,14 @@ public protocol LayoutFrameProtocol: AnyObject, Sendable {
     func indexOf(key: UInt64)  -> UInt32?
     
     /**
+     * Every picture and video in the transcript, in order: inline and
+     * generated images, a prompt's attached pictures and videos, and shared
+     * image and video files. Uploads still in flight are left out, and a
+     * reference appears once (its first place).
+     */
+    func media()  -> [TranscriptMedia]
+    
+    /**
      * Copyable text of the whole message owning `index` (context menus).
      */
     func messageText(index: UInt32)  -> String?
@@ -3250,6 +3258,21 @@ open func indexOf(key: UInt64) -> UInt32?  {
     uniffi_zeron_mobile_fn_method_layoutframe_index_of(
             self.uniffiCloneHandle(),
         FfiConverterUInt64.lower(key),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Every picture and video in the transcript, in order: inline and
+     * generated images, a prompt's attached pictures and videos, and shared
+     * image and video files. Uploads still in flight are left out, and a
+     * reference appears once (its first place).
+     */
+open func media() -> [TranscriptMedia]  {
+    return try!  FfiConverterSequenceTypeTranscriptMedia.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_zeron_mobile_fn_method_layoutframe_media(
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -13782,6 +13805,158 @@ public func FfiConverterTypeTextRun_lower(_ value: TextRun) -> RustBuffer {
 
 
 /**
+ * One picture or video in a transcript, in transcript order: what the
+ * thread's lightbox pages through.
+ */
+public struct TranscriptMedia: Equatable, Hashable {
+    /**
+     * The row showing it (to scroll it into view).
+     */
+    public var key: UInt64
+    public var kind: MediaKind
+    /**
+     * What the row loads: an attachment ref (`read_attachment`) for an
+     * inline image or thumbnail, the file's host path for a shared file.
+     * Unique within a frame; the lightbox's id for the item.
+     */
+    public var reference: String
+    /**
+     * A shared file's card fields (`None` for inline images, which load
+     * by `reference`).
+     */
+    public var file: TranscriptMediaFile?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The row showing it (to scroll it into view).
+         */key: UInt64, kind: MediaKind, 
+        /**
+         * What the row loads: an attachment ref (`read_attachment`) for an
+         * inline image or thumbnail, the file's host path for a shared file.
+         * Unique within a frame; the lightbox's id for the item.
+         */reference: String, 
+        /**
+         * A shared file's card fields (`None` for inline images, which load
+         * by `reference`).
+         */file: TranscriptMediaFile?) {
+        self.key = key
+        self.kind = kind
+        self.reference = reference
+        self.file = file
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension TranscriptMedia: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTranscriptMedia: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TranscriptMedia {
+        return
+            try TranscriptMedia(
+                key: FfiConverterUInt64.read(from: &buf), 
+                kind: FfiConverterTypeMediaKind.read(from: &buf), 
+                reference: FfiConverterString.read(from: &buf), 
+                file: FfiConverterOptionTypeTranscriptMediaFile.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TranscriptMedia, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.key, into: &buf)
+        FfiConverterTypeMediaKind.write(value.kind, into: &buf)
+        FfiConverterString.write(value.reference, into: &buf)
+        FfiConverterOptionTypeTranscriptMediaFile.write(value.file, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTranscriptMedia_lift(_ buf: RustBuffer) throws -> TranscriptMedia {
+    return try FfiConverterTypeTranscriptMedia.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTranscriptMedia_lower(_ value: TranscriptMedia) -> RustBuffer {
+    return FfiConverterTypeTranscriptMedia.lower(value)
+}
+
+
+public struct TranscriptMediaFile: Equatable, Hashable {
+    public var name: String
+    public var mimeType: String
+    public var size: UInt64
+    public var transferId: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(name: String, mimeType: String, size: UInt64, transferId: String?) {
+        self.name = name
+        self.mimeType = mimeType
+        self.size = size
+        self.transferId = transferId
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension TranscriptMediaFile: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTranscriptMediaFile: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TranscriptMediaFile {
+        return
+            try TranscriptMediaFile(
+                name: FfiConverterString.read(from: &buf), 
+                mimeType: FfiConverterString.read(from: &buf), 
+                size: FfiConverterUInt64.read(from: &buf), 
+                transferId: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TranscriptMediaFile, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterString.write(value.mimeType, into: &buf)
+        FfiConverterUInt64.write(value.size, into: &buf)
+        FfiConverterOptionString.write(value.transferId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTranscriptMediaFile_lift(_ buf: RustBuffer) throws -> TranscriptMediaFile {
+    return try FfiConverterTypeTranscriptMediaFile.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTranscriptMediaFile_lower(_ value: TranscriptMediaFile) -> RustBuffer {
+    return FfiConverterTypeTranscriptMediaFile.lower(value)
+}
+
+
+/**
  * Transcript-level facts the platform needs without the rows (loader vs
  * empty state, scroll-to-bottom affordances, the working pill).
  */
@@ -16969,6 +17144,75 @@ public func FfiConverterTypeMathFace_lift(_ buf: RustBuffer) throws -> MathFace 
 #endif
 public func FfiConverterTypeMathFace_lower(_ value: MathFace) -> RustBuffer {
     return FfiConverterTypeMathFace.lower(value)
+}
+
+
+
+/**
+ * Whether a gallery item is a picture or something to play.
+ */
+
+public enum MediaKind: Equatable, Hashable {
+    
+    case image
+    case video
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MediaKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMediaKind: FfiConverterRustBuffer {
+    typealias SwiftType = MediaKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MediaKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .image
+        
+        case 2: return .video
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MediaKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .image:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .video:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMediaKind_lift(_ buf: RustBuffer) throws -> MediaKind {
+    return try FfiConverterTypeMediaKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMediaKind_lower(_ value: MediaKind) -> RustBuffer {
+    return FfiConverterTypeMediaKind.lower(value)
 }
 
 
@@ -20549,6 +20793,30 @@ fileprivate struct FfiConverterOptionTypeTerminalSelection: FfiConverterRustBuff
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeTranscriptMediaFile: FfiConverterRustBuffer {
+    typealias SwiftType = TranscriptMediaFile?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeTranscriptMediaFile.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeTranscriptMediaFile.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeWorktreeSpec: FfiConverterRustBuffer {
     typealias SwiftType = WorktreeSpec?
 
@@ -21684,6 +21952,31 @@ fileprivate struct FfiConverterSequenceTypeTextRun: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeTextRun.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeTranscriptMedia: FfiConverterRustBuffer {
+    typealias SwiftType = [TranscriptMedia]
+
+    public static func write(_ value: [TranscriptMedia], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeTranscriptMedia.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [TranscriptMedia] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [TranscriptMedia]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeTranscriptMedia.read(from: &buf))
         }
         return seq
     }
@@ -22866,6 +23159,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_layoutframe_index_of() != 52386) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_layoutframe_media() != 36980) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_layoutframe_message_text() != 60311) {

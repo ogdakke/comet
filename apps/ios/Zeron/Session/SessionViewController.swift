@@ -105,6 +105,7 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
             guard let self, let viewer = self.source.fileViewer(for: file) else { return }
             self.present(viewer, animated: true)
         }
+        list.onMedia = { [weak self] reference in self?.openMedia(reference) }
         list.onOpenChat = { [weak self] id in
             guard let self, id != self.chatId else { return }
             // On the phone the sender's chat pushes over this one, so Back
@@ -585,6 +586,33 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
     func finishArrival() {
         list.alpha = 1
         bottom.alpha = 1
+    }
+
+    /// The thread's lightbox, on `reference`: every picture and video in the
+    /// transcript as one gallery, zooming out of the one tapped.
+    private func openMedia(_ reference: String) {
+        guard presentedViewController == nil else { return }
+        var media = list.media()
+        if !media.contains(where: { $0.reference == reference }) {
+            // Not in this frame yet (a row that just arrived): just this one.
+            media = [TranscriptMedia(key: 0, kind: .image, reference: reference, file: nil)]
+        }
+        let transitionSource = StudioGalleryTransitionSource()
+        transitionSource.provider = list
+        let opening = (list.transitionImageView(for: reference) as? UIImageView)?.image
+        let loader = ThreadMediaLoader(
+            image: { [weak self] ref in await self?.source.image(ref) },
+            thumbnail: { [weak self] ref, view in self?.source.loadImage(ref, into: view) },
+            fileURL: { [weak self] file, streaming in await self?.source.mediaURL(for: file, streaming: streaming) }
+        )
+        let viewer = ThreadMediaViewerController(
+            items: media.map(ThreadMediaItem.init),
+            selectedId: reference,
+            opening: opening,
+            loader: loader,
+            transitionSource: transitionSource
+        )
+        present(viewer, animated: true)
     }
 
     @objc private func dismissComposer() {

@@ -621,17 +621,36 @@ fn user_attachments_render_as_images_not_trailer_text() {
 }
 
 #[test]
-fn synced_file_attachments_render_as_chips_and_name_pills() {
+fn sent_attachments_preview_like_received_ones() {
     // A desktop send mixing an image and ZIPs (one still a queued-upload ref),
-    // with composer chips in the prompt. Chipped attachments show as their
-    // chip only; the image chip opens its upload; the unchipped ZIP keeps a
-    // name pill and never reaches image loading.
+    // with composer chips in the prompt. Each attachment previews as a
+    // received one would, chip or not: the image as a picture (its chip
+    // still opens it), each ZIP as a file card that opens it, except the
+    // upload still queued. ZIPs never reach image loading.
     let mut w = worker(390.0);
     let text = "Compare [Image 1](zeron-image:1) with [notes.zip](zeron-attachment:2)\n\nAttached images (local files — open them to view):\n- /tmp/uploads/ab12cd34-Image_1.png\n- /tmp/uploads/ab12cd34-notes.zip\n- pending://up-3/logs.zip".to_owned();
     w.input = debug_input(vec![DebugEntry { id: "u".into(), user: true, text, streaming: false }], false);
     let frame = w.pass();
     let d = frame.display(0).unwrap();
-    assert!(!d.widgets.iter().any(|w| matches!(&w.kind, display::WidgetKind::Image { .. })));
+    let images: Vec<_> = d
+        .widgets
+        .iter()
+        .filter_map(|w| match &w.kind {
+            display::WidgetKind::Image { reference } => Some((reference.as_str(), w.w)),
+            _ => None,
+        })
+        .collect();
+    // Alone, it's as large as a received image.
+    assert_eq!(images, [("/tmp/uploads/ab12cd34-Image_1.png", 260.0)]);
+    let cards: Vec<(&str, &str)> = d
+        .widgets
+        .iter()
+        .filter_map(|w| match &w.kind {
+            display::WidgetKind::File { name, path, .. } => Some((name.as_str(), path.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cards, [("notes.zip", "/tmp/uploads/ab12cd34-notes.zip")]);
     let icons: Vec<&str> = d
         .widgets
         .iter()
@@ -640,13 +659,31 @@ fn synced_file_attachments_render_as_chips_and_name_pills() {
             _ => None,
         })
         .collect();
-    // The unchipped ZIP's pill, then the bubble's two chips.
-    assert_eq!(icons, ["fileicon-files-compressed", "photo", "fileicon-files-compressed"]);
+    // Both ZIP cards, then the bubble's two chips.
+    assert_eq!(icons, ["fileicon-files-compressed", "fileicon-files-compressed", "photo", "fileicon-files-compressed"]);
+    assert!(d.text.contains("ZIP"), "{}", d.text);
     assert!(d.text.contains("Compare Image 1 with notes.zip"), "{}", d.text);
     assert!(d.text.contains("logs.zip") && !d.text.contains("ab12cd34-"), "{}", d.text);
     assert!(!d.text.contains("zeron-image") && !d.text.contains("zeron-attachment"), "{}", d.text);
     let links: Vec<&str> = d.links.iter().map(|l| l.url.as_str()).collect();
     assert_eq!(links, ["zeron-preview://image?ref=%2Ftmp%2Fuploads%2Fab12cd34-Image_1.png"]);
+}
+
+#[test]
+fn several_sent_pictures_share_a_right_aligned_grid() {
+    let mut w = worker(390.0);
+    let refs: Vec<String> = (0..5).map(|i| format!("/tmp/uploads/p{i}.png")).collect();
+    let text = format!("Look\n\nAttached images (local files — open them to view):\n{}", refs.iter().map(|r| format!("- {r}")).collect::<Vec<_>>().join("\n"));
+    w.input = debug_input(vec![DebugEntry { id: "u".into(), user: true, text, streaming: false }], false);
+    let frame = w.pass();
+    let d = frame.display(0).unwrap();
+    let tiles: Vec<_> = d.widgets.iter().filter(|w| matches!(w.kind, display::WidgetKind::Image { .. })).collect();
+    assert_eq!(tiles.len(), 5);
+    // Three across, then two; every row ends at the column's right edge.
+    let right = tiles.iter().map(|t| t.x + t.w).fold(0.0, f32::max);
+    assert!((tiles[2].x + tiles[2].w - right).abs() < 0.5 && (tiles[4].x + tiles[4].w - right).abs() < 0.5);
+    assert!(tiles[3].y > tiles[0].y && (tiles[0].w - tiles[4].w).abs() < 0.5);
+    assert!(tiles[0].x < tiles[1].x && tiles[3].x < tiles[4].x, "reading order");
 }
 
 #[test]
@@ -825,6 +862,61 @@ fn shared_files_render_as_cards_and_images_inline() {
     assert!(all.contains("HTML · 2.4 MB · v2"), "{all}");
     assert!(all.contains("The demo recording"), "{all}");
     assert!(rows.iter().flat_map(|d| d.widgets.iter()).any(|w| matches!(&w.kind, display::WidgetKind::Image { reference } if reference.ends_with("chart.png"))));
+}
+
+#[test]
+fn media_lists_every_picture_and_video_in_order() {
+    let file = |id: &str, name: &str, mime: &str| MessagePart::File {
+        id: id.into(),
+        path: format!("/up/shared/{id}/{name}"),
+        name: name.into(),
+        mime_type: mime.into(),
+        size: 2_500_000,
+        transfer_id: Some(format!("t-{id}")),
+        artifact: name.into(),
+        version: 1,
+        caption: None,
+    };
+    let mut w = worker(390.0);
+    let prompt = "Compare [Image 1](zeron-image:1)\n\nAttached images (local files — open them to view):\n- /tmp/uploads/ab12cd34-Image_1.png\n- /tmp/uploads/shot.png\n- /tmp/uploads/clip.mov\n- pending://up-3/later.png".to_owned();
+    let mut input = debug_input(vec![DebugEntry { id: "u".into(), user: true, text: prompt, streaming: false }], false);
+    input.entries.push(Arc::new(SessionMessageEntry {
+        id: "a1".into(),
+        role: MessageRole::Assistant,
+        parts: vec![
+            file("f1", "demo.mp4", "video/mp4"),
+            file("f2", "report.html", "text/html"),
+            file("f3", "chart.png", "image/png"),
+            file("f4", "icon.svg", "image/svg+xml"),
+            // The same picture again: listed once.
+            file("f3", "chart.png", "image/png"),
+        ],
+        created_at: 0,
+        device_id: String::new(),
+        status: Some(MessageStatus::Complete),
+        continuation_of: None,
+        duration_ms: None,
+    }));
+    w.input = input;
+    let frame = w.pass();
+    let media = frame.media();
+    let refs: Vec<(&str, MediaKind)> = media.iter().map(|m| (m.reference.as_str(), m.kind)).collect();
+    assert_eq!(
+        refs,
+        [
+            ("/tmp/uploads/ab12cd34-Image_1.png", MediaKind::Image),
+            ("/tmp/uploads/shot.png", MediaKind::Image),
+            ("/tmp/uploads/clip.mov", MediaKind::Video),
+            ("/up/shared/f1/demo.mp4", MediaKind::Video),
+            ("/up/shared/f3/chart.png", MediaKind::Image),
+            // Shown inline like any raster, so it pages like one.
+            ("/up/shared/f4/icon.svg", MediaKind::Image),
+        ]
+    );
+    let video = media.iter().find(|m| m.reference.ends_with("demo.mp4")).unwrap();
+    assert_eq!(video.file.as_ref().map(|f| f.transfer_id.clone()), Some(Some("t-f1".into())));
+    // Every item names a row the frame has.
+    assert!(media.iter().all(|m| frame.index_of(m.key).is_some()));
 }
 
 /// Every row of a one-message transcript at `width`.

@@ -89,7 +89,7 @@ enum StudioArtifactActions {
         try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
     }
 
-    private static func requestPhotoAddAccess() async throws {
+    static func requestPhotoAddAccess() async throws {
         // Add-only access needs its own usage string; without it the prompt
         // would crash the app, so fall back to full access (whose string the
         // app already declares for attachments).

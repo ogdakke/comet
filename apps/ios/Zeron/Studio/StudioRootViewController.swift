@@ -351,7 +351,7 @@ final class StudioRootViewController: UIViewController, UIAdaptivePresentationCo
             }
         )
         presented = controller
-        StudioViewerNativeTransition.configure(controller, session: session, source: transitionSource)
+        StudioViewerNativeTransition.configure(controller, source: transitionSource)
         viewer = controller
         presenter.present(controller, animated: true) { [weak self, weak controller] in
             controller?.presentationController?.delegate = self

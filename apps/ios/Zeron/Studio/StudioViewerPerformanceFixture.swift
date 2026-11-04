@@ -116,7 +116,7 @@ final class StudioViewerFixtureHostController: UIViewController, StudioGalleryTr
             },
             requestThread: { _, _ in }
         )
-        StudioViewerNativeTransition.configure(viewer, session: session, source: transitionSource)
+        StudioViewerNativeTransition.configure(viewer, source: transitionSource)
         present(viewer, animated: true) {
             guard ProcessInfo.processInfo.arguments.contains("-studio-viewer-autoplay") else { return }
             Task {

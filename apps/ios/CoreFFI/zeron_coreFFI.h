@@ -1272,6 +1272,11 @@ RustBuffer uniffi_zeron_mobile_fn_method_layoutframe_index_at(uint64_t ptr, floa
 RustBuffer uniffi_zeron_mobile_fn_method_layoutframe_index_of(uint64_t ptr, uint64_t key, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_LAYOUTFRAME_MEDIA
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_LAYOUTFRAME_MEDIA
+RustBuffer uniffi_zeron_mobile_fn_method_layoutframe_media(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_LAYOUTFRAME_MESSAGE_TEXT
 #define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_LAYOUTFRAME_MESSAGE_TEXT
 RustBuffer uniffi_zeron_mobile_fn_method_layoutframe_message_text(uint64_t ptr, uint32_t index, RustCallStatus *_Nonnull out_status
@@ -3116,6 +3121,12 @@ uint16_t uniffi_zeron_mobile_checksum_method_layoutframe_index_at(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_LAYOUTFRAME_INDEX_OF
 #define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_LAYOUTFRAME_INDEX_OF
 uint16_t uniffi_zeron_mobile_checksum_method_layoutframe_index_of(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_LAYOUTFRAME_MEDIA
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_LAYOUTFRAME_MEDIA
+uint16_t uniffi_zeron_mobile_checksum_method_layoutframe_media(void
     
 );
 #endif

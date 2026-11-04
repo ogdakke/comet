@@ -45,6 +45,8 @@ protocol RowViewDelegate: AnyObject {
     func rowView(_ view: RowView, openSubagent docId: String, title: String, running: Bool)
     /// A shared file's card was tapped.
     func rowView(_ view: RowView, openFile file: SharedFile)
+    /// A picture or video was tapped (its gallery reference), from `source`.
+    func rowView(_ view: RowView, openMedia reference: String, from source: UIView)
 }
 
 /// A reusable transcript row: canvas + horizontal scrollers + native widgets.
@@ -102,6 +104,14 @@ final class RowView: UIView {
     weak var delegate: RowViewDelegate?
     /// Rings over thumbnails still uploading (`pending://` refs).
     private var uploadRings: [UploadRingView] = []
+    /// Pictures and playable file cards by gallery reference: where the
+    /// lightbox zooms out of and back into.
+    private var mediaViews: [String: UIView] = [:]
+
+    func mediaView(for reference: String) -> UIView? {
+        guard let view = mediaViews[reference], view.superview != nil else { return nil }
+        return view
+    }
     var uploadProgress: Double? {
         didSet { if uploadProgress != oldValue { uploadRings.forEach { $0.progress = uploadProgress } } }
     }
@@ -217,6 +227,7 @@ final class RowView: UIView {
 
     private func layoutWidgets(_ d: RowDisplay) {
         uploadRings.removeAll()
+        mediaViews.removeAll()
         // Only views still here: a visual's view moves between rows, and a
         // row reused later mustn't pull it out of the one showing it now.
         for v in widgetViews where v.superview === self || scrollers.contains(where: { $0 === v.superview }) {
@@ -250,6 +261,7 @@ final class RowView: UIView {
                 iv.accessibilityTraits = .image
                 iv.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(openImage(_:))))
                 delegate?.rowView(self, imageFor: reference, into: iv)
+                mediaViews[reference] = iv
                 if reference.hasPrefix("pending://") {
                     // Size the thumbnail first: autoresizing from a zero frame
                     // would double the ring when the widget frame lands.
@@ -345,10 +357,17 @@ final class RowView: UIView {
                 control.accessibilityTraits = .button
                 control.accessibilityIdentifier = "file-card"
                 let file = SharedFile(name: name, mimeType: mimeType, path: path, transferId: transferId, size: size)
-                control.addAction(UIAction { [weak self] _ in
-                    guard let self else { return }
+                // Videos and pictures page through the thread's gallery.
+                let gallery = file.isGalleryMedia
+                if gallery { mediaViews[path] = control }
+                control.addAction(UIAction { [weak self, weak control] _ in
+                    guard let self, let control else { return }
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                    self.delegate?.rowView(self, openFile: file)
+                    if gallery {
+                        self.delegate?.rowView(self, openMedia: path, from: control)
+                    } else {
+                        self.delegate?.rowView(self, openFile: file)
+                    }
                 }, for: .touchUpInside)
                 view = control
             case .shimmer:
@@ -380,8 +399,15 @@ final class RowView: UIView {
     }
 
     @objc private func openImage(_ tap: UITapGestureRecognizer) {
-        guard let iv = tap.view as? UIImageView, let image = iv.image, let vc = findViewController() else { return }
-        vc.present(ImageViewer(image: image, source: iv), animated: true)
+        guard let iv = tap.view as? UIImageView,
+              let reference = mediaViews.first(where: { $0.value === iv })?.key else { return }
+        // Still uploading: not in the gallery yet, so just this picture.
+        if reference.hasPrefix("pending://") {
+            guard let image = iv.image, let vc = findViewController() else { return }
+            vc.present(ImageViewer(image: image, source: iv), animated: true)
+            return
+        }
+        delegate?.rowView(self, openMedia: reference, from: iv)
     }
 
     /// Link at a point in row coordinates.

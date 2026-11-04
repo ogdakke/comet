@@ -127,6 +127,9 @@ final class TranscriptListView: UIScrollView, RowViewDelegate, UIScrollViewDeleg
     var onOpenChat: ((String) -> Void)?
     /// A shared file's card was tapped.
     var onFile: ((SharedFile) -> Void)?
+    /// A picture or video was tapped (its gallery reference): open the
+    /// thread's lightbox there. Unset, an image chip opens just its picture.
+    var onMedia: ((String) -> Void)?
     var onDistanceFromBottom: ((CGFloat) -> Void)?
     var imageLoader: ((String, UIImageView) -> Void)?
     /// An attachment's picture, for an image chip opened full size.
@@ -700,13 +703,31 @@ final class TranscriptListView: UIScrollView, RowViewDelegate, UIScrollViewDeleg
         onFile?(file)
     }
 
+    func rowView(_ view: RowView, openMedia reference: String, from source: UIView) {
+        if let onMedia {
+            onMedia(reference)
+        } else if let iv = source as? UIImageView, let image = iv.image, let vc = findViewController() {
+            vc.present(ImageViewer(image: image, source: iv), animated: true)
+        }
+    }
+
+    /// Every picture and video in the thread, in order (the lightbox's pages).
+    func media() -> [TranscriptMedia] {
+        current?.media() ?? []
+    }
+
     func rowView(_ view: RowView, open url: URL) {
         guard let vc = findViewController() else { return }
-        // An image chip opens its upload full size, as its thumbnail did.
+        // An image chip opens its upload in the thread's gallery, as its
+        // picture does.
         if url.scheme == "zeron-preview" {
             guard let reference = URLComponents(url: url, resolvingAgainstBaseURL: false)?
                 .queryItems?.first(where: { $0.name == "ref" })?.value
             else { return }
+            if let onMedia {
+                onMedia(reference)
+                return
+            }
             Task { @MainActor [weak self, weak view, weak vc] in
                 guard let image = await self?.imageFetcher?(reference), let view, let vc else { return }
                 vc.present(ImageViewer(image: image, source: view), animated: true)
@@ -748,6 +769,21 @@ final class TranscriptListView: UIScrollView, RowViewDelegate, UIScrollViewDeleg
 
     fileprivate func row(at point: CGPoint) -> RowView? {
         visible.values.first { !$0.isHidden && $0.frame.contains(point) }
+    }
+}
+
+/// Where the lightbox zooms from and back into: the picture (or file card)
+/// on screen for a reference. One scrolled away isn't a place to land; the
+/// viewer fades instead.
+extension TranscriptListView: StudioGalleryTransitionSourceProvider {
+    func transitionImageView(for artifactId: String) -> UIView? {
+        let bounds = self.bounds
+        for row in visible.values where !row.isHidden {
+            guard let view = row.mediaView(for: artifactId) else { continue }
+            let frame = view.convert(view.bounds, to: self)
+            return frame.intersects(bounds) ? view : nil
+        }
+        return nil
     }
 }
 

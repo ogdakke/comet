@@ -133,6 +133,37 @@ pub struct RowPlacement {
     pub kind: RowKind,
 }
 
+/// Whether a gallery item is a picture or something to play.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MediaKind {
+    Image,
+    Video,
+}
+
+/// One picture or video in a transcript, in transcript order: what the
+/// thread's lightbox pages through.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct TranscriptMedia {
+    /// The row showing it (to scroll it into view).
+    pub key: u64,
+    pub kind: MediaKind,
+    /// What the row loads: an attachment ref (`read_attachment`) for an
+    /// inline image or thumbnail, the file's host path for a shared file.
+    /// Unique within a frame; the lightbox's id for the item.
+    pub reference: String,
+    /// A shared file's card fields (`None` for inline images, which load
+    /// by `reference`).
+    pub file: Option<TranscriptMediaFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct TranscriptMediaFile {
+    pub name: String,
+    pub mime_type: String,
+    pub size: u64,
+    pub transfer_id: Option<String>,
+}
+
 struct FrameRow {
     core: Arc<RowCore>,
     gap: Gap,
@@ -259,6 +290,61 @@ impl LayoutFrame {
             }
             out.push_str(&r.core.copy_text);
             last = Some(&r.core.entry_id);
+        }
+        out
+    }
+
+    /// Every picture and video in the transcript, in order: inline and
+    /// generated images, a prompt's attached pictures and videos, and shared
+    /// image and video files. Uploads still in flight are left out, and a
+    /// reference appears once (its first place).
+    pub fn media(&self) -> Vec<TranscriptMedia> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        let mut push = |item: TranscriptMedia| {
+            if !item.reference.starts_with("pending://") && seen.insert(item.reference.clone()) {
+                out.push(item);
+            }
+        };
+        let image = |key: u64, reference: &str| TranscriptMedia { key, kind: MediaKind::Image, reference: reference.to_owned(), file: None };
+        // A shared or sent file that plays or shows as a picture.
+        let file = |key: u64, widget: &display::WidgetKind| {
+            let display::WidgetKind::File { path, name, mime_type, size, transfer_id, .. } = widget else { return None };
+            let kind = if mime_type.starts_with("video/") {
+                MediaKind::Video
+            } else if mime_type.starts_with("image/") && mime_type != "image/svg+xml" {
+                MediaKind::Image
+            } else {
+                return None;
+            };
+            Some(TranscriptMedia {
+                key,
+                kind,
+                reference: path.clone(),
+                file: Some(TranscriptMediaFile { name: name.clone(), mime_type: mime_type.clone(), size: *size, transfer_id: transfer_id.clone() }),
+            })
+        };
+        for r in &self.rows {
+            let key = r.core.key;
+            match &r.core.content {
+                rows::Content::Image { reference } => push(image(key, reference)),
+                rows::Content::User(u) => {
+                    for reference in &u.images {
+                        push(image(key, reference));
+                    }
+                    for f in u.files.iter().filter_map(|f| f.widget.as_ref()) {
+                        if let Some(item) = file(key, f) {
+                            push(item);
+                        }
+                    }
+                }
+                rows::Content::File(card) => {
+                    if let Some(item) = file(key, &card.widget) {
+                        push(item);
+                    }
+                }
+                _ => {}
+            }
         }
         out
     }
