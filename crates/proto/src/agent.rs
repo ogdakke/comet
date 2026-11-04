@@ -850,6 +850,10 @@ const _: () = assert!(
         < 16 * 1024 * 1024
 );
 
+/// Images one tool call shows with it ([`AgentEvent::ToolImage`]); a call
+/// that returns more keeps its first ones.
+pub const TOOL_IMAGES_MAX: usize = 4;
+
 /// Largest image file an agent may show with `show_image` (it rides one
 /// WebSocket message, base64-encoded, like a visual's assets).
 pub const IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
@@ -1058,6 +1062,24 @@ pub enum AgentEvent {
         version: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caption: Option<String>,
+    },
+    /// An image a tool call put in front of the model: the agent read an
+    /// image file (Claude Code's `Read`, Codex's `view_image`). It belongs to
+    /// the tool part `tool_id` and shows with it, not as a reply image.
+    ///
+    /// A harness reports the image as it has it: `data` (base64, the bytes
+    /// the model saw) or else `path` (the file it read). The engine copies
+    /// either into uploads before anything is journaled or published, and
+    /// passes on only the copy: `path` is then the copy and `data` is gone.
+    #[serde(rename_all = "camelCase")]
+    ToolImage {
+        tool_id: String,
+        path: String,
+        /// The file's own name, for captions and copy (not the copy's).
+        name: String,
+        mime_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<String>,
     },
     ReasoningDelta {
         text: String,

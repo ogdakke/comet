@@ -369,9 +369,7 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
             }];
             // Some agents send a single terminal-status `tool_call` with the
             // result inline instead of a follow-up update.
-            if let Some(resolved) = resolved_result(update, id) {
-                events.push(resolved);
-            }
+            events.extend(resolved_result(update, id));
             events
         }
         "tool_call_update" => {
@@ -391,9 +389,7 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
                     call: typed_call(update),
                 });
             }
-            if let Some(resolved) = resolved_result(update, id) {
-                events.push(resolved);
-            }
+            events.extend(resolved_result(update, id));
             events
         }
         "plan" => {
@@ -448,21 +444,49 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
 }
 
 /// A terminal `status` on a tool_call/tool_call_update resolves the call:
-/// `completed`/`failed` → ToolResult with capped output + inline diff.
-fn resolved_result(update: &Value, id: String) -> Option<AgentEvent> {
-    let status = update.get("status").and_then(Value::as_str)?;
+/// `completed`/`failed` → ToolResult with capped output + inline diff, after
+/// the images a completed call put in front of the model (image content: a
+/// read of an image file).
+fn resolved_result(update: &Value, id: String) -> Vec<AgentEvent> {
+    let Some(status) = update.get("status").and_then(Value::as_str) else {
+        return Vec::new();
+    };
     let is_error = match status {
         "completed" => false,
         "failed" => true,
-        _ => return None,
+        _ => return Vec::new(),
     };
-    Some(AgentEvent::ToolResult {
+    let mut events = if is_error { Vec::new() } else { tool_images(update, &id) };
+    events.push(AgentEvent::ToolResult {
         id,
         is_error,
         output: tool_output(update),
         diff: tool_diff(update),
         exit_code: None,
-    })
+    });
+    events
+}
+
+/// The image blocks of a tool call's `content` (`{type: "image", data |
+/// uri, mimeType}`), as tool images.
+fn tool_images(update: &Value, id: &str) -> Vec<AgentEvent> {
+    let Some(content) = update.get("content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    content
+        .iter()
+        .filter(|c| c.get("type").and_then(Value::as_str) == Some("content"))
+        .filter_map(|c| c.get("content"))
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("image"))
+        .filter_map(|b| {
+            let mime = b.get("mimeType").and_then(Value::as_str).unwrap_or_default();
+            match b.get("data").and_then(Value::as_str).filter(|d| !d.is_empty()) {
+                Some(data) => Some(crate::tool_images::from_data(id, data, mime)),
+                None => crate::tool_images::from_url(id, b.get("uri")?.as_str()?, mime),
+            }
+        })
+        .take(zeron_proto::TOOL_IMAGES_MAX)
+        .collect()
 }
 
 /// Decode an `availableCommands` array (`{name, description, input: {hint}}`).
@@ -533,6 +557,37 @@ mod tests {
             "content": { "type": "image", "data": "...", "mimeType": "image/png" },
         });
         assert_eq!(map_update(&image), Vec::new());
+    }
+
+    /// A completed read whose content is an image (claude-agent-acp's
+    /// shape): the image rides out ahead of the result; a failed one's
+    /// doesn't.
+    #[test]
+    fn completed_image_content_becomes_the_calls_image() {
+        let update = |status: &str| {
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "t1",
+                "status": status,
+                "content": [
+                    { "type": "content", "content": { "type": "image", "data": "iVBORw0K", "mimeType": "image/png" } },
+                    { "type": "content", "content": { "type": "image", "uri": "file:///w/b.png", "mimeType": "image/png" } },
+                ],
+            })
+        };
+        let events = map_update(&update("completed"));
+        assert!(
+            matches!(events.as_slice(), [
+                AgentEvent::ToolImage { tool_id, data: Some(data), .. },
+                AgentEvent::ToolImage { path, data: None, .. },
+                AgentEvent::ToolResult { is_error: false, .. },
+            ] if tool_id == "t1" && data == "iVBORw0K" && path == "/w/b.png"),
+            "{events:?}"
+        );
+        assert!(matches!(
+            map_update(&update("failed")).as_slice(),
+            [AgentEvent::ToolResult { is_error: true, .. }]
+        ));
     }
 
     #[test]

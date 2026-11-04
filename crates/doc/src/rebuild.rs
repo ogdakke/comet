@@ -185,6 +185,7 @@ mod tests {
                     subagent_tail: None,
                     exit_code: None,
                     output_truncated: false,
+                    images: Vec::new(),
                 },
             ],
             created_at: 5,

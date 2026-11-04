@@ -328,6 +328,11 @@ impl LayoutFrame {
             let key = r.core.key;
             match &r.core.content {
                 rows::Content::Image { reference } => push(image(key, reference)),
+                rows::Content::ToolImages { references } => {
+                    for reference in references {
+                        push(image(key, reference));
+                    }
+                }
                 rows::Content::User(u) => {
                     for reference in &u.images {
                         push(image(key, reference));

@@ -1949,14 +1949,93 @@ impl SessionsEngine {
     }
 }
 
+/// Where a tool image's bytes come from: the harness's inline copy (base64)
+/// or the file the agent read.
+enum ToolImageSource {
+    Data(String),
+    Path(std::path::PathBuf),
+}
+
+/// What one run's event pump tracks to give tool calls their images
+/// (keys: chat, subagent parents, tool id — like generated images').
+#[derive(Default)]
+struct ToolImageIntake {
+    /// The run's folder, for a read named relative to it.
+    cwd: std::path::PathBuf,
+    /// Image files read by calls still waiting on their result.
+    reads: std::collections::HashMap<String, String>,
+    /// Images each call has taken so far (at most `MAX_TOOL_IMAGES`).
+    imaged: std::collections::HashMap<String, usize>,
+}
+
+impl ToolImageIntake {
+    fn new(cwd: &str) -> Self {
+        Self {
+            cwd: cwd.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Claims one of the call's image slots; `false` once they're spent.
+    fn take_slot(&mut self, key: &str) -> bool {
+        let taken = self.imaged.entry(key.to_owned()).or_default();
+        if *taken >= zeron_doc::MAX_TOOL_IMAGES {
+            return false;
+        }
+        *taken += 1;
+        true
+    }
+
+    fn resolve(&self, path: &str) -> std::path::PathBuf {
+        let path = std::path::Path::new(path);
+        if path.is_absolute() {
+            path.to_owned()
+        } else {
+            self.cwd.join(path)
+        }
+    }
+}
+
+/// The last component of a path, either separator.
+fn file_name_of(path: &str) -> String {
+    path.rsplit(['/', '\\']).next().unwrap_or(path).to_owned()
+}
+
+/// `event` back under the subagent spawns it came through, outermost first.
+fn rewrap(mut event: AgentEvent, parents: &[String]) -> Vec<AgentEvent> {
+    for parent in parents.iter().rev() {
+        event = AgentEvent::Subagent {
+            parent_tool_use_id: parent.clone(),
+            event: Box::new(event),
+        };
+    }
+    vec![event]
+}
+
 impl Inner {
-    /// Journal + broadcast one event (the two unconditional legs of the pipeline).
-    /// Sanitize before ANY journal/publish path, including nested subagent events.
+    #[cfg(test)]
     async fn prepare_generated_image(
         &self,
         chat_id: &str,
         event: AgentEvent,
         seen: &mut std::collections::HashSet<String>,
+    ) -> Vec<AgentEvent> {
+        self.prepare_media(chat_id, event, seen, &mut ToolImageIntake::default())
+            .await
+    }
+
+    /// Images in `event` made safe to journal and publish: a generated image
+    /// imported into uploads, and a tool image (an image file the agent
+    /// read) copied there — its inline bytes never reach the journal. Runs
+    /// before ANY journal/publish path, including nested subagent events. A
+    /// successful image read whose harness sent no bytes (it reports only
+    /// the path) gets its image from the file, after its result.
+    async fn prepare_media(
+        &self,
+        chat_id: &str,
+        event: AgentEvent,
+        seen: &mut std::collections::HashSet<String>,
+        intake: &mut ToolImageIntake,
     ) -> Vec<AgentEvent> {
         let mut parents = Vec::new();
         let mut leaf = event;
@@ -1968,6 +2047,72 @@ impl Inner {
             parents.push(parent_tool_use_id);
             leaf = *event;
         }
+        let tool_key = |id: &str| {
+            std::iter::once(chat_id)
+                .chain(parents.iter().map(String::as_str))
+                .chain(std::iter::once(id))
+                .collect::<Vec<_>>()
+                .join("\0")
+        };
+        let leaf = match leaf {
+            AgentEvent::ToolCall {
+                ref id,
+                call: zeron_proto::ToolCall::ReadFile { ref path },
+            } => {
+                if zeron_proto::attachment_mentions::is_raster_image_path(path) {
+                    intake.reads.insert(tool_key(id), path.clone());
+                }
+                return rewrap(leaf, &parents);
+            }
+            AgentEvent::ToolImage {
+                tool_id,
+                path,
+                name,
+                data,
+                ..
+            } => {
+                let key = tool_key(&tool_id);
+                let read = intake.reads.get(&key).cloned();
+                if !intake.take_slot(&key) {
+                    return vec![];
+                }
+                let source = match data {
+                    Some(data) => ToolImageSource::Data(data),
+                    None if !path.is_empty() => ToolImageSource::Path(intake.resolve(&path)),
+                    None => return vec![],
+                };
+                let name = Some(name)
+                    .filter(|n| !n.is_empty())
+                    .or_else(|| read.as_deref().map(file_name_of))
+                    .or_else(|| (!path.is_empty()).then(|| file_name_of(&path)));
+                return self
+                    .store_tool_image(chat_id, tool_id, name, source)
+                    .await
+                    .map(|image| rewrap(image, &parents))
+                    .unwrap_or_default();
+            }
+            AgentEvent::ToolResult { ref id, is_error, .. } => {
+                let key = tool_key(id);
+                let read = intake.reads.remove(&key);
+                let fallback = match read {
+                    Some(path) if !is_error && intake.imaged.get(&key).is_none_or(|n| *n == 0) => {
+                        intake.take_slot(&key).then_some(path)
+                    }
+                    _ => None,
+                };
+                intake.imaged.remove(&key);
+                let Some(path) = fallback else {
+                    return rewrap(leaf, &parents);
+                };
+                let tool_id = id.clone();
+                let name = Some(file_name_of(&path));
+                let source = ToolImageSource::Path(intake.resolve(&path));
+                let mut out = vec![leaf];
+                out.extend(self.store_tool_image(chat_id, tool_id, name, source).await);
+                return out.into_iter().flat_map(|e| rewrap(e, &parents)).collect();
+            }
+            other => other,
+        };
         let events = if let AgentEvent::GeneratedImage { id, path, .. } = leaf {
             let key = std::iter::once(chat_id)
                 .chain(parents.iter().map(String::as_str))
@@ -2022,16 +2167,53 @@ impl Inner {
         };
         events
             .into_iter()
-            .map(|mut event| {
-                for parent in parents.iter().rev() {
-                    event = AgentEvent::Subagent {
-                        parent_tool_use_id: parent.clone(),
-                        event: Box::new(event),
-                    };
-                }
-                event
-            })
+            .flat_map(|event| rewrap(event, &parents))
             .collect()
+    }
+
+    /// A tool image copied into uploads, as the event that carries the copy;
+    /// `None` (logged) when it can't be: a tool image is a nicety, its call
+    /// stands without one.
+    async fn store_tool_image(
+        &self,
+        chat_id: &str,
+        tool_id: String,
+        name: Option<String>,
+        source: ToolImageSource,
+    ) -> Option<AgentEvent> {
+        let (uploads, _) = self.generated_images.get()?;
+        let uploads = uploads.clone();
+        let stored = tokio::task::spawn_blocking(move || {
+            let bytes = match source {
+                ToolImageSource::Data(data) => {
+                    use base64::Engine as _;
+                    // Bounded before decoding: base64 is 4 bytes per 3.
+                    if data.len() as u64 > crate::uploads::MAX_TOOL_IMAGE_SOURCE_BYTES.div_ceil(3) * 4 {
+                        return Err(EngineError::Other("tool image too large".into()));
+                    }
+                    base64::engine::general_purpose::STANDARD
+                        .decode(data.trim())
+                        .map_err(|e| EngineError::Other(format!("tool image is not base64: {e}")))?
+                }
+                ToolImageSource::Path(path) => crate::uploads::read_tool_image_file(&path)?,
+            };
+            uploads.store_tool_image(&bytes)
+        })
+        .await
+        .unwrap_or_else(|err| Err(EngineError::Other(err.to_string())));
+        match stored {
+            Ok(image) => Some(AgentEvent::ToolImage {
+                tool_id,
+                path: image.path,
+                name: name.unwrap_or(image.name),
+                mime_type: image.mime_type,
+                data: None,
+            }),
+            Err(err) => {
+                tracing::debug!(chat = %chat_id, error = %err, "tool image skipped");
+                None
+            }
+        }
     }
 
     fn publish(&self, chat_id: &str, event: &AgentEvent) -> u64 {
@@ -3372,6 +3554,7 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 subagent_tail,
                 exit_code,
                 output_truncated,
+                images,
             } => MessagePart::Tool {
                 id: id.clone(),
                 call: sanitize_tool_call(call),
@@ -3392,6 +3575,7 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 subagent_tail: subagent_tail.clone(),
                 exit_code: *exit_code,
                 output_truncated: *output_truncated,
+                images: images.clone(),
             },
             other => other.clone(),
         })
@@ -3626,6 +3810,7 @@ async fn drive_run(
     // segment — the mid-word transcript splits.
     let mut seen_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut seen_images = std::collections::HashSet::new();
+    let mut tool_images = ToolImageIntake::new(&run_cwd);
     for entry in doc_ref.read_entries().unwrap_or_default() {
         for part in entry.parts {
             if let MessagePart::Image { id, .. } = part {
@@ -4315,7 +4500,7 @@ async fn drive_run(
 
             prepared_events.extend(
                 inner
-                    .prepare_generated_image(&chat_id, raw_event, &mut seen_images)
+                    .prepare_media(&chat_id, raw_event, &mut seen_images, &mut tool_images)
                     .await,
             );
             let Some(event) = prepared_events.pop_front() else {
@@ -4682,6 +4867,9 @@ async fn drive_run(
             AgentEvent::ToolResult { id, .. }
                 if !in_segment(&folded, id) && seen_tools.contains(id) =>
             {
+                continue;
+            }
+            AgentEvent::ToolImage { tool_id, .. } if !in_segment(&folded, tool_id) => {
                 continue;
             }
             _ => {}
@@ -5242,6 +5430,137 @@ mod tests {
     }
 
     use zeron_proto::{HarnessId, RunRequest, SandboxLevel};
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(width, height, image::Rgb([255, 0, 0]))
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+
+    fn intake_engine(dir: &std::path::Path) -> SessionsEngine {
+        let sessions = SessionsEngine::new(
+            "host".into(),
+            Arc::new(RunJournal::open(dir.join("journals")).unwrap()),
+            Arc::new(HarnessRegistry::new()),
+        );
+        sessions.set_generated_images(
+            crate::uploads::Uploads::from_root(&dir.join("uploads")),
+            dir.join("generated"),
+        );
+        sessions
+    }
+
+    #[tokio::test]
+    async fn tool_images_are_copied_and_never_carry_their_bytes_on() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = intake_engine(dir.path());
+        let mut intake = ToolImageIntake::new(dir.path().to_str().unwrap());
+        let mut seen = std::collections::HashSet::new();
+        let mut prepare = async |event| {
+            sessions.inner.prepare_media("chat", event, &mut seen, &mut intake).await
+        };
+        let data = base64::engine::general_purpose::STANDARD.encode(png(4, 2));
+        // A subagent's read, bytes inline (Claude Code's tool_result).
+        let sub = |event| AgentEvent::Subagent {
+            parent_tool_use_id: "spawn".into(),
+            event: Box::new(event),
+        };
+        let call = prepare(sub(AgentEvent::ToolCall {
+            id: "r".into(),
+            call: zeron_proto::ToolCall::ReadFile { path: "/w/red.png".into() },
+        }))
+        .await;
+        assert_eq!(call.len(), 1);
+        let image = prepare(sub(AgentEvent::ToolImage {
+            tool_id: "r".into(),
+            path: String::new(),
+            name: String::new(),
+            mime_type: "image/png".into(),
+            data: Some(data.clone()),
+        }))
+        .await;
+        let [AgentEvent::Subagent { parent_tool_use_id, event }] = image.as_slice() else {
+            panic!("the image stays under its subagent: {image:?}");
+        };
+        assert_eq!(parent_tool_use_id, "spawn");
+        let AgentEvent::ToolImage { tool_id, path, name, mime_type, data: None } = event.as_ref() else {
+            panic!("the copy, without bytes: {event:?}");
+        };
+        assert_eq!((tool_id.as_str(), name.as_str(), mime_type.as_str()), ("r", "red.png", "image/png"));
+        assert!(path.starts_with(dir.path().join("uploads").to_str().unwrap()));
+        assert_eq!(std::fs::read(path).unwrap(), png(4, 2));
+        // Bytes arrived, so the result reads nothing more from disk.
+        let result = prepare(sub(AgentEvent::ToolResult {
+            id: "r".into(),
+            is_error: false,
+            output: None,
+            diff: None,
+            exit_code: None,
+        }))
+        .await;
+        assert_eq!(result.len(), 1);
+        for event in call.iter().chain(&image).chain(&result) {
+            sessions.inner.publish("chat", event);
+        }
+        let journal = std::fs::read_dir(dir.path().join("journals"))
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap_or_default())
+            .collect::<String>();
+        assert!(!journal.contains(&data), "inline bytes reached the journal");
+    }
+
+    #[tokio::test]
+    async fn a_path_only_image_read_gets_its_image_from_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = intake_engine(dir.path());
+        std::fs::write(dir.path().join("shot.png"), png(3, 3)).unwrap();
+        std::fs::write(dir.path().join("big.png"), png(5000, 10)).unwrap();
+        let mut intake = ToolImageIntake::new(dir.path().to_str().unwrap());
+        let mut seen = std::collections::HashSet::new();
+        let mut run = async |id: &str, path: &str, is_error: bool| {
+            let mut out = Vec::new();
+            for event in [
+                AgentEvent::ToolCall {
+                    id: id.into(),
+                    call: zeron_proto::ToolCall::ReadFile { path: path.into() },
+                },
+                AgentEvent::ToolResult {
+                    id: id.into(),
+                    is_error,
+                    output: None,
+                    diff: None,
+                    exit_code: None,
+                },
+            ] {
+                out.extend(sessions.inner.prepare_media("chat", event, &mut seen, &mut intake).await);
+            }
+            out
+        };
+        // Relative to the run's folder, as Codex's view_image may name it.
+        let events = run("v", "shot.png", false).await;
+        let [AgentEvent::ToolCall { .. }, AgentEvent::ToolResult { .. }, AgentEvent::ToolImage { name, path, data: None, .. }] =
+            events.as_slice()
+        else {
+            panic!("call, result, then its image: {events:?}");
+        };
+        assert_eq!(name, "shot.png");
+        assert_eq!(std::fs::read(path).unwrap(), png(3, 3));
+        // A failed read, a non-image and a missing file show nothing.
+        assert_eq!(run("f", "shot.png", true).await.len(), 2);
+        assert_eq!(run("t", "notes.txt", false).await.len(), 2);
+        assert_eq!(run("m", "/nowhere/gone.png", false).await.len(), 2);
+        // Too large to draw: kept scaled down.
+        let events = run("b", "big.png", false).await;
+        let Some(AgentEvent::ToolImage { path, mime_type, .. }) = events.last() else {
+            panic!("a large image is scaled, not dropped: {events:?}");
+        };
+        assert_eq!(mime_type, "image/jpeg");
+        let (w, h) = image::image_dimensions(path).unwrap();
+        assert_eq!((w, h), (crate::uploads::TOOL_IMAGE_SCALED_SIDE, 4));
+    }
 
     #[tokio::test]
     async fn generated_image_failure_is_sanitized_even_inside_subagents() {

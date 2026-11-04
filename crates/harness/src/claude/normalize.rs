@@ -309,7 +309,8 @@ fn subagent_results(
     f.message
         .blocks()
         .filter(|b: &ContentBlock| b.kind == "tool_result")
-        .map(|b| tag(parent, tool_result(&b, commands)))
+        .flat_map(|b| tool_result_events(&b, commands))
+        .map(|e| tag(parent, e))
         .collect()
 }
 
@@ -362,6 +363,47 @@ fn tool_result(
         diff: None,
         exit_code,
     }
+}
+
+/// A `tool_result` block's events: the images it put in front of the model
+/// (a `Read` of an image file, a screenshot tool's capture), then its result.
+/// The images ride as base64 for the engine to copy into uploads; the copy is
+/// what the journal and the transcript see.
+fn tool_result_events(
+    b: &ContentBlock,
+    commands: &mut std::collections::HashMap<String, bool>,
+) -> Vec<AgentEvent> {
+    let mut out: Vec<AgentEvent> = result_images(&b.content)
+        .map(|(data, mime_type)| AgentEvent::ToolImage {
+            tool_id: b.tool_use_id.clone(),
+            path: String::new(),
+            name: String::new(),
+            mime_type,
+            data: Some(data),
+        })
+        .collect();
+    out.push(tool_result(b, commands));
+    out
+}
+
+/// A `tool_result`'s base64 image blocks, as (data, media type), at most
+/// [`zeron_proto::TOOL_IMAGES_MAX`].
+fn result_images(content: &Value) -> impl Iterator<Item = (String, String)> + '_ {
+    content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("image"))
+        .filter_map(|b| {
+            let source = b.get("source")?;
+            if source.get("type").and_then(Value::as_str) != Some("base64") {
+                return None;
+            }
+            let data = source.get("data").and_then(Value::as_str)?;
+            let mime = source.get("media_type").and_then(Value::as_str).unwrap_or_default();
+            Some((data.to_owned(), mime.to_owned()))
+        })
+        .take(zeron_proto::TOOL_IMAGES_MAX)
 }
 
 /// A `tool_result`'s text: its string, or its text blocks joined.
@@ -1212,11 +1254,11 @@ impl Normalizer {
                 f.message
                     .blocks()
                     .filter(|b: &ContentBlock| b.kind == "tool_result")
-                    .map(|b| {
+                    .flat_map(|b| {
                         // A skill whose result came back without a task
                         // start ran inline: it never forks now.
                         self.skill_calls.remove(&b.tool_use_id);
-                        tool_result(&b, &mut self.command_calls)
+                        tool_result_events(&b, &mut self.command_calls)
                     })
                     .collect()
             }
@@ -1454,6 +1496,45 @@ mod tests {
             decode_tool_use("Mystery", &json!({})),
             ToolCall::Unknown { .. }
         ));
+    }
+
+    /// A `Read` of an image (the wire shape Claude Code 2.1 emits): its
+    /// base64 image rides out ahead of the result, for the main agent and
+    /// under a subagent's parent alike; text results carry none.
+    #[test]
+    fn image_tool_results_carry_their_bytes_ahead_of_the_result() {
+        let frame = |parent: Option<&str>| {
+            json!({"type": "user", "parent_tool_use_id": parent, "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_r", "content": [
+                    {"type": "image", "source": {"type": "base64", "data": "iVBORw0K", "media_type": "image/png"}}
+                ]}
+            ]}})
+        };
+        for parent in [None, Some("toolu_spawn")] {
+            let mut n = Normalizer::new();
+            let raw = frame(parent).to_string();
+            let events = n.normalize(crate::claude::wire::parse_frame(&raw).expect("frame parses"), false);
+            let events: Vec<AgentEvent> = events
+                .into_iter()
+                .map(|e| match (e, parent) {
+                    (AgentEvent::Subagent { parent_tool_use_id, event }, Some(p)) => {
+                        assert_eq!(parent_tool_use_id, p);
+                        *event
+                    }
+                    (e, None) => e,
+                    (e, Some(_)) => panic!("untagged subagent event {e:?}"),
+                })
+                .collect();
+            assert!(
+                matches!(events.as_slice(), [
+                    AgentEvent::ToolImage { tool_id, data: Some(data), mime_type, .. },
+                    AgentEvent::ToolResult { id, .. },
+                ] if tool_id == "toolu_r" && id == "toolu_r" && data == "iVBORw0K" && mime_type == "image/png"),
+                "{events:?}"
+            );
+        }
+        let part = folded_tool("Read", json!({"file_path": "/w/a.rs"}), json!("fn main() {}"), false);
+        assert!(matches!(part, zeron_doc::MessagePart::Tool { images, .. } if images.is_empty()));
     }
 
     /// Folds a Bash call and its result through a fresh normalizer and the

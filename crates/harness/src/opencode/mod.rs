@@ -4545,6 +4545,25 @@ fn part_snapshot_events(
                     })
                     .filter(|t| !t.is_empty())
                     .map(|t| cap_text(t, OUTPUT_CAP));
+                // Images the call put in front of the model (a `read` of an
+                // image file): opencode attaches them as file parts.
+                if status == "completed" {
+                    let attachments = part
+                        .pointer("/state/attachments")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten();
+                    events.extend(
+                        attachments
+                            .filter_map(|a| {
+                                let mime = a.get("mime").and_then(Value::as_str)?;
+                                let url = a.get("url").and_then(Value::as_str)?;
+                                crate::tool_images::is_raster_mime(mime)
+                                    .then(|| crate::tool_images::from_url(&call_id, url, mime))?
+                            })
+                            .take(zeron_proto::TOOL_IMAGES_MAX),
+                    );
+                }
                 events.push(AgentEvent::ToolResult {
                     id: call_id,
                     is_error: status == "error",
@@ -5111,11 +5130,27 @@ fn normalize_v2_frame_with_session_models(
                         .join("\n")
                 })
                 .unwrap_or_default();
+            // File content (an image the call read) rides as 1.x
+            // attachments, which the tool part's completion turns into images.
+            let attachments: Vec<Value> = data
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|p| p.get("type").and_then(Value::as_str) == Some("file"))
+                .filter_map(|p| {
+                    Some(json!({
+                        "type": "file",
+                        "mime": p.get("mime")?.as_str()?,
+                        "url": p.get("uri")?.as_str()?,
+                    }))
+                })
+                .collect();
             vec![v2_tool_part(
                 &data,
                 id,
                 &name,
-                &json!({ "status": "completed", "output": output }),
+                &json!({ "status": "completed", "output": output, "attachments": attachments }),
             )]
         }
         "session.tool.failed" | "session.tool.error" => {

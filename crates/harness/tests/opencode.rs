@@ -818,6 +818,50 @@ async fn a_stop_aborts_the_turns_subagent_sessions() {
     );
 }
 
+/// A `read` of an image (the shape opencode 1.2 emits): the attachment's
+/// data URL rides out as the call's image, ahead of its result.
+#[tokio::test]
+async fn an_image_read_carries_its_attachment() {
+    let fake = FakeOpencode::start().await;
+    let (controls, _steer, _token) = controls();
+    let mut stream = harness(&fake)
+        .run(request("hi"), controls)
+        .await
+        .expect("run starts");
+    let _ = next_event(&mut stream).await;
+    let _ = next_event(&mut stream).await;
+    assistant_message(&fake, "ses_test", "msg_1");
+    fake.emit(json!({
+        "type": "message.part.updated",
+        "properties": { "part": {
+            "id": "prt_read", "messageID": "msg_1", "sessionID": "ses_test",
+            "type": "tool", "tool": "read", "callID": "call_img1",
+            "state": {
+                "status": "completed",
+                "input": { "filePath": "/w/red.png" },
+                "output": "Image read successfully",
+                "attachments": [{
+                    "type": "file", "mime": "image/png",
+                    "url": "data:image/png;base64,iVBORw0K",
+                    "id": "prt_att", "sessionID": "ses_test", "messageID": "msg_1",
+                }],
+            },
+        }},
+    }));
+    let call = next_event(&mut stream).await;
+    let AgentEvent::ToolCall { id: call_id, .. } = &call else {
+        panic!("{call:?}");
+    };
+    let image = next_event(&mut stream).await;
+    assert!(
+        matches!(&image, AgentEvent::ToolImage { tool_id, data: Some(data), mime_type, .. }
+            if tool_id == call_id && data == "iVBORw0K" && mime_type == "image/png"),
+        "{image:?}"
+    );
+    let result = next_event(&mut stream).await;
+    assert!(matches!(&result, AgentEvent::ToolResult { id, .. } if id == call_id), "{result:?}");
+}
+
 #[tokio::test]
 async fn images_sent_mid_turn_ride_the_queued_prompt() {
     let fake = FakeOpencode::start().await;

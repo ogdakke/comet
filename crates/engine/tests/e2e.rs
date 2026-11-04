@@ -1338,6 +1338,7 @@ fn spawn_chip(id: &str, status: SubagentStatus) -> MessagePart {
         subagent_tail: None,
         exit_code: None,
         output_truncated: false,
+        images: Vec::new(),
     }
 }
 
@@ -2682,6 +2683,123 @@ async fn real_claude_sees_uploaded_image_inline() {
         "claude should name the image's color; got: {reply:?}"
     );
     core.shutdown().await;
+}
+
+/// Real-CLI proof that an image the agent reads shows with its call: claude
+/// (haiku) `Read`s a PNG in its folder, and the doc's tool part carries the
+/// host's copy of the bytes it saw, which never ride the journal inline.
+/// Ignored by default: needs an installed, authenticated `claude` CLI and
+/// spends real tokens.
+/// Run with: `cargo test -p zeron-engine --test e2e real_claude_image_read -- --ignored`
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires installed+authenticated claude CLI; spends tokens"]
+async fn real_claude_image_read_shows_with_its_call() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    let cwd = tmp.path().join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    // 8×8 solid red.
+    const RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CAB+GTG2wAAJP0GeGuMDBnAAAAAElFTkSuQmCC";
+    use base64::Engine as _;
+    let red = base64::engine::general_purpose::STANDARD.decode(RED_PNG_B64).unwrap();
+    std::fs::write(cwd.join("swatch.png"), &red).unwrap();
+
+    let core = EngineCore::assemble(
+        &dir,
+        Arc::new(zeron_engine::default_registry()),
+        HarnessId::ClaudeCode,
+        None,
+    )
+    .expect("engine core assembles");
+    core.workspace
+        .create_chat(CHAT, None, Some(&core.device_id), None, Some("/tmp".into()))
+        .expect("create chat row");
+    core.workspace.rename_chat(CHAT, "Pre-titled").expect("rename chat");
+    let request = RunRequest {
+        mcp: None,
+        prompt: "Use the Read tool on ./swatch.png, then reply with its solid color in one lowercase word.".into(),
+        harness: None,
+        model: Some("haiku".into()),
+        reasoning: None,
+        model_options: Default::default(),
+        cwd: cwd.to_string_lossy().to_string(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+        auto_approve: true,
+        access: Default::default(),
+        plan: false,
+        attachments: Vec::new(),
+        resume: None,
+        worktree: None,
+        env: Default::default(),
+        extra_mcp: Vec::new(),
+    };
+    core.doc_host
+        .queue_command(
+            CHAT,
+            SessionCommandPayload::Run {
+                request,
+                message_id: "msg-read-1".into(),
+            },
+        )
+        .expect("queue real read run");
+    wait_for_within_secs(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
+        },
+        "real claude read turn",
+        180,
+    )
+    .await;
+    let parts: Vec<MessagePart> = entries(&core)
+        .into_iter()
+        .filter(|e| e.role == MessageRole::Assistant)
+        .flat_map(|e| e.parts)
+        .collect();
+    let images: Vec<zeron_doc::ToolImage> = parts
+        .iter()
+        .filter_map(|p| match p {
+            MessagePart::Tool {
+                call: zeron_proto::ToolCall::ReadFile { path },
+                images,
+                ..
+            } if path.ends_with("swatch.png") => Some(images.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(images.len(), 1, "the Read carries its image: {parts:#?}");
+    assert_eq!(images[0].name, "swatch.png");
+    assert_eq!(images[0].mime_type, "image/png");
+    assert!(images[0].path.contains("-read."), "{}", images[0].path);
+    let copy = std::fs::read(&images[0].path).expect("the host's copy");
+    assert!(copy.starts_with(b"\x89PNG"), "a PNG copy");
+    // The inline bytes stayed out of the journal.
+    let journal: String = walk_files(&dir)
+        .into_iter()
+        .filter(|p| p.to_string_lossy().contains("journal"))
+        .map(|p| String::from_utf8_lossy(&std::fs::read(p).unwrap_or_default()).into_owned())
+        .collect();
+    assert!(!journal.is_empty(), "the run was journaled");
+    assert!(!journal.contains("\"data\":\"iVBOR"), "inline image bytes reached the journal");
+    core.shutdown().await;
+}
+
+fn walk_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out
 }
 
 async fn wait_for_within_secs<F>(mut predicate: F, what: &str, secs: u64)

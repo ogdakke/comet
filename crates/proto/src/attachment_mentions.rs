@@ -86,6 +86,19 @@ pub fn is_image_path(path: &str) -> bool {
     })
 }
 
+/// Whether `path` names a PNG, JPEG, GIF or WebP by its extension: the
+/// rasters every client draws inline (an image part's formats).
+pub fn is_raster_image_path(path: &str) -> bool {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    name.rsplit_once('.').is_some_and(|(stem, extension)| {
+        !stem.is_empty()
+            && matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp"
+            )
+    })
+}
+
 /// The file name to show for an attachment ref: uploads are stored as
 /// `{id8}-{name}`, and the prefix is not part of the name.
 pub fn attachment_display_name(name: &str) -> &str {

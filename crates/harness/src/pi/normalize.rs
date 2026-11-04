@@ -139,6 +139,18 @@ impl Normalizer {
                         _ => None,
                     }
                 });
+                // An image the call put in front of the model (a `read` of
+                // an image file): its bytes, for the engine to copy.
+                if frame["isError"] != true {
+                    let images = result["content"].as_array().into_iter().flatten();
+                    events.extend(
+                        images
+                            .filter(|v| v["type"] == "image")
+                            .filter_map(|v| Some((v["data"].as_str()?, string(v, "mimeType"))))
+                            .take(zeron_proto::TOOL_IMAGES_MAX)
+                            .map(|(data, mime)| crate::tool_images::from_data(&id, data, mime)),
+                    );
+                }
                 events.push(AgentEvent::ToolResult {
                     id,
                     is_error: frame["isError"].as_bool().unwrap_or(false),
@@ -238,6 +250,24 @@ mod tests {
         );
         assert_eq!(n.status(), DoneStatus::Completed);
     }
+    #[test]
+    fn image_reads_carry_their_bytes() {
+        let mut n = Normalizer::default();
+        let frame = json!({"type":"tool_execution_end","toolCallId":"call_img1","toolName":"read","isError":false,
+            "result":{"content":[{"type":"text","text":"Read image file [image/png]"},{"type":"image","data":"iVBORw0K","mimeType":"image/png"}]}});
+        let events = n.map(&frame);
+        assert!(
+            matches!(events.as_slice(), [
+                AgentEvent::ToolImage { tool_id, data: Some(data), mime_type, .. },
+                AgentEvent::ToolResult { .. },
+            ] if tool_id == "call_img1" && data == "iVBORw0K" && mime_type == "image/png"),
+            "{events:?}"
+        );
+        let failed = json!({"type":"tool_execution_end","toolCallId":"x","isError":true,
+            "result":{"content":[{"type":"image","data":"iVBORw0K","mimeType":"image/png"}]}});
+        assert_eq!(n.map(&failed).len(), 1);
+    }
+
     #[test]
     fn tools_preserve_identity_and_edit_diff() {
         let mut n = Normalizer::default();

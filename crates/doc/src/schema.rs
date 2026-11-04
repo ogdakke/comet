@@ -149,6 +149,10 @@ struct DocPartJson {
     /// only when true): the UI says earlier output was trimmed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output_truncated: Option<bool>,
+    /// Images a tool call put in front of the model (additive; written only
+    /// when there are some): `[{path, name, mimeType}]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    images: Option<serde_json::Value>,
     /// A sent file's byte length (`kind: "file"`, additive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     size: Option<u64>,
@@ -241,6 +245,7 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             subagent_tail,
             exit_code,
             output_truncated,
+            images,
         } => DocPartJson {
             id: id.clone(),
             kind: "tool".into(),
@@ -266,6 +271,9 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             subagent_tail: subagent_tail.clone(),
             exit_code: *exit_code,
             output_truncated: output_truncated.then_some(true),
+            images: (!images.is_empty())
+                .then(|| serde_json::to_value(images))
+                .transpose()?,
             ..Default::default()
         },
         MessagePart::Input {
@@ -315,6 +323,26 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             ..Default::default()
         },
     })
+}
+
+/// A tool part's `images`, keeping the well-formed raster entries (at most
+/// [`crate::parts::MAX_TOOL_IMAGES`]); anything else reads as none.
+fn tool_images(value: serde_json::Value) -> Vec<crate::parts::ToolImage> {
+    let serde_json::Value::Array(items) = value else {
+        return Vec::new();
+    };
+    items
+        .into_iter()
+        .filter_map(|item| serde_json::from_value::<crate::parts::ToolImage>(item).ok())
+        .filter(|image| {
+            !image.path.is_empty()
+                && matches!(
+                    image.mime_type.as_str(),
+                    "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+                )
+        })
+        .take(crate::parts::MAX_TOOL_IMAGES)
+        .collect()
 }
 
 /// Doc part json → app part (mirror of `fromDocParts`; malformed degrades to empty text).
@@ -373,6 +401,7 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                 subagent_tail: p.subagent_tail,
                 exit_code: p.exit_code,
                 output_truncated: p.output_truncated.unwrap_or(false),
+                images: p.images.map(tool_images).unwrap_or_default(),
             },
             None => MessagePart::Text {
                 id: p.id,
@@ -1151,6 +1180,9 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     if let Some(truncated) = doc_part.output_truncated {
         map.insert("outputTruncated", truncated)?;
     }
+    if let Some(images) = &doc_part.images {
+        map.insert("images", loro_value_from_json(images))?;
+    }
     if let Some(size) = doc_part.size {
         map.insert("size", size as i64)?;
     }
@@ -1338,6 +1370,7 @@ fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<M
                 .get("outputTruncated")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false),
+            images: obj.get("images").cloned().map(tool_images).unwrap_or_default(),
         });
     }
     if let Some(message) = obj.get("message").and_then(|x| x.as_str()) {
@@ -1648,6 +1681,9 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     if let Some(truncated) = doc_part.output_truncated {
         map.insert("outputTruncated", truncated)?;
     }
+    if let Some(images) = &doc_part.images {
+        map.insert("images", loro_value_from_json(images))?;
+    }
     if let Some(size) = doc_part.size {
         map.insert("size", size as i64)?;
     }
@@ -1818,6 +1854,58 @@ mod tests {
     }
 
     #[test]
+    fn tool_images_fold_onto_their_call_and_persist() {
+        let doc = SessionDoc::init("tool-images").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "a", "owner", 1).unwrap();
+        let mut parts = vec![];
+        let image = |tool_id: &str, path: &str, data: Option<&str>| AgentEvent::ToolImage {
+            tool_id: tool_id.into(),
+            path: path.into(),
+            name: "shot.png".into(),
+            mime_type: "image/png".into(),
+            data: data.map(Into::into),
+        };
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "read".into(),
+                call: zeron_proto::ToolCall::ReadFile { path: "/w/shot.png".into() },
+            },
+        );
+        // Streaming: the call is written before its image arrives.
+        writer.sync(&parts).unwrap();
+        // Inline bytes, an unknown call and a repeat never fold.
+        fold_event_into_parts(&mut parts, &image("read", "", Some("iVBOR")));
+        fold_event_into_parts(&mut parts, &image("other", "/uploads/x.png", None));
+        fold_event_into_parts(&mut parts, &image("read", "/uploads/0-read.png", None));
+        fold_event_into_parts(&mut parts, &image("read", "/uploads/0-read.png", None));
+        for n in 1..10 {
+            fold_event_into_parts(&mut parts, &image("read", &format!("/uploads/{n}-read.png"), None));
+        }
+        let MessagePart::Tool { images, .. } = &parts[0] else {
+            panic!("the call stays a tool part");
+        };
+        assert_eq!(parts.len(), 1);
+        assert_eq!(images.len(), crate::parts::MAX_TOOL_IMAGES);
+        assert_eq!(images[0].path, "/uploads/0-read.png");
+        assert_eq!(images[0].name, "shot.png");
+        writer.sync(&parts).unwrap();
+        assert_eq!(doc.read_entries().unwrap()[0].parts, parts);
+        let imported = LoroDoc::new();
+        imported.import(&doc.export_snapshot().unwrap()).unwrap();
+        assert_eq!(SessionDoc::from_doc(imported).read_entries().unwrap()[0].parts, parts);
+
+        // Malformed entries read as none; a salvaged call keeps good ones.
+        let salvaged = serde_json::json!({"id":"t", "call":{"kind":"readFile","path":"/w/a.png"},
+            "images":[{"path":"/uploads/a.png","name":"a.png","mimeType":"image/png"},
+                      {"path":"/uploads/b.svg","name":"b.svg","mimeType":"image/svg+xml"}, 7]});
+        let Some(MessagePart::Tool { images, .. }) = salvage_part(&salvaged, "a", 0) else {
+            panic!("a call salvages as a tool part");
+        };
+        assert_eq!(images.len(), 1);
+    }
+
+    #[test]
     fn generated_image_persists_updates_and_salvages() {
         let doc = SessionDoc::init("images").unwrap();
         let mut writer = SegmentWriter::begin(&doc, "a", "owner", 1).unwrap();
@@ -1965,6 +2053,7 @@ mod tests {
             subagent_tail: None,
             exit_code: None,
             output_truncated: false,
+            images: Vec::new(),
         };
         let doc = SessionDoc::init("c1").unwrap();
         let mut w = SegmentWriter::begin(&doc, "e1", "dev", 1).unwrap();
@@ -2031,6 +2120,7 @@ mod tests {
             subagent_tail: None,
             exit_code: None,
             output_truncated: false,
+            images: Vec::new(),
         };
         w.sync(std::slice::from_ref(&part)).unwrap();
         if let MessagePart::Tool {
@@ -2085,6 +2175,7 @@ mod tests {
             subagent_tail: None,
             exit_code: None,
             output_truncated: false,
+            images: Vec::new(),
         };
         let parts = vec![
             tool(
@@ -2544,6 +2635,7 @@ mod tests {
                 subagent_tail: None,
                 exit_code: None,
                 output_truncated: false,
+                images: Vec::new(),
             }],
             created_at: 1,
             device_id: "dev-a".into(),

@@ -1082,6 +1082,69 @@ pub struct ImportedImage {
 
 const MAX_GENERATED_IMAGE_BYTES: u64 = 24 * 1024 * 1024;
 
+/// Largest image file a tool read is copied from; the copy itself is bounded
+/// by [`Uploads::store_tool_image`].
+pub const MAX_TOOL_IMAGE_SOURCE_BYTES: u64 = 48 * 1024 * 1024;
+/// Longest side of a tool image too large to keep as it is, once scaled.
+pub const TOOL_IMAGE_SCALED_SIDE: u32 = 2048;
+
+/// The image file a tool read, for [`Uploads::store_tool_image`]: a regular
+/// file (never a FIFO or device, which could block or never end) of at most
+/// [`MAX_TOOL_IMAGE_SOURCE_BYTES`].
+pub fn read_tool_image_file(path: &Path) -> Result<Vec<u8>, EngineError> {
+    use std::io::Read;
+    let invalid = || EngineError::Other("not a readable image file".into());
+    if !path.is_absolute() {
+        return Err(invalid());
+    }
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() || meta.len() > MAX_TOOL_IMAGE_SOURCE_BYTES {
+        return Err(invalid());
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    std::fs::File::open(path)?
+        .take(MAX_TOOL_IMAGE_SOURCE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_TOOL_IMAGE_SOURCE_BYTES {
+        return Err(invalid());
+    }
+    Ok(bytes)
+}
+
+/// A tool image too large to keep, scaled to [`TOOL_IMAGE_SCALED_SIDE`]: a
+/// PNG when it has transparency, else a JPEG. Its first frame only.
+fn scale_tool_image(
+    bytes: &[u8],
+    format: image::ImageFormat,
+) -> Result<(Vec<u8>, &'static str, &'static str), EngineError> {
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(512 * 1024 * 1024);
+    reader.limits(limits);
+    let decoded = reader
+        .decode()
+        .map_err(|e| EngineError::Other(format!("unreadable image: {e}")))?;
+    let scaled = decoded.thumbnail(TOOL_IMAGE_SCALED_SIDE, TOOL_IMAGE_SCALED_SIDE);
+    let mut out = std::io::Cursor::new(Vec::new());
+    let kind = if scaled.color().has_alpha() {
+        scaled
+            .write_to(&mut out, image::ImageFormat::Png)
+            .map(|()| ("png", "image/png"))
+    } else {
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85)
+            .encode_image(&scaled.to_rgb8())
+            .map(|()| ("jpg", "image/jpeg"))
+    }
+    .map_err(|e| EngineError::Other(format!("image could not be scaled: {e}")))?;
+    let out = out.into_inner();
+    if out.len() > zeron_proto::IMAGE_MAX_BYTES {
+        return Err(EngineError::Other("image too large even scaled".into()));
+    }
+    Ok((out, kind.0, kind.1))
+}
+
 fn raster_signature(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some(("png", "image/png"))
@@ -1329,6 +1392,51 @@ impl Uploads {
         Ok(ImportedImage {
             path: destination.to_string_lossy().into_owned(),
             name: sanitize(name),
+            mime_type: mime.into(),
+            size: bytes.len() as u64,
+        })
+    }
+
+    /// Store an image a tool call put in front of the model (an image file
+    /// the agent read), named by its content so a re-read or a replay lands
+    /// on the same file. One every client can draw is kept as it is; a larger
+    /// one (more than [`zeron_proto::IMAGE_MAX_BYTES`] or
+    /// [`zeron_proto::IMAGE_MAX_SIDE`] pixels on a side) is scaled down to
+    /// [`TOOL_IMAGE_SCALED_SIDE`] first.
+    pub fn store_tool_image(&self, bytes: &[u8]) -> Result<ImportedImage, EngineError> {
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+        use zeron_proto::{IMAGE_MAX_BYTES, IMAGE_MAX_SIDE};
+        let (ext, mime) = raster_signature(bytes)
+            .ok_or_else(|| EngineError::Other("not a PNG, JPEG, WebP, or GIF image".into()))?;
+        let format = image::ImageFormat::from_extension(ext).expect("a sniffed raster format");
+        let (width, height) =
+            image::ImageReader::with_format(std::io::Cursor::new(bytes), format)
+                .into_dimensions()
+                .map_err(|e| EngineError::Other(format!("unreadable {ext} image: {e}")))?;
+        let scaled;
+        let (bytes, ext, mime) = if bytes.len() <= IMAGE_MAX_BYTES
+            && width.max(height) <= IMAGE_MAX_SIDE
+        {
+            (bytes, ext, mime)
+        } else {
+            scaled = scale_tool_image(bytes, format)?;
+            (scaled.0.as_slice(), scaled.1, scaled.2)
+        };
+        std::fs::create_dir_all(self.dir())?;
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        let destination = self.dir().join(format!("{hash}-read.{ext}"));
+        if !std::fs::metadata(&destination).is_ok_and(|m| m.is_file() && m.len() == bytes.len() as u64) {
+            let mut temporary = tempfile::NamedTempFile::new_in(self.dir())?;
+            temporary.write_all(bytes)?;
+            temporary.as_file().sync_all()?;
+            temporary
+                .persist(&destination)
+                .map_err(|e| EngineError::Io(e.error))?;
+        }
+        Ok(ImportedImage {
+            path: destination.to_string_lossy().into_owned(),
+            name: format!("image.{ext}"),
             mime_type: mime.into(),
             size: bytes.len() as u64,
         })

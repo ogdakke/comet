@@ -21,6 +21,26 @@ The existing transport limits remain: at most 8 MiB of image bytes, 384 KiB chun
 
 Each Files image surface admits at most 64 MiB of retained image resources, including its panel rendering variants. A generation guard rejects obsolete work. Collapsing the right panel or switching files, tabs or chats suspends image loads, clears media and schedules asset/atlas eviction. Resuming reloads from the owning workspace. Watcher updates do not reload hidden images; modifications, deletion and renaming invalidate the relevant image. Changing the target suspends the old view before clearing documents. Closing/disposal releases the image preview resources. Text documents retain their existing cache and editing lifecycle. Renaming an edited text file to an image extension preserves its buffer and pending save; image conversion waits until those edits are resolved. Watcher events continue through text conflict handling while edits remain.
 
+## Images an agent read
+
+When a tool call puts an image in front of the model (the agent reads an image file, or a tool such as a browser screenshot returns one), the host copies that image into uploads and it shows with the call: a strip of thumbnails under the tool group, visible whether the group is open or not, on desktop and on phones. A click or tap opens the lightbox (on a phone, the thread's gallery). Each tool part holds at most four (`images` on the doc's tool part: `{path, name, mimeType}`, the path being the copy on the message's device). Old readers ignore the field.
+
+How each harness reports the image (verified against real CLIs on 2026-11-04):
+
+| Harness | What the wire carries | Where it's read |
+| --- | --- | --- |
+| Claude Code | `tool_result` image blocks, base64 (the bytes the model saw, already resized by the CLI) | `claude/normalize.rs` `tool_result_events` |
+| pi | `tool_execution_end` result `{type:"image", data, mimeType}` | `pi/normalize.rs` |
+| opencode 1.x / 2.x | the read part's `state.attachments` data URL / `tool.success` file content | `opencode/mod.rs` |
+| ACP agents | `tool_call_update` image content (`data` or `uri`) | `acp/normalize.rs` `tool_images` |
+| Codex (`view_image`), cursor, gemini, muse | the path only | the engine reads the file |
+
+A harness with the bytes emits `AgentEvent::ToolImage { data }` ahead of the call's result. For a successful `ReadFile` of a PNG, JPEG, GIF or WebP that got no image that way, the engine reads the file itself after the result (relative paths against the run's folder; a regular file of at most 48 MB). Either way the engine stores the image, named by its content (`{sha256}-read.{ext}`), before anything is journaled or published, so inline bytes never reach the journal, the doc or the relay. An image more than 10 MB or 4096 pixels on a side is scaled to 2048 pixels (PNG with transparency, else JPEG). A failed read, a non-raster file, or an image that can't be stored shows nothing extra; the call itself is unchanged.
+
+A subagent's reads land on its tool parts in the subagent's own doc, so they show in its transcript and never in the parent's (or the parent's gallery). Children no stream exposes (muse subagents, pi-subagents children, gemini subagents) show nothing.
+
+A chip whose part carries images doesn't also preview them on expansion; chips without (old parts, or a command that only names an image path) keep the path-based preview below.
+
 ## Tool-call image previews
 
 A tool chip whose call or output names an image file (PNG, JPEG, GIF, WebP, BMP, SVG, TIFF; at most four per chip) previews it when the chip is expanded. Relative paths resolve against the chat's cwd on the owning host. Bytes arrive through `ReadAttachmentChunk`, so its jail applies: the owning host's uploads directory (plus any read-only legacy uploads roots) and the working directory of every chat in the workspace on that host, not just the chat that ran the tool. A projectless chat's working directory is the home directory, so any image under home on that host is readable. Other paths show *Image unavailable*. Network and device paths (UNC `\\host\share`, `//host/share`, `\\?\UNC\…`, `\\.\…`) and drive-relative paths (`C:x.png`) are never previewed. The engine also jails each path lexically, resolving `.`/`..` without touching the filesystem, before it canonicalizes the path, so a path outside every root is refused without being opened.

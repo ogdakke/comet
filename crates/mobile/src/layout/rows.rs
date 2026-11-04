@@ -117,6 +117,10 @@ pub(crate) enum Content {
     /// message this chat's agent sent. Faded while sending.
     Caption { text: PText, pending: bool },
     Image { reference: String },
+    /// The images a tool group's calls put in front of the model (image
+    /// files the agent read): a strip of thumbnails under the group, each
+    /// opening the thread's gallery.
+    ToolImages { references: Vec<String> },
     /// A file the agent sent: a tappable card (icon, name, kind · size · version).
     File(FileCard),
     Working { since_ms: Option<i64>, streaming: bool },
@@ -191,6 +195,8 @@ pub(crate) mod geom {
     pub const NOTICE_BUTTON: f32 = 32.0;
     pub const NOTICE_BUTTON_W: f32 = 80.0;
     pub const IMAGE: f32 = 260.0;
+    /// A tool image's thumbnail (the strip under a tool group).
+    pub const TOOL_IMAGE: f32 = 96.0;
     pub const FILE_CARD: f32 = 60.0;
     pub const FILE_CARD_W: f32 = 340.0;
     pub const FILE_CAPTION_LINES: usize = 3;
@@ -439,6 +445,26 @@ impl RowBuilder {
             let agents = tools.iter().any(|p| matches!(p, MessagePart::Tool { call, .. } if call.is_subagent_spawn()));
             let row = this.tool_row(ctx, &entry.id, &id, tools, streaming && tail, agents);
             rows.push(Placed { core: Arc::new(row), gap });
+            // Shown under the group whether it's open or not.
+            let references: Vec<String> = tools
+                .iter()
+                .filter_map(|p| match p {
+                    MessagePart::Tool { images, .. } => Some(images.iter().map(|i| i.path.clone())),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            if !references.is_empty() {
+                let core = Arc::new(RowCore {
+                    key: row_key(&format!("{id}-images")),
+                    version: next_version(),
+                    kind: RowKind::Image,
+                    entry_id: Arc::from(entry.id.as_str()),
+                    content: Content::ToolImages { references },
+                    copy_text: String::new(),
+                });
+                rows.push(Placed { core, gap: Gap::Block });
+            }
             tools.clear();
         };
         let nparts = entry.parts.len();
@@ -1241,6 +1267,23 @@ pub(crate) fn place_row(
             }
             h
         }
+        Content::ToolImages { references } => {
+            // One line of squares while they fit, wrapping past that.
+            let gap = px.v(6.0);
+            let side = px.v(TOOL_IMAGE).min(cw);
+            let cols = (((cw + gap) / (side + gap)).floor() as usize).max(1);
+            let lines = references.len().div_ceil(cols);
+            let h = lines as f32 * side + lines.saturating_sub(1) as f32 * gap;
+            if let Some(out) = out {
+                for (i, reference) in references.iter().enumerate() {
+                    let tx = x + (i % cols) as f32 * (side + gap);
+                    let ty = top + (i / cols) as f32 * (side + gap);
+                    out.fill(tx, ty, side, side, px.v(12.0), ColorRole::ChipBackground);
+                    out.widget(WidgetKind::Image { reference: reference.clone() }, (tx, ty, side, side), None);
+                }
+            }
+            h
+        }
         Content::Image { reference } => {
             let side = px.v(IMAGE).min(cw);
             if let Some(out) = out {
@@ -1484,6 +1527,7 @@ pub(crate) fn content_heap_bytes(content: &Content) -> usize {
         Content::Caption { text, .. } => text.p.heap_bytes(),
         Content::Notice(n) => n.text.p.heap_bytes(),
         Content::Image { reference } => reference.len(),
+        Content::ToolImages { references } => references.iter().map(String::len).sum(),
         Content::File(card) => card.name.p.heap_bytes() + card.meta.p.heap_bytes() + card.caption.as_ref().map_or(0, |c| c.p.heap_bytes()),
         Content::Working { .. } | Content::Visual(_) => 0,
     }

@@ -183,6 +183,20 @@ pub fn diff_stat(diff: &ToolDiff) -> ToolDiffStat {
     }
 }
 
+/// An image a tool call put in front of the model (the agent read an image
+/// file), copied into the host's uploads: `path` is the copy on the message's
+/// device, `name` the file the agent read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolImage {
+    pub path: String,
+    pub name: String,
+    pub mime_type: String,
+}
+
+/// Images one tool part keeps; a call returning more keeps its first ones.
+pub const MAX_TOOL_IMAGES: usize = zeron_proto::TOOL_IMAGES_MAX;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MessageStatus {
@@ -306,6 +320,11 @@ pub enum MessagePart {
         /// `output_bytes`): the UI says earlier output was trimmed.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         output_truncated: bool,
+        /// Images the call put in front of the model (an image file it
+        /// read), at most [`MAX_TOOL_IMAGES`]: they show with the call.
+        /// Additive; old readers ignore it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ToolImage>,
     },
     #[serde(rename_all = "camelCase")]
     Input {
@@ -383,10 +402,15 @@ impl MessagePart {
                 output,
                 diff,
                 diff_stats,
+                images,
                 ..
             } => {
                 serde_json::to_vec(call).map_or(0, |v| v.len())
                     + output.as_ref().map_or(0, String::len)
+                    + images
+                        .iter()
+                        .map(|i| i.path.len() + i.name.len() + i.mime_type.len())
+                        .sum::<usize>()
                     + diff
                         .as_ref()
                         .map_or(0, |d| serde_json::to_vec(d).map_or(0, |v| v.len()))
@@ -567,6 +591,29 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     subagent_tail: None,
                     exit_code: None,
                     output_truncated: false,
+                    images: Vec::new(),
+                });
+            }
+        }
+        // Only an engine-made copy folds (no inline bytes); a call that
+        // already holds this image or its full share keeps what it has.
+        AgentEvent::ToolImage {
+            tool_id,
+            path,
+            name,
+            mime_type,
+            data: None,
+        } => {
+            if let Some(images) = out.iter_mut().find_map(|p| match p {
+                MessagePart::Tool { id, images, .. } if id == tool_id => Some(images),
+                _ => None,
+            }) && images.len() < MAX_TOOL_IMAGES
+                && !images.iter().any(|i| i.path == *path)
+            {
+                images.push(ToolImage {
+                    path: path.clone(),
+                    name: name.clone(),
+                    mime_type: mime_type.clone(),
                 });
             }
         }
@@ -754,7 +801,9 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         | AgentEvent::PlanUsage { .. }
         | AgentEvent::ContextUsage { .. }
         | AgentEvent::AvailableCommands { .. }
-        | AgentEvent::UserMessage { .. } => {}
+        | AgentEvent::UserMessage { .. }
+        // Inline bytes never reach a doc: the engine copies them first.
+        | AgentEvent::ToolImage { data: Some(_), .. } => {}
     }
 }
 
@@ -1308,6 +1357,7 @@ mod tests {
                 subagent_tail: None,
                 exit_code: None,
                 output_truncated: false,
+                images: Vec::new(),
             },
         ];
         let chunks = split_parts(&parts);

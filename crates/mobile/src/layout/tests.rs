@@ -163,6 +163,7 @@ fn messages_the_agent_sent_show_as_one_line_naming_the_recipient() {
         subagent_tail: None,
         exit_code: None,
         output_truncated: false,
+        images: Vec::new(),
     };
     let mut w = worker(390.0);
     w.input = TranscriptInput {
@@ -721,6 +722,7 @@ fn running_subagent_shows_a_spinner_after_its_spawn_resolves() {
         subagent_tail: None,
         exit_code: None,
         output_truncated: false,
+        images: Vec::new(),
     };
     let frame_for = |status: SubagentStatus| {
         let mut w = worker(390.0);
@@ -917,6 +919,65 @@ fn media_lists_every_picture_and_video_in_order() {
     assert_eq!(video.file.as_ref().map(|f| f.transfer_id.clone()), Some(Some("t-f1".into())));
     // Every item names a row the frame has.
     assert!(media.iter().all(|m| frame.index_of(m.key).is_some()));
+}
+
+/// Images a tool read show as a thumbnail strip under the group (closed or
+/// open), and page in the thread's gallery.
+#[test]
+fn tool_images_show_under_their_group_and_page_in_the_gallery() {
+    let read = |id: &str, images: &[&str]| MessagePart::Tool {
+        id: id.into(),
+        call: zeron_proto::ToolCall::ReadFile { path: format!("/w/{id}.png") },
+        is_error: false,
+        resolved: true,
+        output: None,
+        diff: None,
+        output_ref: None,
+        output_bytes: None,
+        diff_ref: None,
+        diff_stats: None,
+        subagent_ref: None,
+        subagent_status: None,
+        subagent_tail: None,
+        exit_code: None,
+        output_truncated: false,
+        images: images
+            .iter()
+            .map(|p| zeron_client::ToolImage { path: (*p).into(), name: "shot.png".into(), mime_type: "image/png".into() })
+            .collect(),
+    };
+    let mut w = worker(390.0);
+    w.input = TranscriptInput {
+        entries: vec![Arc::new(SessionMessageEntry {
+            id: "a".into(),
+            role: MessageRole::Assistant,
+            parts: vec![read("r1", &["/up/1-read.png"]), read("r2", &["/up/2-read.png", "/up/3-read.png"]), read("r3", &[])],
+            created_at: 0,
+            device_id: String::new(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            duration_ms: None,
+        })],
+        ..Default::default()
+    };
+    let frame = w.pass();
+    assert_eq!(frame.row_count(), 2);
+    assert_eq!(frame.placement(0).unwrap().kind, RowKind::Tools);
+    assert_eq!(frame.placement(1).unwrap().kind, RowKind::Image);
+    let d = frame.display(1).unwrap();
+    let thumbs: Vec<(&str, f32, f32)> = d
+        .widgets
+        .iter()
+        .filter_map(|w| match &w.kind {
+            display::WidgetKind::Image { reference } => Some((reference.as_str(), w.y, w.h)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(thumbs.iter().map(|t| t.0).collect::<Vec<_>>(), ["/up/1-read.png", "/up/2-read.png", "/up/3-read.png"]);
+    // One line of thumbnails, smaller than a reply image.
+    assert!(thumbs.iter().all(|t| t.1 == thumbs[0].1 && t.2 < rows::geom::IMAGE));
+    let refs: Vec<String> = frame.media().into_iter().map(|m| m.reference).collect();
+    assert_eq!(refs, ["/up/1-read.png", "/up/2-read.png", "/up/3-read.png"]);
 }
 
 /// Every row of a one-message transcript at `width`.

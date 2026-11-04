@@ -195,6 +195,10 @@ const USER_CAPTION_GAP: f32 = 6.0;
 /// a wrapping strip. Fixed thumbnail sizes keep load-state flips from
 /// shifting the virtualizer.
 pub const ATT_THUMB_W: f32 = 112.0;
+/// A tool group's image thumbnails: this tall, as wide as the image's aspect
+/// asks up to [`TOOL_STRIP_THUMB_MAX_W`].
+const TOOL_STRIP_THUMB_H: f32 = 120.0;
+const TOOL_STRIP_THUMB_MAX_W: f32 = 240.0;
 pub const ATT_THUMB_H: f32 = 80.0;
 
 // ---------------------------------------------------------------------------
@@ -400,6 +404,9 @@ pub struct ToolItem {
     /// Image files the call read, wrote or printed (as reported; relative
     /// paths resolve against the chat cwd). Expanding the chip previews them.
     pub images: Arc<[SharedString]>,
+    /// Images the call put in front of the model, copied by the host (the
+    /// doc part's `images`): they show under the group, open or not.
+    pub read_images: Arc<[zeron_doc::ToolImage]>,
 }
 
 /// Subagent spawn chips — [`ToolCall::is_subagent_spawn`], the shared genus
@@ -766,6 +773,7 @@ fn thought_item(part_id: &str, tree: &BlockTree, live: bool) -> ToolItem {
         subagent_tail: None,
         kind: ToolItemKind::Thought,
         images: Arc::new([]),
+        read_images: Arc::new([]),
     }
 }
 
@@ -1052,6 +1060,13 @@ pub fn diff_to_file(diff: &zeron_proto::ToolDiff) -> crate::changes::FileDiff {
 
 #[derive(Clone)]
 pub enum RowKind {
+    /// The images a tool group's calls put in front of the model (image
+    /// files the agent read), as a thumbnail strip under the group. Shown
+    /// whether the group is open or not; a click opens the lightbox.
+    ToolImages {
+        owner: String,
+        images: Arc<[zeron_doc::ToolImage]>,
+    },
     GeneratedImage {
         owner: String,
         path: String,
@@ -1508,6 +1523,7 @@ pub fn rows_for_entry(
             }
             let tools = std::mem::take(group);
             let auto_open = streaming && last_ix == last_part_ix;
+            let images = tool_images_row(entry, &format!("{}#g{}", entry.id, group_ix), &tools);
             rows.push(Row {
                 id: format!("{}#g{}", entry.id, group_ix).into(),
                 version: tool_fingerprint(&tools, auto_open),
@@ -1524,6 +1540,7 @@ pub fn rows_for_entry(
                 copy_text: None,
                 compact_fold: None,
             });
+            rows.extend(images);
             *group_ix += 1;
         };
 
@@ -1542,6 +1559,7 @@ pub fn rows_for_entry(
                 subagent_ref,
                 subagent_status,
                 subagent_tail,
+                images,
                 ..
             } => {
                 // A message to another chat reads as one line naming the
@@ -1594,7 +1612,14 @@ pub fn rows_for_entry(
                     subagent_status: *subagent_status,
                     subagent_tail: subagent_tail.clone().map(SharedString::from),
                     kind: ToolItemKind::Call,
-                    images: crate::tool_images::image_paths(call, output.as_deref()),
+                    // A call with images of its own shows those under the
+                    // group; its chip doesn't preview them again.
+                    images: if images.is_empty() {
+                        crate::tool_images::image_paths(call, output.as_deref())
+                    } else {
+                        Arc::new([])
+                    },
+                    read_images: images.as_slice().into(),
                 };
                 if compact {
                     // Compact mode keeps ONE group for the whole turn —
@@ -1946,12 +1971,16 @@ pub fn rows_for_entry(
                 };
                 rows_for_entry(&work_entry, pending, false, parse)
             };
+            // The work's images stay in view under the folded header, so
+            // the unfolded rows don't repeat them.
+            inner.retain(|row| !matches!(row.kind, RowKind::ToolImages { .. }));
             for row in &mut inner {
                 row.turn_start = false;
                 row.timestamp = None;
                 row.copy_text = None;
                 row.compact_fold = Some(work_id.clone());
             }
+            let images = tool_images_row(entry, &work_id, &tools);
             let header = Row {
                 id: work_id,
                 version: tool_fingerprint(&tools, false),
@@ -1976,8 +2005,12 @@ pub fn rows_for_entry(
                 compact_fold: None,
             };
             let pos = compact_group_pos.unwrap_or(rows.len());
+            let after = pos + inner.len();
             for (i, row) in inner.into_iter().enumerate() {
                 rows.insert(pos + i, row);
+            }
+            if let Some(images) = images {
+                rows.insert(after, images);
             }
             rows.insert(pos, header);
         }
@@ -2009,6 +2042,36 @@ pub fn rows_for_entry(
         last.version ^= 1 << 62;
     }
     rows
+}
+
+/// The strip of images a tool group's calls put in front of the model, when
+/// any did: one row under the group, `{group_id}-images`.
+fn tool_images_row(entry: &SessionMessageEntry, group_id: &str, tools: &[ToolItem]) -> Option<Row> {
+    let images: Arc<[zeron_doc::ToolImage]> = tools
+        .iter()
+        .flat_map(|tool| tool.read_images.iter().cloned())
+        .collect();
+    if images.is_empty() {
+        return None;
+    }
+    let mut key = entry.device_id.clone();
+    for image in images.iter() {
+        key.push('\0');
+        key.push_str(&image.path);
+    }
+    Some(Row {
+        id: format!("{group_id}-images").into(),
+        version: fnv1a(key.as_bytes()),
+        turn_start: false,
+        kind: RowKind::ToolImages {
+            owner: entry.device_id.clone(),
+            images,
+        },
+        entry_id: entry.id.clone().into(),
+        timestamp: None,
+        copy_text: None,
+        compact_fold: None,
+    })
 }
 
 fn is_compact_work_part(ix: usize, part: &MessagePart, reply_start: Option<usize>) -> bool {
@@ -7495,6 +7558,103 @@ impl Transcript {
         }
     }
 
+    /// A tool group's images: thumbnails in a wrapping row, each opening the
+    /// lightbox (right-click: copy path / image). Loaded like generated
+    /// images, from the host's copies.
+    fn render_tool_images(
+        &mut self,
+        row_id: &SharedString,
+        owner: &str,
+        images: &[zeron_doc::ToolImage],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::attachments::AttachmentSnapshot;
+        let devices = self.generated_attachment_device_ids(owner, cx);
+        let theme = Theme::of(cx).clone();
+        let mut strip = div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_start()
+            .gap(px(8.0))
+            .pt(px(2.0))
+            .pb(px(4.0));
+        for (ix, image) in images.iter().enumerate() {
+            let state = self.attachment_state(&devices, &image.path, Some(&image.mime_type), cx);
+            let frame = div()
+                .id(SharedString::from(format!("{row_id}#{ix}")))
+                .flex_none()
+                .h(px(TOOL_STRIP_THUMB_H))
+                .rounded(px(8.0))
+                .overflow_hidden()
+                .border_1()
+                .border_color(crate::theme::hairline(0.11))
+                .bg(crate::theme::ink(0.035));
+            let thumb = match state {
+                AttachmentSnapshot::Loaded(loaded) => {
+                    let (w, h) = crate::appshots::png_dimensions(&loaded.image.bytes)
+                        .map_or((4.0, 3.0), |(w, h)| (w.max(1) as f32, h.max(1) as f32));
+                    let inner_h = TOOL_STRIP_THUMB_H - 2.0;
+                    let width = (inner_h * w / h).clamp(TOOL_STRIP_THUMB_H * 0.6, TOOL_STRIP_THUMB_MAX_W);
+                    let preview = crate::attachments::PreviewImage::new(
+                        image.name.clone(),
+                        loaded.image.clone(),
+                    );
+                    let (menu_path, menu_devices) = (image.path.clone(), devices.clone());
+                    frame
+                        .w(px(width + 2.0))
+                        .cursor_pointer()
+                        .role(gpui::Role::Button)
+                        .aria_label(format!("Preview {}", image.name))
+                        .on_mouse_down(
+                            gpui::MouseButton::Right,
+                            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.open_image_menu(
+                                    menu_path.clone(),
+                                    menu_devices.clone(),
+                                    event.position,
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_image_preview(preview.clone(), window, cx)
+                        }))
+                        .child(
+                            img(loaded.image.clone())
+                                .w(px(width))
+                                .h(px(inner_h))
+                                .rounded(px(7.0))
+                                .object_fit(ObjectFit::Cover),
+                        )
+                        .into_any_element()
+                }
+                AttachmentSnapshot::Loading | AttachmentSnapshot::Error { .. } => {
+                    let label = if matches!(state, AttachmentSnapshot::Loading) {
+                        "Loading…"
+                    } else {
+                        "Unavailable"
+                    };
+                    frame
+                        .w(px(TOOL_STRIP_THUMB_H * 1.4))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted)
+                        .child(label)
+                        .into_any_element()
+                }
+            };
+            strip = strip.child(thumb);
+        }
+        strip.into_any_element()
+    }
+
     fn render_visual(
         &mut self,
         row_id: &SharedString,
@@ -8391,6 +8551,9 @@ impl Transcript {
                 name,
                 mime_type,
             } => self.render_generated_image(&row.id, owner, path, name, mime_type, cx),
+            RowKind::ToolImages { owner, images } => {
+                self.render_tool_images(&row.id, owner, images, cx)
+            }
             RowKind::Visual { owner, path, title } => {
                 self.render_visual(&row.id, owner, path, title, cx)
             }
@@ -13365,6 +13528,7 @@ mod tests {
             subagent_tail: None,
             exit_code: None,
             output_truncated: false,
+            images: Vec::new(),
         };
         let entry = assistant(
             "a1",
@@ -13911,6 +14075,47 @@ mod tests {
         assert_eq!(rows.len(), 4);
         assert!(matches!(rows[1].kind, RowKind::ToolGroup { .. }));
         assert!(matches!(rows[2].kind, RowKind::GeneratedImage { .. }));
+    }
+
+    /// A read image shows as a strip under its group (its chip doesn't
+    /// preview it again), and stays in view when compact mode folds the work.
+    #[test]
+    fn read_images_show_under_their_group_open_or_not() {
+        let mut read = tool_part("r", "unused");
+        let MessagePart::Tool { call, images, .. } = &mut read else {
+            unreachable!()
+        };
+        *call = ToolCall::ReadFile {
+            path: "/w/shot.png".into(),
+        };
+        images.push(zeron_doc::ToolImage {
+            path: "/uploads/h-read.png".into(),
+            name: "shot.png".into(),
+            mime_type: "image/png".into(),
+        });
+        let entry = assistant(
+            "a",
+            MessageStatus::Complete,
+            vec![tool_part("t", "ls"), read, text_part("x", "done")],
+        );
+        let rows = rows_for_entry(&entry, false, false, &mut parse);
+        let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
+            panic!("the group leads");
+        };
+        assert!(tools.iter().all(|t| t.images.is_empty()));
+        let RowKind::ToolImages { owner, images } = &rows[1].kind else {
+            panic!("the strip follows its group");
+        };
+        assert_eq!((owner.as_str(), images.len()), ("dev", 1));
+        assert_eq!(images[0].name, "shot.png");
+
+        let compact = rows_for_entry(&entry, false, true, &mut parse);
+        let strips: Vec<&Row> = compact
+            .iter()
+            .filter(|row| matches!(row.kind, RowKind::ToolImages { .. }))
+            .collect();
+        assert_eq!(strips.len(), 1, "one strip, not one per fold state");
+        assert!(strips[0].compact_fold.is_none(), "visible while folded");
     }
 
     #[test]
@@ -14561,6 +14766,7 @@ mod tests {
             subagent_tail: None,
             exit_code: None,
             output_truncated: false,
+            images: Vec::new(),
         }
     }
 
@@ -14685,6 +14891,7 @@ mod tests {
             subagent_tail: None,
             exit_code: None,
             output_truncated: false,
+            images: Vec::new(),
         }
     }
 
@@ -17448,6 +17655,7 @@ mod tests {
             subagent_tail: None,
             kind: ToolItemKind::Call,
             images: Arc::new([]),
+            read_images: Arc::new([]),
         };
         let edit = |p: &str| ToolItem {
             part_id: "fixture".into(),
@@ -17468,6 +17676,7 @@ mod tests {
             subagent_tail: None,
             kind: ToolItemKind::Call,
             images: Arc::new([]),
+            read_images: Arc::new([]),
         };
         let tools = vec![
             exec("ls"),
@@ -17504,6 +17713,7 @@ mod tests {
                 subagent_tail: None,
                 kind: ToolItemKind::Call,
                 images: Arc::new([]),
+                read_images: Arc::new([]),
             },
             ToolItem {
                 part_id: "fixture".into(),
@@ -17522,6 +17732,7 @@ mod tests {
                 subagent_tail: None,
                 kind: ToolItemKind::Call,
                 images: Arc::new([]),
+                read_images: Arc::new([]),
             },
             ToolItem {
                 part_id: "fixture".into(),
@@ -17538,6 +17749,7 @@ mod tests {
                 subagent_tail: None,
                 kind: ToolItemKind::Call,
                 images: Arc::new([]),
+                read_images: Arc::new([]),
             },
         ];
         assert_eq!(tool_group_summary(&tools), "Read 1 file · searched 2 times");
@@ -17681,6 +17893,7 @@ mod tests {
         let read = |path: &str| ToolItem {
             part_id: "fixture".into(),
             images: Default::default(),
+            read_images: Arc::new([]),
             call: ToolCall::ReadFile { path: path.into() },
             is_error: false,
             resolved: true,
