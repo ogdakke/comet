@@ -1099,6 +1099,12 @@ public protocol CoreClientProtocol: AnyObject, Sendable {
     func executionDevices()  -> [DeviceView]
     
     /**
+     * A file the agent sent, on this device (fetched once, resumable, kept
+     * in the cache dir): its local path. Falls back to the host's copy.
+     */
+    func fetchSharedFile(file: SharedFileRequest) async throws  -> String
+    
+    /**
      * Threads page: pinned, sections, recent.
      */
     func frontPage()  -> FrontPage
@@ -1227,6 +1233,18 @@ public protocol CoreClientProtocol: AnyObject, Sendable {
     func setSectionCollapsed(sectionId: String, collapsed: Bool) throws 
     
     func setSessionConfig(chatId: String, config: ChatConfig) throws 
+    
+    /**
+     * Fraction fetched while `fetch_shared_file` downloads through the edge.
+     */
+    func sharedFileProgress(file: SharedFileRequest)  -> Double?
+    
+    /**
+     * A streamable URL (byte ranges) for a file the agent sent, valid for
+     * hours: hand it to AVPlayer. `None` when the edge has no copy; then
+     * open `fetch_shared_file`'s local copy instead.
+     */
+    func sharedFileUrl(chatId: String, transferId: String) async throws  -> String?
     
     /**
      * Stop all background work (sign-out). Snapshots stay readable.
@@ -1729,6 +1747,26 @@ open func executionDevices() -> [DeviceView]  {
 }
     
     /**
+     * A file the agent sent, on this device (fetched once, resumable, kept
+     * in the cache dir): its local path. Falls back to the host's copy.
+     */
+open func fetchSharedFile(file: SharedFileRequest)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_zeron_mobile_fn_method_coreclient_fetch_shared_file(
+                        self.uniffiCloneHandle(),FfiConverterTypeSharedFileRequest_lower(file)
+                )
+            },
+            pollFunc: ffi_zeron_mobile_rust_future_poll_rust_buffer,
+            completeFunc: ffi_zeron_mobile_rust_future_complete_rust_buffer,
+            freeFunc: ffi_zeron_mobile_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
      * Threads page: pinned, sections, recent.
      */
 open func frontPage() -> FrontPage  {
@@ -2160,6 +2198,40 @@ open func setSessionConfig(chatId: String, config: ChatConfig)throws   {try rust
         FfiConverterTypeChatConfig_lower(config),uniffiCallStatus
     )
 }
+}
+    
+    /**
+     * Fraction fetched while `fetch_shared_file` downloads through the edge.
+     */
+open func sharedFileProgress(file: SharedFileRequest) -> Double?  {
+    return try!  FfiConverterOptionDouble.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_zeron_mobile_fn_method_coreclient_shared_file_progress(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeSharedFileRequest_lower(file),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * A streamable URL (byte ranges) for a file the agent sent, valid for
+     * hours: hand it to AVPlayer. `None` when the edge has no copy; then
+     * open `fetch_shared_file`'s local copy instead.
+     */
+open func sharedFileUrl(chatId: String, transferId: String)async throws  -> String?  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_zeron_mobile_fn_method_coreclient_shared_file_url(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(chatId),FfiConverterString.lower(transferId)
+                )
+            },
+            pollFunc: ffi_zeron_mobile_rust_future_poll_rust_buffer,
+            completeFunc: ffi_zeron_mobile_rust_future_complete_rust_buffer,
+            freeFunc: ffi_zeron_mobile_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionString.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
     /**
@@ -11029,14 +11101,30 @@ public func FfiConverterTypeOrbFrame_lower(_ value: OrbFrame) -> RustBuffer {
 public struct OutgoingAttachment: Equatable, Hashable {
     public var name: String
     public var mimeType: String
+    /**
+     * The bytes; empty when `path` names the file instead.
+     */
     public var data: Data
+    /**
+     * A file on this device the core takes over (moves into its stash):
+     * large files go this way, never through memory.
+     */
+    public var path: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(name: String, mimeType: String, data: Data) {
+    public init(name: String, mimeType: String, 
+        /**
+         * The bytes; empty when `path` names the file instead.
+         */data: Data, 
+        /**
+         * A file on this device the core takes over (moves into its stash):
+         * large files go this way, never through memory.
+         */path: String? = nil) {
         self.name = name
         self.mimeType = mimeType
         self.data = data
+        self.path = path
     }
 
     
@@ -11057,7 +11145,8 @@ public struct FfiConverterTypeOutgoingAttachment: FfiConverterRustBuffer {
             try OutgoingAttachment(
                 name: FfiConverterString.read(from: &buf), 
                 mimeType: FfiConverterString.read(from: &buf), 
-                data: FfiConverterData.read(from: &buf)
+                data: FfiConverterData.read(from: &buf), 
+                path: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -11065,6 +11154,7 @@ public struct FfiConverterTypeOutgoingAttachment: FfiConverterRustBuffer {
         FfiConverterString.write(value.name, into: &buf)
         FfiConverterString.write(value.mimeType, into: &buf)
         FfiConverterData.write(value.data, into: &buf)
+        FfiConverterOptionString.write(value.path, into: &buf)
     }
 }
 
@@ -12770,6 +12860,82 @@ public func FfiConverterTypeSessionRow_lift(_ buf: RustBuffer) throws -> Session
 #endif
 public func FfiConverterTypeSessionRow_lower(_ value: SessionRow) -> RustBuffer {
     return FfiConverterTypeSessionRow.lower(value)
+}
+
+
+/**
+ * A file the agent sent, as its transcript widget names it
+ * (`WidgetKind::File`).
+ */
+public struct SharedFileRequest: Equatable, Hashable {
+    /**
+     * The chat's host.
+     */
+    public var deviceId: String
+    public var chatId: String
+    public var transferId: String?
+    public var path: String
+    public var name: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The chat's host.
+         */deviceId: String, chatId: String, transferId: String?, path: String, name: String) {
+        self.deviceId = deviceId
+        self.chatId = chatId
+        self.transferId = transferId
+        self.path = path
+        self.name = name
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SharedFileRequest: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSharedFileRequest: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SharedFileRequest {
+        return
+            try SharedFileRequest(
+                deviceId: FfiConverterString.read(from: &buf), 
+                chatId: FfiConverterString.read(from: &buf), 
+                transferId: FfiConverterOptionString.read(from: &buf), 
+                path: FfiConverterString.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SharedFileRequest, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.deviceId, into: &buf)
+        FfiConverterString.write(value.chatId, into: &buf)
+        FfiConverterOptionString.write(value.transferId, into: &buf)
+        FfiConverterString.write(value.path, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSharedFileRequest_lift(_ buf: RustBuffer) throws -> SharedFileRequest {
+    return try FfiConverterTypeSharedFileRequest.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSharedFileRequest_lower(_ value: SharedFileRequest) -> RustBuffer {
+    return FfiConverterTypeSharedFileRequest.lower(value)
 }
 
 
@@ -17480,6 +17646,7 @@ public enum RowKind: Equatable, Hashable {
     case image
     case working
     case visual
+    case file
 
 
 
@@ -17516,6 +17683,8 @@ public struct FfiConverterTypeRowKind: FfiConverterRustBuffer {
         case 7: return .working
         
         case 8: return .visual
+        
+        case 9: return .file
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -17555,6 +17724,10 @@ public struct FfiConverterTypeRowKind: FfiConverterRustBuffer {
         
         case .visual:
             writeInt(&buf, Int32(8))
+        
+        
+        case .file:
+            writeInt(&buf, Int32(9))
         
         }
     }
@@ -19511,6 +19684,14 @@ public enum WidgetKind: Equatable, Hashable {
      */
     case shimmer
     /**
+     * A file the agent sent (tap opens it). `path` reads through the host
+     * (`read_attachment`); `transfer_id` names its R2 copy when there is one
+     * (`transfer_content_url` / `fetch_shared_file`). `artifact` groups the
+     * versions of one file.
+     */
+    case file(id: String, path: String, name: String, mimeType: String, size: UInt64, transferId: String?, artifact: String, version: UInt32
+    )
+    /**
      * An agent visual; `TranscriptView::visual(id)` is its live session.
      */
     case visual(id: String
@@ -19581,13 +19762,16 @@ public struct FfiConverterTypeWidgetKind: FfiConverterRustBuffer {
         
         case 12: return .shimmer
         
-        case 13: return .visual(id: try FfiConverterString.read(from: &buf)
+        case 13: return .file(id: try FfiConverterString.read(from: &buf), path: try FfiConverterString.read(from: &buf), name: try FfiConverterString.read(from: &buf), mimeType: try FfiConverterString.read(from: &buf), size: try FfiConverterUInt64.read(from: &buf), transferId: try FfiConverterOptionString.read(from: &buf), artifact: try FfiConverterString.read(from: &buf), version: try FfiConverterUInt32.read(from: &buf)
         )
         
-        case 14: return .action(action: try FfiConverterString.read(from: &buf), label: try FfiConverterString.read(from: &buf)
+        case 14: return .visual(id: try FfiConverterString.read(from: &buf)
         )
         
-        case 15: return .subagent(docId: try FfiConverterOptionString.read(from: &buf), title: try FfiConverterString.read(from: &buf), running: try FfiConverterBool.read(from: &buf), failed: try FfiConverterBool.read(from: &buf)
+        case 15: return .action(action: try FfiConverterString.read(from: &buf), label: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 16: return .subagent(docId: try FfiConverterOptionString.read(from: &buf), title: try FfiConverterString.read(from: &buf), running: try FfiConverterBool.read(from: &buf), failed: try FfiConverterBool.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -19664,19 +19848,31 @@ public struct FfiConverterTypeWidgetKind: FfiConverterRustBuffer {
             writeInt(&buf, Int32(12))
         
         
-        case let .visual(id):
+        case let .file(id,path,name,mimeType,size,transferId,artifact,version):
             writeInt(&buf, Int32(13))
+            FfiConverterString.write(id, into: &buf)
+            FfiConverterString.write(path, into: &buf)
+            FfiConverterString.write(name, into: &buf)
+            FfiConverterString.write(mimeType, into: &buf)
+            FfiConverterUInt64.write(size, into: &buf)
+            FfiConverterOptionString.write(transferId, into: &buf)
+            FfiConverterString.write(artifact, into: &buf)
+            FfiConverterUInt32.write(version, into: &buf)
+            
+        
+        case let .visual(id):
+            writeInt(&buf, Int32(14))
             FfiConverterString.write(id, into: &buf)
             
         
         case let .action(action,label):
-            writeInt(&buf, Int32(14))
+            writeInt(&buf, Int32(15))
             FfiConverterString.write(action, into: &buf)
             FfiConverterString.write(label, into: &buf)
             
         
         case let .subagent(docId,title,running,failed):
-            writeInt(&buf, Int32(15))
+            writeInt(&buf, Int32(16))
             FfiConverterOptionString.write(docId, into: &buf)
             FfiConverterString.write(title, into: &buf)
             FfiConverterBool.write(running, into: &buf)
@@ -22309,6 +22505,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_zeron_mobile_checksum_method_coreclient_execution_devices() != 15578) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_zeron_mobile_checksum_method_coreclient_fetch_shared_file() != 62318) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_zeron_mobile_checksum_method_coreclient_front_page() != 3792) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -22409,6 +22608,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_coreclient_set_session_config() != 56055) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_coreclient_shared_file_progress() != 38688) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_coreclient_shared_file_url() != 56893) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_coreclient_shutdown() != 4352) {

@@ -43,6 +43,8 @@ protocol RowViewDelegate: AnyObject {
     /// A subagent card was tapped: its transcript doc, title, and whether it
     /// still runs.
     func rowView(_ view: RowView, openSubagent docId: String, title: String, running: Bool)
+    /// A shared file's card was tapped.
+    func rowView(_ view: RowView, openFile file: SharedFile)
 }
 
 /// A reusable transcript row: canvas + horizontal scrollers + native widgets.
@@ -172,6 +174,7 @@ final class RowView: UIView {
         case .image: "row-image"
         case .working: "row-working"
         case .visual: "row-visual"
+        case .file: "row-file"
         }
         element.accessibilityTraits = .staticText
         element.accessibilityFrameInContainerSpace = bounds
@@ -335,6 +338,19 @@ final class RowView: UIView {
                     }, for: .touchUpInside)
                 }
                 view = card
+            case let .file(_, path, name, mimeType, size, transferId, _, _):
+                // The card is painted by the core; this is its tap target.
+                let control = UIControl()
+                control.accessibilityLabel = name
+                control.accessibilityTraits = .button
+                control.accessibilityIdentifier = "file-card"
+                let file = SharedFile(name: name, mimeType: mimeType, path: path, transferId: transferId, size: size)
+                control.addAction(UIAction { [weak self] _ in
+                    guard let self else { return }
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    self.delegate?.rowView(self, openFile: file)
+                }, for: .touchUpInside)
+                view = control
             case .shimmer:
                 view = ShimmerView(model: model!, rect: rect)
             case let .visual(id):

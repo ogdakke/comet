@@ -1,12 +1,28 @@
 import PhotosUI
 import UIKit
 
-/// An image staged in the composer before sending.
+/// A file staged by path: a video or any other file. The core moves it into
+/// its stash on send, so it is a temp copy this app owns.
+struct StagedFile: Equatable {
+    let url: URL
+    let size: Int64
+    let mimeType: String
+}
+
+/// An image (data) or a file (path) staged in the composer before sending.
 struct StagedImage: Identifiable, Equatable {
     let id: String
     let name: String
-    let data: Data
-    let thumbnail: UIImage
+    var data = Data()
+    /// Nil for a file with nothing to show: its chip draws a symbol and name.
+    var thumbnail: UIImage?
+    var file: StagedFile?
+
+    /// Deletes the temp copy of a file that won't be sent.
+    func discard() {
+        guard let file else { return }
+        try? FileManager.default.removeItem(at: file.url.deletingLastPathComponent())
+    }
 }
 
 /// How a message sent during a running turn is delivered.
@@ -475,12 +491,16 @@ final class ComposerBar: UIView, UITextViewDelegate, UIGestureRecognizerDelegate
         images.append(contentsOf: new.prefix(max(0, 8 - images.count)))
     }
 
-    func clearImages() { images.removeAll() }
+    func clearImages() {
+        images.forEach { $0.discard() }
+        images.removeAll()
+    }
 
     private func rebuildThumbs() {
         thumbs.arrangedSubviews.forEach { $0.removeFromSuperview() }
         for img in images {
             let iv = UIImageView(image: img.thumbnail)
+            if img.thumbnail == nil { iv.backgroundColor = Palette.chip }
             iv.contentMode = .scaleAspectFill
             iv.clipsToBounds = true
             iv.layer.cornerRadius = 14
@@ -498,12 +518,35 @@ final class ComposerBar: UIView, UITextViewDelegate, UIGestureRecognizerDelegate
             x.cornerStyle = .capsule
             x.contentInsets = .zero
             let remove = UIButton(configuration: x)
-            remove.accessibilityLabel = "Remove image"
+            remove.accessibilityLabel = "Remove \(img.name)"
             remove.translatesAutoresizingMaskIntoConstraints = false
             remove.addAction(UIAction { [weak self] _ in
+                img.discard()
                 UIView.animate(withDuration: 0.25) { self?.images.removeAll { $0.id == img.id } }
             }, for: .touchUpInside)
             iv.addSubview(remove)
+            if img.thumbnail == nil {
+                let glyph = UIImageView(image: UIImage(systemName: img.file?.mimeType.hasPrefix("video/") == true ? "play.rectangle" : "doc", withConfiguration: UIImage.SymbolConfiguration(pointSize: 16, weight: .medium)))
+                glyph.tintColor = Palette.secondary
+                glyph.contentMode = .center
+                let label = UILabel()
+                label.text = img.name
+                label.font = Fonts.ui(.sansMedium, 9)
+                label.textColor = Palette.secondary
+                label.textAlignment = .center
+                label.lineBreakMode = .byTruncatingMiddle
+                for v in [glyph, label] {
+                    v.translatesAutoresizingMaskIntoConstraints = false
+                    iv.addSubview(v)
+                }
+                NSLayoutConstraint.activate([
+                    glyph.centerXAnchor.constraint(equalTo: iv.centerXAnchor),
+                    glyph.centerYAnchor.constraint(equalTo: iv.centerYAnchor, constant: -8),
+                    label.leadingAnchor.constraint(equalTo: iv.leadingAnchor, constant: 4),
+                    label.trailingAnchor.constraint(equalTo: iv.trailingAnchor, constant: -4),
+                    label.bottomAnchor.constraint(equalTo: iv.bottomAnchor, constant: -6),
+                ])
+            }
             NSLayoutConstraint.activate([
                 remove.topAnchor.constraint(equalTo: iv.topAnchor, constant: 4),
                 remove.trailingAnchor.constraint(equalTo: iv.trailingAnchor, constant: -4),

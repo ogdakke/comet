@@ -388,6 +388,11 @@ final class CoreSessionSource: SessionSource {
         (try? await client.searchFiles(deviceId: hostDevice, chatId: chatId, spaceId: nil, query: query)) ?? []
     }
 
+    func fileViewer(for file: SharedFile) -> UIViewController? {
+        guard !hostDevice.isEmpty else { return nil }
+        return FileViewerController.presentable(file: file, client: client, chatId: chatId, hostDevice: hostDevice)
+    }
+
     private static let images = NSCache<NSString, UIImage>()
 
     func image(_ reference: String) async -> UIImage? {

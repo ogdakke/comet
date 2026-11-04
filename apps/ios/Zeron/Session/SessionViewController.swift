@@ -101,6 +101,10 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
             guard let self else { return }
             self.presentCompanion(SubagentViewController(app: self.app, parentId: self.chatId, docId: doc, title: title, running: running))
         }
+        list.onFile = { [weak self] file in
+            guard let self, let viewer = self.source.fileViewer(for: file) else { return }
+            self.present(viewer, animated: true)
+        }
         list.onOpenChat = { [weak self] id in
             guard let self, id != self.chatId else { return }
             // On the phone the sender's chat pushes over this one, so Back

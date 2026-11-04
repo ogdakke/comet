@@ -257,6 +257,20 @@ typedef void (*UniffiCallbackInterfaceUploadProgressMethod0)(uint64_t, double, v
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_STUDIO_STREAM_SINK_METHOD0
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_STUDIO_STREAM_SINK_METHOD0
+typedef void (*UniffiCallbackInterfaceStudioStreamSinkMethod0)(uint64_t, RustBuffer, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_STUDIO_STREAM_SINK_METHOD1
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_STUDIO_STREAM_SINK_METHOD1
+typedef void (*UniffiCallbackInterfaceStudioStreamSinkMethod1)(uint64_t, RustBuffer, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
 #ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_VOICE_MEDIA_LISTENER_METHOD0
 #define UNIFFI_FFIDEF_CALLBACK_INTERFACE_VOICE_MEDIA_LISTENER_METHOD0
 typedef void (*UniffiCallbackInterfaceVoiceMediaListenerMethod0)(uint64_t, RustBuffer, void* _Nonnull, 
@@ -343,6 +357,16 @@ typedef struct UniffiVTableCallbackInterfaceUploadProgress {
     UniffiCallbackInterfaceClone _Nonnull uniffiClone;
     UniffiCallbackInterfaceUploadProgressMethod0 _Nonnull onProgress;
 } UniffiVTableCallbackInterfaceUploadProgress;
+
+#endif
+#ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_STUDIO_STREAM_SINK
+#define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_STUDIO_STREAM_SINK
+typedef struct UniffiVTableCallbackInterfaceStudioStreamSink {
+    UniffiCallbackInterfaceFree _Nonnull uniffiFree;
+    UniffiCallbackInterfaceClone _Nonnull uniffiClone;
+    UniffiCallbackInterfaceStudioStreamSinkMethod0 _Nonnull onItem;
+    UniffiCallbackInterfaceStudioStreamSinkMethod1 _Nonnull onEnd;
+} UniffiVTableCallbackInterfaceStudioStreamSink;
 
 #endif
 #ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_VOICE_MEDIA_LISTENER
@@ -543,6 +567,11 @@ RustBuffer uniffi_zeron_mobile_fn_method_coreclient_devices(uint64_t ptr, RustCa
 RustBuffer uniffi_zeron_mobile_fn_method_coreclient_execution_devices(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_CORECLIENT_FETCH_SHARED_FILE
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_CORECLIENT_FETCH_SHARED_FILE
+uint64_t uniffi_zeron_mobile_fn_method_coreclient_fetch_shared_file(uint64_t ptr, RustBuffer file
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_CORECLIENT_FRONT_PAGE
 #define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_CORECLIENT_FRONT_PAGE
 RustBuffer uniffi_zeron_mobile_fn_method_coreclient_front_page(uint64_t ptr, RustCallStatus *_Nonnull out_status
@@ -711,6 +740,16 @@ void uniffi_zeron_mobile_fn_method_coreclient_set_section_collapsed(uint64_t ptr
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_CORECLIENT_SET_SESSION_CONFIG
 #define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_CORECLIENT_SET_SESSION_CONFIG
 void uniffi_zeron_mobile_fn_method_coreclient_set_session_config(uint64_t ptr, RustBuffer chat_id, RustBuffer config, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_CORECLIENT_SHARED_FILE_PROGRESS
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_CORECLIENT_SHARED_FILE_PROGRESS
+RustBuffer uniffi_zeron_mobile_fn_method_coreclient_shared_file_progress(uint64_t ptr, RustBuffer file, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_CORECLIENT_SHARED_FILE_URL
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_CORECLIENT_SHARED_FILE_URL
+uint64_t uniffi_zeron_mobile_fn_method_coreclient_shared_file_url(uint64_t ptr, RustBuffer chat_id, RustBuffer transfer_id
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_CORECLIENT_SHUTDOWN
@@ -933,6 +972,16 @@ uint64_t uniffi_zeron_mobile_fn_method_coreclient_device_login_start(uint64_t pt
 uint64_t uniffi_zeron_mobile_fn_method_coreclient_set_harness_enabled(uint64_t ptr, RustBuffer device_id, RustBuffer harness, int8_t enabled
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_CORECLIENT_STUDIO_CALL
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_CORECLIENT_STUDIO_CALL
+uint64_t uniffi_zeron_mobile_fn_method_coreclient_studio_call(uint64_t ptr, RustBuffer device_id, RustBuffer method, RustBuffer params_json
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_CORECLIENT_STUDIO_WATCH
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_CORECLIENT_STUDIO_WATCH
+uint64_t uniffi_zeron_mobile_fn_method_coreclient_studio_watch(uint64_t ptr, RustBuffer device_id, RustBuffer method, RustBuffer params_json, uint64_t sink, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_CORECLIENT_START_VOICE
 #define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_CORECLIENT_START_VOICE
 uint64_t uniffi_zeron_mobile_fn_method_coreclient_start_voice(uint64_t ptr, RustBuffer host_device_id, RustBuffer voice, uint64_t media, uint64_t listener, RustCallStatus *_Nonnull out_status
@@ -1081,6 +1130,46 @@ void uniffi_zeron_mobile_fn_method_sessionhandle_set_view_attached(uint64_t ptr,
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_SESSIONHANDLE_TRANSCRIPT_STATUS
 #define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_SESSIONHANDLE_TRANSCRIPT_STATUS
 RustBuffer uniffi_zeron_mobile_fn_method_sessionhandle_transcript_status(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_CLONE_STUDIOSTREAM
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_CLONE_STUDIOSTREAM
+uint64_t uniffi_zeron_mobile_fn_clone_studiostream(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_FREE_STUDIOSTREAM
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_FREE_STUDIOSTREAM
+void uniffi_zeron_mobile_fn_free_studiostream(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_STUDIOSTREAM_CANCEL
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_STUDIOSTREAM_CANCEL
+void uniffi_zeron_mobile_fn_method_studiostream_cancel(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_CLONE_STUDIOSTREAMSINK
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_CLONE_STUDIOSTREAMSINK
+uint64_t uniffi_zeron_mobile_fn_clone_studiostreamsink(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_FREE_STUDIOSTREAMSINK
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_FREE_STUDIOSTREAMSINK
+void uniffi_zeron_mobile_fn_free_studiostreamsink(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_INIT_CALLBACK_VTABLE_STUDIOSTREAMSINK
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_INIT_CALLBACK_VTABLE_STUDIOSTREAMSINK
+void uniffi_zeron_mobile_fn_init_callback_vtable_studiostreamsink(const UniffiVTableCallbackInterfaceStudioStreamSink* _Nonnull vtable
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_STUDIOSTREAMSINK_ON_ITEM
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_STUDIOSTREAMSINK_ON_ITEM
+void uniffi_zeron_mobile_fn_method_studiostreamsink_on_item(uint64_t ptr, RustBuffer json, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_STUDIOSTREAMSINK_ON_END
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_METHOD_STUDIOSTREAMSINK_ON_END
+void uniffi_zeron_mobile_fn_method_studiostreamsink_on_end(uint64_t ptr, RustBuffer error, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_CLONE_VOICECALL
@@ -2304,6 +2393,12 @@ uint16_t uniffi_zeron_mobile_checksum_method_coreclient_execution_devices(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_CORECLIENT_FETCH_SHARED_FILE
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_CORECLIENT_FETCH_SHARED_FILE
+uint16_t uniffi_zeron_mobile_checksum_method_coreclient_fetch_shared_file(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_CORECLIENT_FRONT_PAGE
 #define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_CORECLIENT_FRONT_PAGE
 uint16_t uniffi_zeron_mobile_checksum_method_coreclient_front_page(void
@@ -2505,6 +2600,18 @@ uint16_t uniffi_zeron_mobile_checksum_method_coreclient_set_section_collapsed(vo
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_CORECLIENT_SET_SESSION_CONFIG
 #define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_CORECLIENT_SET_SESSION_CONFIG
 uint16_t uniffi_zeron_mobile_checksum_method_coreclient_set_session_config(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_CORECLIENT_SHARED_FILE_PROGRESS
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_CORECLIENT_SHARED_FILE_PROGRESS
+uint16_t uniffi_zeron_mobile_checksum_method_coreclient_shared_file_progress(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_CORECLIENT_SHARED_FILE_URL
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_CORECLIENT_SHARED_FILE_URL
+uint16_t uniffi_zeron_mobile_checksum_method_coreclient_shared_file_url(void
     
 );
 #endif
@@ -2772,6 +2879,18 @@ uint16_t uniffi_zeron_mobile_checksum_method_coreclient_set_harness_enabled(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_CORECLIENT_STUDIO_CALL
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_CORECLIENT_STUDIO_CALL
+uint16_t uniffi_zeron_mobile_checksum_method_coreclient_studio_call(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_CORECLIENT_STUDIO_WATCH
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_CORECLIENT_STUDIO_WATCH
+uint16_t uniffi_zeron_mobile_checksum_method_coreclient_studio_watch(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_CORECLIENT_START_VOICE
 #define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_CORECLIENT_START_VOICE
 uint16_t uniffi_zeron_mobile_checksum_method_coreclient_start_voice(void
@@ -2919,6 +3038,24 @@ uint16_t uniffi_zeron_mobile_checksum_method_sessionhandle_set_view_attached(voi
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_SESSIONHANDLE_TRANSCRIPT_STATUS
 #define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_SESSIONHANDLE_TRANSCRIPT_STATUS
 uint16_t uniffi_zeron_mobile_checksum_method_sessionhandle_transcript_status(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_STUDIOSTREAM_CANCEL
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_STUDIOSTREAM_CANCEL
+uint16_t uniffi_zeron_mobile_checksum_method_studiostream_cancel(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_STUDIOSTREAMSINK_ON_ITEM
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_STUDIOSTREAMSINK_ON_ITEM
+uint16_t uniffi_zeron_mobile_checksum_method_studiostreamsink_on_item(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_STUDIOSTREAMSINK_ON_END
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_METHOD_STUDIOSTREAMSINK_ON_END
+uint16_t uniffi_zeron_mobile_checksum_method_studiostreamsink_on_end(void
     
 );
 #endif

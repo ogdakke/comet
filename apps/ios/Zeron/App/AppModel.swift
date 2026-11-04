@@ -781,9 +781,14 @@ final class AppModel {
         (try? await client?.githubBranches(repo: repo)) ?? []
     }
 
+    /// Why the last `createSession` failed after the chat was reachable (an
+    /// attachment the core refused, say); nil for a missing target.
+    private(set) var createSessionError: String?
+
     /// Create the chat, open it, and send the first message.
     func createSession(draft: NewSessionDraft, text: String, images: [StagedImage]) -> String? {
         guard let client else { return nil }
+        createSessionError = nil
         let target: SessionTarget
         if let p = draft.projectId {
             target = .project(spaceId: p)
@@ -804,13 +809,17 @@ final class AppModel {
             return chatId
         } catch {
             NSLog("create session failed: \(error)")
+            createSessionError = "\(error)"
             return nil
         }
     }
 }
 
 extension StagedImage {
-    var outgoing: OutgoingAttachment { OutgoingAttachment(name: name, mimeType: "image/jpeg", data: data) }
+    var outgoing: OutgoingAttachment {
+        guard let file else { return OutgoingAttachment(name: name, mimeType: "image/jpeg", data: data, path: nil) }
+        return OutgoingAttachment(name: name, mimeType: file.mimeType, data: Data(), path: file.url.path)
+    }
 }
 
 /// Core events arrive on Rust runtime threads; hop to main.

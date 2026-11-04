@@ -540,7 +540,7 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
             return false
         }
         guard let chatId = app.createSession(draft: draft, text: text, images: images) else {
-            let alert = UIAlertController(title: "Couldn't start the session", message: "Choose a project or a host that can run it.", preferredStyle: .alert)
+            let alert = UIAlertController(title: "Couldn't start the session", message: app.createSessionError ?? "Choose a project or a host that can run it.", preferredStyle: .alert)
             alert.addAction(UIAlertAction(title: "OK", style: .default))
             present(alert, animated: true)
             return false

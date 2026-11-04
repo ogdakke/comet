@@ -125,6 +125,8 @@ final class TranscriptListView: UIScrollView, RowViewDelegate, UIScrollViewDeleg
     var onSubagent: ((String, String, Bool) -> Void)?
     /// An agent message's sender caption was tapped (the sending chat's id).
     var onOpenChat: ((String) -> Void)?
+    /// A shared file's card was tapped.
+    var onFile: ((SharedFile) -> Void)?
     var onDistanceFromBottom: ((CGFloat) -> Void)?
     var imageLoader: ((String, UIImageView) -> Void)?
     /// An attachment's picture, for an image chip opened full size.
@@ -692,6 +694,10 @@ final class TranscriptListView: UIScrollView, RowViewDelegate, UIScrollViewDeleg
 
     func rowView(_ view: RowView, openSubagent docId: String, title: String, running: Bool) {
         onSubagent?(docId, title, running)
+    }
+
+    func rowView(_ view: RowView, openFile file: SharedFile) {
+        onFile?(file)
     }
 
     func rowView(_ view: RowView, open url: URL) {

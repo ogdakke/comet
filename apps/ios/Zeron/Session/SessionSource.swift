@@ -82,6 +82,8 @@ protocol SessionSource: AnyObject {
     /// Where this chat's provider signs in (an error card's "Log in").
     func signInTarget() -> AgentAccountsViewController.Target?
     func loadImage(_ reference: String, into view: UIImageView)
+    /// The viewer for a file an agent sent, when this source can fetch it.
+    func fileViewer(for file: SharedFile) -> UIViewController?
     /// An attachment's picture, for opening it full size (an image chip).
     func image(_ reference: String) async -> UIImage?
     /// Workspace files for `@` mentions.
@@ -235,6 +237,7 @@ final class FixtureSessionSource: SessionSource {
         }
     }
     func loadImage(_ reference: String, into view: UIImageView) {}
+    func fileViewer(for file: SharedFile) -> UIViewController? { nil }
     func image(_ reference: String) async -> UIImage? { nil }
     func searchFiles(_ query: String) async -> [FileMatch] { [] }
 }
