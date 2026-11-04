@@ -25,6 +25,17 @@ if (!config.includes('"main"') || !config.includes('"name"')) {
   process.exit(2);
 }
 
+// The Worker imports node:buffer (@cloudflare/puppeteer, src/card-image.ts),
+// which only loads with nodejs_compat. A private config that predates it
+// gets the flag here; one that sets its own flags must include it.
+const compatArgs = [];
+if (!config.includes('"compatibility_flags"')) {
+  compatArgs.push("--compatibility-flags", "nodejs_compat");
+} else if (!config.includes('"nodejs_compat"')) {
+  console.error('The production Wrangler config sets compatibility_flags without "nodejs_compat".');
+  process.exit(2);
+}
+
 const edgeRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const configPath = join(edgeRoot, ".wrangler.production.generated.jsonc");
 const wranglerPath = join(edgeRoot, "node_modules", ".bin", "wrangler");
@@ -34,7 +45,7 @@ try {
   chmodSync(configPath, 0o600);
   const result = spawnSync(
     wranglerPath,
-    ["deploy", "--config", configPath, ...process.argv.slice(2)],
+    ["deploy", "--config", configPath, ...compatArgs, ...process.argv.slice(2)],
     { cwd: edgeRoot, stdio: "inherit" }
   );
   if (result.error) throw result.error;
