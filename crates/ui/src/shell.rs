@@ -21128,9 +21128,16 @@ mod settings_modal_regressions {
             });
             shell.active_chat = "newer".into();
         });
-        cx.run_until_parked();
-        cx.update(|window, cx| window.draw(cx).clear());
-        let row = cx.debug_bounds("chat-older").expect("sidebar row");
+        // The sidebar settles over its first frames (the chrome glides into
+        // place); start the drag once its rows are drawn.
+        let row = (0..10)
+            .find_map(|_| {
+                shell.update(cx, |_, cx| cx.notify());
+                cx.run_until_parked();
+                cx.update(|window, cx| window.draw(cx).clear());
+                cx.debug_bounds("chat-older")
+            })
+            .expect("sidebar row");
         let from = row.center();
         cx.simulate_mouse_down(from, MouseButton::Left, gpui::Modifiers::default());
         // Several frames of dragging, inside the sidebar and then out of it.
