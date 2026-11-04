@@ -130,6 +130,22 @@ matters; doing it right needs manifest-walking garbage collection under the 30-d
    machine with an iOS background transport, host fetch and wait window, any-file pickers.
 4. Later: Markdown links to local files, desktop and Android transports.
 
+## Status (first cut)
+
+Built: the edge routes and the transfer crate; `send_file` with versions and the path approval;
+the mobile `File` card, read-URL streaming and resumable fetch with the host as fallback; the
+client sending a picked file by path through R2 and the host fetching it while parts arrive.
+
+Not yet as designed:
+
+- The phone uploads in-process (the Rust escort, resumed on every launch from the stash) rather
+  than through an iOS background `URLSession`, so an upload pauses while the app is suspended.
+  The stash is one file read by offset (`PartSource::File`); the split-from-the-end layout
+  (`split_into_parts`) is ready for when the background transport lands.
+- The host's wait is "while its fetcher still expects the transfer" (it appeared within 15 min,
+  and parts arrived within the last 2 h, up to 48 h) rather than a fixed 30-minute progress window.
+- Older versions aren't collapsed in the transcript yet; every version renders as its own card.
+
 ## Deployment
 
 - `wrangler secret put TRANSFER_TOKEN_SECRET` (32+ random bytes).
