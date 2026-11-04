@@ -292,6 +292,8 @@ struct DocHostInner {
     /// Uploads store (engine assembly) — resolves `pending://` attachment
     /// refs and jails transfer reads to the uploads dir.
     uploads: OnceLock<crate::uploads::Uploads>,
+    /// R2 file transfers (`send_file` uploads; set with the uploads store).
+    r2_transfers: OnceLock<crate::transfers::Transfers>,
     /// Connectivity watch (`WatchConnectivity`): lazily-started monitor
     /// publishes the edge posture on change (see `watch_connectivity`).
     connectivity: OnceLock<watch::Sender<zeron_proto::Connectivity>>,
@@ -1072,6 +1074,7 @@ impl DocHost {
                 seed_waiting: Mutex::new(HashSet::new()),
                 drain_waiting: Mutex::new(HashSet::new()),
                 uploads: OnceLock::new(),
+                r2_transfers: OnceLock::new(),
                 connectivity: OnceLock::new(),
                 connectivity_started: AtomicBool::new(false),
                 transfers: watch::channel(Vec::new()).0,
@@ -1323,7 +1326,19 @@ impl DocHost {
     /// Wire the uploads store (engine assembly) — `pending://` ref resolution
     /// and the transfer-read jail.
     pub fn set_uploads(&self, uploads: crate::uploads::Uploads) {
+        let transfers =
+            crate::transfers::Transfers::new(uploads.dir(), self.inner.config.edge.clone());
+        // Uploads a previous run queued and didn't finish.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            transfers.resume_outbox();
+        }
+        let _ = self.inner.r2_transfers.set(transfers);
         let _ = self.inner.uploads.set(uploads);
+    }
+
+    /// The R2 transfer service (engine assembly sets it with the uploads).
+    pub fn transfers(&self) -> Option<&crate::transfers::Transfers> {
+        self.inner.r2_transfers.get()
     }
 
     /// Wire the peer-link cache (engine assembly, edge runtimes only) — the

@@ -13765,6 +13765,7 @@ dependencies = [
  "zeron-studio",
  "zeron-sync",
  "zeron-term-link",
+ "zeron-transfer",
  "zeron-update",
  "zeron-visual",
  "zip",

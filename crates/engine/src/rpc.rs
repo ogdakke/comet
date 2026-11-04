@@ -623,6 +623,20 @@ struct PublishVisualParams {
     assets: std::collections::BTreeMap<String, String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PublishFileParams {
+    chat_id: String,
+    /// Absolute path of the file or folder on this device.
+    path: String,
+    #[serde(default)]
+    caption: Option<String>,
+}
+
+/// How long `send_file` waits for the person to allow a file from outside
+/// the chat's folder before giving up.
+const SEND_FILE_APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PublishImageParams {
@@ -5900,6 +5914,91 @@ impl RpcService for EngineRpc {
                     "title": title,
                     "checkedInteractions": report.interactions,
                     "printed": report.logs,
+                }))
+            }
+            methods::PUBLISH_FILE => {
+                let p: PublishFileParams = parse_params(params)?;
+                if !self.sessions.has_run(&p.chat_id) {
+                    return Err(no_turn_for("send_file"));
+                }
+                let Some(transfers) = self.doc_host.transfers().cloned() else {
+                    return Err(RpcError::Failed(
+                        "Sending files isn't available on this device".into(),
+                    ));
+                };
+                let source = std::path::PathBuf::from(&p.path);
+                if !source.is_absolute() {
+                    return Err(RpcError::BadParams(format!(
+                        "{} is not an absolute path",
+                        p.path
+                    )));
+                }
+                let source = std::fs::canonicalize(&source)
+                    .map_err(|e| RpcError::BadParams(format!("can't read {}: {e}", p.path)))?;
+                let cwd = self
+                    .workspace
+                    .read_chats()
+                    .ok()
+                    .and_then(|chats| chats.into_iter().find(|c| c.id == p.chat_id))
+                    .and_then(|chat| chat.cwd)
+                    .filter(|cwd| !cwd.is_empty())
+                    .map(std::path::PathBuf::from);
+                if !crate::transfers::sendable_without_asking(&source, cwd.as_deref()) {
+                    let question = zeron_proto::UserInputQuestion {
+                        id: "send-file".into(),
+                        header: "Send a file".into(),
+                        question: format!(
+                            "The agent wants to send you {}, which is outside this chat's folder. Send it?",
+                            source.display()
+                        ),
+                        options: vec!["Send it".into(), "Don't send".into()],
+                        multi_select: false,
+                        prefill: None,
+                        multiline: false,
+                    };
+                    let Some(answer) = self.sessions.ask_person(&p.chat_id, vec![question]) else {
+                        return Err(no_turn_for("send_file"));
+                    };
+                    let allowed = matches!(
+                        tokio::time::timeout(SEND_FILE_APPROVAL_WAIT, answer).await,
+                        Ok(Ok(answers)) if answers.iter().any(|a| a.labels.iter().any(|l| l == "Send it"))
+                    );
+                    if !allowed {
+                        return Err(RpcError::Failed(format!(
+                            "The person didn't allow sending {}. Don't retry or copy it elsewhere to send it; ask them if it matters.",
+                            source.display()
+                        )));
+                    }
+                }
+                let chat_id = p.chat_id.clone();
+                let sharing = transfers.clone();
+                let shared = tokio::task::spawn_blocking(move || sharing.share(&chat_id, &source))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let event = AgentEvent::SharedFile {
+                    id: shared.id.clone(),
+                    path: shared.path.clone(),
+                    name: shared.name.clone(),
+                    mime_type: shared.mime_type.clone(),
+                    size: shared.size,
+                    transfer_id: shared.transfer_id.clone(),
+                    artifact: shared.artifact.clone(),
+                    version: shared.version,
+                    caption: p.caption.filter(|c| !c.trim().is_empty()),
+                };
+                if !self.sessions.inject_event(&p.chat_id, event) {
+                    return Err(no_turn_for("send_file"));
+                }
+                if let Some(transfer_id) = &shared.transfer_id {
+                    transfers.start(transfer_id);
+                }
+                RpcReply::value(&serde_json::json!({
+                    "id": shared.id,
+                    "name": shared.name,
+                    "mimeType": shared.mime_type,
+                    "bytes": shared.size,
+                    "version": shared.version,
                 }))
             }
             methods::PUBLISH_IMAGE => {

@@ -223,6 +223,24 @@ pub enum MessagePart {
         path: String,
         title: String,
     },
+    /// A file the agent sent (`send_file`): rendered inline by type, opened
+    /// from its transfer (or the host's snapshot at `path`). Sends of the same
+    /// `artifact` are its versions. Old desktop builds' unknown-kind fallback
+    /// yields an empty text part (invisible); iOS drops unknown kinds.
+    #[serde(rename_all = "camelCase")]
+    File {
+        id: String,
+        path: String,
+        name: String,
+        mime_type: String,
+        size: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transfer_id: Option<String>,
+        artifact: String,
+        version: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+    },
     /// Model thinking. Carries its body in a dedicated doc field (`reasoning`,
     /// never `text`) so pre-reasoning desktop builds — whose unknown-kind
     /// fallback renders `text` as prose — degrade to an invisible empty text
@@ -347,6 +365,7 @@ impl MessagePart {
             MessagePart::Text { id, .. }
             | MessagePart::Image { id, .. }
             | MessagePart::Visual { id, .. }
+            | MessagePart::File { id, .. }
             | MessagePart::Reasoning { id, .. }
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
@@ -390,6 +409,24 @@ impl MessagePart {
                 mime_type,
             } => id.len() + path.len() + name.len() + mime_type.len(),
             MessagePart::Visual { id, path, title } => id.len() + path.len() + title.len(),
+            MessagePart::File {
+                id,
+                path,
+                name,
+                mime_type,
+                transfer_id,
+                artifact,
+                caption,
+                ..
+            } => {
+                id.len()
+                    + path.len()
+                    + name.len()
+                    + mime_type.len()
+                    + transfer_id.as_ref().map_or(0, String::len)
+                    + artifact.len()
+                    + caption.as_ref().map_or(0, String::len)
+            }
             MessagePart::Error { message, .. } => message.len(),
             MessagePart::Fork {
                 source_chat_id,
@@ -459,6 +496,34 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 *existing = visual;
             } else {
                 out.push(visual);
+            }
+        }
+        AgentEvent::SharedFile {
+            id,
+            path,
+            name,
+            mime_type,
+            size,
+            transfer_id,
+            artifact,
+            version,
+            caption,
+        } => {
+            let file = MessagePart::File {
+                id: id.clone(),
+                path: path.clone(),
+                name: name.clone(),
+                mime_type: mime_type.clone(),
+                size: *size,
+                transfer_id: transfer_id.clone(),
+                artifact: artifact.clone(),
+                version: *version,
+                caption: caption.clone(),
+            };
+            if let Some(existing) = out.iter_mut().find(|p| p.id() == id) {
+                *existing = file;
+            } else {
+                out.push(file);
             }
         }
         AgentEvent::ReasoningDelta { text } => {

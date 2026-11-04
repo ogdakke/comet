@@ -118,6 +118,11 @@ fn render_one(entry: &SessionMessageEntry, options: RenderOptions) -> RenderedMe
             }
             MessagePart::Image { name, .. } => tools.push(format!("image: {name}")),
             MessagePart::Visual { title, .. } => tools.push(format!("visual: {title}")),
+            MessagePart::File { name, version, .. } => tools.push(if *version > 1 {
+                format!("file: {name} (v{version})")
+            } else {
+                format!("file: {name}")
+            }),
             MessagePart::Reasoning { text, .. } => {
                 if options.include_reasoning && !text.trim().is_empty() {
                     reasoning_parts.push(text.as_str());

@@ -319,6 +319,10 @@ pub mod methods {
     /// Store an image file an agent shows and fold it into that chat's live
     /// turn as an image part (`show_image`). Local only, like `PublishVisual`.
     pub const PUBLISH_IMAGE: &str = "PublishImage";
+    /// Snapshot a file (or zipped folder) an agent sends, fold it into that
+    /// chat's live turn as a file part, and upload it to the edge's transfer
+    /// store in the background (`send_file`). Local only, like `PublishImage`.
+    pub const PUBLISH_FILE: &str = "PublishFile";
     /// Lazy full-tool-output fetch from the R2 sidecar by doc-resident ref
     /// (chat2-sync A3). Edge-direct from any device — never relay-forwarded.
     pub const FETCH_TOOL_BLOB: &str = "FetchToolBlob";
@@ -697,6 +701,7 @@ pub fn agent_allowed(method: &str) -> bool {
             // Showing the person something in the calling chat.
             | methods::PUBLISH_VISUAL
             | methods::PUBLISH_IMAGE
+            | methods::PUBLISH_FILE
             // Plugins: authoring, installing (lands waiting for the person),
             // checking for updates, and their tools.
             | methods::LIST_PLUGINS

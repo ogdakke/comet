@@ -149,6 +149,21 @@ struct DocPartJson {
     /// only when true): the UI says earlier output was trimmed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output_truncated: Option<bool>,
+    /// A sent file's byte length (`kind: "file"`, additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
+    /// A sent file's R2 transfer (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transfer_id: Option<String>,
+    /// The artifact a sent file is a version of, and which version (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artifact: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<u32>,
+    /// A sent file's caption. Not `text`: old readers' unknown-kind fallback
+    /// would render it as prose with no file beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    caption: Option<String>,
 }
 
 /// App parts → doc part json (mirror of `toDocParts`).
@@ -173,6 +188,29 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             kind: "visual".into(),
             path: Some(path.clone()),
             name: Some(title.clone()),
+            ..Default::default()
+        },
+        MessagePart::File {
+            id,
+            path,
+            name,
+            mime_type,
+            size,
+            transfer_id,
+            artifact,
+            version,
+            caption,
+        } => DocPartJson {
+            id: id.clone(),
+            kind: "file".into(),
+            path: Some(path.clone()),
+            name: Some(name.clone()),
+            mime_type: Some(mime_type.clone()),
+            size: Some(*size),
+            transfer_id: transfer_id.clone(),
+            artifact: Some(artifact.clone()),
+            version: Some(*version),
+            caption: caption.clone(),
             ..Default::default()
         },
         MessagePart::Text { id, text } => DocPartJson {
@@ -292,6 +330,25 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
             None => MessagePart::Error {
                 id: p.id,
                 message: "Visual unavailable".into(),
+            },
+        },
+        "file" => match (p.path, p.name, p.mime_type) {
+            (Some(path), Some(name), Some(mime_type)) if !path.is_empty() && !name.is_empty() => {
+                MessagePart::File {
+                    artifact: p.artifact.unwrap_or_else(|| path.clone()),
+                    id: p.id,
+                    path,
+                    name,
+                    mime_type,
+                    size: p.size.unwrap_or(0),
+                    transfer_id: p.transfer_id.filter(|t| !t.is_empty()),
+                    version: p.version.unwrap_or(1).max(1),
+                    caption: p.caption,
+                }
+            }
+            _ => MessagePart::Error {
+                id: p.id,
+                message: "File unavailable".into(),
             },
         },
         "tool" => match p.call.and_then(|c| serde_json::from_value(c).ok()) {
@@ -1094,6 +1151,21 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     if let Some(truncated) = doc_part.output_truncated {
         map.insert("outputTruncated", truncated)?;
     }
+    if let Some(size) = doc_part.size {
+        map.insert("size", size as i64)?;
+    }
+    if let Some(transfer_id) = &doc_part.transfer_id {
+        map.insert("transferId", transfer_id.as_str())?;
+    }
+    if let Some(artifact) = &doc_part.artifact {
+        map.insert("artifact", artifact.as_str())?;
+    }
+    if let Some(version) = doc_part.version {
+        map.insert("version", version as i64)?;
+    }
+    if let Some(caption) = &doc_part.caption {
+        map.insert("caption", caption.as_str())?;
+    }
     Ok(())
 }
 
@@ -1575,6 +1647,21 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     }
     if let Some(truncated) = doc_part.output_truncated {
         map.insert("outputTruncated", truncated)?;
+    }
+    if let Some(size) = doc_part.size {
+        map.insert("size", size as i64)?;
+    }
+    if let Some(transfer_id) = &doc_part.transfer_id {
+        map.insert("transferId", transfer_id.as_str())?;
+    }
+    if let Some(artifact) = &doc_part.artifact {
+        map.insert("artifact", artifact.as_str())?;
+    }
+    if let Some(version) = doc_part.version {
+        map.insert("version", version as i64)?;
+    }
+    if let Some(caption) = &doc_part.caption {
+        map.insert("caption", caption.as_str())?;
     }
     if let Some(text) = &doc_part.text {
         // Defensive path only — the fold never rewrites earlier text.

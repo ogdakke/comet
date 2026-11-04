@@ -17,6 +17,9 @@ zeron-harness.workspace = true
 zeron-studio.workspace = true
 semver = "1"
 zeron-rpc.workspace = true
+zeron-transfer.workspace = true
+# `send_file` sends a folder as a zip.
+zip.workspace = true
 zeron-update.workspace = true
 zeron-notify.workspace = true
 zeron-visual.workspace = true

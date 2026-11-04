@@ -611,6 +611,26 @@ pub fn parse_auth_state(value: &serde_json::Value) -> Option<AuthState> {
 // Sidebar grouping
 // ---------------------------------------------------------------------------
 
+/// A file size for people: "812 B", "12 KB", "3.4 MB", "1.2 GB".
+pub fn human_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let b = bytes as f64;
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if b < KB * KB {
+        format!("{:.0} KB", b / KB)
+    } else if b < KB * KB * KB {
+        let mb = b / (KB * KB);
+        if mb < 10.0 {
+            format!("{mb:.1} MB")
+        } else {
+            format!("{mb:.0} MB")
+        }
+    } else {
+        format!("{:.1} GB", b / (KB * KB * KB))
+    }
+}
+
 /// One grouped-by-project sidebar section.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatGroup<'a> {

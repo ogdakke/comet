@@ -1035,6 +1035,30 @@ pub enum AgentEvent {
         path: String,
         title: String,
     },
+    /// A file the agent sent with Zeron's `send_file` MCP tool
+    /// (docs/design/file-transfer.md). `path` is the engine's snapshot in
+    /// uploads (what was sent, whatever happens to the original since);
+    /// viewers fetch the bytes from the transfer when it has one, else from
+    /// the host. Engine-made, like [`Self::Visual`].
+    #[serde(rename_all = "camelCase")]
+    SharedFile {
+        id: String,
+        path: String,
+        name: String,
+        mime_type: String,
+        size: u64,
+        /// The R2 transfer holding the bytes (`/xfer/{chatId}/{transferId}`);
+        /// `None` when the edge had no transfer store (read from the host).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transfer_id: Option<String>,
+        /// Stable key of the artifact this file is a version of: the source
+        /// path it was sent from. Sends of the same path are versions.
+        artifact: String,
+        /// 1 for the first send of `artifact` in the chat, then 2, 3, ...
+        version: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+    },
     ReasoningDelta {
         text: String,
     },

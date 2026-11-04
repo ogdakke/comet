@@ -1762,6 +1762,68 @@ pub fn rows_for_entry(
                             },
                         });
                     }
+                    // A sent file: images as the reply images they are; other
+                    // types a one-line note until the desktop has file cards.
+                    MessagePart::File {
+                        id: part_id,
+                        path,
+                        name,
+                        mime_type,
+                        size,
+                        version,
+                        caption,
+                        ..
+                    } => {
+                        let id = format!("{}#{}", entry.id, part_id);
+                        let image = matches!(
+                            mime_type.as_str(),
+                            "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+                        );
+                        if image {
+                            rows.push(Row {
+                                id: id.into(),
+                                version: fnv1a(
+                                    format!("{}\0{path}\0{name}\0{mime_type}", entry.device_id)
+                                        .as_bytes(),
+                                ),
+                                turn_start: false,
+                                entry_id: entry_id.clone(),
+                                timestamp: None,
+                                copy_text: None,
+                                compact_fold: None,
+                                kind: RowKind::GeneratedImage {
+                                    owner: entry.device_id.clone(),
+                                    path: path.clone(),
+                                    name: name.clone(),
+                                    mime_type: mime_type.clone(),
+                                },
+                            });
+                            continue;
+                        }
+                        let mut note = format!("📎 **{name}** · {}", zeron_proto::view::human_bytes(*size));
+                        if *version > 1 {
+                            note.push_str(&format!(" · v{version}"));
+                        }
+                        if let Some(caption) = caption.as_deref().filter(|c| !c.trim().is_empty()) {
+                            note.push_str(&format!("\n\n{caption}"));
+                        }
+                        let tree = parse(&id, &note);
+                        for block_ix in 0..tree.blocks.len() {
+                            rows.push(Row {
+                                id: format!("{id}.{block_ix}").into(),
+                                version: fnv1a(note.as_bytes()),
+                                turn_start: false,
+                                entry_id: entry_id.clone(),
+                                timestamp: None,
+                                copy_text: None,
+                                compact_fold: None,
+                                kind: RowKind::Markdown {
+                                    tree: tree.clone(),
+                                    block_ix,
+                                },
+                            });
+                        }
+                    }
                     MessagePart::Input {
                         id: part_id,
                         questions,

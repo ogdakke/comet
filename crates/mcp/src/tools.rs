@@ -268,6 +268,24 @@ fn catalog() -> Vec<ToolDef> {
             "required": ["path"]
         }),
     });
+    tools.push(ToolDef {
+        name: SEND_FILE,
+        description: SEND_FILE_DESCRIPTION,
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The file or folder on this machine, absolute or relative to your working directory. A folder is sent as a zip."
+                },
+                "caption": {
+                    "type": "string",
+                    "description": "Optional one-line note shown with the file."
+                }
+            },
+            "required": ["path"]
+        }),
+    });
     tools.extend(plugins::catalog());
     tools
 }
@@ -286,6 +304,21 @@ appear. PNG, JPEG, WebP, or GIF, at most 10 MB and 4096 pixels on a side. Zeron 
 into the chat, so it stays visible after the file changes or is deleted. The reader \
 already sees the image, so the reply should not announce or describe it: add only what the image \
 doesn't show.";
+
+/// Sends a file to the reader of the CALLING chat; offered like `show_visual`.
+const SEND_FILE: &str = "send_file";
+
+const SEND_FILE_DESCRIPTION: &str = "\
+Send the reader a file: any type, up to 4 GB (a folder is sent as a zip). It appears in this chat \
+above your final text reply, rendered by type (Markdown and HTML rendered, PDFs, images and video \
+inline, anything else as a file they can open, save or share), and stays openable from their phone \
+while this machine sleeps. Use it for deliverables the person should look at or keep: a report, a \
+page, a build, a recording. Zeron copies the file when you call this, so later edits don't change \
+what was sent. Sending the same path again sends a new version of it: after the person asks for \
+changes, edit the file and send it again rather than pasting its contents. Files in this chat's \
+working folder or the system temp directory send at once; anything else asks the person first, and \
+if they decline, the call fails: don't retry or copy the file elsewhere to get around that. The \
+reader sees the file, so don't restate its contents in the reply.";
 
 const SHOW_VISUAL_DESCRIPTION: &str = "\
 Show an interactive visual (chart, table, dashboard, diagram, simulation, 3D view) inline in this \
@@ -515,6 +548,13 @@ async fn read_image(path: &str) -> anyhow::Result<Vec<u8>> {
 #[derive(Deserialize)]
 struct ShowImageArgs {
     path: String,
+}
+
+#[derive(Deserialize)]
+struct SendFileArgs {
+    path: String,
+    #[serde(default)]
+    caption: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -752,7 +792,7 @@ impl Tools {
         let in_chat = self.zeron.origin().chat_id.is_some();
         catalog()
             .into_iter()
-            .filter(|tool| in_chat || ![SHOW_VISUAL, SHOW_IMAGE].contains(&tool.name))
+            .filter(|tool| in_chat || ![SHOW_VISUAL, SHOW_IMAGE, SEND_FILE].contains(&tool.name))
             .collect()
     }
 
@@ -782,6 +822,7 @@ impl Tools {
             "archive_chat" => self.archive_chat(parse(args)?).await,
             SHOW_VISUAL => self.show_visual(parse(args)?).await,
             SHOW_IMAGE => self.show_image(parse(args)?).await,
+            SEND_FILE => self.send_file(parse(args)?).await,
             plugins::CREATE_PLUGIN => return self.create_plugin(args).await,
             plugins::LIST_PLUGINS => return self.list_plugins().await,
             plugins::DESCRIBE_ELEMENTS => return self.describe_elements().await,
@@ -1475,6 +1516,39 @@ impl Tools {
         Ok(json!({
             "image": shown,
             "message": "Shown to the reader above your reply. Don't mention or describe the image; reply with only what it doesn't already show.",
+        }))
+    }
+
+    async fn send_file(&self, args: SendFileArgs) -> anyhow::Result<Value> {
+        let chat_id = self
+            .zeron
+            .origin()
+            .chat_id
+            .clone()
+            .context("send_file only works from an agent Zeron launched in a chat")?;
+        // The engine reads the file itself (it may be gigabytes): pass where
+        // it is, resolved against this agent's working directory.
+        let path = std::path::absolute(&args.path)
+            .with_context(|| format!("can't resolve {}", args.path))?;
+        anyhow::ensure!(path.exists(), "{} doesn't exist", path.display());
+        let caption = args
+            .caption
+            .map(|c| c.trim().chars().take(500).collect::<String>())
+            .filter(|c| !c.is_empty());
+        let sent = self
+            .zeron
+            .call(
+                zeron_rpc::methods::PUBLISH_FILE,
+                json!({
+                    "chatId": chat_id,
+                    "path": path.to_string_lossy(),
+                    "caption": caption,
+                }),
+            )
+            .await?;
+        Ok(json!({
+            "file": sent,
+            "message": "Sent: the reader sees it above your reply. Don't restate its contents; add only what it doesn't say.",
         }))
     }
 

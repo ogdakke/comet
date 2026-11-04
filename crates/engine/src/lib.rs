@@ -75,6 +75,7 @@ pub mod studio_sync;
 pub mod terminals;
 pub mod titles;
 mod transcript_history;
+pub mod transfers;
 pub mod uploads;
 pub mod venice_import;
 pub mod voice;

@@ -3836,6 +3836,126 @@ async fn publish_image_lands_in_the_live_turn() {
     core.shutdown().await;
 }
 
+/// `send_file` end to end below the MCP server: a file from the temp
+/// directory sends at once as a snapshot in uploads; sending its path again is
+/// version 2; a file from anywhere else asks the person first, and a "Don't
+/// send" refuses the call and leaves no part.
+#[tokio::test]
+async fn publish_file_versions_and_asks_outside_the_chat_folder() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(HoldsTurn {
+            events: std::sync::Mutex::new(Some(rx)),
+        }),
+    );
+    let client = Arc::new(zeron_rpc::memory_client(core.rpc_service()));
+    let scratch = tempfile::tempdir().unwrap();
+    let report = scratch.path().join("report.md");
+    std::fs::write(&report, "# Draft").unwrap();
+    let send = |path: &std::path::Path| {
+        let client = client.clone();
+        let path = path.to_string_lossy().into_owned();
+        async move {
+            client
+                .call(
+                    zeron_rpc::methods::PUBLISH_FILE,
+                    serde_json::json!({ "chatId": CHAT, "path": path, "caption": "First pass" }),
+                )
+                .await
+        }
+    };
+    assert!(send(&report).await.is_err(), "no live turn yet");
+
+    core.sessions
+        .dispatch(CHAT, HarnessId::Mock, run_request("write it up"), None)
+        .await
+        .unwrap();
+    tx.send(mock_script()[0].clone()).unwrap();
+    wait_for(|| core.sessions.turn_in_flight(CHAT), "turn starts").await;
+    let first = send(&report).await.expect("PublishFile");
+    assert_eq!(
+        (first["name"].as_str(), first["version"].as_u64()),
+        (Some("report.md"), Some(1))
+    );
+    assert_eq!(first["mimeType"], "text/markdown");
+    std::fs::write(&report, "# Final").unwrap();
+    let second = send(&report).await.expect("PublishFile again");
+    assert_eq!(second["version"], 2);
+
+    // Outside the chat's folder and temp: the person is asked.
+    let elsewhere = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    let secret = elsewhere.path().join("notes.txt");
+    std::fs::write(&secret, "private").unwrap();
+    let asked = tokio::spawn(send(&secret));
+    let request_id = {
+        let mut found = None;
+        for _ in 0..200 {
+            found = entries(&core)
+                .into_iter()
+                .flat_map(|e| e.parts)
+                .find_map(|p| match p {
+                    MessagePart::Input {
+                        request_id,
+                        resolved: false,
+                        ..
+                    } => Some(request_id),
+                    _ => None,
+                });
+            if found.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        found.expect("an approval question")
+    };
+    assert!(
+        core.sessions
+            .respond_input(
+                CHAT,
+                &request_id,
+                vec![zeron_proto::UserInputAnswer {
+                    question_id: "send-file".into(),
+                    labels: vec!["Don't send".into()],
+                }],
+            )
+            .unwrap()
+    );
+    let refused = asked.await.unwrap().unwrap_err().to_string();
+    assert!(refused.contains("didn't allow"), "{refused}");
+
+    tx.send(done(DoneStatus::Completed)).unwrap();
+    wait_for(|| !core.sessions.turn_in_flight(CHAT), "turn ends").await;
+    let files: Vec<MessagePart> = entries(&core)
+        .into_iter()
+        .flat_map(|e| e.parts)
+        .filter(|p| matches!(p, MessagePart::File { .. }))
+        .collect();
+    assert_eq!(files.len(), 2, "{files:#?}");
+    let MessagePart::File {
+        path,
+        version,
+        caption,
+        artifact,
+        ..
+    } = &files[1]
+    else {
+        unreachable!()
+    };
+    assert_eq!((*version, caption.as_deref()), (2, Some("First pass")));
+    assert_eq!(
+        artifact,
+        &std::fs::canonicalize(&report).unwrap().to_string_lossy()
+    );
+    assert!(
+        std::path::Path::new(path).starts_with(core.uploads.dir()),
+        "{path}"
+    );
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "# Final");
+    core.shutdown().await;
+}
+
 /// An image a reply names in Markdown reads only from inside that one chat's
 /// working folder, and never through a folder that would open too much:
 /// home or above, Zeron's own data, a chat another device runs.

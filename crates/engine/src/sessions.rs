@@ -1546,6 +1546,35 @@ impl SessionsEngine {
             .is_some_and(|h| h.engine_tx.send(event).is_ok())
     }
 
+    /// Ask the person a question of the engine's own in `chat_id`'s live run
+    /// (an approval a tool needs), through the same input flow as a harness's
+    /// questions: answered from any device with `respond_input`, closed
+    /// unanswered (empty answers) when the run ends first. `None` when the
+    /// chat has no live run.
+    pub fn ask_person(
+        &self,
+        chat_id: &str,
+        questions: Vec<UserInputQuestion>,
+    ) -> Option<oneshot::Receiver<Vec<UserInputAnswer>>> {
+        let (pending, engine_tx) = lock(&self.inner.runs)
+            .get(chat_id)
+            .map(|h| (h.pending_inputs.clone(), h.engine_tx.clone()))?;
+        let request_id = new_id();
+        let (answer_tx, answer_rx) = oneshot::channel();
+        lock(&pending).insert(request_id.clone(), answer_tx);
+        if engine_tx
+            .send(AgentEvent::InputRequested {
+                request_id: request_id.clone(),
+                questions,
+            })
+            .is_err()
+        {
+            lock(&pending).remove(&request_id);
+            return None;
+        }
+        Some(answer_rx)
+    }
+
     /// Resolve a pending `request_input` question set. Empty `answers` close
     /// it unanswered — the harness answers with its own decline. Returns
     /// `false` when no such request is pending (unknown id, or the run
@@ -3008,6 +3037,7 @@ fn turn_tail(events: impl Iterator<Item = AgentEvent>, closed: bool) -> TurnTail
             | AgentEvent::ToolResult { .. }
             | AgentEvent::GeneratedImage { .. }
             | AgentEvent::Visual { .. }
+            | AgentEvent::SharedFile { .. }
             | AgentEvent::AssistantMessageCompleted { .. }
             | AgentEvent::Steered { .. } => tail.reached_provider = true,
             _ => {}
