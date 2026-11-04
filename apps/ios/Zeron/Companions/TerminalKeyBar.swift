@@ -26,6 +26,7 @@ final class TerminalKeyBar: UIInputView {
         if alt == .once { alt = .off }
     }
 
+    private let clip = UIView()
     private let scroller = UIScrollView()
     private let stack = UIStackView()
     private var ctrlButton: UIButton!
@@ -43,7 +44,9 @@ final class TerminalKeyBar: UIInputView {
         scroller.alwaysBounceHorizontal = true
         scroller.contentInset = UIEdgeInsets(top: 0, left: 8, bottom: 0, right: 8)
         scroller.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(scroller)
+        clip.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(clip)
+        clip.addSubview(scroller)
         stack.axis = .horizontal
         stack.spacing = 6
         stack.alignment = .center
@@ -74,10 +77,14 @@ final class TerminalKeyBar: UIInputView {
 
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: 52),
-            scroller.leadingAnchor.constraint(equalTo: leadingAnchor),
-            scroller.topAnchor.constraint(equalTo: topAnchor),
-            scroller.bottomAnchor.constraint(equalTo: bottomAnchor),
-            scroller.trailingAnchor.constraint(equalTo: dismiss.leadingAnchor, constant: -4),
+            clip.leadingAnchor.constraint(equalTo: leadingAnchor),
+            clip.topAnchor.constraint(equalTo: topAnchor),
+            clip.bottomAnchor.constraint(equalTo: bottomAnchor),
+            clip.trailingAnchor.constraint(equalTo: dismiss.leadingAnchor, constant: -4),
+            scroller.leadingAnchor.constraint(equalTo: clip.leadingAnchor),
+            scroller.topAnchor.constraint(equalTo: clip.topAnchor),
+            scroller.bottomAnchor.constraint(equalTo: clip.bottomAnchor),
+            scroller.trailingAnchor.constraint(equalTo: clip.trailingAnchor),
             dismiss.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor, constant: -8),
             dismiss.centerYAnchor.constraint(equalTo: centerYAnchor),
             stack.leadingAnchor.constraint(equalTo: scroller.contentLayoutGuide.leadingAnchor),
@@ -85,12 +92,14 @@ final class TerminalKeyBar: UIInputView {
             stack.centerYAnchor.constraint(equalTo: scroller.frameLayoutGuide.centerYAnchor),
             stack.heightAnchor.constraint(equalToConstant: 38),
         ])
-        // Keys slide under a soft edge instead of being cut.
+        // Keys slide under a soft edge instead of being cut. The mask lives on
+        // a still container: on the scroller itself it would sit in content
+        // coordinates and the keys would scroll out from under it.
         fade.startPoint = CGPoint(x: 0, y: 0.5)
         fade.endPoint = CGPoint(x: 1, y: 0.5)
         fade.colors = [UIColor.clear.cgColor, UIColor.black.cgColor, UIColor.black.cgColor, UIColor.clear.cgColor]
         fade.locations = [0, 0.03, 0.95, 1]
-        scroller.layer.mask = fade
+        clip.layer.mask = fade
         accessibilityIdentifier = "terminal-key-bar"
     }
 
@@ -98,7 +107,10 @@ final class TerminalKeyBar: UIInputView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        fade.frame = scroller.bounds
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        fade.frame = clip.bounds
+        CATransaction.commit()
     }
 
     private func send(_ action: Action) {
