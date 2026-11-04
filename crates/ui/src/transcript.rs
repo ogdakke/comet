@@ -11594,6 +11594,13 @@ impl Render for Transcript {
         // Release gpui-side decoded copies of any images the attachment LRU
         // evicted since the last frame (no-op when nothing was evicted).
         crate::attachments::flush_evicted(Some(window), cx);
+        // Images the rows draw from here on are on screen and spared
+        // eviction. Only the primary transcript counts frames: an override
+        // instance rendering later in the same frame would otherwise age the
+        // primary's visible images out of the one-frame grace.
+        if self.doc_override.is_none() {
+            crate::attachments::begin_render_frame();
+        }
         // Diagram requests are scoped to paint passes; rasters follow the
         // reading column and display density (a no-op while both hold).
         let released_diagrams = {

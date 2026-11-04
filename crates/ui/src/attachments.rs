@@ -881,6 +881,8 @@ enum CacheEntry {
         image: CachedAttachmentImage,
         bytes: usize,
         last_used: u64,
+        /// The [`ImageCache::frame`] that last drew this image (0: never).
+        seen_frame: u64,
     },
     Error {
         attempts: u32,
@@ -935,6 +937,11 @@ struct ImageCache {
     tick: u64,
     loaded_bytes: usize,
     generated_bytes: usize,
+    /// Bumped by each render of the open transcript ([`begin_render_frame`]).
+    /// An image drawn this frame or the one before is on screen, so eviction
+    /// skips it: a viewport of screenshots bigger than the budget otherwise
+    /// evicts its own thumbnails, which reload and evict the next ones, forever.
+    frame: u64,
     /// Evicted images awaiting `flush_evicted` (freeing needs `&mut App`,
     /// which eviction sites — async load completions — don't always have).
     pending_free: Vec<Arc<Image>>,
@@ -959,6 +966,7 @@ impl ImageCache {
                 image,
                 bytes,
                 last_used: self.tick,
+                seen_frame: self.frame,
             },
         ) {
             self.loaded_bytes = self.loaded_bytes.saturating_sub(bytes);
@@ -972,6 +980,7 @@ impl ImageCache {
             self.generated_bytes = self.generated_bytes.saturating_add(bytes);
         }
         let shielded = protected().lock().unwrap().clone();
+        let on_screen = self.frame.saturating_sub(1);
         // Separate budgets prevent protected legacy attachments from repeatedly
         // evicting visible generated previews, or vice versa.
         while (if generated {
@@ -990,7 +999,13 @@ impl ImageCache {
                             || !shielded.contains(&(k.device.clone(), k.path.clone())))
                 })
                 .filter_map(|(k, e)| match e {
-                    CacheEntry::Loaded { last_used, .. } => Some((*last_used, k.clone())),
+                    CacheEntry::Loaded {
+                        last_used,
+                        seen_frame,
+                        ..
+                    } if *seen_frame == 0 || *seen_frame < on_screen => {
+                        Some((*last_used, k.clone()))
+                    }
                     _ => None,
                 })
                 .min_by_key(|(tick, _)| *tick);
@@ -1024,6 +1039,12 @@ fn protected() -> &'static Mutex<std::collections::HashSet<(String, String)>> {
 }
 
 /// Replace the eviction shield with the given keys (see [`protected`]).
+/// Start a render frame of the open transcript: images it draws from here on
+/// count as on screen and are spared eviction (see [`ImageCache::frame`]).
+pub fn begin_render_frame() {
+    cache().lock().unwrap().frame += 1;
+}
+
 pub fn protect_attachments(keys: std::collections::HashSet<(String, String)>) {
     *protected().lock().unwrap() = keys;
 }
@@ -1043,11 +1064,16 @@ pub(crate) fn attachment_snapshot_for(source: &AttachmentKey) -> AttachmentSnaps
         cache.tick += 1;
         cache.tick
     };
+    let frame = cache.frame;
     match cache.map.get_mut(source) {
         Some(CacheEntry::Loaded {
-            image, last_used, ..
+            image,
+            last_used,
+            seen_frame,
+            ..
         }) => {
             *last_used = tick;
+            *seen_frame = frame;
             AttachmentSnapshot::Loaded(image.clone())
         }
         Some(CacheEntry::Error { attempts, at }) => AttachmentSnapshot::Error {
@@ -1766,6 +1792,48 @@ mod generated_image_tests {
             "/99.png",
             Some("image/png")
         )));
+    }
+
+    /// A screen of screenshots bigger than the budget must not evict itself:
+    /// each eviction reloads the image, whose load evicted the next, forever
+    /// (2026-11-04 recording: tool-image strips cycling through "Loading…").
+    /// Images still drawn stay; ones scrolled away go at the next insert.
+    #[test]
+    fn on_screen_generated_images_are_not_evicted() {
+        let png = |side: u32| {
+            let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+            bytes.extend_from_slice(&side.to_be_bytes());
+            bytes.extend_from_slice(&side.to_be_bytes());
+            CachedAttachmentImage {
+                name: "shot.png".into(),
+                image: Arc::new(Image::from_bytes(ImageFormat::Png, bytes)),
+            }
+        };
+        let key =
+            |i: usize| AttachmentKey::new("on-screen", &format!("/{i}.png"), Some("image/png"));
+        let mut cache = ImageCache::default();
+        cache.frame = 1;
+        // 2048² counts ~32 MiB: six of them are three budgets' worth.
+        for i in 0..6 {
+            cache.insert_loaded(key(i), png(2048));
+        }
+        assert!(
+            (0..6).all(|i| cache.map.contains_key(&key(i))),
+            "all drawn this frame"
+        );
+
+        // Two frames on, only 4 and 5 are still drawn.
+        cache.frame = 3;
+        for i in [4, 5] {
+            if let Some(CacheEntry::Loaded { seen_frame, .. }) = cache.map.get_mut(&key(i)) {
+                *seen_frame = 3;
+            }
+        }
+        cache.insert_loaded(key(6), png(16));
+        for i in 0..4 {
+            assert!(!cache.map.contains_key(&key(i)), "{i} scrolled away");
+        }
+        assert!((4..7).all(|i| cache.map.contains_key(&key(i))));
     }
 
     #[test]
