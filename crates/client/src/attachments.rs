@@ -281,6 +281,15 @@ impl AttachmentCache {
         }
     }
 
+    pub(crate) fn remove(&self, device_id: &str, path: &str) {
+        let mut inner = lock(&self.inner);
+        let key = (device_id.to_owned(), path.to_owned());
+        if let Some(old) = inner.map.remove(&key) {
+            inner.bytes -= old.len();
+            inner.order.retain(|k| *k != key);
+        }
+    }
+
     pub(crate) fn clear(&self) {
         *lock(&self.inner) = CacheInner::default();
     }

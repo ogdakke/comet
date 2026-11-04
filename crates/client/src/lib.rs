@@ -41,6 +41,7 @@ pub mod providers;
 pub mod rpc;
 pub mod runtime;
 pub mod session;
+pub mod shared_files;
 pub mod studio;
 pub mod subagents;
 pub mod terminal;

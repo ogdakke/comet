@@ -15,6 +15,15 @@ pub trait Bearer: Send + Sync {
     async fn bearer(&self) -> Result<String, TransferError>;
 }
 
+/// Transfer tokens; `expires_at` (ms) is the read token's expiry.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tokens {
+    pub token: String,
+    pub read_token: String,
+    pub expires_at: i64,
+}
+
 /// A create's answer: the stored manifest and what has already arrived.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -184,6 +193,12 @@ impl EdgeClient {
     ) -> Result<(), TransferError> {
         let url = self.url(chat_id, transfer_id, if cancel { "?cancel=1" } else { "" })?;
         self.send(self.http.delete(url)).await.map(drop)
+    }
+
+    /// Fresh write and read tokens for an existing transfer (bearer only).
+    pub async fn tokens(&self, chat_id: &str, transfer_id: &str) -> Result<Tokens, TransferError> {
+        let url = self.url(chat_id, transfer_id, "/token")?;
+        Ok(self.send(self.http.post(url)).await?.json().await?)
     }
 
     /// The `/content` URL a URL-only opener (a video player, QuickLook) can

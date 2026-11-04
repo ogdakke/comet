@@ -782,6 +782,51 @@ fn visual_rows_take_the_height_their_worker_measures() {
     view.close();
 }
 
+#[test]
+fn shared_files_render_as_cards_and_images_inline() {
+    let file = |id: &str, name: &str, mime: &str, version: u32| MessagePart::File {
+        id: id.into(),
+        path: format!("/up/shared/{id}/{name}"),
+        name: name.into(),
+        mime_type: mime.into(),
+        size: 2_500_000,
+        transfer_id: Some("t1".into()),
+        artifact: name.into(),
+        version,
+        caption: (id == "f1").then(|| "The demo recording".into()),
+    };
+    let mut w = worker(390.0);
+    w.input = TranscriptInput {
+        entries: vec![Arc::new(SessionMessageEntry {
+            id: "a1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![file("f1", "demo.mp4", "video/mp4", 1), file("f2", "report.html", "text/html", 2), file("f3", "chart.png", "image/png", 1)],
+            created_at: 0,
+            device_id: String::new(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            duration_ms: None,
+        })],
+        ..Default::default()
+    };
+    let frame = w.pass();
+    let rows: Vec<_> = (0..frame.row_count()).map(|i| frame.display(i).unwrap()).collect();
+    let cards: Vec<_> = rows
+        .iter()
+        .flat_map(|d| d.widgets.iter())
+        .filter_map(|w| match &w.kind {
+            display::WidgetKind::File { name, version, transfer_id, .. } => Some((name.clone(), *version, transfer_id.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cards, [("demo.mp4".into(), 1, Some("t1".into())), ("report.html".into(), 2, Some("t1".into()))]);
+    let all: String = rows.iter().map(|d| d.text.clone()).collect();
+    assert!(all.contains("MP4 · 2.4 MB"), "{all}");
+    assert!(all.contains("HTML · 2.4 MB · v2"), "{all}");
+    assert!(all.contains("The demo recording"), "{all}");
+    assert!(rows.iter().flat_map(|d| d.widgets.iter()).any(|w| matches!(&w.kind, display::WidgetKind::Image { reference } if reference.ends_with("chart.png"))));
+}
+
 /// Every row of a one-message transcript at `width`.
 fn rows_of(md: &str, width: f32) -> Vec<RowDisplay> {
     let mut w = worker(width);

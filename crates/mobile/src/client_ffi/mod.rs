@@ -534,6 +534,28 @@ impl CoreClient {
         Ok(bytes.as_ref().clone())
     }
 
+    /// A streamable URL (byte ranges) for a file the agent sent, valid for
+    /// hours: hand it to AVPlayer. `None` when the edge has no copy; then
+    /// open `fetch_shared_file`'s local copy instead.
+    pub async fn shared_file_url(&self, chat_id: String, transfer_id: String) -> CoreResult<Option<String>> {
+        let client = self.client.clone();
+        on_runtime(async move { client.shared_file_url(&chat_id, &transfer_id).await }).await
+    }
+
+    /// A file the agent sent, on this device (fetched once, resumable, kept
+    /// in the cache dir): its local path. Falls back to the host's copy.
+    pub async fn fetch_shared_file(&self, file: SharedFileRequest) -> CoreResult<String> {
+        let client = self.client.clone();
+        on_runtime(async move { client.fetch_shared_file(file.into()).await }).await
+    }
+
+    /// Fraction fetched while `fetch_shared_file` downloads through the edge.
+    pub fn shared_file_progress(&self, file: SharedFileRequest) -> Option<f64> {
+        self.client
+            .shared_file_progress(&file.into())
+            .map(|(got, total)| if total == 0 { 1.0 } else { got as f64 / total as f64 })
+    }
+
     // ── lifecycle ──────────────────────────────────────────────────────────
 
     /// OS network path: `false` only for a definitive "unsatisfied".

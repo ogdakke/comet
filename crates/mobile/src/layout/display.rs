@@ -265,6 +265,11 @@ pub enum WidgetKind {
     /// underneath; the painter re-draws those runs brighter through a moving
     /// gradient).
     Shimmer,
+    /// A file the agent sent (tap opens it). `path` reads through the host
+    /// (`read_attachment`); `transfer_id` names its R2 copy when there is one
+    /// (`transfer_content_url` / `fetch_shared_file`). `artifact` groups the
+    /// versions of one file.
+    File { id: String, path: String, name: String, mime_type: String, size: u64, transfer_id: Option<String>, artifact: String, version: u32 },
     /// An agent visual; `TranscriptView::visual(id)` is its live session.
     Visual { id: String },
     /// A button the app acts on: `action` names what (`sign-in`), `label`

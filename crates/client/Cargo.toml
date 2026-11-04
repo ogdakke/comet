@@ -19,6 +19,7 @@ zeron-sync.workspace = true
 zeron-rpc.workspace = true
 zeron-preview.workspace = true
 zeron-term-link.workspace = true
+zeron-transfer.workspace = true
 anyhow.workspace = true
 loro.workspace = true
 tokio.workspace = true

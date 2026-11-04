@@ -35,6 +35,7 @@ pub enum RowKind {
     Image,
     Working,
     Visual,
+    File,
 }
 
 /// A user message awaiting its host echo (client-minted id = the echo's id).
@@ -114,9 +115,19 @@ pub(crate) enum Content {
     /// message this chat's agent sent. Faded while sending.
     Caption { text: PText, pending: bool },
     Image { reference: String },
+    /// A file the agent sent: a tappable card (icon, name, kind · size · version).
+    File(FileCard),
     Working { since_ms: Option<i64>, streaming: bool },
     /// An agent visual: its height comes from its worker.
     Visual(Arc<crate::visual::VisualSlot>),
+}
+
+pub(crate) struct FileCard {
+    pub widget: WidgetKind,
+    pub icon: String,
+    pub name: PText,
+    pub meta: PText,
+    pub caption: Option<PText>,
 }
 
 /// A width-independent row: identity, top gap class and prepared content.
@@ -171,6 +182,9 @@ pub(crate) mod geom {
     pub const NOTICE_BUTTON: f32 = 32.0;
     pub const NOTICE_BUTTON_W: f32 = 80.0;
     pub const IMAGE: f32 = 260.0;
+    pub const FILE_CARD: f32 = 60.0;
+    pub const FILE_CARD_W: f32 = 340.0;
+    pub const FILE_CAPTION_LINES: usize = 3;
     pub const WORKING: f32 = 36.0;
     pub const VISUAL_LOADING: f32 = 18.0;
 }
@@ -478,6 +492,27 @@ impl RowBuilder {
                                 entry_id: Arc::from(entry.id.as_str()),
                                 content: Content::Image { reference: path.clone() },
                                 copy_text: String::new(),
+                            });
+                            rows.push(Placed { core, gap });
+                        }
+                        MessagePart::File { id, path, name, mime_type, size, transfer_id, artifact, version, caption } => {
+                            let gap = gap_for(&rows, false);
+                            let key = row_key(&format!("{}#{}", entry.id, id));
+                            // Raster images show inline (read like generated
+                            // images); everything else is a card.
+                            let content = if zeron_proto::attachment_mentions::is_image_path(name) && *size <= zeron_proto::IMAGE_MAX_BYTES as u64 {
+                                Content::Image { reference: path.clone() }
+                            } else {
+                                Content::File(file_card(ctx, FileFields { id, path, name, mime_type, size: *size, transfer_id, artifact, version: *version, caption }))
+                            };
+                            let kind = if matches!(content, Content::Image { .. }) { RowKind::Image } else { RowKind::File };
+                            let core = Arc::new(RowCore {
+                                key,
+                                version: next_version(),
+                                kind,
+                                entry_id: Arc::from(entry.id.as_str()),
+                                content,
+                                copy_text: name.clone(),
                             });
                             rows.push(Placed { core, gap });
                         }
@@ -842,6 +877,71 @@ fn chip_row(ctx: &mut Ctx, entry_id: &str, part_id: &str, icon: &'static str, co
     }
 }
 
+struct FileFields<'a> {
+    id: &'a str,
+    path: &'a str,
+    name: &'a str,
+    mime_type: &'a str,
+    size: u64,
+    transfer_id: &'a Option<String>,
+    artifact: &'a str,
+    version: u32,
+    caption: &'a Option<String>,
+}
+
+/// "PDF · 2.4 MB · v2": the file's kind, its size, and its version once
+/// there's more than one.
+fn file_meta(name: &str, mime_type: &str, size: u64, version: u32) -> String {
+    let ext = std::path::Path::new(name).extension().and_then(|e| e.to_str()).filter(|e| e.len() <= 8);
+    let kind = match (ext, mime_type.split('/').next()) {
+        (Some(ext), _) => ext.to_ascii_uppercase(),
+        (None, Some("video")) => "Video".into(),
+        (None, Some("audio")) => "Audio".into(),
+        (None, Some("text")) => "Text".into(),
+        _ => "File".into(),
+    };
+    let mut meta = format!("{kind} · {}", zeron_proto::view::human_bytes(size));
+    if version > 1 {
+        meta.push_str(&format!(" · v{version}"));
+    }
+    meta
+}
+
+fn file_card(ctx: &mut Ctx, f: FileFields) -> FileCard {
+    let (size, lh) = TYPE.small;
+    let lh = ctx.typo.px(lh);
+    let strong = ctx.typo.style(Family::Sans, Weight::Medium, false, size);
+    let soft = ctx.typo.style(Family::Sans, Weight::Regular, false, size);
+    let icon = if f.mime_type.starts_with("video/") {
+        "play.rectangle.fill".to_owned()
+    } else if f.mime_type.starts_with("audio/") {
+        "waveform".to_owned()
+    } else {
+        file_icon_asset(f.name)
+    };
+    FileCard {
+        widget: WidgetKind::File {
+            id: f.id.to_owned(),
+            path: f.path.to_owned(),
+            name: f.name.to_owned(),
+            mime_type: f.mime_type.to_owned(),
+            size: f.size,
+            transfer_id: f.transfer_id.clone(),
+            artifact: f.artifact.to_owned(),
+            version: f.version,
+        },
+        icon,
+        name: prepare_plain(ctx, f.name, strong, lh, ColorRole::Text, WhiteSpace::Pre),
+        meta: prepare_plain(ctx, &file_meta(f.name, f.mime_type, f.size, f.version), soft, lh, ColorRole::TextSecondary, WhiteSpace::Pre),
+        caption: f
+            .caption
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(|c| prepare_plain(ctx, c, soft, lh, ColorRole::TextSecondary, WhiteSpace::Normal)),
+    }
+}
+
 fn notice_row(ctx: &mut Ctx, entry_id: &str, part_id: &str, message: &str) -> RowCore {
     let (size, lh) = TYPE.small;
     let style = ctx.typo.style(Family::Sans, Weight::Medium, false, size);
@@ -1090,6 +1190,32 @@ pub(crate) fn place_row(
             }
             side
         }
+        Content::File(card) => {
+            // The card: icon, then name over meta; the caption under it.
+            let w = px.v(FILE_CARD_W).min(cw);
+            let h = px.v(FILE_CARD);
+            let pad = px.v(14.0);
+            let is = px.v(28.0);
+            let text_x = x + pad + is + px.v(12.0);
+            let text_w = (x + w - pad - text_x).max(1.0);
+            let lines = card.name.lh + card.meta.lh;
+            let caption_h = card.caption.as_ref().map_or(0.0, |c| {
+                let lines = c.p.stats(cw).line_count.min(FILE_CAPTION_LINES);
+                px.v(8.0) + lines as f32 * c.lh
+            });
+            if let Some(out) = out {
+                out.fill(x, top, w, h, px.v(14.0), ColorRole::ChipBackground);
+                out.widget(WidgetKind::Icon { name: card.icon.clone(), color: ColorRole::TextSoft }, (x + pad, top + (h - is) / 2.0, is, is), None);
+                let ty = top + (h - lines) / 2.0;
+                place_text_lines(&card.name, text_x, ty, text_w, 1, px, out);
+                place_text_lines(&card.meta, text_x, ty + card.name.lh, text_w, 1, px, out);
+                out.widget(card.widget.clone(), (x, top, w, h), None);
+                if let Some(c) = &card.caption {
+                    place_text_lines(c, x, top + h + px.v(8.0), cw, FILE_CAPTION_LINES, px, out);
+                }
+            }
+            h + caption_h
+        }
         Content::Visual(slot) => {
             // Until its worker has measured it: the loading line.
             let h = visual.unwrap_or(px.v(VISUAL_LOADING));
@@ -1257,6 +1383,7 @@ pub(crate) fn content_heap_bytes(content: &Content) -> usize {
         Content::Caption { text, .. } => text.p.heap_bytes(),
         Content::Notice(n) => n.text.p.heap_bytes(),
         Content::Image { reference } => reference.len(),
+        Content::File(card) => card.name.p.heap_bytes() + card.meta.p.heap_bytes() + card.caption.as_ref().map_or(0, |c| c.p.heap_bytes()),
         Content::Working { .. } | Content::Visual(_) => 0,
     }
 }

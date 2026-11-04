@@ -24,7 +24,7 @@ mod upload;
 use serde::{Deserialize, Serialize};
 
 pub use download::{download, work_dir};
-pub use http::{Bearer, Created, EdgeClient, Status};
+pub use http::{Bearer, Created, EdgeClient, Status, Tokens};
 pub use plan::{PART_FILE_EXT, plan_file, split_into_parts};
 pub use upload::{PartSource, Upload, upload};
 
@@ -119,7 +119,7 @@ impl TransferError {
 }
 
 /// Lowercase hex of `bytes`.
-pub(crate) fn hex(bytes: &[u8]) -> String {
+pub fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     bytes
         .iter()

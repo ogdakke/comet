@@ -1101,3 +1101,27 @@ pub struct PushPrefs {
     pub input: bool,
     pub failed: bool,
 }
+
+/// A file the agent sent, as its transcript widget names it
+/// (`WidgetKind::File`).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SharedFileRequest {
+    /// The chat's host.
+    pub device_id: String,
+    pub chat_id: String,
+    pub transfer_id: Option<String>,
+    pub path: String,
+    pub name: String,
+}
+
+impl From<SharedFileRequest> for zeron_client::shared_files::SharedFileRef {
+    fn from(f: SharedFileRequest) -> Self {
+        Self {
+            device_id: f.device_id,
+            chat_id: f.chat_id,
+            transfer_id: f.transfer_id,
+            path: f.path,
+            name: f.name,
+        }
+    }
+}
