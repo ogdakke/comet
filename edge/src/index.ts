@@ -45,6 +45,13 @@
  *   GET|PUT /studio/:orgId/manifest — personal Studio snapshot generation
  *   GET|HEAD|PUT /studio/:orgId/objects/:sha256 — immutable Studio media
  *
+ * File transfers (transfers.ts, docs/design/file-transfer.md) — bearer or transfer token:
+ *   POST|GET|DELETE /xfer/:chatId/:transferId — create (manifest) / status / remove
+ *   PUT|GET /xfer/:chatId/:transferId/p/:n    — one checksum-verified part
+ *   POST /xfer/:chatId/:transferId/done       — seal; nudges the manifest's device
+ *   GET|HEAD /xfer/:chatId/:transferId/content — the whole file, Range-aware
+ *   POST /xfer/:chatId/:transferId/token      — fresh read/write tokens
+ *
  * Cloud device + credential vault (docs/design/cloud-device.md):
  *   POST /runner/enroll | /runner/token — pre-bearer runner identity
  *   POST /runner/heartbeat              — runner bearer
@@ -71,7 +78,8 @@
  *     (every public card route goes through publicCardGate: per-IP limit, one plain 503)
  *   GET|POST /username, GET /username/check — user bearer (claim, availability)
  */
-import { authenticate } from "./auth";
+import { authenticate, bearerFromRequest, type Verified } from "./auth";
+import { handleTransferRoute } from "./transfers";
 import { chatRoute } from "./chat-route";
 import { dialDeviceRoom } from "./device-link";
 import { deviceParam, forward } from "./forward";
@@ -175,6 +183,32 @@ export default {
     if (usersRouted) return usersRouted;
     const cardRouted = await publicCardGate(request, env, url, () => handlePublicCardRoute(request, env, ctx, url));
     if (cardRouted) return cardRouted;
+
+    // ── file transfers (docs/design/file-transfer.md): a bearer when the
+    //    request carries one, else a transfer token (background uploads and
+    //    URL-only openers like AVPlayer) ─────────────────────────────────────
+    if (parts[0] === "xfer") {
+      let bearer: Verified | undefined;
+      if (bearerFromRequest(request)) {
+        bearer = await authenticate(env, request);
+        if (!bearer) return json({ error: "unauthenticated" }, 401);
+        const refusedRunner = runnerRefusal(bearer, request.method, url);
+        if (refusedRunner) return json({ error: "forbidden", message: refusedRunner }, 403);
+      }
+      const routed = await handleTransferRoute(request, env, url, bearer, {
+        nudge: async (caller, deviceId, chatId) => {
+          const as: Verified = { userId: caller.userId, orgId: caller.orgId, kind: "user" };
+          autoWakeCloudDevice(env, ctx, as, deviceId);
+          const nudge = new Request("https://device/nudge", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ chatId })
+          });
+          await forward(env.DEVICE_ROOMS, `d2/${deviceId}`, nudge, as, "/nudge", "");
+        }
+      });
+      if (routed) return routed;
+    }
 
     const auth = await authenticate(env, request);
     if (!auth) return json({ error: "unauthenticated" }, 401);

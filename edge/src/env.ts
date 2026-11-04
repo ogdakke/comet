@@ -119,6 +119,9 @@ export interface Env {
   RUNNER_JWT_PUBLIC_KEY?: string;
   /** Operator bearer for /admin/cloud/usage (secret). Unset ⇒ route 404s. */
   ADMIN_TOKEN?: string;
+  /** HMAC key for transfer tokens (transfers.ts; secret, 32+ random bytes).
+   * Unset ⇒ /xfer creates and token-authorized requests answer 503. */
+  TRANSFER_TOKEN_SECRET?: string;
   /** Public card reads per client IP (card-gate.ts). Unset ⇒ unlimited. */
   CARD_READS?: RateLimit;
   /** The cards' still pictures (card-image.ts), keyed by the public card. */

@@ -14094,6 +14094,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeron-transfer"
+version = "0.2.136"
+dependencies = [
+ "async-trait",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "zeron-ui"
 version = "0.2.136"
 dependencies = [

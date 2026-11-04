@@ -70,6 +70,7 @@ export const runnerRefusal = (auth: Verified, method: string, url: URL): string 
       return "runner tokens cannot use this route";
     case "chat2":
     case "blob":
+    case "xfer":
       // Gated per chat on the registry's host field (runner-access.ts).
       return undefined;
     case "runner":
