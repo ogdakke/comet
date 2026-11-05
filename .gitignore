@@ -11,7 +11,7 @@ node_modules
 .cloudflare
 edge/wrangler.personal.jsonc
 edge/wrangler.*.personal.jsonc
-edge/.wrangler.production.generated.jsonc
+edge/.wrangler.*.generated.jsonc
 apps/ios/Zeron/Private.*.xcconfig
 build/
 edge/dist/

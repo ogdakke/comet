@@ -61,18 +61,30 @@ npm exec wrangler -- deploy --config wrangler.dev.personal.jsonc
 npm exec wrangler -- deploy --config wrangler.prod.personal.jsonc
 ```
 
-For Cloudflare Builds, keep the production config in the secret environment
-variable `ZERON_WRANGLER_PRODUCTION_CONFIG_B64`. Create its value locally
-without printing the config:
+Cloudflare Builds clones only tracked files, so each Worker's config travels in
+a secret Builds variable instead:
+
+| Worker     | Variable                              | Build command              | Deploy command              |
+| ---------- | ------------------------------------- | -------------------------- | --------------------------- |
+| production | `ZERON_WRANGLER_PRODUCTION_CONFIG_B64` | `npm run build:production` | `npm run deploy:production` |
+| staging    | `ZERON_WRANGLER_STAGING_CONFIG_B64`    | `npm run build:staging`    | `npm run deploy:staging`    |
+
+Set the root directory to `edge` for both. Create each value locally without
+printing the config, and paste it into the Worker's Settings → Build →
+Variables and secrets as a secret:
 
 ```sh
-openssl base64 -A -in edge/wrangler.prod.personal.jsonc
+openssl base64 -A -in edge/wrangler.prod.personal.jsonc | pbcopy  # production
+openssl base64 -A -in edge/wrangler.personal.jsonc | pbcopy       # staging
 ```
 
-Set the Cloudflare Builds root directory to `edge` and the deploy command to
-`npm run deploy:production`. The deploy script fails if the secret is absent or
-malformed, writes it to a mode-0600 ignored file for Wrangler, and removes the
-file when Wrangler exits. URLs and resource identifiers stay out of Git.
+Update the secret whenever the ignored config changes. A stale one is worse
+than none: a config missing a migration the Worker has already run makes
+Wrangler replay every migration from v1, which Cloudflare refuses (10074).
+`scripts/deploy-private.mjs` checks for the v1–v5 tags, adds `nodejs_compat`
+when the config sets no compatibility flags, writes the config to a mode-0600
+ignored file for Wrangler, and removes the file when Wrangler exits. URLs and
+resource identifiers stay out of Git.
 
 ## Devices
 
